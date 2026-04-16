@@ -64,6 +64,7 @@ from .variables import (
     FunctorchHigherOrderVariable,
     InspectSignatureVariable,
     IterBuiltinVariable,
+    ListBuiltinVariable,
     LocalGeneratorFunctionVariable,
     LocalGeneratorObjectVariable,
     NestedUserFunctionVariable,
@@ -674,6 +675,9 @@ torch_c_binding_in_graph_functions = dict.fromkeys(
         "torch._C._from_dlpack",
         "torch._C._functionality_to_backend_keys",
         "torch._C._functionalization_reapply_views_tls",
+        "torch._C._functorch._grad_decrement_nesting",
+        "torch._C._functorch._grad_increment_nesting",
+        "torch._C._functorch.set_inplace_requires_grad_allowed",
         "torch._C._fuse_to_static_module",
         "torch._C._gather_out",
         "torch._C._gather",
@@ -1444,12 +1448,9 @@ torch_c_binding_in_graph_functions = dict.fromkeys(
         "torch._C.parse_ir",
         "torch._C.parse_schema",
         "torch._C.parse_type_comment",
-        "torch._C.read_vitals",
         "torch._C.set_autocast_cache_enabled",
         "torch._C.set_autocast_enabled",
-        "torch._C.set_vital",
         "torch._C.unify_type_list",
-        "torch._C.vitals_enabled",
         "torch._C.wait",
         "torch._cast_Byte",
         "torch._cast_Char",
@@ -3833,6 +3834,7 @@ we don't want to inline the lower level function call (e.g, f3) by default.
 _force_inline_flag = False
 
 
+# pyrefly: ignore [deprecated]
 @contextlib.contextmanager
 def _force_inline() -> Iterator[None]:
     """
@@ -3996,7 +3998,11 @@ def is_torch(filename: str) -> bool:
 Main entry point for looking up the trace rule (the Dynamo variable) for a given callable object.
 """
 
-BUILTIN_CALLABLES = {dict: DictBuiltinVariable, iter: IterBuiltinVariable}
+BUILTIN_CALLABLES = {
+    dict: DictBuiltinVariable,
+    iter: IterBuiltinVariable,
+    list: ListBuiltinVariable,
+}
 
 
 def lookup_callable(obj: Callable[..., Any]) -> type[VariableTracker] | None:
