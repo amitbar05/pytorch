@@ -13,6 +13,7 @@ namespace vulkan {
 struct DeviceCapabilities {
     bool float16 = false;
     bool int8 = false;
+    bool int64 = false;
     bool float64 = false;
     uint32_t subgroup_size = 0;
     bool cooperative_matrix = false;
@@ -20,6 +21,9 @@ struct DeviceCapabilities {
     uint32_t max_compute_shared_memory = 0;
     std::string device_name;
     uint32_t device_type = 0; // VkPhysicalDeviceType
+    // VK_EXT_descriptor_indexing / Vulkan 1.2 descriptor indexing
+    bool descriptor_indexing = false;
+    uint32_t max_per_stage_storage_buffers = 16; // default pre-descriptor-indexing limit
 };
 
 class Context {
@@ -47,6 +51,10 @@ public:
     std::string device_name(uint32_t index = UINT32_MAX) const;
 
     bool is_available() const { return !devices_.empty(); }
+
+    // Descriptor indexing (UPDATE_AFTER_BIND) support for current device.
+    // Gated by VK_EXT_descriptor_indexing + env var TORCH_VULKAN_DESCRIPTOR_INDEXING.
+    bool descriptor_indexing_enabled(uint32_t index = UINT32_MAX) const;
 
     // Release all Vulkan resources held by other singletons before
     // destroying VkDevice. Called automatically from the destructor.

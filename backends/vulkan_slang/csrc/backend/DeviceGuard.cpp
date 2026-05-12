@@ -30,6 +30,28 @@ c10::Stream VulkanGuardImpl::getStream(c10::Device device) const {
     return c10::Stream(c10::Stream::UNSAFE, device, current_stream_id);
 }
 
+// Single-stream backend: every "stream" maps to the one Vulkan compute queue.
+// Returning a valid Stream here (instead of throwing) keeps the autograd engine
+// happy when it queries stream metadata for backward Nodes — e.g. in
+// `Node::stream()` / `at::accelerator::getCurrentStream()` paths that the
+// engine uses to populate `opt_parent_stream` / `opt_ready_stream` before the
+// `TORCH_INTERNAL_ASSERT(opt_ready_stream && opt_parent_stream)` at
+// torch/csrc/autograd/engine.cpp:1084.
+c10::Stream VulkanGuardImpl::getDefaultStream(c10::Device device) const {
+    return c10::Stream(c10::Stream::UNSAFE, device, /*id=*/0);
+}
+
+c10::Stream VulkanGuardImpl::getNewStream(c10::Device device, int /*priority*/) const {
+    // No multi-stream support yet — alias to the single default stream.
+    return c10::Stream(c10::Stream::UNSAFE, device, /*id=*/0);
+}
+
+c10::Stream VulkanGuardImpl::getStreamFromGlobalPool(
+    c10::Device device, bool /*isHighPriority*/) const {
+    // No stream pool yet — alias to the single default stream.
+    return c10::Stream(c10::Stream::UNSAFE, device, /*id=*/0);
+}
+
 c10::Stream VulkanGuardImpl::exchangeStream(c10::Stream stream) const noexcept {
     auto old = c10::Stream(c10::Stream::UNSAFE,
                             c10::Device(kDeviceType, current_device),

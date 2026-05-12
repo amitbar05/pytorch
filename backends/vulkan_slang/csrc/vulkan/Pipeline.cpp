@@ -1,4 +1,5 @@
 #include "Pipeline.h"
+#include "Context.h"
 #include <stdexcept>
 
 namespace vulkan {
@@ -8,8 +9,28 @@ Pipeline::Pipeline(VkDevice device,
                    size_t spirv_size,
                    uint32_t num_buffers,
                    uint32_t push_constant_size)
-    : device_(device) {
+    : device_(device),
+      descriptor_counts_(num_buffers, 1u),
+      total_buffers_(num_buffers) {
+    create_pipeline_objects(spirv_code, spirv_size, push_constant_size);
+}
 
+Pipeline::Pipeline(VkDevice device,
+                   const uint32_t* spirv_code,
+                   size_t spirv_size,
+                   const std::vector<uint32_t>& descriptor_counts,
+                   uint32_t push_constant_size)
+    : device_(device), descriptor_counts_(descriptor_counts) {
+    total_buffers_ = 0;
+    for (uint32_t c : descriptor_counts_) {
+        total_buffers_ += c;
+    }
+    create_pipeline_objects(spirv_code, spirv_size, push_constant_size);
+}
+
+void Pipeline::create_pipeline_objects(const uint32_t* spirv_code,
+                                       size_t spirv_size,
+                                       uint32_t push_constant_size) {
     // Create shader module
     VkShaderModuleCreateInfo sm_ci{};
     sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -22,23 +43,65 @@ Pipeline::Pipeline(VkDevice device,
     }
 
     // Create descriptor set layout
-    std::vector<VkDescriptorSetLayoutBinding> bindings(num_buffers);
-    for (uint32_t i = 0; i < num_buffers; i++) {
+    bool desc_idx = Context::instance().descriptor_indexing_enabled();
+    const uint32_t num_bindings =
+        static_cast<uint32_t>(descriptor_counts_.size());
+
+    // Sanity: any descriptorCount > 1 requires descriptor indexing on this
+    // backend (we set UPDATE_AFTER_BIND on every binding when desc_idx is on).
+    // Without it, the runtime path that consumes array bindings is unsafe.
+    bool has_array_binding = false;
+    for (uint32_t c : descriptor_counts_) {
+        if (c > 1) { has_array_binding = true; break; }
+    }
+    if (has_array_binding && !desc_idx) {
+        vkDestroyShaderModule(device_, shader_module_, nullptr);
+        shader_module_ = VK_NULL_HANDLE;
+        throw std::runtime_error(
+            "Pipeline: descriptorCount>1 binding requested but "
+            "VK_EXT_descriptor_indexing is disabled "
+            "(set TORCH_VULKAN_DESCRIPTOR_INDEXING=1 and ensure device support)");
+    }
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings(num_bindings);
+    std::vector<VkDescriptorBindingFlags> binding_flags(num_bindings, 0);
+
+    for (uint32_t i = 0; i < num_bindings; i++) {
         bindings[i] = {};
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
+        bindings[i].descriptorCount = descriptor_counts_[i];
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        if (desc_idx) {
+            binding_flags[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        }
     }
 
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{};
     VkDescriptorSetLayoutCreateInfo dsl_ci{};
     dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = num_buffers;
+    if (desc_idx) {
+        flags_ci.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        flags_ci.bindingCount = num_bindings;
+        flags_ci.pBindingFlags = binding_flags.data();
+        dsl_ci.pNext = &flags_ci;
+        // Spec (VUID-VkDescriptorSetLayoutCreateInfo-flags-03000): if any
+        // binding flag has UPDATE_AFTER_BIND_BIT set, the layout flags must
+        // include UPDATE_AFTER_BIND_POOL_BIT. We set the binding flag on
+        // every binding when desc_idx is enabled, so the layout flag must
+        // match unconditionally.
+        dsl_ci.flags =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    }
+    dsl_ci.bindingCount = num_bindings;
     dsl_ci.pBindings = bindings.data();
 
-    result = vkCreateDescriptorSetLayout(device_, &dsl_ci, nullptr, &desc_set_layout_);
-    if (result != VK_SUCCESS) {
+    VkResult result_dsl =
+        vkCreateDescriptorSetLayout(device_, &dsl_ci, nullptr, &desc_set_layout_);
+    if (result_dsl != VK_SUCCESS) {
         vkDestroyShaderModule(device_, shader_module_, nullptr);
+        shader_module_ = VK_NULL_HANDLE;
         throw std::runtime_error("Failed to create descriptor set layout");
     }
 
@@ -57,10 +120,12 @@ Pipeline::Pipeline(VkDevice device,
         pl_ci.pPushConstantRanges = &pc_range;
     }
 
-    result = vkCreatePipelineLayout(device_, &pl_ci, nullptr, &layout_);
-    if (result != VK_SUCCESS) {
+    VkResult result_pl = vkCreatePipelineLayout(device_, &pl_ci, nullptr, &layout_);
+    if (result_pl != VK_SUCCESS) {
         vkDestroyDescriptorSetLayout(device_, desc_set_layout_, nullptr);
         vkDestroyShaderModule(device_, shader_module_, nullptr);
+        desc_set_layout_ = VK_NULL_HANDLE;
+        shader_module_ = VK_NULL_HANDLE;
         throw std::runtime_error("Failed to create pipeline layout");
     }
 
@@ -78,6 +143,9 @@ Pipeline::Pipeline(VkDevice device,
         vkDestroyPipelineLayout(device_, layout_, nullptr);
         vkDestroyDescriptorSetLayout(device_, desc_set_layout_, nullptr);
         vkDestroyShaderModule(device_, shader_module_, nullptr);
+        layout_ = VK_NULL_HANDLE;
+        desc_set_layout_ = VK_NULL_HANDLE;
+        shader_module_ = VK_NULL_HANDLE;
         throw std::runtime_error("Failed to create compute pipeline");
     }
 }
@@ -127,6 +195,35 @@ Pipeline* PipelineCache::get_or_create(
 
     auto pipeline = std::make_unique<Pipeline>(
         device, spirv_code, spirv_size, num_buffers, push_constant_size);
+    auto* ptr = pipeline.get();
+    cache_[key] = std::move(pipeline);
+    return ptr;
+}
+
+Pipeline* PipelineCache::get_or_create(
+    VkDevice device,
+    const std::string& key,
+    const uint32_t* spirv_code,
+    size_t spirv_size,
+    const std::vector<uint32_t>& descriptor_counts,
+    uint32_t push_constant_size) {
+
+    {
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            return it->second.get();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = cache_.find(key);
+    if (it != cache_.end()) {
+        return it->second.get();
+    }
+
+    auto pipeline = std::make_unique<Pipeline>(
+        device, spirv_code, spirv_size, descriptor_counts, push_constant_size);
     auto* ptr = pipeline.get();
     cache_[key] = std::move(pipeline);
     return ptr;

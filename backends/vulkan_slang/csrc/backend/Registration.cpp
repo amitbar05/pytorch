@@ -154,9 +154,47 @@ at::Tensor vulkan_empty_strided(
     std::optional<at::Layout> layout_opt,
     std::optional<at::Device> device_opt,
     std::optional<bool> pin_memory_opt) {
-    // For now, ignore strides and create contiguous
-    return vulkan_empty(size, dtype_opt, layout_opt, device_opt,
-                        pin_memory_opt, c10::MemoryFormat::Contiguous);
+    // TRAIN.1: Create a tensor with the exact requested strides.
+    // The inductor's kernel codegen uses these strides to compute
+    // load/store memory offsets, so the tensor metadata MUST match
+    // what the kernels expect.
+    auto dtype = dtype_opt.value_or(at::ScalarType::Float);
+    auto device = device_opt.value_or(c10::Device(c10::DeviceType::PrivateUse1, 0));
+
+    // Compute the required storage size: max linear offset + 1.
+    // For a tensor with shape (d0,...,dn) and strides (s0,...,sn),
+    // the maximum offset is sum((di-1)*si) for all dimensions.
+    // We also handle the case where strides are < 0 by taking the min offset.
+    int64_t max_offset = 0;
+    int64_t min_offset = 0;
+    for (size_t i = 0; i < size.size(); i++) {
+        int64_t end_offset = (size[i] - 1) * stride[i];
+        if (end_offset > 0) max_offset += end_offset;
+        else min_offset += end_offset;
+    }
+    int64_t num_elements = max_offset - min_offset + 1;
+    auto nbytes = c10::elementSize(dtype) * num_elements;
+    if (nbytes <= 0) nbytes = c10::elementSize(dtype);  // scalar or empty
+
+    auto allocator = &VulkanAllocator::instance();
+    auto storage = c10::Storage(
+        c10::Storage::use_byte_size_t(),
+        static_cast<int64_t>(nbytes),
+        allocator,
+        /*resizable=*/false);
+
+    auto type_meta = caffe2::TypeMeta::fromScalarType(dtype);
+
+    auto tensor = at::detail::make_tensor<c10::TensorImpl>(
+        std::move(storage),
+        c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+        type_meta);
+
+    // Set sizes AND custom strides (not set_sizes_contiguous).
+    auto* impl = tensor.unsafeGetTensorImpl();
+    impl->set_sizes_and_strides(size, stride);
+
+    return tensor;
 }
 
 // ── zero_ ───────────────────────────────────────────────────────
@@ -714,6 +752,20 @@ static at::Tensor vulkan_sdpa_autograd_adapter(
     return ops::vulkan_sdpa_autograd(query, key, value, attn_mask, dropout_p, is_causal, scale);
 }
 
+// _fft_c2c: SymInt[] dim in 2.10 — convert to IntArrayRef
+static at::Tensor vulkan_fft_c2c_adapter(
+    const at::Tensor& self, c10::SymIntArrayRef dim,
+    int64_t normalization, bool forward) {
+    return ops::vulkan_fft_c2c(self, symint_to_int(dim), normalization, forward);
+}
+
+// _fft_c2r: SymInt last_dim_size in 2.10 — convert to int64_t
+static at::Tensor vulkan_fft_c2r_adapter(
+    const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, c10::SymInt last_dim_size) {
+    return ops::vulkan_fft_c2r(self, dim, normalization, last_dim_size.expect_int());
+}
+
 // arange.default: only end param
 static at::Tensor vulkan_arange_default_adapter(
     const at::Scalar& end,
@@ -801,6 +853,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Activations
     m.impl("relu", ops::vulkan_relu);
     m.impl("relu_", ops::vulkan_relu_);
+    // C1: threshold forward — required for inductor relu decomposition.
+    m.impl("threshold", ops::vulkan_threshold);
     m.impl("sigmoid", ops::vulkan_sigmoid);
     m.impl("tanh", ops::vulkan_tanh);
     m.impl("gelu", ops::vulkan_gelu);
@@ -889,8 +943,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
     // BLAS
     m.impl("mm", ops::vulkan_mm);
+    m.impl("mm.out", ops::vulkan_mm_out);
     m.impl("addmm", ops::vulkan_addmm);
+    m.impl("addmm.out", ops::vulkan_addmm_out);
     m.impl("bmm", ops::vulkan_bmm);
+    m.impl("bmm.out", ops::vulkan_bmm_out);
     m.impl("linear", ops::vulkan_linear);
     m.impl("_scaled_mm", ops::vulkan_scaled_mm);
 
@@ -1007,6 +1064,35 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("as_strided", vulkan_as_strided_adapter);
     m.impl("resize_", vulkan_resize_adapter);
 
+    // FFT (OP.4-eager-followup) — eager FFT path on Vulkan.
+    // Inductor `make_fallback` lowerings in lowerings/fft.py also depend on these
+    // PrivateUse1 implementations being live. Numerical-parity tests in
+    // tests/test_fft_svd.py and the two skipif-gated cases in TestFftLowerings
+    // activate once these are registered.
+    m.impl("_fft_r2c", ops::vulkan_fft_r2c);
+    m.impl("_fft_c2c", vulkan_fft_c2c_adapter);
+    m.impl("_fft_c2r", vulkan_fft_c2r_adapter);
+
+    // OP.4-fft-followup-2: view_as_complex / view_as_real — pure metadata views.
+    // These reinterpret a tensor's storage between real `[..., 2]` and complex
+    // `[...]` shapes (no data movement; just dtype + shape change). They're the
+    // next link in the FFT decomposition chain after _fft_r2c/_fft_c2c/_fft_c2r.
+    //
+    // Path 1: reuse upstream's backend-agnostic view impl (`at::native::*` from
+    // ATen/native/ComplexHelper.h, exported as TORCH_API by libtorch_cpu.so).
+    // It builds a VIEW TensorImpl over our existing storage and key_set so the
+    // resulting tensor stays on PrivateUse1 — no Vulkan-specific code needed.
+    m.impl("view_as_complex", &at::native::view_as_complex);
+    m.impl("view_as_real", &at::native::view_as_real);
+
+    // _linalg_svd(A, full_matrices, compute_uv, *, driver=None) -> (U, S, Vh)
+    // GPU Jacobi forward; compute_uv=false returns empty U/Vh placeholders.
+    m.impl("_linalg_svd", &ops::vulkan_linalg_svd);
+
+    // OP.1.a-fast: nonzero — GPU-native two-pass scan for Vulkan float tensors.
+    // Falls back to CPU roundtrip for non-Vulkan or non-float inputs.
+    m.impl("nonzero", ops::vulkan_nonzero);
+
     // Missing registrations for implemented ops
     m.impl("masked_scatter_", ops::vulkan_masked_scatter_);
     // NOTE: Do NOT register "chunk" — it's CompositeImplicitAutograd and decomposes
@@ -1031,6 +1117,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("softplus_backward", ops::vulkan_softplus_backward);
     m.impl("mish_backward", ops::vulkan_mish_backward);
     m.impl("avg_pool2d_backward", ops::vulkan_avg_pool2d_backward);
+    m.impl("_adaptive_avg_pool2d_backward", ops::vulkan_adaptive_avg_pool2d_backward);
     m.impl("max_pool2d_with_indices", ops::vulkan_max_pool2d_with_indices);
     m.impl("max_pool2d_with_indices_backward", ops::vulkan_max_pool2d_with_indices_backward);
     m.impl("embedding_dense_backward", ops::vulkan_embedding_dense_backward);

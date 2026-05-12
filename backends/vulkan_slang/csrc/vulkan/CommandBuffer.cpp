@@ -8,7 +8,12 @@ CommandPool::CommandPool(VkDevice device, uint32_t queue_family)
     : device_(device) {
     VkCommandPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    // No RESET_COMMAND_BUFFER_BIT — we only ever reset the whole pool via
+    // vkResetCommandPool() (see CommandPool::reset). The per-buffer reset
+    // flag adds tracking overhead that the driver flags as a best-practices
+    // warning when unused. See validation hint
+    // BestPractices-vkCreateCommandPool-command-buffer-reset.
+    ci.flags = 0;
     ci.queueFamilyIndex = queue_family;
 
     VkResult result = vkCreateCommandPool(device_, &ci, nullptr, &pool_);

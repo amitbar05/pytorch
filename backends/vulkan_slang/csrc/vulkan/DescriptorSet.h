@@ -41,4 +41,18 @@ void bind_buffers(VkDevice device,
                   const VkDeviceSize* sizes,
                   uint32_t count);
 
+// N+1.5: bind buffers to a layout that may include descriptor arrays
+// (per-binding descriptorCount > 1). The buffers/sizes arrays are flat:
+// total = sum(descriptor_counts). Each binding consumes
+// descriptor_counts[i] consecutive entries from buffers/sizes.
+//   num_bindings = descriptor_counts_n
+//   total_buffers = sum(descriptor_counts[0..n))
+// `buffers` / `sizes` must have `total_buffers` entries.
+void bind_buffers_indexed(VkDevice device,
+                          VkDescriptorSet set,
+                          const VkBuffer* buffers,
+                          const VkDeviceSize* sizes,
+                          const uint32_t* descriptor_counts,
+                          uint32_t num_bindings);
+
 } // namespace vulkan

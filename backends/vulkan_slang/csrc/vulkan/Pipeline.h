@@ -13,11 +13,22 @@ namespace vulkan {
 
 class Pipeline {
 public:
+    // Legacy ctor: every binding has descriptorCount=1 (one buffer per slot).
     Pipeline(VkDevice device,
              const uint32_t* spirv_code,
              size_t spirv_size,
              uint32_t num_buffers,
              uint32_t push_constant_size = 0);
+
+    // N+1.5 ctor: per-binding descriptorCount (`descriptor_counts.size()`
+    // = number of bindings; each entry = how many buffers in that slot's
+    // descriptor array). Sum(descriptor_counts) = total buffers bound.
+    // Requires VK_EXT_descriptor_indexing for any count > 1.
+    Pipeline(VkDevice device,
+             const uint32_t* spirv_code,
+             size_t spirv_size,
+             const std::vector<uint32_t>& descriptor_counts,
+             uint32_t push_constant_size);
     ~Pipeline();
 
     Pipeline(const Pipeline&) = delete;
@@ -27,18 +38,33 @@ public:
     VkPipelineLayout layout() const { return layout_; }
     VkDescriptorSetLayout descriptor_set_layout() const { return desc_set_layout_; }
 
+    // Per-binding descriptorCount (size = num_bindings). For legacy
+    // pipelines all entries are 1.
+    const std::vector<uint32_t>& descriptor_counts() const {
+        return descriptor_counts_;
+    }
+    // Total buffer count = sum(descriptor_counts_).
+    uint32_t total_buffers() const { return total_buffers_; }
+
 private:
+    void create_pipeline_objects(const uint32_t* spirv_code,
+                                 size_t spirv_size,
+                                 uint32_t push_constant_size);
+
     VkDevice device_;
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout desc_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    std::vector<uint32_t> descriptor_counts_;
+    uint32_t total_buffers_ = 0;
 };
 
 class PipelineCache {
 public:
     static PipelineCache& instance();
 
+    // Legacy: all bindings have descriptorCount=1.
     Pipeline* get_or_create(
         VkDevice device,
         const std::string& key,
@@ -46,6 +72,17 @@ public:
         size_t spirv_size,
         uint32_t num_buffers,
         uint32_t push_constant_size = 0);
+
+    // N+1.5: per-binding descriptorCount (descriptor arrays).
+    // The cache key must encode the binding shape, otherwise lookups
+    // collide between flat and array-of-buffers pipelines.
+    Pipeline* get_or_create(
+        VkDevice device,
+        const std::string& key,
+        const uint32_t* spirv_code,
+        size_t spirv_size,
+        const std::vector<uint32_t>& descriptor_counts,
+        uint32_t push_constant_size);
 
     void clear();
 

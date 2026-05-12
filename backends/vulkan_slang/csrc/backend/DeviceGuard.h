@@ -31,6 +31,10 @@ struct VulkanGuardImpl final : public c10::impl::DeviceGuardImplInterface {
     void uncheckedSetDevice(c10::Device device) const noexcept override;
 
     c10::Stream getStream(c10::Device device) const override;
+    c10::Stream getDefaultStream(c10::Device device) const override;
+    c10::Stream getNewStream(c10::Device device, int priority = 0) const override;
+    c10::Stream getStreamFromGlobalPool(
+        c10::Device device, bool isHighPriority = false) const override;
     c10::Stream exchangeStream(c10::Stream stream) const noexcept override;
     c10::DeviceIndex deviceCount() const noexcept override;
 

@@ -197,16 +197,48 @@ void Context::init_device(uint32_t index) {
     VkPhysicalDeviceFeatures features;
     vkGetPhysicalDeviceFeatures(dev.physical, &features);
     dev.caps.float64 = features.shaderFloat64;
+    dev.caps.int64 = features.shaderInt64;
 
-    // Check for float16 support
+    // Check for float16 / int8 support (chain through Vulkan 1.2
+    // features then descriptor indexing features for a single query).
+    VkPhysicalDeviceDescriptorIndexingFeatures desc_idx_features{};
+    desc_idx_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+
     VkPhysicalDeviceVulkan12Features vk12_features{};
     vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vk12_features.pNext = &desc_idx_features;
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vk12_features;
     vkGetPhysicalDeviceFeatures2(dev.physical, &features2);
     dev.caps.float16 = vk12_features.shaderFloat16;
     dev.caps.int8 = vk12_features.shaderInt8;
+
+    // ── Descriptor indexing support ─────────────────────────
+    // Gate: env var TORCH_VULKAN_DESCRIPTOR_INDEXING (default 1 on
+    // real GPUs, 0 on Lavapipe / llvmpipe where update-after-bind
+    // is unreliable).
+    bool desc_idx_supported =
+        vk12_features.descriptorIndexing &&
+        desc_idx_features.descriptorBindingStorageBufferUpdateAfterBind;
+    const char* env_val = getenv("TORCH_VULKAN_DESCRIPTOR_INDEXING");
+    bool env_gate =
+        (env_val == nullptr) ? true : (strcmp(env_val, "1") == 0);
+    // Lavapipe / llvmpipe auto-detect: descriptor indexing is flaky
+    // on software rasterizers; default to off unless explicitly enabled.
+    bool is_lavapipe =
+        (dev.caps.device_name.find("llvmpipe") != std::string::npos ||
+         dev.caps.device_name.find("Lavapipe") != std::string::npos);
+    if (is_lavapipe && env_val == nullptr) {
+        env_gate = false; // default off on Lavapipe
+    }
+    dev.caps.descriptor_indexing = desc_idx_supported && env_gate;
+
+    // Query the actual maxPerStageDescriptorStorageBuffers limit
+    dev.caps.max_per_stage_storage_buffers =
+        props.limits.maxPerStageDescriptorStorageBuffers;
 
     // Subgroup properties
     VkPhysicalDeviceSubgroupProperties subgroup_props{};
@@ -248,16 +280,27 @@ void Context::init_device(uint32_t index) {
     queue_ci.queueCount = 1;
     queue_ci.pQueuePriorities = &queue_priority;
 
-    // Enable Vulkan 1.2 features we need
+    // Enable Vulkan 1.2 features + descriptor indexing we need.
+    // Spec (VUID-VkDeviceCreateInfo-pNext-02830): when VkPhysicalDeviceVulkan12Features
+    // is in the pNext chain, the legacy per-feature structs (including
+    // VkPhysicalDeviceDescriptorIndexingFeatures) must NOT also be present —
+    // the 1.2 features struct already aggregates those bits.
     VkPhysicalDeviceVulkan12Features enabled_vk12{};
     enabled_vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     enabled_vk12.shaderFloat16 = dev.caps.float16;
     enabled_vk12.shaderInt8 = dev.caps.int8;
     enabled_vk12.timelineSemaphore = VK_TRUE;
     enabled_vk12.bufferDeviceAddress = VK_FALSE;
+    enabled_vk12.descriptorIndexing =
+        dev.caps.descriptor_indexing ? VK_TRUE : VK_FALSE;
+    enabled_vk12.descriptorBindingStorageBufferUpdateAfterBind =
+        dev.caps.descriptor_indexing ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceFeatures enabled_features{};
     enabled_features.shaderFloat64 = dev.caps.float64;
+    // shaderInt64 is required by SPIR-V kernels emitted by Inductor that use
+    // 64-bit integer arithmetic for indexing (cat/view, gather, scatter).
+    enabled_features.shaderInt64 = dev.caps.int64;
 
     VkDeviceCreateInfo device_ci{};
     device_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -346,6 +389,10 @@ const DeviceCapabilities& Context::capabilities(uint32_t index) const {
 
 std::string Context::device_name(uint32_t index) const {
     return capabilities(index).device_name;
+}
+
+bool Context::descriptor_indexing_enabled(uint32_t index) const {
+    return capabilities(index).descriptor_indexing;
 }
 
 } // namespace vulkan
