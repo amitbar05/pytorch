@@ -7,6 +7,7 @@
 #include "dispatch.h"
 #include "dtype_utils.h"
 #include "../generated/shaders.h"
+#include "../backend/MetaGuard.h"
 
 #include <cstring>
 
@@ -16,6 +17,10 @@ namespace torch_vulkan { namespace ops {
 // grad_input = grad_output * (self > threshold) — single pass
 at::Tensor vulkan_threshold_backward(
     const at::Tensor& grad_output, const at::Tensor& self, const at::Scalar& threshold) {
+    if (is_null_storage(grad_output) || is_null_storage(self)) {
+        const at::Tensor& src = is_null_storage(grad_output) ? self : grad_output;
+        return make_vulkan_null(src, grad_output.sizes().vec(), grad_output.scalar_type());
+    }
     auto go_c = grad_output.contiguous();
     auto self_c = self.contiguous();
     auto orig_dtype = self_c.scalar_type();

@@ -63,6 +63,7 @@ at::Tensor vulkan_ge_scalar(const at::Tensor& self, const at::Scalar& other);
 // Activations
 at::Tensor vulkan_relu(const at::Tensor& self);
 at::Tensor& vulkan_relu_(at::Tensor& self);
+at::Tensor vulkan_threshold(const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value);
 at::Tensor vulkan_sigmoid(const at::Tensor& self);
 at::Tensor vulkan_tanh(const at::Tensor& self);
 at::Tensor vulkan_gelu(const at::Tensor& self, c10::string_view approximate);
@@ -128,12 +129,26 @@ at::Tensor vulkan_norm_ScalarOpt_dim(const at::Tensor& self,
 
 // BLAS
 at::Tensor vulkan_mm(const at::Tensor& self, const at::Tensor& mat2);
+// Out-variant. Inductor's compiled BW emits ``aten.mm.out`` to reuse
+// pre-allocated output buffers (PF.13.b memory-planning).
+at::Tensor& vulkan_mm_out(const at::Tensor& self, const at::Tensor& mat2,
+                          at::Tensor& out);
 // Matmul with explicit transpose flags — avoids GPU permute copy from .t()
 at::Tensor vulkan_mm_ex(const at::Tensor& self, const at::Tensor& mat2,
                          bool transpose_a, bool transpose_b);
 at::Tensor vulkan_addmm(const at::Tensor& bias, const at::Tensor& self, const at::Tensor& mat2,
                          const at::Scalar& beta, const at::Scalar& alpha);
+// Out-variant. Inductor's compiled BW emits ``aten.addmm.out`` for
+// memory-planned linear backward graphs.
+at::Tensor& vulkan_addmm_out(const at::Tensor& self, const at::Tensor& mat1,
+                              const at::Tensor& mat2,
+                              const at::Scalar& beta, const at::Scalar& alpha,
+                              at::Tensor& out);
 at::Tensor vulkan_bmm(const at::Tensor& self, const at::Tensor& mat2);
+// Out-variant. Inductor's compiled BW emits ``aten.bmm.out`` for
+// memory-planned batched-matmul backward graphs.
+at::Tensor& vulkan_bmm_out(const at::Tensor& self, const at::Tensor& mat2,
+                           at::Tensor& out);
 // Batched matmul with explicit transpose flags — avoids GPU permute copy
 at::Tensor vulkan_bmm_ex(const at::Tensor& self, const at::Tensor& mat2,
                           bool transpose_a, bool transpose_b, float scale = 1.0f);
@@ -189,6 +204,26 @@ at::Tensor vulkan_index_select(const at::Tensor& self, int64_t dim, const at::Te
 at::Tensor& vulkan_masked_fill(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value);
 at::Tensor vulkan_masked_scatter(const at::Tensor& self, const at::Tensor& mask, const at::Tensor& source);
 at::Tensor& vulkan_masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::Tensor& source);
+// OP.1.a-fast: aten::nonzero — GPU-native two-pass scan.
+// Returns int64 tensor of shape (N, ndim) where N = count of nonzero elements.
+// Falls back to CPU roundtrip for non-Vulkan or non-float inputs.
+at::Tensor vulkan_nonzero(const at::Tensor& self);
+
+// FFT (forward primitives — backward via decomposition through these)
+at::Tensor vulkan_fft_r2c(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, bool onesided);
+at::Tensor vulkan_fft_c2c(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, bool forward);
+at::Tensor vulkan_fft_c2r(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, int64_t last_dim_size);
+
+// Linalg
+// _linalg_svd(A, full_matrices, compute_uv, *, driver=None) -> (U, S, Vh)
+// GPU one-sided Jacobi for M >= N, N <= 32, M <= 256; compute_uv=false returns
+// empty U/Vh placeholders.
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+vulkan_linalg_svd(const at::Tensor& A, bool full_matrices, bool compute_uv,
+    std::optional<c10::string_view> driver);
 
 // Convolution
 at::Tensor vulkan_conv2d(const at::Tensor& input, const at::Tensor& weight,

@@ -1,5 +1,7 @@
+#include "ops.h"
 #include "dispatch.h"
 #include "dtype_utils.h"
+#include "generic_pointwise_bridge.h"
 #include "../generated/shaders.h"
 
 #include <torch/library.h>

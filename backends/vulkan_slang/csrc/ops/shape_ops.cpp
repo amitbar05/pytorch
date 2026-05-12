@@ -2,6 +2,7 @@
 #include "dispatch.h"
 #include "dtype_utils.h"
 #include "../generated/shaders.h"
+#include "../backend/MetaGuard.h"
 
 #include <torch/library.h>
 #include <ATen/TensorUtils.h>
@@ -10,6 +11,9 @@ namespace torch_vulkan { namespace ops {
 
 // ── view / reshape ──────────────────────────────────────────────
 at::Tensor vulkan_view(const at::Tensor& self, at::IntArrayRef size) {
+    if (is_null_storage(self)) {
+        return make_vulkan_null(self, size, self.scalar_type());
+    }
     // Infer -1 dimension
     int64_t numel = self.numel();
     int64_t inferred = -1;
@@ -55,6 +59,9 @@ at::Tensor vulkan_view(const at::Tensor& self, at::IntArrayRef size) {
 }
 
 at::Tensor vulkan_reshape(const at::Tensor& self, at::IntArrayRef shape) {
+    if (is_null_storage(self)) {
+        return make_vulkan_null(self, shape, self.scalar_type());
+    }
     // Infer -1 dimension and compute new sizes
     int64_t numel = self.numel();
     int64_t inferred = -1;
@@ -86,6 +93,14 @@ at::Tensor vulkan_reshape(const at::Tensor& self, at::IntArrayRef shape) {
 // ── unsqueeze ───────────────────────────────────────────────────
 at::Tensor vulkan_unsqueeze(const at::Tensor& self, int64_t dim) {
     dim = at::maybe_wrap_dim(dim, self.dim() + 1, /*wrap_scalar=*/true);
+    // TR.18-B: null/meta-storage guard — see vulkan_transpose. Avoids
+    // producing a meta-device tensor when called from an autograd backward
+    // under AOT joint trace.
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        auto out_shape = self.sizes().vec();
+        out_shape.insert(out_shape.begin() + dim, 1);
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     auto new_sizes = self.sizes().vec();
     auto new_strides = self.strides().vec();
     new_sizes.insert(new_sizes.begin() + dim, 1);
@@ -106,6 +121,15 @@ at::Tensor vulkan_unsqueeze(const at::Tensor& self, int64_t dim) {
 
 // ── squeeze ─────────────────────────────────────────────────────
 at::Tensor vulkan_squeeze(const at::Tensor& self) {
+    // TR.18-B: null/meta-storage guard — see vulkan_transpose.
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        std::vector<int64_t> out_shape;
+        for (int64_t i = 0; i < self.dim(); i++) {
+            if (self.size(i) != 1) out_shape.push_back(self.size(i));
+        }
+        if (out_shape.empty()) out_shape.push_back(1);
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     auto new_sizes = std::vector<int64_t>{};
     auto new_strides = std::vector<int64_t>{};
     for (int64_t i = 0; i < self.dim(); i++) {
@@ -124,6 +148,15 @@ at::Tensor vulkan_squeeze(const at::Tensor& self) {
 
 at::Tensor vulkan_squeeze_dim(const at::Tensor& self, int64_t dim) {
     dim = at::maybe_wrap_dim(dim, self.dim());
+    // TR.18-B: null/meta-storage guard — see vulkan_transpose.
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        std::vector<int64_t> out_shape = self.sizes().vec();
+        if (self.size(dim) == 1) {
+            out_shape.erase(out_shape.begin() + dim);
+        }
+        if (out_shape.empty()) out_shape.push_back(1);
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     if (self.size(dim) != 1) {
         return vulkan_clone(self, c10::nullopt);
     }
@@ -142,6 +175,25 @@ at::Tensor vulkan_squeeze_dim(const at::Tensor& self, int64_t dim) {
 // ── permute / transpose ─────────────────────────────────────────
 // These require actual data movement since our buffers are always contiguous.
 at::Tensor vulkan_permute(const at::Tensor& self, at::IntArrayRef dims) {
+    // PF.13 / TR.18-B: null-storage and meta-storage guard. AOT autograd's
+    // bw_module fake-tensor propagation calls permute on FakeTensor inputs
+    // (e.g. weight transpose for ``addmm`` / ``mm`` backward, or backward
+    // of a ``transpose`` chain in attention). Without this guard the C++
+    // kernel reaches ``self.contiguous()`` and crashes on ``data_ptr()``,
+    // OR (if we built a vanilla TensorImpl over the FakeTensor's Meta
+    // storage) the result inherits ``device=meta`` and propagates through
+    // autograd, breaking ``Node::stream()``. Returning a PrivateUse1
+    // null-storage Vulkan tensor of the permuted shape lets fake_tensor_prop
+    // continue without dispatching a real shader and preserves the
+    // PrivateUse1 dispatch key on the gradient.
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        int64_t ndim = self.dim();
+        std::vector<int64_t> out_shape(ndim);
+        for (int64_t i = 0; i < ndim; i++) {
+            out_shape[i] = self.size(at::maybe_wrap_dim(dims[i], ndim));
+        }
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     auto self_c = self.contiguous();
     auto orig_dtype = self_c.scalar_type();
     int64_t ndim = self_c.dim();
@@ -209,6 +261,19 @@ at::Tensor vulkan_transpose(const at::Tensor& self, int64_t dim0, int64_t dim1) 
 
     if (dim0 == dim1) return self;
 
+    // TR.18-B: null/meta-storage guard. Under AOT joint trace, ``self`` may
+    // be a FakeTensor backed by a Meta storage. Building a vanilla
+    // ``TensorImpl`` over that storage produces a ``device=meta`` result,
+    // which then propagates through ``VulkanTransposeFunction::backward``
+    // and breaks ``Node::stream()`` (engine.cpp:1084 assert). Fall through
+    // to a PrivateUse1 null-storage tensor with the transposed shape so
+    // the gradient carries the correct PrivateUse1 dispatch key.
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        std::vector<int64_t> out_shape = self.sizes().vec();
+        std::swap(out_shape[dim0], out_shape[dim1]);
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
+
     if (self.scalar_type() == at::kFloat) {
         // Zero-copy: swap sizes + strides (metadata only, no GPU copy).
         // This works for both contiguous and non-contiguous float32 tensors.
@@ -239,6 +304,14 @@ at::Tensor vulkan_transpose(const at::Tensor& self, int64_t dim0, int64_t dim1) 
 at::Tensor vulkan_t(const at::Tensor& self) {
     TORCH_CHECK(self.dim() <= 2, "t() expects a 0, 1, or 2-D tensor");
     if (self.dim() < 2) return vulkan_clone(self, c10::nullopt);
+    // TR.18-B: null/meta-storage guard. See vulkan_transpose for details.
+    // Under AOT joint trace, ``self`` may be a FakeTensor with Meta storage;
+    // a vanilla TensorImpl over that storage would produce a meta-device
+    // result that breaks autograd's Node::stream().
+    if (is_null_storage(self) || self.is_meta() || !self.has_storage()) {
+        std::vector<int64_t> out_shape = {self.size(1), self.size(0)};
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     // Zero-copy transpose for float32: swap sizes/strides (metadata only, no GPU copy).
     // vulkan_mm / vulkan_linear detect this stride pattern and use mm_ex transpose flags.
     // For other dtypes (fp16, bf16, etc.), fall back to a GPU copy via permute since
@@ -262,6 +335,17 @@ at::Tensor vulkan_t(const at::Tensor& self) {
 // ── expand ──────────────────────────────────────────────────────
 at::Tensor vulkan_expand(const at::Tensor& self, at::IntArrayRef size,
                          bool implicit) {
+    if (is_null_storage(self)) {
+        // Compute expanded shape, handling -1 entries.
+        std::vector<int64_t> out_size;
+        out_size.reserve(size.size());
+        for (size_t i = 0; i < size.size(); i++) {
+            int64_t s = size[i];
+            if (s == -1) s = self.size(i);
+            out_size.push_back(s);
+        }
+        return make_vulkan_null(self, out_size, self.scalar_type());
+    }
     int64_t ndim = static_cast<int64_t>(size.size());
     TORCH_CHECK(ndim <= 8, "expand: max 8 dimensions supported");
 
@@ -452,6 +536,17 @@ at::Tensor vulkan_cat(const at::ITensorListRef& tensors, int64_t dim) {
 
 // ── select / slice / narrow ─────────────────────────────────────
 at::Tensor vulkan_select(const at::Tensor& self, int64_t dim, int64_t index) {
+    if (is_null_storage(self)) {
+        int64_t ndim = self.dim();
+        int64_t wd = at::maybe_wrap_dim(dim, ndim);
+        std::vector<int64_t> out_shape;
+        out_shape.reserve(std::max<int64_t>(ndim - 1, 1));
+        for (int64_t d = 0; d < ndim; d++) {
+            if (d != wd) out_shape.push_back(self.size(d));
+        }
+        if (out_shape.empty()) out_shape.push_back(1);
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     auto self_c = self.contiguous();
     auto orig_dtype = self_c.scalar_type();
     dim = at::maybe_wrap_dim(dim, self_c.dim());
@@ -501,6 +596,22 @@ at::Tensor vulkan_select(const at::Tensor& self, int64_t dim, int64_t index) {
 at::Tensor vulkan_slice(const at::Tensor& self, int64_t dim,
                         std::optional<int64_t> start, std::optional<int64_t> end,
                         int64_t step) {
+    if (is_null_storage(self)) {
+        int64_t ndim = self.dim();
+        int64_t wd = at::maybe_wrap_dim(dim, ndim);
+        int64_t dim_size_n = self.size(wd);
+        int64_t s = start.value_or(0);
+        int64_t e = end.value_or(dim_size_n);
+        if (s < 0) s += dim_size_n;
+        if (e < 0) e += dim_size_n;
+        s = std::max<int64_t>(0, std::min<int64_t>(s, dim_size_n));
+        e = std::max<int64_t>(0, std::min<int64_t>(e, dim_size_n));
+        int64_t out_dim_size = (e - s + step - 1) / step;
+        if (out_dim_size < 0) out_dim_size = 0;
+        std::vector<int64_t> out_shape(self.sizes().begin(), self.sizes().end());
+        out_shape[wd] = out_dim_size;
+        return make_vulkan_null(self, out_shape, self.scalar_type());
+    }
     auto self_c = self.contiguous();
     auto orig_dtype = self_c.scalar_type();
     dim = at::maybe_wrap_dim(dim, self_c.dim());

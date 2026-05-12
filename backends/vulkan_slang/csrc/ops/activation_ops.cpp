@@ -7,6 +7,24 @@
 
 namespace torch_vulkan { namespace ops {
 
+// Forward declaration — used by vulkan_threshold below.
+at::Tensor vulkan_relu(const at::Tensor& self);
+
+// C1: threshold forward — required for inductor relu decomposition.
+// threshold(x, 0, 0) is equivalent to relu(x). For non-zero thresholds,
+// dispatches the generic pointwise path (or eager fallback).
+at::Tensor vulkan_threshold(
+    const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value) {
+    // Relu case: threshold=0, value=0 — use the fast relu shader.
+    if (threshold.toFloat() == 0.0f && value.toFloat() == 0.0f) {
+        return vulkan_relu(self);
+    }
+    // General case not yet implemented — fall through to eager CPU.
+    TORCH_CHECK(false,
+        "Vulkan threshold with non-zero threshold/value not yet supported. "
+        "Got threshold=", threshold.toFloat(), " value=", value.toFloat());
+}
+
 // Helper for simple unary activations (2 buffers: input, output; numel push constant)
 static at::Tensor activation_unary(
     const at::Tensor& self,

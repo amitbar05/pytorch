@@ -60,6 +60,25 @@ void dispatch_shader(
     uint32_t push_constants_size = 0,
     uint32_t num_outputs = 1);
 
+// N+1.5: dispatch with descriptor-array bindings.
+// `descriptor_counts.size()` = number of bindings; sum = total buffers,
+// which must equal `buffers.size()`. Each binding consumes
+// `descriptor_counts[i]` consecutive entries from `buffers`.
+//
+// Falls back to the flat path when all counts are 1.
+void dispatch_shader_indexed(
+    const std::string& key,
+    const uint32_t* spirv_code,
+    size_t spirv_size,
+    const std::vector<at::Tensor>& buffers,
+    const std::vector<uint32_t>& descriptor_counts,
+    uint32_t num_workgroups_x,
+    uint32_t num_workgroups_y = 1,
+    uint32_t num_workgroups_z = 1,
+    const void* push_constants = nullptr,
+    uint32_t push_constants_size = 0,
+    uint32_t num_outputs = 1);
+
 // Convenience: dispatch element-wise shader with numel push constant
 inline void dispatch_elementwise(
     const std::string& key,
@@ -103,5 +122,19 @@ uint64_t get_barrier_count();
 uint64_t get_barrier_skip_count();
 void reset_perf_counters();
 void inc_war_flush_count();
+
+// ── Per-dispatch timing breakdown (nanoseconds, cumulative) ────
+// Only populated when TORCH_VULKAN_PROFILE_DISPATCH=1 is set.
+// Divide by get_dispatch_count() to get per-dispatch averages.
+bool dispatch_profiling_enabled();
+uint64_t get_profile_pipeline_cache_ns();
+uint64_t get_profile_get_runtime_ns();
+uint64_t get_profile_desc_alloc_ns();
+uint64_t get_profile_buffer_info_ns();
+uint64_t get_profile_desc_write_ns();
+uint64_t get_profile_barrier_check_ns();
+uint64_t get_profile_cmd_record_ns();
+uint64_t get_profile_dirty_track_ns();
+void reset_profile_timers();
 
 }} // namespace torch_vulkan::ops

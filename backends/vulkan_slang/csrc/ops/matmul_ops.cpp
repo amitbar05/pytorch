@@ -116,133 +116,169 @@ static void mm_tiled_dispatch(const at::Tensor& A, const at::Tensor& B,
 }
 
 
-at::Tensor vulkan_mm(const at::Tensor& self, const at::Tensor& mat2) {
-    TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2,
-                "mm: expected 2D tensors, got ", self.dim(), "D and ", mat2.dim(), "D");
-    TORCH_CHECK(self.size(1) == mat2.size(0),
-                "mm: mat1 and mat2 shapes cannot be multiplied (",
-                self.size(0), "x", self.size(1), " and ",
-                mat2.size(0), "x", mat2.size(1), ")");
+// ── TRAIN.8: Direct-write mm helpers ─────────────────────────────
 
-    // Fast path: detect zero-copy transposed views from vulkan_t() and use mm_ex
-    // transpose flags to avoid a strided-copy dispatch.
-    // mm_ex expects PHYSICAL (un-transposed) matrices with transpose flags set.
-    // If self is a transposed view: self_view=[K,M] but physical=[M,K] → ta=true
-    // If mat2 is a transposed view: mat2_view=[N,K] but physical=[K,N] → tb=true
-    bool ta = is_t_transposed(self);
-    bool tb = is_t_transposed(mat2);
-    if (ta || tb) {
-        // Recover physical (un-transposed) storage for the flagged inputs
-        auto self_use = ta ? get_physical_storage(self, true) : self;
-        auto mat2_use = tb ? get_physical_storage(mat2, true) : mat2;
-        return vulkan_mm_ex(self_use, mat2_use, ta, tb);
-    }
+// Simple shader dispatch wrapper: writes A @ B directly into output_f32.
+// All three tensors must be f32 Vulkan tensors with correct layout.
+static void vulkan_mm_dispatch(
+    const at::Tensor& A_f32, const at::Tensor& B_f32,
+    at::Tensor& output_f32,
+    bool transpose_a, bool transpose_b,
+    int64_t M, int64_t N, int64_t K) {
+    struct { uint32_t M, N, K, transpose_a, transpose_b; } params{
+        static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+        transpose_a ? 1u : 0u, transpose_b ? 1u : 0u
+    };
+    uint32_t wg_x = (static_cast<uint32_t>(M) + 15) / 16;
+    uint32_t wg_y = (static_cast<uint32_t>(N) + 15) / 16;
+    dispatch_shader("matmul_mm_tiled_fwd",
+                    shaders::matmul_mm_tiled_fwd, shaders::matmul_mm_tiled_fwd_size,
+                    {A_f32, B_f32, output_f32},
+                    wg_x, wg_y, 1, &params, sizeof(params));
+}
+
+// Core mm implementation: handles dtype widening, chunked accumulation,
+// and dispatches into a pre-allocated f32 output tensor.
+// For the chunked path, out_f32 must be zero-initialized by the caller.
+static void vulkan_mm_into(
+    const at::Tensor& self, const at::Tensor& mat2,
+    at::Tensor& out_f32,
+    bool transpose_a, bool transpose_b) {
+    int64_t M = transpose_a ? self.size(1) : self.size(0);
+    int64_t K = transpose_a ? self.size(0) : self.size(1);
+    int64_t N = transpose_b ? mat2.size(0) : mat2.size(1);
+    if (M == 0 || N == 0 || K == 0) return;
 
     auto self_c = self.contiguous();
     auto mat2_c = mat2.contiguous();
-
-    check_supported_float(self_c, "mm");
-    auto orig_dtype = self_c.scalar_type();
-
-    // Logical dimensions: self_c is [M, K], mat2_c is [K, N]
-    int64_t M = self.size(0);
-    int64_t K = self.size(1);
-    int64_t N = mat2.size(1);
-
-    if (M == 0 || N == 0 || K == 0) {
-        auto empty_out = at::zeros({M, N}, self_c.options().dtype(at::kFloat));
-        return cast_from_float32(empty_out, orig_dtype);
-    }
-
-    // Check if either matrix is too large for ensure_float32.
-    // Critical case: mat2_c [K, N] where K*N > kMaxCastElements → OOM.
-    // Strategy: chunk along K. C[M,N] = sum_k(A[:,k:k+cs] @ B[k:k+cs,:])
-    // Skip chunking for f32 inputs — no cast needed, matmul workgroups are within Vulkan limits.
+    const auto orig_dtype = self_c.scalar_type();
     const bool already_f32 = (orig_dtype == at::kFloat);
     const bool mat2_too_large = !already_f32 && (K * N > kMaxCastElements);
     const bool self_too_large = !already_f32 && (M * K > kMaxCastElements);
 
     if (mat2_too_large || self_too_large) {
-        // Chunked path: needs zero-initialized accumulator
-        auto output_f32 = at::zeros({M, N}, self_c.options().dtype(at::kFloat));
-        // Chunk size: max rows of B (or cols of A) that keep B chunk within kMaxCastElements
+        // Chunked path: accumulate into out_f32 (must be zero-init'd by caller)
         int64_t max_cols = std::max(N, int64_t(1));
         int64_t k_chunk = std::max(int64_t(16),
             (kMaxCastElements / max_cols) & ~int64_t(15));
-
-        // For self_c [M, K]: upcast once if safe, otherwise upcast inside loop
-        // For the LM head backward case: M=4, K=248320, N=1024
-        //   → self_too_large=false (M*K=992K), mat2_too_large=true (K*N=248M)
-        //   → self_f32 = [4, 248320] f32 — upcast once (3.7MB, safe)
-        //   → self_f32_t = [248320, 4] f32 — for column extraction
-        //   → each k_chunk: extract self_f32_t[k:k+cs] → [k_cs, 4] → .t() → [4, k_cs]
-        //   → extract mat2_c[k:k+cs] → fresh Vulkan tensor → upcast → [k_cs, N=1024]
-        //   → mm: [4, k_cs] @ [k_cs, 1024] → [4, 1024] partial → accumulate
-
-        // Upcast small matrix once outside the loop
         at::Tensor self_f32, self_f32_t, mat2_f32;
         if (!self_too_large) {
-            self_f32 = ensure_float32(self_c);          // [M, K] f32 — safe
-            self_f32_t = self_f32.t().contiguous();     // [K, M] f32 — for row extraction
+            self_f32 = ensure_float32(self_c);
+            self_f32_t = self_f32.t().contiguous();
         }
         if (!mat2_too_large) {
-            mat2_f32 = ensure_float32(mat2_c);          // [K, N] f32 — safe
+            mat2_f32 = ensure_float32(mat2_c);
         }
-
         for (int64_t k_start = 0; k_start < K; k_start += k_chunk) {
             int64_t k_end = std::min(k_start + k_chunk, K);
-
-            // A chunk: self_c columns [k_start:k_end] → [M, k_cs]
             at::Tensor a_chunk;
             if (self_too_large) {
-                // Upcast self_c inside loop (not cached since it's too large)
-                // Extract columns: upcast full → transpose → extract rows → transpose back
-                // This is valid because even if self_c is large, we split K
                 auto sc_f32 = ensure_float32(extract_rows(
                     ensure_float32(self_c).t().contiguous(), k_start, k_end));
                 a_chunk = sc_f32.t().contiguous();
             } else {
-                // Extract column-slice from cached transposed f32
                 a_chunk = extract_rows(self_f32_t, k_start, k_end).t().contiguous();
             }
-
-            // B chunk: mat2_c rows [k_start:k_end] → [k_cs, N]
             at::Tensor b_chunk;
             if (mat2_too_large) {
                 b_chunk = ensure_float32(extract_rows(mat2_c, k_start, k_end));
             } else {
                 b_chunk = extract_rows(mat2_f32, k_start, k_end);
             }
-
-            // Partial result: [M, k_cs] @ [k_cs, N] = [M, N]
             auto partial = at::zeros({M, N}, at::TensorOptions().dtype(at::kFloat)
-                                                                  .device(a_chunk.device()));
+                                                              .device(a_chunk.device()));
             mm_tiled_dispatch(a_chunk, b_chunk, partial, false, false);
-            output_f32 = vulkan_add(output_f32, partial, 1);
+            out_f32 = vulkan_add(out_f32, partial, 1);
         }
-        return cast_from_float32(output_f32, orig_dtype);
+        return;
     }
-
-    // Fast path: both matrices fit within workgroup limits
+    // Fast path: single dispatch
     auto self_f32 = ensure_float32(self_c);
     auto mat2_f32 = ensure_float32(mat2_c);
-    // Use empty (not zeros) — mm_tiled_fwd writes every output element
-    auto output_f32 = at::empty({M, N}, self_c.options().dtype(at::kFloat));
+    vulkan_mm_dispatch(self_f32, mat2_f32, out_f32,
+                       transpose_a, transpose_b, M, N, K);
+}
 
-    struct { uint32_t M, N, K, transpose_a, transpose_b; } params{
-        static_cast<uint32_t>(M),
-        static_cast<uint32_t>(N),
-        static_cast<uint32_t>(K),
-        0u, 0u  // transpose already handled above via self_c/mat2_c
-    };
-    uint32_t wg_x = (static_cast<uint32_t>(M) + 15) / 16;
-    uint32_t wg_y = (static_cast<uint32_t>(N) + 15) / 16;
-    dispatch_shader("matmul_mm_tiled_fwd",
-                    shaders::matmul_mm_tiled_fwd, shaders::matmul_mm_tiled_fwd_size,
-                    {self_f32, mat2_f32, output_f32},
-                    wg_x, wg_y, 1,
-                    &params, sizeof(params));
-    return cast_from_float32(output_f32, orig_dtype);
+
+// TRAIN.8: Out-variant of mm. Writes self @ mat2 directly into ``out``
+// (pool-backed buffer) — no internal allocation on the f32 fast path.
+at::Tensor& vulkan_mm_out(const at::Tensor& self, const at::Tensor& mat2,
+                          at::Tensor& out) {
+    TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: expected 2D tensors");
+    TORCH_CHECK(self.size(1) == mat2.size(0), "mm: incompatible dimensions");
+    check_supported_float(self, "mm");
+    auto orig_dtype = out.scalar_type();
+    int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
+
+    // Transposed-view fast path: recover physical storage, use transpose flags
+    bool ta = is_t_transposed(self), tb = is_t_transposed(mat2);
+    if (ta || tb) {
+        auto self_use = ta ? get_physical_storage(self, true) : self;
+        auto mat2_use = tb ? get_physical_storage(mat2, true) : mat2;
+        // When an operand is transposed:
+        //   ta=true: self is a transposed view (shape=[M,K], strides=[1,M]).
+        //     Physical storage is [K,M]. The mm should compute op(A) @ B.
+        //     M (output rows) = self.size(0), K (reduction) = self.size(1).
+        //   tb=true: mat2 is a transposed view (shape=[N,K], strides=[1,N]).
+        //     Physical storage is [K,N]. The mm should compute A @ op(B).
+        //
+        // For the tb case we must distinguish a valid .t() from a
+        // reinterpret_tensor view:
+        //   Valid .t():  B is (K,N), B.t() is (N,K). K == self.size(1) == mat2.size(1).
+        //     Output N = mat2.size(0) (= N).
+        //   Reinterpret:  physical (K,N) viewed as (N,K). K == self.size(1) != mat2.size(1).
+        //     Output N = mat2.size(1) (= N).
+        //
+        // The ta case does NOT need this distinction: in both the valid .t()
+        // and reinterpret cases, M = self.size(0) and K = self.size(1).
+        M = ta ? self.size(0) : self.size(0);   // always self.size(0)
+        K = ta ? self.size(1) : self.size(1);   // always self.size(1)
+        if (tb && self.size(1) != mat2.size(1)) {
+            N = mat2.size(1);  // reinterpret_tensor: reduction dim is mat2.size(0)
+        } else {
+            N = tb ? mat2.size(0) : mat2.size(1);
+        }
+        if (M == 0 || N == 0 || K == 0) { out.zero_(); return out; }
+        auto self_c = self_use.contiguous();
+        auto mat2_c = mat2_use.contiguous();
+        if (orig_dtype != at::kFloat) {
+            auto tmp = at::empty({M, N}, out.options().dtype(at::kFloat));
+            vulkan_mm_dispatch(ensure_float32(self_c), ensure_float32(mat2_c),
+                               tmp, ta, tb, M, N, K);
+            out.copy_(cast_from_float32(tmp, orig_dtype));
+        } else {
+            out.resize_({M, N});
+            vulkan_mm_dispatch(ensure_float32(self_c), ensure_float32(mat2_c),
+                               out, ta, tb, M, N, K);
+        }
+        return out;
+    }
+    if (M == 0 || N == 0 || K == 0) { out.zero_(); return out; }
+
+    const bool chunked = (orig_dtype != at::kFloat) &&
+        ((K * N > kMaxCastElements) || (M * K > kMaxCastElements));
+    if (orig_dtype != at::kFloat) {
+        auto tmp = chunked
+            ? at::zeros({M, N}, out.options().dtype(at::kFloat))
+            : at::empty({M, N}, out.options().dtype(at::kFloat));
+        vulkan_mm_into(self, mat2, tmp, false, false);
+        out.copy_(cast_from_float32(tmp, orig_dtype));
+    } else {
+        out.resize_({M, N});
+        vulkan_mm_into(self, mat2, out, false, false);
+    }
+    return out;
+}
+
+
+// Simplified mm: delegates to vulkan_mm_out which handles all chunking/fast-path logic.
+at::Tensor vulkan_mm(const at::Tensor& self, const at::Tensor& mat2) {
+    TORCH_CHECK(self.dim() == 2 && mat2.dim() == 2, "mm: expected 2D tensors");
+    TORCH_CHECK(self.size(1) == mat2.size(0), "mm: incompatible dimensions");
+    int64_t M = self.size(0), N = mat2.size(1);
+    auto out = at::empty({M, N}, self.options());
+    vulkan_mm_out(self, mat2, out);
+    return out;
 }
 
 at::Tensor vulkan_mm_ex(const at::Tensor& self, const at::Tensor& mat2,
@@ -290,6 +326,50 @@ at::Tensor vulkan_mm_ex(const at::Tensor& self, const at::Tensor& mat2,
     return cast_from_float32(output, orig_dtype);
 }
 
+// TRAIN.8: Direct-write out-variant of addmm.
+// For the common case (alpha=1, beta=1), dispatches mm directly into out_f32,
+// then adds bias, avoiding the double allocation from vulkan_addmm's internal mm.
+// For other cases, falls back to vulkan_addmm + copy.
+at::Tensor& vulkan_addmm_out(
+    const at::Tensor& self,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha,
+    at::Tensor& out) {
+    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "addmm: expected 2D tensors");
+    TORCH_CHECK(mat1.size(1) == mat2.size(0), "addmm: incompatible dimensions");
+    check_supported_float(mat1, "addmm");
+
+    if (beta.toDouble() == 1.0 && alpha.toDouble() == 1.0) {
+        int64_t M = mat1.size(0), N = mat2.size(1);
+        auto orig_dtype = out.scalar_type();
+        if (M == 0 || N == 0) { out.zero_(); return out; }
+        // TRAIN.8-F1: Compute mm into f32 buffer, then bias-add.
+        // When bias already matches tmp shape (f32 contiguous), use
+        // in-place add to skip the intermediate allocation; otherwise
+        // fall back to vulkan_add (broadcast shader).
+        auto tmp = at::empty({M, N}, out.options().dtype(at::kFloat));
+        vulkan_mm_into(mat1, mat2, tmp, false, false);
+        auto bias_c = self.contiguous();
+        auto bias_f32 = ensure_float32(bias_c);
+        if (bias_f32.is_contiguous() && bias_f32.sizes() == tmp.sizes()) {
+            vulkan_add_(tmp, bias_f32, 1);
+        } else {
+            auto biased = vulkan_add(tmp, bias_f32, 1);
+            out.copy_(cast_from_float32(biased, orig_dtype));
+            return out;
+        }
+        out.copy_(cast_from_float32(tmp, orig_dtype));
+        return out;
+    }
+
+    // Fallback for non-standard alpha/beta
+    auto result = vulkan_addmm(self, mat1, mat2, beta, alpha);
+    out.copy_(result);
+    return out;
+}
+
 at::Tensor vulkan_addmm(
     const at::Tensor& bias,
     const at::Tensor& self,
@@ -314,6 +394,76 @@ at::Tensor vulkan_addmm(
 }
 
 // ── Batched Matrix Multiplication ────────────────────────────────
+// TRAIN.8: Direct-write out-variant of bmm.
+// Dispatches directly into ``out`` on the f32 fast path to avoid
+// the double-allocation from vulkan_bmm's internal output + pool-backed out.
+at::Tensor& vulkan_bmm_out(const at::Tensor& self, const at::Tensor& mat2,
+                           at::Tensor& out) {
+    TORCH_CHECK(self.dim() == 3 && mat2.dim() == 3,
+                "bmm: expected 3D tensors");
+
+    // Fast path: detect zero-copy last-2-dims-transposed views
+    bool ta = is_last2_transposed(self);
+    bool tb = is_last2_transposed(mat2);
+    if (ta || tb) {
+        auto self_use = ta ? get_physical_storage_nd(self) : self;
+        auto mat2_use = tb ? get_physical_storage_nd(mat2) : mat2;
+        auto result = vulkan_bmm_ex(self_use, mat2_use, ta, tb);
+        out.copy_(result);
+        return out;
+    }
+
+    auto self_c = self.contiguous();
+    auto mat2_c = mat2.contiguous();
+
+    TORCH_CHECK(self_c.size(0) == mat2_c.size(0), "bmm: batch sizes must match");
+    TORCH_CHECK(self_c.size(2) == mat2_c.size(1), "bmm: incompatible matrix sizes");
+    check_supported_float(self_c, "bmm");
+    auto orig_dtype = out.scalar_type();
+
+    int64_t B = self_c.size(0);
+    int64_t M = self_c.size(1);
+    int64_t K = self_c.size(2);
+    int64_t N = mat2_c.size(2);
+
+    if (B == 0 || M == 0 || N == 0 || K == 0) { out.zero_(); return out; }
+
+    // Widen to f32 for compute
+    self_c = ensure_float32(self_c);
+    mat2_c = ensure_float32(mat2_c);
+
+    struct { uint32_t batch, M, N, K, transpose_a, transpose_b; float scale; } params{
+        static_cast<uint32_t>(B),
+        static_cast<uint32_t>(M),
+        static_cast<uint32_t>(N),
+        static_cast<uint32_t>(K),
+        0u, 0u,  // both inputs are contiguous row-major
+        1.0f     // scale = 1.0 (no scaling)
+    };
+
+    uint32_t wg_x = (static_cast<uint32_t>(M) + 15) / 16;
+    uint32_t wg_y = (static_cast<uint32_t>(N) + 15) / 16;
+    uint32_t wg_z = static_cast<uint32_t>(B);
+
+    if (orig_dtype != at::kFloat) {
+        auto tmp = at::empty({B, M, N}, out.options().dtype(at::kFloat));
+        dispatch_shader("matmul_bmm_tiled_fwd",
+                        shaders::matmul_bmm_tiled_fwd, shaders::matmul_bmm_tiled_fwd_size,
+                        {self_c, mat2_c, tmp},
+                        wg_x, wg_y, wg_z,
+                        &params, sizeof(params));
+        out.copy_(cast_from_float32(tmp, orig_dtype));
+    } else {
+        out.resize_({B, M, N});
+        dispatch_shader("matmul_bmm_tiled_fwd",
+                        shaders::matmul_bmm_tiled_fwd, shaders::matmul_bmm_tiled_fwd_size,
+                        {self_c, mat2_c, out},
+                        wg_x, wg_y, wg_z,
+                        &params, sizeof(params));
+    }
+    return out;
+}
+
 // Check if tensor is a transpose of its last two dims (i.e., the only
 // non-contiguous dims are the last two, and they are swapped).
 at::Tensor vulkan_bmm(const at::Tensor& self, const at::Tensor& mat2) {
