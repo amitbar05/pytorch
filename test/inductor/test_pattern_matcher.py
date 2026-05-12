@@ -16,23 +16,23 @@ from torch._inductor.fx_passes import joint_graph
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
-    fwd_only,
-    gen_pattern,
-    is_mutation_op,
     KeywordArg,
     Match,
     PatternMatcherPass,
     PatternPrettyPrinter,
+    fwd_only,
+    gen_pattern,
+    is_mutation_op,
     register_graph_pattern,
     register_replacement,
     stable_topological_sort,
 )
-from torch._inductor.test_case import run_tests, TestCase
+from torch._inductor.test_case import TestCase, run_tests
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch._library.opaque_object import (
-    get_opaque_type_name,
     OpaqueBase,
+    get_opaque_type_name,
     register_opaque_type,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -40,14 +40,13 @@ from torch.testing import FileCheck
 from torch.testing._internal.common_cuda import SM80OrLater, xfailIfSM89
 from torch.testing._internal.common_device_type import skipCUDAIf
 from torch.testing._internal.common_utils import (
-    instantiate_parametrized_tests,
     IS_LINUX,
+    instantiate_parametrized_tests,
     parametrize,
 )
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, IS_BIG_GPU
 from torch.testing._internal.logging_utils import LoggingTestCase, make_logging_test
 from torch.utils import _pytree as pytree
-
 
 aten = torch.ops.aten
 
@@ -206,8 +205,8 @@ class TestPatternMatcher(TestCase):
 
         import torch
         from torch._inductor.pattern_matcher import (
-            fwd_only,
             PatternMatcherPass,
+            fwd_only,
             register_replacement,
         )
 
@@ -1053,8 +1052,8 @@ class TestPatternMatcher(TestCase):
     def test_symint_pattern_matching(self):
         import torch._inductor.config as config
         from torch._inductor.pattern_matcher import (
-            fwd_only,
             PatternMatcherPass,
+            fwd_only,
             register_replacement,
         )
 
@@ -2531,6 +2530,232 @@ class TestPatternMatcherLogging(LoggingTestCase):
             ]
             self.assertNotIn(torch.ops._test_pm.original_op.default, op_targets)
             self.assertIn(torch.ops._test_pm.replacement_op.default, op_targets)
+
+    # =========================================================================
+    # Tests for RMSNorm decomposition pattern fusion
+    # =========================================================================
+    @inductor_config.patch("pattern_matcher", True)
+    def test_rms_norm_decomp_fusion(self):
+        """
+        Test that a decomposed RMSNorm pattern:
+          pow(x,2) -> mean -> add(eps) -> rsqrt -> mul(x) -> mul(weight)
+        gets fused into aten.rms_norm.
+        """
+
+        def rms_norm_decomp(x, weight, eps):
+            var = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+            rstd = torch.rsqrt(torch.add(var, eps))
+            normed = torch.mul(x, rstd)
+            return torch.mul(normed, weight)
+
+        def fn(x, weight, eps):
+            return rms_norm_decomp(x, weight, eps)
+
+        args = [
+            torch.randn(4, 8, device=GPU_TYPE),
+            torch.randn(8, device=GPU_TYPE),
+            1e-5,
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        # Verify that the RMSNorm fusion counter was incremented
+        self.assertGreater(
+            counters["inductor"].get("fuse_rms_norm", 0),
+            0,
+            "RMSNorm fusion pattern should have matched",
+        )
+        counters.clear()
+
+    @inductor_config.patch("pattern_matcher", True)
+    def test_rms_norm_linear_fusion(self):
+        """
+        Test that decomposed RMSNorm followed by a linear layer:
+          pow(x,2)->mean->add->rsqrt->mul->mul(weight) -> addmm(bias, normed, w)
+        gets fused into rms_norm + addmm.
+        """
+
+        def rms_norm_linear_decomp(x, rms_weight, eps, w_lin, bias):
+            var = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+            rstd = torch.rsqrt(torch.add(var, eps))
+            normed = torch.mul(x, rstd)
+            normed_weighted = torch.mul(normed, rms_weight)
+            return torch.addmm(bias, normed_weighted, w_lin)
+
+        def fn(x, rms_weight, eps, w_lin, bias):
+            return rms_norm_linear_decomp(x, rms_weight, eps, w_lin, bias)
+
+        args = [
+            torch.randn(4, 8, device=GPU_TYPE),
+            torch.randn(8, device=GPU_TYPE),
+            1e-5,
+            torch.randn(8, 16, device=GPU_TYPE),
+            torch.randn(16, device=GPU_TYPE),
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        # Verify that the RMSNorm+Linear fusion counter was incremented
+        self.assertGreater(
+            counters["inductor"].get("fuse_rms_norm_linear", 0),
+            0,
+            "RMSNorm+Linear fusion pattern should have matched",
+        )
+        counters.clear()
+
+    # =========================================================================
+    # Tests for SiLU + Mul (SwiGLU) fusion pattern
+    # =========================================================================
+    @inductor_config.patch("pattern_matcher", True)
+    def test_silu_mul_fusion(self):
+        """
+        Test that sigmoid(x) * x * y (SiLU * y = SwiGLU component)
+        gets fused into silu(x) * y.
+        """
+
+        def swiglu_component(x, y):
+            return torch.mul(torch.mul(x, torch.sigmoid(x)), y)
+
+        def fn(x, y):
+            return swiglu_component(x, y)
+
+        args = [
+            torch.randn(4, 8, device=GPU_TYPE),
+            torch.randn(4, 8, device=GPU_TYPE),
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        # Verify that the SiLU+Mul fusion counter was incremented
+        self.assertGreater(
+            counters["inductor"].get("fuse_silu_mul", 0),
+            0,
+            "SiLU+Mul fusion pattern should have matched",
+        )
+        counters.clear()
+
+    # =========================================================================
+    # Tests for RoPE (Rotary Position Embedding) fusion pattern
+    # =========================================================================
+    @inductor_config.patch("pattern_matcher", True)
+    def test_rope_fusion(self):
+        """
+        Test that the RoPE pattern:
+          split(x, 2, dim=-1) -> [x1, x2]
+          neg(x2) -> cat([neg_x2, x1], dim=-1)
+          x * cos + rotated * sin
+        gets fused.
+        """
+
+        def apply_rotary_emb(x, cos, sin):
+            half = x.shape[-1] // 2
+            x1 = x[..., :half]
+            x2 = x[..., half:]
+            neg_x2 = torch.neg(x2)
+            rotated = torch.cat([neg_x2, x1], dim=-1)
+            return torch.add(torch.mul(x, cos), torch.mul(rotated, sin))
+
+        def fn(x, cos, sin):
+            return apply_rotary_emb(x, cos, sin)
+
+        args = [
+            torch.randn(2, 4, 64, device=GPU_TYPE),
+            torch.randn(2, 4, 64, device=GPU_TYPE),
+            torch.randn(2, 4, 64, device=GPU_TYPE),
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        # Verify that the RoPE fusion counter was incremented
+        self.assertGreater(
+            counters["inductor"].get("fuse_rope", 0),
+            0,
+            "RoPE fusion pattern should have matched",
+        )
+        counters.clear()
+
+    @inductor_config.patch("pattern_matcher", True)
+    def test_rope_fusion_3d_input(self):
+        """
+        Test RoPE fusion with 3D inputs (batch, seq, head_dim).
+        """
+
+        def apply_rotary_emb(x, cos, sin):
+            half = x.shape[-1] // 2
+            x1 = x[..., :half]
+            x2 = x[..., half:]
+            neg_x2 = torch.neg(x2)
+            rotated = torch.cat([neg_x2, x1], dim=-1)
+            return torch.add(torch.mul(x, cos), torch.mul(rotated, sin))
+
+        def fn(x, cos, sin):
+            return apply_rotary_emb(x, cos, sin)
+
+        args = [
+            torch.randn(4, 128, device=GPU_TYPE),  # (seq_len, head_dim)
+            torch.randn(4, 128, device=GPU_TYPE),
+            torch.randn(4, 128, device=GPU_TYPE),
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        # Verify that the RoPE fusion counter was incremented
+        self.assertGreater(
+            counters["inductor"].get("fuse_rope", 0),
+            0,
+            "RoPE fusion pattern should have matched for 3D inputs",
+        )
+        counters.clear()
+
+    @inductor_config.patch("pattern_matcher", True)
+    def test_silu_mul_fusion_different_shapes(self):
+        """
+        Test SiLU+Mul fusion with different shapes that still broadcast.
+        """
+
+        def swiglu_component(x, y):
+            return torch.mul(torch.mul(x, torch.sigmoid(x)), y)
+
+        def fn(x, y):
+            return swiglu_component(x, y)
+
+        args = [
+            torch.randn(2, 3, 16, device=GPU_TYPE),
+            torch.randn(2, 3, 16, device=GPU_TYPE),
+        ]
+
+        counters.clear()
+        torch.manual_seed(42)
+        expected = fn(*args)
+        torch.manual_seed(42)
+        actual = torch.compile(fn)(*args)
+        torch.testing.assert_close(actual, expected)
+        self.assertGreater(
+            counters["inductor"].get("fuse_silu_mul", 0),
+            0,
+            "SiLU+Mul fusion pattern should have matched",
+        )
+        counters.clear()
 
 
 if __name__ == "__main__":

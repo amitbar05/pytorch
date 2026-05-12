@@ -8,7 +8,6 @@ from torch.utils._ordered_set import OrderedSet
 
 from ..pattern_matcher import fwd_only, register_replacement
 
-
 aten = torch.ops.aten
 
 
@@ -152,6 +151,240 @@ def _misc_patterns_init(input_device: torch.device | None = None):
             [post_grad_patterns],
             extra_check=e8m0_extra_check,
         )
+
+    # =========================================================================
+    # RMSNorm decomposition pattern:
+    # Matches: pow(x,2)->mean->add(eps)->rsqrt->mul(x)->mul(weight)
+    # Replaces with: aten.rms_norm (fused kernel)
+    # =========================================================================
+    def _rms_norm_decomp_pattern(x, weight, eps):
+        var = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+        rstd = torch.rsqrt(torch.add(var, eps))
+        normed = torch.mul(x, rstd)
+        return torch.mul(normed, weight)
+
+    def _rms_norm_decomp_replacement(x, weight, eps):
+        counters["inductor"]["fuse_rms_norm"] += 1
+        return aten.rms_norm(x, [x.shape[-1]], weight, eps)
+
+    def _rms_norm_extra_check(match):
+        x = match.kwargs.get("x")
+        if x is None:
+            return False
+        x_val = x.meta.get("val")
+        if x_val is None:
+            return False
+        weight = match.kwargs.get("weight")
+        if weight is not None:
+            w_val = weight.meta.get("val")
+            if w_val is not None and w_val.dtype != x_val.dtype:
+                return False
+            # weight should be 1D and match the last dim of x
+            if w_val is not None and w_val.dim() != 1:
+                return False
+        # Only match for float dtypes and at least 2D tensors
+        return (
+            x_val.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and x_val.dim() >= 2
+        )
+
+    register_replacement(
+        # pyrefly: ignore [bad-argument-type]
+        _rms_norm_decomp_pattern,
+        # pyrefly: ignore [bad-argument-type]
+        _rms_norm_decomp_replacement,
+        [
+            torch.randn(4, 8, device=device),
+            torch.randn(8, device=device),
+            1e-5,
+        ],
+        # pyrefly: ignore [bad-argument-type]
+        fwd_only,
+        # pyrefly: ignore [bad-argument-type]
+        [post_grad_patterns, joint_graph_patterns],
+        extra_check=_rms_norm_extra_check,
+        scalar_workaround={"eps": 1e-5},
+        skip_duplicates=True,
+    )
+
+    # =========================================================================
+    # RMSNorm + Linear (matmul) fusion pattern:
+    # Matches: rms_norm(x, weight, eps) -> linear(normed, w_lin) or
+    # decomposed rms_norm -> matmul/addmm
+    # Replaces with: fused operation via rms_norm + addmm
+    # =========================================================================
+    def _rms_norm_linear_pattern(x, rms_weight, eps, w_lin, bias):
+        var = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+        rstd = torch.rsqrt(torch.add(var, eps))
+        normed = torch.mul(x, rstd)
+        normed_weighted = torch.mul(normed, rms_weight)
+        return torch.addmm(bias, normed_weighted, w_lin)
+
+    def _rms_norm_linear_replacement(x, rms_weight, eps, w_lin, bias):
+        counters["inductor"]["fuse_rms_norm_linear"] += 1
+        normed = aten.rms_norm(x, [x.shape[-1]], rms_weight, eps)
+        return torch.addmm(bias, normed, w_lin)
+
+    def _rms_norm_linear_extra_check(match):
+        x = match.kwargs.get("x")
+        if x is None:
+            return False
+        x_val = x.meta.get("val")
+        if x_val is None:
+            return False
+        w_lin = match.kwargs.get("w_lin")
+        if w_lin is None:
+            return False
+        w_lin_val = w_lin.meta.get("val")
+        if w_lin_val is None:
+            return False
+        # x shape: [..., D], w_lin shape: [D, D_out] or [D_out, D]
+        if x_val.dim() < 2 or w_lin_val.dim() != 2:
+            return False
+        return x_val.dtype in (torch.float32, torch.float16, torch.bfloat16)
+
+    register_replacement(
+        # pyrefly: ignore [bad-argument-type]
+        _rms_norm_linear_pattern,
+        # pyrefly: ignore [bad-argument-type]
+        _rms_norm_linear_replacement,
+        [
+            torch.randn(4, 8, device=device),
+            torch.randn(8, device=device),
+            1e-5,
+            torch.randn(8, 16, device=device),
+            torch.randn(16, device=device),
+        ],
+        # pyrefly: ignore [bad-argument-type]
+        fwd_only,
+        # pyrefly: ignore [bad-argument-type]
+        [post_grad_patterns, joint_graph_patterns],
+        extra_check=_rms_norm_linear_extra_check,
+        scalar_workaround={"eps": 1e-5},
+        skip_duplicates=True,
+    )
+
+    # =========================================================================
+    # SiLU + Mul fusion (SwiGLU component):
+    # Matches: sigmoid(x) -> mul(x) -> mul(y)  which is silu(x) * y
+    # This is a key component of SwiGLU FFN layers in LLaMA/Mistral/etc.
+    # Replaces with: aten.silu(x) * y
+    #
+    # Also matches the inductor-specific decomposition:
+    # neg(x)->exp->add(1)->div(x)->mul(y)  which is silu(x) * y
+    # =========================================================================
+    def _silu_mul_pattern_1(x, y):
+        return torch.mul(torch.mul(x, torch.sigmoid(x)), y)
+
+    def _silu_mul_replacement_1(x, y):
+        counters["inductor"]["fuse_silu_mul"] += 1
+        return aten.silu(x).mul(y)
+
+    def _silu_mul_extra_check(match):
+        x = match.kwargs.get("x")
+        if x is None:
+            return False
+        x_val = x.meta.get("val")
+        if x_val is None:
+            return False
+        y = match.kwargs.get("y")
+        if y is None:
+            return False
+        y_val = y.meta.get("val")
+        if y_val is None:
+            return False
+        # Both inputs should be float dtypes
+        return x_val.dtype in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ) and y_val.dtype in (torch.float32, torch.float16, torch.bfloat16)
+
+    register_replacement(
+        # pyrefly: ignore [bad-argument-type]
+        _silu_mul_pattern_1,
+        # pyrefly: ignore [bad-argument-type]
+        _silu_mul_replacement_1,
+        [
+            torch.randn(4, 8, device=device),
+            torch.randn(4, 8, device=device),
+        ],
+        # pyrefly: ignore [bad-argument-type]
+        fwd_only,
+        # pyrefly: ignore [bad-argument-type]
+        [post_grad_patterns, joint_graph_patterns],
+        extra_check=_silu_mul_extra_check,
+        skip_duplicates=True,
+    )
+
+    # =========================================================================
+    # RoPE (Rotary Position Embedding) fusion pattern:
+    # Matches the common RoPE computation:
+    #   split(x, 2, dim=-1) -> [x1, x2]
+    #   neg(x2) -> cat([neg_x2, x1], dim=-1)  (the rotated half)
+    #   mul(x, cos) + mul(rotated, sin)
+    #
+    # Replaces with a fused RoPE operation.
+    # Pattern: x * cos + cat([-x[..., half:], x[..., :half]], dim=-1) * sin
+    # =========================================================================
+    def _rope_pattern(x, cos, sin):
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        neg_x2 = torch.neg(x2)
+        rotated = torch.cat([neg_x2, x1], dim=-1)
+        return torch.add(torch.mul(x, cos), torch.mul(rotated, sin))
+
+    def _rope_replacement(x, cos, sin):
+        counters["inductor"]["fuse_rope"] += 1
+        # Use a fused RoPE implementation that avoids the split/cat overhead
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        # Compute directly: x * cos + [-x2, x1] * sin
+        # This keeps the computation structured for further fusion
+        rotated_x1 = x1 * cos[..., :half] + (-x2) * sin[..., :half]
+        rotated_x2 = x2 * cos[..., half:] + x1 * sin[..., half:]
+        return torch.cat([rotated_x1, rotated_x2], dim=-1)
+
+    def _rope_extra_check(match):
+        x = match.kwargs.get("x")
+        if x is None:
+            return False
+        x_val = x.meta.get("val")
+        if x_val is None:
+            return False
+        cos = match.kwargs.get("cos")
+        sin = match.kwargs.get("sin")
+        if cos is None or sin is None:
+            return False
+        cos_val = cos.meta.get("val")
+        sin_val = sin.meta.get("val")
+        if cos_val is None or sin_val is None:
+            return False
+        # x should be at least 2D with even last dimension
+        if x_val.dim() < 2 or x_val.shape[-1] % 2 != 0:
+            return False
+        # cos and sin should be broadcastable with x
+        return x_val.dtype in (torch.float32, torch.float16, torch.bfloat16)
+
+    register_replacement(
+        # pyrefly: ignore [bad-argument-type]
+        _rope_pattern,
+        # pyrefly: ignore [bad-argument-type]
+        _rope_replacement,
+        [
+            torch.randn(2, 4, 64, device=device),
+            torch.randn(2, 4, 64, device=device),
+            torch.randn(2, 4, 64, device=device),
+        ],
+        # pyrefly: ignore [bad-argument-type]
+        fwd_only,
+        # pyrefly: ignore [bad-argument-type]
+        [post_grad_patterns, joint_graph_patterns],
+        extra_check=_rope_extra_check,
+        skip_duplicates=True,
+    )
 
     # TODO: Add pattern for cvt.rn.bf16x2.ue8m0x2 (e8m0 -> bf16 conversion)
     # This is the inverse operation for MX format dequantization

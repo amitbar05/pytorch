@@ -1,7 +1,7 @@
 import os
 import sys
 from collections.abc import Callable
-from typing import Any, cast, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 import torch._inductor.custom_graph_pass
@@ -12,7 +12,6 @@ from torch.utils._config_module import (
     inherit_fields_from,
     install_config_module,
 )
-
 
 if TYPE_CHECKING:
     from torch._inductor.choices import InductorChoices
@@ -265,6 +264,13 @@ use_fast_math = os.environ.get("TORCHINDUCTOR_USE_FAST_MATH") == "1"
 memory_pool: Literal["none", "intermediates", "outputs", "combined"] = os.environ.get(
     "TORCHINDUCTOR_MEMORY_POOL", "intermediates"
 )  # type: ignore[assignment]
+
+# Enable interval graph coloring for buffer reuse to minimize peak memory.
+# Uses an O(n log n) greedy coloring algorithm that models buffer lifetimes
+# as intervals and assigns non-overlapping buffers to shared memory allocations.
+aggressive_memory_reuse = (
+    os.environ.get("TORCHINDUCTOR_AGGRESSIVE_MEMORY_REUSE", "0") == "1"
+)
 
 # codegen benchmark harness
 benchmark_harness = True
@@ -727,6 +733,41 @@ coordinate_descent_check_all_directions = (
 )
 coordinate_descent_search_radius = int(
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_RADIUS", "1")
+)
+
+# Coordinate descent tuner: maximum outer-loop iterations
+coordinate_descent_max_iterations = int(
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_MAX_ITER", "100")
+)
+
+# Coordinate descent tuner: early stop improvement threshold (e.g. 0.001 = 0.1%)
+coordinate_descent_early_stop_threshold = float(
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_EARLY_STOP_THRESHOLD", "0.001")
+)
+
+# Coordinate descent tuner: number of plateau iterations before stopping
+coordinate_descent_early_stop_patience = int(
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_EARLY_STOP_PATIENCE", "3")
+)
+
+# Coordinate descent tuner: enable adaptive step sizes (coarse-to-fine search)
+coordinate_descent_adaptive_step = (
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_ADAPTIVE_STEP") != "0"
+)
+
+# Coordinate descent tuner: enable multi-field tuning for general kernels
+coordinate_descent_multi_field_tuning = (
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_MULTI_FIELD") == "1"
+)
+
+# Coordinate descent tuner: enable multi-field tuning for matmul kernels (default on)
+coordinate_descent_multi_field_tuning_for_mm = (
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_MULTI_FIELD_FOR_MM") != "0"
+)
+
+# Coordinate descent tuner: number of warmup samples before starting main tuning
+coordinate_descent_warmup_samples = int(
+    os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_WARMUP", "4")
 )
 
 # AutoHeuristic is a framework that allows one to collect data from autotuning, use the data to learn a heuristic, and
