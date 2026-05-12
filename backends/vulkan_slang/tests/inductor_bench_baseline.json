@@ -1,0 +1,6 @@
+{
+  "test_kernel": {
+    "call_count": 5,
+    "total_us": 100.0
+  }
+}
