@@ -2,7 +2,10 @@
 import copy
 import itertools
 import logging
+import random
 from collections.abc import Callable
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
 from torch.utils._ordered_set import OrderedSet
@@ -11,12 +14,56 @@ from ..utils import get_max_numwarps
 from .hints import TRITON_MAX_BLOCK
 from .runtime_utils import red_text, triton_config_to_hashable
 
-
 if TYPE_CHECKING:
     from .triton_compat import triton
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class CoordescTunerConfig:
+    """Configuration for the coordinate descent autotuner."""
+
+    # Maximum number of outer-loop iterations (each iteration tunes all fields once)
+    max_iterations: int = 100
+
+    # Early termination: stop if the best timing hasn't improved by more than
+    # this fraction in the last `early_stop_patience` iterations.
+    # e.g. 0.001 means 0.1% improvement threshold.
+    early_stop_threshold: float = 0.001
+
+    # Number of iterations with less than `early_stop_threshold` improvement
+    # before stopping early.
+    early_stop_patience: int = 3
+
+    # Enable adaptive step sizes per field (like a per-field learning rate).
+    # When True, step sizes shrink when a direction stops yielding improvements.
+    adaptive_step: bool = True
+
+    # Enable multi-field (joint) tuning when single-field tuning plateaus.
+    # When True, pairs of correlated fields are tuned together.
+    multi_field_tuning: bool = False
+
+    # For matmul kernels, multi-field tuning is particularly useful because
+    # BLOCK_M and BLOCK_N are correlated.
+    multi_field_tuning_for_mm: bool = True
+
+    # Number of warmup samples to evaluate before starting coordinate descent.
+    # The tuner will sample `warmup_samples` random configs and start from the best.
+    # Set to 0 to disable (start from the provided baseline config).
+    warmup_samples: int = 4
+
+    # After single-field tuning plateaus, check all direction combinations.
+    check_all_directions: bool = False
+
+    # Search radius for neighbour values.
+    search_radius: int = 1
+
+    # Correlated field pairs for multi-field tuning.
+    # Each tuple is a pair of field names that should be tuned together.
+    # If empty, sensible defaults are chosen based on kernel type.
+    correlated_fields: list[tuple[str, str]] = dc_field(default_factory=list)
 
 
 def get_field(config, name):
@@ -43,11 +90,11 @@ class CoordescTuner:
     """
     The coordinate descent tuner. Tune one field/coordinate at a time.
 
-    TODO will it be necessary to tune multiple fields simultaneously.
-
-
-    TODO: what if both increasing and decreasing a field can improve perf.
-          i.e., there are multiple local optima..
+    Features:
+    - Adaptive step sizes: coarse-to-fine search with per-field learning rates.
+    - Multi-field tuning: tune correlated field pairs jointly when single-field plateaus.
+    - Early termination: stop when improvement drops below a threshold.
+    - Warmup: sample multiple initial configs and start from the best.
     """
 
     def __init__(
@@ -59,6 +106,7 @@ class CoordescTuner:
         size_hints=None,
         inductor_meta=None,
         frozen_fields=None,
+        tuner_config: CoordescTunerConfig | None = None,
     ):
         self.is_mm = is_mm  # we will tune num_stages for mm
 
@@ -75,6 +123,52 @@ class CoordescTuner:
         self.frozen_fields: OrderedSet[str] = (
             OrderedSet(frozen_fields) if frozen_fields is not None else OrderedSet()
         )
+
+        # Tuner configuration
+        if tuner_config is None:
+            tuner_config = CoordescTunerConfig()
+        self.tuner_config = tuner_config
+
+        # Per-field step sizes for adaptive tuning (maps field_name -> current_step)
+        self._step_sizes: dict[str, int] = {}
+
+        # For early termination: track best timing per iteration
+        self._timing_history: list[float] = []
+
+    def _init_step_size(self, name: str, orig_val: int) -> int:
+        """Initialize the step size for a field based on its starting value."""
+        if name in ("num_stages", "NUM_STAGES"):
+            return 2  # start coarser for stages
+        elif name == "num_warps":
+            return 2  # powers of 2 step
+        else:
+            # For block sizes, start with a multiplicative factor of 4
+            return 4
+
+    def _get_correlated_field_pairs(self) -> list[tuple[str, str]]:
+        """Return the list of correlated field pairs for multi-field tuning."""
+        cfg = self.tuner_config
+        if cfg.correlated_fields:
+            return cfg.correlated_fields
+
+        # Sensible defaults based on kernel type
+        fields = self.tunable_fields
+        pairs = []
+
+        # For matmuls, BLOCK_M and BLOCK_N are highly correlated
+        if self.is_mm and (cfg.multi_field_tuning or cfg.multi_field_tuning_for_mm):
+            if "BLOCK_M" in fields and "BLOCK_N" in fields:
+                pairs.append(("BLOCK_M", "BLOCK_N"))
+            if "num_warps" in fields and "num_stages" in fields:
+                pairs.append(("num_warps", "num_stages"))
+        else:
+            # For reductions: XBLOCK and R0_BLOCK are correlated
+            if "XBLOCK" in fields and "R0_BLOCK" in fields:
+                pairs.append(("XBLOCK", "R0_BLOCK"))
+            if "num_warps" in fields and "num_stages" in fields:
+                pairs.append(("num_warps", "num_stages"))
+
+        return pairs
 
     def get_config_max(self, prefix: str) -> int:
         max_block = TRITON_MAX_BLOCK[prefix.upper()]
@@ -163,9 +257,12 @@ class CoordescTuner:
         """
         Get neighbour values in 'radius' steps. The original value is not
         returned as it's own neighbour.
+
+        When adaptive_step is enabled, uses per-field step sizes for multiplicative
+        fields (blocks, num_warps) instead of fixed doubling/halving.
         """
         if radius is None:
-            radius = 1
+            radius = self.tuner_config.search_radius
         if name == "NUM_STAGES":
             # we see cases that
             # NUM_STAGES=1 is better than NUM_STAGES=2
@@ -173,6 +270,17 @@ class CoordescTuner:
             radius = max(radius, 2)
 
         assert radius >= 1
+
+        # Determine the multiplicative step factor for adaptive tuning
+        if self.tuner_config.adaptive_step and name not in (
+            "num_stages",
+            "NUM_STAGES",
+        ):
+            if name not in self._step_sizes:
+                self._step_sizes[name] = self._init_step_size(name, orig_val)
+            step_factor = self._step_sizes[name]
+        else:
+            step_factor = 2  # default: double/halve
 
         def update(cur_val, inc=True):
             if name in ["num_stages", "NUM_STAGES"]:
@@ -182,9 +290,9 @@ class CoordescTuner:
                     return cur_val - 1
             else:
                 if inc:
-                    return cur_val * 2
+                    return cur_val * step_factor
                 else:
-                    return cur_val // 2
+                    return cur_val // step_factor
 
         out = []
         # increment loop
@@ -207,9 +315,14 @@ class CoordescTuner:
             out.append(orig_val)
         return out
 
-    @staticmethod
-    def has_improvement(baseline, test):
-        threshold = 0.001  # 0.1%
+    def _shrink_step(self, name: str) -> None:
+        """Shrink the adaptive step size for a field (fine-grained search)."""
+        if name in self._step_sizes and self._step_sizes[name] > 2:
+            self._step_sizes[name] = max(2, self._step_sizes[name] // 2)
+            log.debug("  Shrinking step for %s to %d", name, self._step_sizes[name])
+
+    def has_improvement(self, baseline, test):
+        threshold = self.tuner_config.early_stop_threshold
         return test is not None and test < baseline * (1 - threshold)
 
     def is_valid_config(self, config) -> bool:
@@ -239,7 +352,9 @@ class CoordescTuner:
             old_value = get_field(best_config, field)
             if old_value is None:
                 continue
-            radius = self.inductor_meta.get("coordinate_descent_search_radius", 1)
+            radius = self.inductor_meta.get(
+                "coordinate_descent_search_radius", self.tuner_config.search_radius
+            )
             candidate_values = self.get_neighbour_values(
                 field,
                 old_value,
@@ -267,6 +382,144 @@ class CoordescTuner:
                 best_timing = candidate_timing
 
         return improved, best_config, best_timing
+
+    def _multi_field_tune(
+        self,
+        func: Callable[["triton.Config"], float],  # pyrefly: ignore
+        best_config,
+        best_timing,
+    ) -> tuple[bool, "triton.Config", float]:  # pyrefly: ignore
+        """
+        Tune pairs of correlated fields jointly. This is useful when two fields
+        interact (e.g., BLOCK_M and BLOCK_N for matmuls).
+
+        For each correlated pair, we try all combinations of neighbour values
+        for both fields simultaneously.
+        """
+        pairs = self._get_correlated_field_pairs()
+        if not pairs:
+            return False, best_config, best_timing
+
+        improved = False
+        for field_a, field_b in pairs:
+            val_a = get_field(best_config, field_a)
+            val_b = get_field(best_config, field_b)
+            if val_a is None or val_b is None:
+                continue
+
+            neighbours_a = self.get_neighbour_values(field_a, val_a, include_self=True)
+            neighbours_b = self.get_neighbour_values(field_b, val_b, include_self=True)
+
+            log.debug(
+                "  Multi-field tuning pair (%s, %s): %d x %d combinations",
+                field_a,
+                field_b,
+                len(neighbours_a),
+                len(neighbours_b),
+            )
+
+            for next_a in neighbours_a:
+                for next_b in neighbours_b:
+                    candidate_config = copy.deepcopy(best_config)
+                    set_field(candidate_config, field_a, next_a)
+                    set_field(candidate_config, field_b, next_b)
+
+                    if not self.is_valid_config(candidate_config):
+                        continue
+                    cmp_res, candidate_timing = self.compare_config(
+                        func, candidate_config, best_config, best_timing
+                    )
+                    if cmp_res:
+                        improved = True
+                        best_config, best_timing = candidate_config, candidate_timing
+
+        return improved, best_config, best_timing
+
+    def _check_early_termination(self, best_timing: float) -> bool:
+        """
+        Check if we should terminate early based on the timing history.
+        Returns True if we should stop.
+        """
+        cfg = self.tuner_config
+        if cfg.early_stop_patience <= 0:
+            return False
+
+        self._timing_history.append(best_timing)
+
+        if len(self._timing_history) < cfg.early_stop_patience + 1:
+            return False
+
+        # Check if the improvement over the last K iterations is below threshold
+        recent = self._timing_history[-cfg.early_stop_patience - 1 :]
+        old_best = recent[0]
+        new_best = min(recent[1:])
+
+        if old_best > 0 and (old_best - new_best) / old_best < cfg.early_stop_threshold:
+            log.debug(
+                "  Early termination: improvement %.4f%% below threshold %.4f%% over last %d iterations",
+                100 * (old_best - new_best) / old_best,
+                100 * cfg.early_stop_threshold,
+                cfg.early_stop_patience,
+            )
+            return True
+        return False
+
+    def _warmup(
+        self,
+        func: Callable[["triton.Config"], float],  # pyrefly: ignore
+        baseline_config: "triton.Config",  # pyrefly: ignore
+        baseline_timing: float,
+    ) -> tuple["triton.Config", float]:  # pyrefly: ignore
+        """
+        Sample several configs before starting coordinate descent and return
+        the best one as the starting point.
+        """
+        cfg = self.tuner_config
+        if cfg.warmup_samples <= 0:
+            return baseline_config, baseline_timing
+
+        best_config = baseline_config
+        best_timing = baseline_timing
+        tunable_fields = self.tunable_fields
+
+        log.debug(
+            "  Warmup: sampling %d random configs (baseline: %f)",
+            cfg.warmup_samples,
+            baseline_timing,
+        )
+
+        for i in range(cfg.warmup_samples):
+            candidate_config = copy.deepcopy(baseline_config)
+            # Randomly perturb some fields
+            fields_to_perturb = random.sample(
+                tunable_fields,
+                k=min(len(tunable_fields), random.randint(1, len(tunable_fields))),
+            )
+            for field in fields_to_perturb:
+                cur_val = get_field(candidate_config, field)
+                if cur_val is None:
+                    continue
+                neighbours = self.get_neighbour_values(field, cur_val, radius=1)
+                if neighbours:
+                    new_val = random.choice(neighbours)
+                    set_field(candidate_config, field, new_val)
+
+            if not self.is_valid_config(candidate_config):
+                continue
+
+            try:
+                timing = self.call_func(func, candidate_config)
+            except Exception as e:
+                log.debug("  Warmup config %d failed: %s", i, e)
+                continue
+
+            log.debug("  Warmup config %d: %f", i, timing)
+            if self.has_improvement(best_timing, timing):
+                best_config = candidate_config
+                best_timing = timing
+                log.debug("  Warmup found better config: %f", timing)
+
+        return best_config, best_timing
 
     def compare_config(self, func, candidate_config, best_config, best_timing):
         """
@@ -312,13 +565,22 @@ class CoordescTuner:
             baseline_config,
             baseline_timing,
         )
-        improved = True
-        best_config = baseline_config
-        best_timing = baseline_timing
-        tunable_fields = self.tunable_fields
 
-        while improved:
+        # Phase 0: Warmup - sample configs to find a better starting point
+        best_config, best_timing = self._warmup(func, baseline_config, baseline_timing)
+
+        # Reset timing history for early termination tracking
+        self._timing_history = [best_timing]
+
+        tunable_fields = self.tunable_fields
+        iteration = 0
+        improved = True
+        field_improved_in_iteration: dict[str, bool] = {}
+
+        while improved and iteration < self.tuner_config.max_iterations:
             improved = False
+            iteration += 1
+            log.debug("  Iteration %d, best timing %f", iteration, best_timing)
 
             for name in tunable_fields:
                 cur_val = get_field(best_config, name)
@@ -331,6 +593,7 @@ class CoordescTuner:
                 # We would not try either larger or smaller XBLOCK in this case.
                 candidate_values = self.get_neighbour_values(name, cur_val)
 
+                field_improved = False
                 for next_val in candidate_values:
                     candidate_config = copy.deepcopy(best_config)
                     set_field(candidate_config, name, next_val)
@@ -342,11 +605,31 @@ class CoordescTuner:
                     )
                     if cmp_res:
                         improved = True
+                        field_improved = True
                         best_config, best_timing = candidate_config, candidate_timing
 
-            if not improved and self.inductor_meta.get(
-                "coordinate_descent_check_all_directions"
+                # Adaptive step: shrink step size when no improvement found for this field
+                if (
+                    self.tuner_config.adaptive_step
+                    and not field_improved
+                    and name in self._step_sizes
+                ):
+                    self._shrink_step(name)
+
+                field_improved_in_iteration[name] = field_improved
+
+            # Phase 2: Multi-field tuning when single-field plateaus
+            if not improved and (
+                self.tuner_config.multi_field_tuning
+                or self.tuner_config.multi_field_tuning_for_mm
             ):
+                log.debug("  Single-field tuning plateaued, trying multi-field tuning")
+                improved, best_config, best_timing = self._multi_field_tune(
+                    func, best_config, best_timing
+                )
+
+            # Phase 3: Check all directions
+            if not improved and self.tuner_config.check_all_directions:
                 old_best_timing = best_timing
                 improved, best_config, best_timing = self.check_all_tuning_directions(
                     func, best_config, best_timing
@@ -354,7 +637,7 @@ class CoordescTuner:
 
                 if improved:
                     msg = red_text(
-                        "%s: Coordinate descend tuning found improvement of %.3fx by looking in all directions."
+                        "%s: Coordinate descent tuning found improvement of %.3fx by looking in all directions."
                     )
                     log.debug(
                         msg,
@@ -362,14 +645,24 @@ class CoordescTuner:
                         old_best_timing / best_timing,
                     )
 
+            # Early termination check
+            if not improved and self._check_early_termination(best_timing):
+                log.debug("  Stopping early at iteration %d", iteration)
+                break
+
+            # Track timing for early termination
+            if not improved:
+                self._timing_history.append(best_timing)
+
         log.debug(
-            "%s: Improve from %s %f -> %s %f, %.3fx",
+            "%s: Improve from %s %f -> %s %f, %.3fx (iterations: %d)",
             self.name,
             baseline_config,
             baseline_timing,
             best_config,
             best_timing,
             baseline_timing / best_timing,
+            iteration,
         )
 
         return best_config
