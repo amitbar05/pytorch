@@ -20,13 +20,17 @@ For porting GLSL reference code (e.g., llama.cpp's `mul_mm.comp`): Slang provide
 
 ```
 shaders/
-├── common/                        # Shared Slang modules
-│   ├── types.slang                # Type aliases, IScalarType interface
-│   ├── indexing.slang             # N-dim index <-> linear offset (generic)
-│   ├── reduce.slang               # Subgroup/workgroup reduce primitives
-│   ├── broadcast.slang            # Broadcasting logic for binary ops
-│   └── random.slang               # Philox4x32 PRNG module
-├── unary/                         # Unary element-wise (all [Differentiable])
+├── lib/                            # Library modules (SSOT for Inductor codegen)
+│   ├── helpers.slang               # Math extensions, Welford, Philox, type-packing
+│   ├── pointwise.slang             # Activations, IPointwise interface, operator structs
+│   ├── reduction.slang             # Workgroup reductions, IWaveReduction interface
+│   ├── norm.slang                  # Layer/RMS norm element functions, INormAffine
+│   ├── losses.slang                # MSE/l1/smooth_l1/huber/bce/kl_div elementals
+│   ├── mm.slang                    # Tiled GEMM with epilogue interface
+│   ├── conv.slang                  # Direct convolution with bias interface
+│   ├── atomics.slang               # GPU atomics (f32, i32, u32, packed f16)
+│   └── tensor_layout.slang         # N-dim offset/unravel/ravel/broadcast helpers
+├── unary/                          # Unary element-wise (all [Differentiable])
 │   ├── neg.slang, exp.slang, log.slang, sqrt.slang, rsqrt.slang
 │   ├── abs.slang, sign.slang, ceil_floor.slang
 │   └── cast.slang                 # dtype conversion (non-differentiable)
@@ -232,21 +236,18 @@ compile_shaders.py                     compile_cpu_tests.py
 
 ### Implementation Tasks
 
-- [ ] `shaders/common/types.slang`: `IScalarType` interface, f32/f16 aliases
-- [ ] `shaders/common/indexing.slang`: generic N-dim index ↔ flat offset with stride
-- [ ] `shaders/common/broadcast.slang`: broadcasting logic as reusable module
-- [ ] `shaders/common/reduce.slang`: subgroup/workgroup reduce primitives
-- [ ] `shaders/common/random.slang`: Philox4x32 PRNG module
-- [ ] `compile_shaders.py`: batch compile, generate forward + backward SPIR-V + C++ test targets
-- [ ] `compile_cpu_tests.py`: generates C++ from Slang for CPU-side unit tests
+- [x] `shaders/lib/*.slang` (9 modules): f32/f16/fp8 dtypes, generic interfaces, `[Differentiable]` annotations, `[BackwardDerivative]` on elementals
+- [x] `compile_shaders.py`: batch compile, generate forward + backward SPIR-V + C++ test targets
+- [x] `compile_cpu_tests.py`: generates C++ from Slang for CPU-side unit tests
+- [x] `tools/lib_graph.py`: library-module dependency graph + dead-shader detector
 
 **Testing gate:**
-- [ ] `slangc` compiles a trivial compute shader to valid SPIR-V
-- [ ] `slangc -target cpp` produces compilable C++ from the same source
-- [ ] Backward entry generation works for `[Differentiable]` functions
-- [ ] Slang SPIR-V loads and executes correctly on SwiftShader
-- [ ] CPU-compiled Slang functions produce same outputs as SPIR-V path
-- [ ] Pin Slang version, document in `tools/slang_version.txt`
+- [x] `slangc` compiles a trivial compute shader to valid SPIR-V
+- [x] `slangc -target cpp` produces compilable C++ from the same source
+- [x] Backward entry generation works for `[Differentiable]` functions
+- [x] Slang SPIR-V loads and executes correctly on SwiftShader
+- [x] CPU-compiled Slang functions produce same outputs as SPIR-V path
+- [x] Pin Slang version, documented in `tools/slang_version.txt`
 
 ---
 
@@ -282,6 +283,127 @@ PyTorch autograd graph:
 ---
 
 ## Reference Materials
+
+### Library Module API Reference (Canonical Signatures)
+
+These 9 modules in `shaders/lib/` form the Slang vocabulary that all
+Inductor-codegen'd kernels and templates consume. **Every public symbol below
+is a contract.** Breaking a signature requires a backward-compatible fallback
+or a synchronized codegen update.
+
+#### `helpers.slang` — Foundational Primitives
+
+| Symbol | Signature | Role |
+|--------|-----------|------|
+| `Welford` (struct) | `{float mean, m2, n}` | Running mean/variance accumulator |
+| `welford_combine` | `(Welford a, Welford b) → Welford` | Merge two Welford states |
+| `welford_finalize` | `(Welford w) → float2(mean, var)` | Finalize mean + population variance |
+| `f16_to_f32` / `f32_to_f16` | `(uint) → float` / `(float) → uint` | IEEE half ↔ float |
+| `bf16_to_f32` / `f32_to_bf16` | `(uint) → float` / `(float) → uint` | BFloat16 ↔ float |
+| `unpack_f16x2` / `pack_f16x2` | `(uint) → float2` / `(float,float) → uint` | Bulk pack/unpack |
+| `philox_rand` / `philox_randn` | `(uint counter, uint seed) → float` | Philox RNG (uniform / gaussian) |
+| `wave_sum<T>` / `wave_max<T>` etc. | `(T v) → T` where `T : __BuiltinFloatingPointType` | Wave-intrinsic wrappers |
+| `wg_sum_smem` | `(float v, uint tid, uint size) → float` | Tree reduction for legacy paths |
+| Extension `float.erf()` | `float → float`, `[ForceInline]` | Error function |
+| Extension `float.log1p()` | `float → float`, `[ForceInline]` | log(1+x) |
+| Extension `float.expm1()` | `float → float`, `[ForceInline]` | exp(x)-1 |
+| Extension `float.digamma()` | `float → float`, `[ForceInline]` | Digamma function |
+| Extension `float.lgamma()` | `float → float`, `[ForceInline]` | Log-gamma |
+| `_vk_unpack_{u8,i8,i16}` | `(StructuredBuffer<uint>, uint idx) → float` | Sub-32-bit dtype unpack |
+
+#### `pointwise.slang` — Elementwise Primitives
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `interface IPointwise` | `static float apply(float x)` | — |
+| `interface IPointwiseBinary` | `static float apply(float a, float b)` | — |
+| `relu_fwd` / `elu_fwd` / `hardswish_fwd` / `hardsigmoid_fwd` / `gelu_fwd` / `silu_fwd` / `softplus_fwd` / `mish_fwd` | `(float x) → float` | `[Differentiable]`, `[BackwardDerivative(...)]` |
+| `sigmoid_fwd` / `tanh_fwd` | `(float x) → float` | `[Differentiable]`, `[BackwardDerivative(...)]` |
+| `OpReLU` / `OpGELU` … (18 structs) | `: IPointwise` | Operator structs for template dispatch |
+| `OpAdd` / `OpMul` … (7 structs) | `: IPointwiseBinary` | Operator structs for binary template dispatch |
+| `pointwise_unary_apply<Op>` | `(StructuredBuffer input, RWStructuredBuffer output, uint idx, uint n)` | `[ForceInline]` |
+| `pointwise_binary_apply<Op>` | `(StructuredBuffer in_a, in_b, RWStructuredBuffer output, uint idx, uint n)` | `[ForceInline]` |
+
+#### `reduction.slang` — Workgroup Reductions
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `interface IReduction` | `static float identity()`, `static float combine(float,float)` | — |
+| `interface IWaveReduction : IReduction` | `static float wave_reduce(float v)` | Extends IReduction |
+| `OpSum` / `OpProd` / `OpMaxReduce` / `OpMinReduce` | `: IReduction, IWaveReduction` | — |
+| `OpAny` / `OpAll` / `OpXorSum` | `: IReduction` | — |
+| `wg_reduce<R : IReduction>` | `(float v, uint tid, uint size) → float` | Tree reduction (always correct) |
+| `wg_reduce_wave<W : IWaveReduction>` | `(float v, uint tid, uint n_waves, uint simd) → float` | Wave-intrinsic two-stage fast path |
+| `wg_argmax` / `wg_argmin` | `(ArgPair v, uint tid, uint size) → ArgPair` | Arg reduction |
+
+#### `norm.slang` — Normalization Primitives
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `interface INormAffine` | `static float apply(float normalized, uint i, StructuredBuffer weight, StructuredBuffer bias)` | — |
+| `ln_affine_elem` / `ln_no_affine_elem` | `(float x, no_diff float mean, no_diff float rstd, [float w, float b]) → float` | `[Differentiable]`, `[BackwardDerivative]` |
+| `rms_affine_elem` / `rms_no_affine_elem` | `(float x, no_diff float rstd, [float w]) → float` | `[Differentiable]`, `[BackwardDerivative]` |
+| `layer_norm_row<Affine>` | `(StructuredBuffer X, weight, bias, RWStructuredBuffer Y, uint row, D, float eps, uint tid, tg)` | — |
+| `rms_norm_row<Affine>` | `(StructuredBuffer X, weight, bias, RWStructuredBuffer Y, uint row, D, float eps, uint tid, tg)` | — |
+| `wg_welford` | `(float3 v, uint tid, uint size) → float3` | Workgroup Welford combine |
+
+#### `losses.slang` — Loss Element Functions
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `mse_elem` | `(float pred, float target) → float` | `[Differentiable]` |
+| `l1_elem` | `(float pred, float target) → float` | `[Differentiable]` |
+| `smooth_l1_elem` | `(float pred, float target, no_diff float beta) → float` | `[Differentiable]` |
+| `huber_elem` | `(float pred, float target, no_diff float delta) → float` | `[Differentiable]` |
+| `bce_elem` | `(float pred, float target) → float` | `[Differentiable]` |
+| `bce_with_logits_elem` | `(float logit, float target) → float` | `[Differentiable]` |
+| `kl_div_elem` | `(float log_pred, float target) → float` | `[Differentiable]` |
+
+#### `mm.slang` — Matrix Multiplication
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `TILE_M` / `TILE_N` / `TILE_K` | `public const uint` | `[[vk::constant_id(N)]]` specialization constants |
+| `interface IEpilogue` | `static float apply(float acc, uint m, uint n)` | — |
+| `mm_tiled<Epi : IEpilogue>` | `(StructuredBuffer A, B, RWStructuredBuffer C, uint M, N, K, uint3 gid, uint3 lid)` | — |
+
+#### `conv.slang` — Convolution
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `KH` … `DILATION_W` (8 consts) | `public const uint` | `[[vk::constant_id(N)]]` |
+| `ConvShape` | `struct {uint N, Cin, H, W, Cout, OH, OW}` | — |
+| `interface IConvBias` | `static float load(StructuredBuffer bias, uint cout)` | — |
+| `conv2d_direct<Bias : IConvBias>` | `(StructuredBuffer X, W, bias, RWStructuredBuffer Y, ConvShape s, uint n, cout, oh, ow)` | — |
+
+#### `atomics.slang` — GPU Atomics
+
+| Symbol | Signature | Role |
+|--------|-----------|------|
+| `atomic_add_f32` | `(RWByteAddressBuffer buf, uint byte_offset, float value)` | 32-bit float CAS-locked add |
+| `atomic_add_i32` / `atomic_add_u32` | `(RWByteAddressBuffer buf, uint byte_offset, int/uint value)` | 32-bit int/uint atomics |
+| `atomic_add_f16_packed` | `(RWByteAddressBuffer buf, uint word_byte_offset, uint lane, float value)` | Packed f16 atomic add |
+| `c10_vulkan_atomic_add` | `(RWStructuredBuffer<uint> buf, uint idx, float value)` | Legacy StructuredBuffer atomic add |
+
+#### `tensor_layout.slang` — Index Arithmetic
+
+| Symbol | Signature | Attributes |
+|--------|-----------|------------|
+| `contiguous_offset<N>` | `(uint linear, uint shape[N]) → uint` | `[ForceInline]` |
+| `strided_offset<N>` | `(uint linear, uint shape[N], uint stride[N]) → uint` | `[ForceInline]` |
+| `broadcast_offset<N>` | `(uint out_linear, uint out_shape[N], uint src_shape[N], uint src_stride[N]) → uint` | `[ForceInline]` |
+| `unravel_index<N>` | `(uint linear, uint shape[N], out uint coords[N])` | — |
+| `ravel_index<N>` | `(uint coords[N], uint stride[N]) → uint` | `[ForceInline]` |
+| `numel<N>` | `(uint shape[N]) → uint` | `[ForceInline]` |
+
+#### Conventions
+
+- **`[ForceInline]`** — All small math helpers use this. Inline into call sites; no slangc code-gen object overhead.
+- **`[Differentiable]`** — Activation/loss/norm element primitives. Enables `bwd_diff()` auto-backward generation.
+- **`[BackwardDerivative(fn)]`** — Fast hand-written backward for hot-path ops (sigmoid, tanh, gelu, silu, norm elements). Replaces what auto-diff would generate with a `_fast_bwd` counterpart.
+- **Interfaces** — `IEpilogue` (mm), `IConvBias` (conv), `INormAffine` (norm), `IPointwise`/`IPointwiseBinary` (pointwise), `IReduction`/`IWaveReduction` (reduction). Used for template dispatch.
+- **`no_diff` parameters** — Mark hyperparameters (beta, delta, mean, rstd) that should not propagate gradients. Required by Slang's autodiff API.
+- **Backward functions are private** — `sigmoid_fast_bwd`, `tanh_fast_bwd`, `ln_affine_elem_bwd`, etc., are NOT `public`. They exist only to satisfy `[BackwardDerivative(fn)]` linkage.
 
 ### Slang
 - Homepage / GitHub: https://shader-slang.org/ / https://github.com/shader-slang/slang

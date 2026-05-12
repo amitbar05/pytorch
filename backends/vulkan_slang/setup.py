@@ -38,22 +38,24 @@ class ShaderBuildExtension(BuildExtension):
         header = gen_dir / "shaders.h"
 
         # Try to compile shaders before building C++
-        try:
-            print("Compiling Slang shaders...")
-            subprocess.run(
-                [sys.executable, "tools/compile_shaders.py"],
-                check=True,
-                cwd=str(root),
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"Warning: Shader compilation failed ({e}).")
-            if not header.exists():
-                print("Generating stub shaders.h for compilation...")
+        # Skip if SKIP_SHADER_COMPILE=1 or if shaders.h already exists (avoid slow recompilation)
+        if not os.environ.get("SKIP_SHADER_COMPILE") and not header.exists():
+            try:
+                print("Compiling Slang shaders...")
                 subprocess.run(
-                    [sys.executable, "tools/generate_stub_shaders.py"],
+                    [sys.executable, "tools/compile_shaders.py"],
                     check=True,
                     cwd=str(root),
                 )
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                print(f"Warning: Shader compilation failed ({e}).")
+                if not header.exists():
+                    print("Generating stub shaders.h for compilation...")
+                    subprocess.run(
+                        [sys.executable, "tools/generate_stub_shaders.py"],
+                        check=True,
+                        cwd=str(root),
+                    )
         super().build_extensions()
 
 
