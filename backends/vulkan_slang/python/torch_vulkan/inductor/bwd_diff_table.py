@@ -1,0 +1,237 @@
+"""PF.6 — `bwd_diff(fwd)` codegen for autodiff-eligible backwards.
+
+Maps each `aten.<op>_backward` whose forward primal lives in
+`shaders/lib/*.slang` as `[Differentiable]` to a wrapper-kernel emitter
+that invokes `bwd_diff(<op>_fwd)(...)`. Slang autodiff produces the
+gradient — the corresponding hand-written backward shader (or the
+hand-derived gradient algebra in `lowerings.py`) is replaced by codegen
+once the per-op autodiff-vs-hand benchmark in PF.11 picks autodiff.
+
+The emitted shader puts ``numel`` (and any ``no_diff`` scalar params)
+into a ``[[vk::push_constant]] cbuffer Push`` block — matching the
+existing project convention so the runtime dispatcher
+(``bwd_diff_dispatch.dispatch_unary_bwd`` /
+``dispatch_binary_bwd``) can invoke ``compile_and_dispatch`` with
+``push_constants=`` directly. Bare ``uniform <scalar>`` entry-point
+parameters are intentionally avoided — slangc maps those to a UBO
+descriptor (``kind: "uniform"``), not a push constant.
+
+Today this module emits the codegen path *and* is wired through the
+dispatcher in ``bwd_diff_dispatch.py``; default lowerings are still
+hand-rolled. PF.6.b.iii benchmarks autodiff vs hand-rolled wall-clock
+to flip the swap op-by-op.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class BwdDiffEntry:
+    fwd_fn: str
+    module: str
+    arity: int
+    # Names of `no_diff`-annotated scalar params in the forward
+    # signature (e.g. `smooth_l1_elem(pred, target, no_diff float beta)`
+    # → `("beta",)`). Slang's bwd_diff threads each no_diff scalar
+    # through unchanged (no DifferentialPair wrap), so the emitter
+    # materializes each as a member of the `[[vk::push_constant]]
+    # cbuffer Push { ... };` block (in declaration order, before
+    # `numel`) and forwards it to the bwd_diff call site between the
+    # DifferentialPair args and the trailing `dOut`. The dispatcher
+    # packs scalars in the same order: `<f * len(no_diff_params)> + <I>`.
+    no_diff_params: tuple[str, ...] = ()
+
+
+BWD_DIFF_TABLE: dict[str, BwdDiffEntry] = {
+    # ── Activation backward (existing, PF.11) ──────────────────────────
+    "aten.relu_backward": BwdDiffEntry("relu_fwd", "pointwise", 1),
+    # C1: threshold_backward(grad, output, 0) IS relu backward — same Slang.
+    "aten.threshold_backward": BwdDiffEntry("relu_fwd", "pointwise", 1),
+    "aten.sigmoid_backward": BwdDiffEntry("sigmoid_fwd", "pointwise", 1),
+    "aten.tanh_backward": BwdDiffEntry("tanh_fwd", "pointwise", 1),
+    "aten.gelu_backward": BwdDiffEntry("gelu_fwd", "pointwise", 1),
+    "aten.silu_backward": BwdDiffEntry("silu_fwd", "pointwise", 1),
+    "aten.elu_backward": BwdDiffEntry("elu_fwd", "pointwise", 1),
+    "aten.hardswish_backward": BwdDiffEntry("hardswish_fwd", "pointwise", 1),
+    "aten.hardsigmoid_backward": BwdDiffEntry("hardsigmoid_fwd", "pointwise", 1),
+    "aten.softplus_backward": BwdDiffEntry("softplus_fwd", "pointwise", 1),
+    "aten.mish_backward": BwdDiffEntry("mish_fwd", "pointwise", 1),
+    # ── CG.M1: basic trig ─────────────────────────────────────────────
+    "aten.sin_backward": BwdDiffEntry("sin_fwd", "pointwise", 1),
+    "aten.cos_backward": BwdDiffEntry("cos_fwd", "pointwise", 1),
+    "aten.tan_backward": BwdDiffEntry("tan_fwd", "pointwise", 1),
+    "aten.asin_backward": BwdDiffEntry("asin_fwd", "pointwise", 1),
+    "aten.acos_backward": BwdDiffEntry("acos_fwd", "pointwise", 1),
+    "aten.atan_backward": BwdDiffEntry("atan_fwd", "pointwise", 1),
+    # ── CG.M1: hyperbolic ─────────────────────────────────────────────
+    "aten.sinh_backward": BwdDiffEntry("sinh_fwd", "pointwise", 1),
+    "aten.cosh_backward": BwdDiffEntry("cosh_fwd", "pointwise", 1),
+    "aten.asinh_backward": BwdDiffEntry("asinh_fwd", "pointwise", 1),
+    "aten.acosh_backward": BwdDiffEntry("acosh_fwd", "pointwise", 1),
+    "aten.atanh_backward": BwdDiffEntry("atanh_fwd", "pointwise", 1),
+    # ── CG.M1: exp / log / power ──────────────────────────────────────
+    "aten.exp_backward": BwdDiffEntry("exp_fwd", "pointwise", 1),
+    "aten.expm1_backward": BwdDiffEntry("expm1_fwd", "pointwise", 1),
+    "aten.exp2_backward": BwdDiffEntry("exp2_fwd", "pointwise", 1),
+    "aten.log_backward": BwdDiffEntry("log_fwd", "pointwise", 1),
+    "aten.log2_backward": BwdDiffEntry("log2_fwd", "pointwise", 1),
+    "aten.log10_backward": BwdDiffEntry("log10_fwd", "pointwise", 1),
+    "aten.log1p_backward": BwdDiffEntry("log1p_fwd", "pointwise", 1),
+    "aten.sqrt_backward": BwdDiffEntry("sqrt_fwd", "pointwise", 1),
+    "aten.rsqrt_backward": BwdDiffEntry("rsqrt_fwd", "pointwise", 1),
+    "aten.reciprocal_backward": BwdDiffEntry("reciprocal_fwd", "pointwise", 1),
+    # ── CG.M1: abs / neg ──────────────────────────────────────────────
+    "aten.abs_backward": BwdDiffEntry("abs_fwd", "pointwise", 1),
+    "aten.neg_backward": BwdDiffEntry("neg_fwd", "pointwise", 1),
+    # ── CG.M1: special functions ──────────────────────────────────────
+    "aten.erf_backward": BwdDiffEntry("erf_fwd", "pointwise", 1),
+    "aten.erfc_backward": BwdDiffEntry("erfc_fwd", "pointwise", 1),
+    "aten.erfinv_backward": BwdDiffEntry("erfinv_fwd", "pointwise", 1),
+    "aten.lgamma_backward": BwdDiffEntry("lgamma_fwd", "pointwise", 1),
+    "aten.digamma_backward": BwdDiffEntry("digamma_fwd", "pointwise", 1),
+    "aten.ndtri_backward": BwdDiffEntry("ndtri_fwd", "pointwise", 1),
+    "aten.i0_backward": BwdDiffEntry("i0_fwd", "pointwise", 1),
+    "aten.i0e_backward": BwdDiffEntry("i0e_fwd", "pointwise", 1),
+    "aten.i1_backward": BwdDiffEntry("i1_fwd", "pointwise", 1),
+    "aten.i1e_backward": BwdDiffEntry("i1e_fwd", "pointwise", 1),
+    # ── CG.M2: binary pointwise backward ───────────────────────────────
+    "aten.pow.Tensor_Tensor_backward": BwdDiffEntry("pow_fwd", "pointwise", 2),
+    "aten.atan2_backward": BwdDiffEntry("atan2_fwd", "pointwise", 2),
+    "aten.hypot_backward": BwdDiffEntry("hypot_fwd", "pointwise", 2),
+    "aten.copysign_tensor_backward": BwdDiffEntry(
+        "copysign_fwd", "pointwise", 2, no_diff_params=("sign",)
+    ),
+    "aten.maximum_backward": BwdDiffEntry("max_fwd", "pointwise", 2),
+    "aten.minimum_backward": BwdDiffEntry("min_fwd", "pointwise", 2),
+    # ── Loss backward (existing, T2.11) ───────────────────────────────
+    # T2.11 (2026-05-08): all 7 loss elementals now carry
+    # [BackwardDerivative] in `lib/losses.slang`. The table entries below
+    # are unchanged — `bwd_diff(<fn>)` automatically resolves to the
+    # closed-form `<fn>_bwd` instead of auto-deriving (and allocating an
+    # `exp`-tape for `bce_with_logits`). No emitter change needed.
+    "aten.mse_loss_backward": BwdDiffEntry("mse_elem", "losses", 2),
+    "aten.l1_loss_backward": BwdDiffEntry("l1_elem", "losses", 2),
+    "aten.binary_cross_entropy_backward": BwdDiffEntry("bce_elem", "losses", 2),
+    "aten.binary_cross_entropy_with_logits_backward": BwdDiffEntry(
+        "bce_with_logits_elem", "losses", 2
+    ),
+    "aten.smooth_l1_loss_backward": BwdDiffEntry(
+        "smooth_l1_elem",
+        "losses",
+        2,
+        no_diff_params=("beta",),
+    ),
+    "aten.huber_loss_backward": BwdDiffEntry(
+        "huber_elem",
+        "losses",
+        2,
+        no_diff_params=("delta",),
+    ),
+    "aten.kl_div_backward": BwdDiffEntry("kl_div_elem", "losses", 2),
+}
+
+
+def is_bwd_diff_eligible(aten_op: str) -> bool:
+    return aten_op in BWD_DIFF_TABLE
+
+
+# Forwards in `shaders/lib/*.slang` that carry `[Differentiable]` but
+# intentionally do not have an entry in `BWD_DIFF_TABLE`. Each exclusion
+# documents the reason so the coverage gate
+# (`TestBwdDiffCoverageGate`) doesn't silently drift — a future
+# annotation drop on a forward shader without a corresponding table or
+# exclusion update breaks the gate.
+EXCLUDED_DIFFERENTIABLE_FWDS: dict[str, str] = {
+    # T3.5 (2026-05-02): [BackwardDerivative] annotations added to all 4 norm
+    # elementals. Fast backward formulas for per-element dx/dw/db gradients.
+    # Still excluded from BWD_DIFF_TABLE because the full norm backward requires
+    # reduction ops (sum over normalized dims) that bwd_diff codegen doesn't emit.
+    # Inductor lowerings handle norm backward via decomposed pointwise+reduction IR.
+    "ln_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
+    "ln_no_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
+    "rms_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
+    "rms_no_affine_elem": "norm: Welford reduction not autodiff-safe (P2.3)",
+    # CG.M1: leaky_relu_fwd takes no_diff float alpha; the unary bwd_diff
+    # emitter doesn't handle no_diff scalars yet (binary emitter does).
+    # leaky_relu backward is handled by a dedicated lowering in activation.py.
+    "leaky_relu_fwd": "activation: no_diff scalar not yet in unary emitter (CG.M1)",
+}
+
+
+def emit_bwd_diff_kernel(
+    aten_op: str,
+    *,
+    dtype: str = "float",
+    numthreads: int = 256,
+) -> str:
+    """Render a self-contained Slang shader source whose body invokes
+    ``bwd_diff(<fwd_fn>)`` to produce the gradient for ``aten_op``.
+
+    The forward primal must carry ``[Differentiable]``; sigmoid resolves
+    to its ``[BackwardDerivative(sigmoid_fast_bwd)]`` override.
+    """
+    entry = BWD_DIFF_TABLE[aten_op]
+    if entry.arity == 1:
+        return _emit_unary(entry, dtype=dtype, numthreads=numthreads)
+    if entry.arity == 2:
+        return _emit_binary(entry, dtype=dtype, numthreads=numthreads)
+    raise ValueError(f"unsupported arity {entry.arity} for {aten_op}")
+
+
+def _emit_unary(entry: BwdDiffEntry, *, dtype: str, numthreads: int) -> str:
+    return (
+        f"import {entry.module};\n"
+        f"\n"
+        f"[[vk::push_constant]] cbuffer Push {{\n"
+        f"    uint numel;\n"
+        f"}};\n"
+        f"\n"
+        f'[shader("compute")][numthreads({numthreads},1,1)]\n'
+        f"void bwd_op(\n"
+        f"    uniform StructuredBuffer<{dtype}> x,\n"
+        f"    uniform StructuredBuffer<{dtype}> grad_out,\n"
+        f"    uniform RWStructuredBuffer<{dtype}> grad_in,\n"
+        f"    uint3 tid : SV_DispatchThreadID\n"
+        f") {{\n"
+        f"    if (tid.x >= numel) return;\n"
+        f"    DifferentialPair<{dtype}> dp = "
+        f"diffPair(x[tid.x], ({dtype})0);\n"
+        f"    bwd_diff({entry.fwd_fn})(dp, grad_out[tid.x]);\n"
+        f"    grad_in[tid.x] = dp.getDifferential();\n"
+        f"}}\n"
+    )
+
+
+def _emit_binary(entry: BwdDiffEntry, *, dtype: str, numthreads: int) -> str:
+    pc_fields = "".join(f"    {dtype} {name};\n" for name in entry.no_diff_params)
+    no_diff_args = "".join(f"{name}, " for name in entry.no_diff_params)
+    return (
+        f"import {entry.module};\n"
+        f"\n"
+        f"[[vk::push_constant]] cbuffer Push {{\n"
+        f"{pc_fields}"
+        f"    uint numel;\n"
+        f"}};\n"
+        f"\n"
+        f'[shader("compute")][numthreads({numthreads},1,1)]\n'
+        f"void bwd_op(\n"
+        f"    uniform StructuredBuffer<{dtype}> a,\n"
+        f"    uniform StructuredBuffer<{dtype}> b,\n"
+        f"    uniform StructuredBuffer<{dtype}> grad_out,\n"
+        f"    uniform RWStructuredBuffer<{dtype}> grad_a,\n"
+        f"    uniform RWStructuredBuffer<{dtype}> grad_b,\n"
+        f"    uint3 tid : SV_DispatchThreadID\n"
+        f") {{\n"
+        f"    if (tid.x >= numel) return;\n"
+        f"    DifferentialPair<{dtype}> dpa = "
+        f"diffPair(a[tid.x], ({dtype})0);\n"
+        f"    DifferentialPair<{dtype}> dpb = "
+        f"diffPair(b[tid.x], ({dtype})0);\n"
+        f"    bwd_diff({entry.fwd_fn})("
+        f"dpa, dpb, {no_diff_args}grad_out[tid.x]);\n"
+        f"    grad_a[tid.x] = dpa.getDifferential();\n"
+        f"    grad_b[tid.x] = dpb.getDifferential();\n"
+        f"}}\n"
+    )

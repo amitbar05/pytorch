@@ -1,0 +1,282 @@
+// CG.M5 — Matmul backward via [Differentiable] tile_inner_madd
+// Single-kernel backward computes BOTH dA and dB in one dispatch.
+//
+// Link-time specialization constants override the defaults when defined
+// BEFORE the `import mm_tile;` statement, or via -specialize-const flags.
+// Slang resolves the importing module's definitions over the defaults.
+//
+// Usage (specialize at link time):
+//   slangc wrapper.slang -I <module_dir> -o kernel.spv
+//   where wrapper.slang defines `static const int TILE_M = 64;` etc.
+//   BEFORE `import bwd_mm_tile;`.
+
+// ── Link-time specialization constants ──────────────────────────────────
+static const int TILE_M = {{ tile_m }};
+static const int TILE_N = {{ tile_n }};
+static const int TILE_K = {{ tile_k }};
+{% set m_per_thread = m_per_thread | default(1) %}
+{% set n_per_thread = n_per_thread | default(1) %}
+static const int M_PER_THREAD = {{ m_per_thread }};
+static const int N_PER_THREAD = {{ n_per_thread }};
+
+// ── Derived constants ───────────────────────────────────────────────────
+static const int WG_M = TILE_M / M_PER_THREAD;
+static const int WG_N = TILE_N / N_PER_THREAD;
+static const int TILE_A_ELEMS = TILE_M * TILE_K;
+static const int TILE_B_ELEMS = TILE_K * TILE_N;
+static const int TILE_C_ELEMS = TILE_M * TILE_N;
+static const int WG_SIZE = WG_M * WG_N;
+
+// ── CG.M5: Differentiable scalar inner — inlined for standalone compilation ──
+// Autodiff derivatives:
+//   dL/da = dL/dout * b    (gradient w.r.t. A element)
+//   dL/db = dL/dout * a    (gradient w.r.t. B element)
+// `acc` is marked no_diff — it is a dummy intermediate (always 0) used only
+// to chain the output gradient into the autodiff propagation.
+[Differentiable]
+float tile_inner_madd(float a, float b, no_diff float acc)
+{
+    return acc + a * b;
+}
+
+// ── Push-constant struct ───────────────────────────────────────────────
+struct BwdPC {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a_m;
+    uint stride_a_k;
+    uint stride_b_k;
+    uint stride_b_n;
+    uint stride_dc_m;
+    uint stride_dc_n;
+    uint stride_da_m;
+    uint stride_da_k;
+    uint stride_db_k;
+    uint stride_db_n;
+{% if has_batch %}
+    uint stride_a_b;
+    uint stride_b_b;
+    uint stride_dc_b;
+    uint stride_da_b;
+    uint stride_db_b;
+{% endif %}
+};
+
+[[vk::push_constant]] BwdPC pc;
+
+// ── Buffer bindings ────────────────────────────────────────────────────
+struct KernelArgs {
+    StructuredBuffer<{{ dtype_a }}> a;
+    StructuredBuffer<{{ dtype_b }}> b;
+    StructuredBuffer<{{ dtype_c }}> dc;
+    RWStructuredBuffer<{{ dtype_a }}> da;
+    RWStructuredBuffer<{{ dtype_b }}> db;
+};
+ParameterBlock<KernelArgs> args;
+
+// +32 bank-conflict padding (M20)
+groupshared {{ dtype_acc }} tile_a[TILE_A_ELEMS + 32];
+groupshared {{ dtype_acc }} tile_b[TILE_B_ELEMS + 32];
+groupshared {{ dtype_acc }} tile_dc[TILE_C_ELEMS + 32];
+
+// ── Load helpers ────────────────────────────────────────────────────────
+
+[ForceInline]
+void load_tiles_bwd(
+    uint k_base,
+    uint row_base,
+    uint col_base,
+    uint M, uint N, uint K,
+    uint stride_a_m, uint stride_a_k,
+    uint stride_b_k, uint stride_b_n,
+    uint stride_dc_m, uint stride_dc_n,
+{% if has_batch %}
+    uint batch_a_off, uint batch_b_off, uint batch_dc_off,
+{% endif %}
+    uint3 lid)
+{
+    uint tid = lid.y * WG_N + lid.x;
+
+    // Load A tile: TILE_M * TILE_K floats.
+    [unroll]
+    for (uint i = tid; i < (uint)TILE_A_ELEMS; i += (uint)WG_SIZE) {
+        uint local_m = i / (uint)TILE_K;
+        uint local_k = i % (uint)TILE_K;
+        uint global_m = row_base + local_m;
+        uint global_k = k_base + local_k;
+        {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
+        if (global_m < M && global_k < K) {
+            v = ({{ dtype_acc }})args.a[{% if has_batch %}batch_a_off + {% endif %}global_m * stride_a_m + global_k * stride_a_k];
+        }
+        tile_a[i] = v;
+    }
+
+    // Load B tile: TILE_K * TILE_N floats.
+    [unroll]
+    for (uint j = tid; j < (uint)TILE_B_ELEMS; j += (uint)WG_SIZE) {
+        uint local_k = j / (uint)TILE_N;
+        uint local_n = j % (uint)TILE_N;
+        uint global_k = k_base + local_k;
+        uint global_n = col_base + local_n;
+        {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
+        if (global_k < K && global_n < N) {
+            v = ({{ dtype_acc }})args.b[{% if has_batch %}batch_b_off + {% endif %}global_k * stride_b_k + global_n * stride_b_n];
+        }
+        tile_b[j] = v;
+    }
+
+    // Load dC tile: TILE_M * TILE_N floats (only on first K tile pass —
+    // dC is reused across all K tiles).  Marked with a flag so the caller
+    // can skip redundant loads for kb > 0.
+    [unroll]
+    for (uint c = tid; c < (uint)TILE_C_ELEMS; c += (uint)WG_SIZE) {
+        uint local_m = c / (uint)TILE_N;
+        uint local_n = c % (uint)TILE_N;
+        uint global_m = row_base + local_m;
+        uint global_n = col_base + local_n;
+        {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
+        if (global_m < M && global_n < N) {
+            v = ({{ dtype_acc }})args.dc[{% if has_batch %}batch_dc_off + {% endif %}global_m * stride_dc_m + global_n * stride_dc_n];
+        }
+        tile_dc[c] = v;
+    }
+}
+
+// ── MMA backward using bwd_diff(tile_inner_madd) ────────────────────────
+// For each kk in [0, TILE_K), for each per-thread (mi, ni):
+//   a = tile_a[mi * TILE_K + kk], b = tile_b[kk * TILE_N + ni], dc = tile_dc[mi * TILE_N + ni]
+//   bwd_diff(tile_inner_madd)(dp_a, dp_b, dp_acc_with_seed_dc)
+//   → dp_a.d = dc * b  (dA contribution)
+//   → dp_b.d = dc * a  (dB contribution)
+[ForceInline]
+void mma_bwd_tile(
+    uint k_base,
+    uint K,
+    uint3 lid,
+    inout {{ dtype_acc }} dA_acc[M_PER_THREAD][TILE_K],
+    inout {{ dtype_acc }} dB_acc[TILE_K][N_PER_THREAD])
+{
+    uint k_end = min((uint)TILE_K, K - k_base);
+    // Cap the unroll factor at 16 to stay within VGPR budget on RDNA1.
+    [unroll(TILE_K <= 16 ? TILE_K : 16)]
+    for (uint kk = 0; kk < k_end; kk++) {
+        // Load M_PER_THREAD A values (one column of the register tile).
+        {{ dtype_acc }} a_reg[M_PER_THREAD];
+        [unroll]
+        for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+            uint local_m = lid.y * (uint)M_PER_THREAD + mi;
+            a_reg[mi] = tile_a[local_m * (uint)TILE_K + kk];
+        }
+        // Load N_PER_THREAD B values (one row of the register tile).
+        {{ dtype_acc }} b_reg[N_PER_THREAD];
+        [unroll]
+        for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+            uint local_n = lid.x * (uint)N_PER_THREAD + ni;
+            b_reg[ni] = tile_b[kk * (uint)TILE_N + local_n];
+        }
+
+        // Compute dA/dB via bwd_diff over the scalar inner.
+        [unroll]
+        for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+            [unroll]
+            for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+                // Re-load dC for the current (mi, ni) — each iteration uses
+                // its own dc value from tile_dc.
+                uint local_m = lid.y * (uint)M_PER_THREAD + mi;
+                uint local_n = lid.x * (uint)N_PER_THREAD + ni;
+                {{ dtype_acc }} dc_val = tile_dc[local_m * (uint)TILE_N + local_n];
+
+                DifferentialPair<{{ dtype_acc }}> dp_a = diffPair(a_reg[mi], ({{ dtype_acc }})0.0);
+                DifferentialPair<{{ dtype_acc }}> dp_b = diffPair(b_reg[ni], ({{ dtype_acc }})0.0);
+                // acc is no_diff: pass raw 0.0. dc_val is output derivative.
+                bwd_diff(tile_inner_madd)(dp_a, dp_b, ({{ dtype_acc }})0.0, dc_val);
+                dA_acc[mi][kk] += dp_a.getDifferential();
+                dB_acc[kk][ni] += dp_b.getDifferential();
+            }
+        }
+    }
+}
+
+// ── Entry point ─────────────────────────────────────────────────────────
+[shader("compute")]
+[numthreads(WG_N, WG_M, 1)]
+void computeMain(
+    uint3 gtid : SV_DispatchThreadID,
+    uint3 lid : SV_GroupThreadID,
+    uint3 gid : SV_GroupID)
+{
+    uint row_base = gid.y * TILE_M;
+    uint col_base = gid.x * TILE_N;
+{% if has_batch %}
+    uint batch_a_off = gid.z * pc.stride_a_b;
+    uint batch_b_off = gid.z * pc.stride_b_b;
+    uint batch_dc_off = gid.z * pc.stride_dc_b;
+    uint batch_da_store_off = gid.z * pc.stride_da_b;
+    uint batch_db_store_off = gid.z * pc.stride_db_b;
+{% endif %}
+
+    // Per-thread register accumulators for dA and dB.
+    // dA: [M_PER_THREAD][TILE_K] — each thread accumulates its M rows across full TILE_K.
+    // dB: [TILE_K][N_PER_THREAD] — each thread accumulates its N cols across full TILE_K.
+    {{ dtype_acc }} dA_acc[M_PER_THREAD][TILE_K];
+    {{ dtype_acc }} dB_acc[TILE_K][N_PER_THREAD];
+    [unroll]
+    for (uint _mi = 0; _mi < (uint)M_PER_THREAD; _mi++) {
+        [unroll]
+        for (uint _kk = 0; _kk < (uint)TILE_K; _kk++) {
+            dA_acc[_mi][_kk] = ({{ dtype_acc }})0.0;
+        }
+    }
+    [unroll]
+    for (uint _kk = 0; _kk < (uint)TILE_K; _kk++) {
+        [unroll]
+        for (uint _ni = 0; _ni < (uint)N_PER_THREAD; _ni++) {
+            dB_acc[_kk][_ni] = ({{ dtype_acc }})0.0;
+        }
+    }
+
+    uint k_blocks = (pc.K + TILE_K - 1u) / TILE_K;
+
+    // Single-stage pipeline: load A/B/dC → compute bwd → barrier — repeat.
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        uint k_base = kb * TILE_K;
+        load_tiles_bwd(
+            k_base,
+            row_base, col_base, pc.M, pc.N, pc.K,
+            pc.stride_a_m, pc.stride_a_k,
+            pc.stride_b_k, pc.stride_b_n,
+            pc.stride_dc_m, pc.stride_dc_n,
+{% if has_batch %}
+            batch_a_off, batch_b_off, batch_dc_off,
+{% endif %}
+            lid);
+        GroupMemoryBarrierWithGroupSync();
+        mma_bwd_tile(k_base, pc.K, lid, dA_acc, dB_acc);
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Store accumulated dA and dB.
+    // dA: each thread writes M_PER_THREAD rows × TILE_K columns.
+    [unroll]
+    for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+        uint row = row_base + lid.y * (uint)M_PER_THREAD + mi;
+        if (row >= pc.M) continue;
+        [unroll]
+        for (uint kk = 0; kk < (uint)TILE_K; kk++) {
+            if (kk >= pc.K) continue;
+            args.da[{% if has_batch %}batch_da_store_off + {% endif %}row * pc.stride_da_m + kk * pc.stride_da_k] = ({{ dtype_a }})dA_acc[mi][kk];
+        }
+    }
+    // dB: each thread writes TILE_K rows × N_PER_THREAD columns.
+    [unroll]
+    for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+        uint col = col_base + lid.x * (uint)N_PER_THREAD + ni;
+        if (col >= pc.N) continue;
+        [unroll]
+        for (uint kk = 0; kk < (uint)TILE_K; kk++) {
+            if (kk >= pc.K) continue;
+            args.db[{% if has_batch %}batch_db_store_off + {% endif %}kk * pc.stride_db_k + col * pc.stride_db_n] = ({{ dtype_b }})dB_acc[kk][ni];
+        }
+    }
+}

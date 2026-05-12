@@ -1,0 +1,224 @@
+// CG.M6 — Conv2D backward via [Differentiable] conv_inner_madd
+// Single-kernel backward computes dX, dW, and dB in one dispatch.
+//
+// Autodiff over conv_inner_madd(a, b, acc) gives:
+//   dL/da = dL/dout * b    → dX element
+//   dL/db = dL/dout * a    → dW element
+//
+// Grid:  (ceil(oW / TILE_W), ceil(oH / TILE_H), N * ceil(C_out / TILE_C))
+// numthreads: (THREADS_W, THREADS_H, 1)
+//
+// Supported: groups==1, f32 only.
+//
+// Atomic accumulators on dX/dW/dB go through `vk_atomic_add` (CAS loop on
+// uint-reinterpreted buffer). Mesa ACO on RDNA1 cannot lower
+// `buffer_atomic_add_f32`; the CAS path is portable.
+import atomics;
+
+/*{%*/ set tile_w = tile_w | default(8) /*%}*/
+/*{%*/ set tile_h = tile_h | default(8) /*%}*/
+/*{%*/ set tile_c = tile_c | default(8) /*%}*/
+/*{%*/ set threads_w = threads_w | default(16) /*%}*/
+/*{%*/ set threads_h = threads_h | default(16) /*%}*/
+
+// ── Push-constant struct (fits in 128B Vulkan limit) ──────────────────
+// grad_input strides = input strides (same NCHW shape).
+// grad_weight strides = weight strides (same [C_out, C_in, kH, kW] shape).
+// grad_bias is always 1-D contiguous, stride = 1.
+struct BwdPC {
+    uint N;
+    uint C_in;
+    uint C_out;
+    uint iH;
+    uint iW;
+    uint oH;
+    uint oW;
+    uint kH;
+    uint kW;
+    uint sH;
+    uint sW;
+    uint pH;
+    uint pW;
+    uint dH;
+    uint dW;
+    // Strides for input / grad_input (NCHW) — same layout
+    uint stride_in_n;
+    uint stride_in_c;
+    uint stride_in_h;
+    uint stride_in_w;
+    // Strides for weight / grad_weight [C_out, C_in, kH, kW] — same layout
+    uint stride_w_out;
+    uint stride_w_in;
+    uint stride_w_kh;
+    uint stride_w_kw;
+    // Strides for grad_output (NCHW)
+    uint stride_go_n;
+    uint stride_go_c;
+    uint stride_go_h;
+    uint stride_go_w;
+    // Total: 15 + 4 + 4 + 4 = 27 uints = 108B (no bias)
+/*{%*/ if has_bias /*%}*/
+    uint _pad_bwd;  // 28 uints = 112B, well under 128B
+/*{%*/ endif /*%}*/
+};
+
+[[vk::push_constant]] BwdPC pc;
+
+// ── Buffer bindings (ParameterBlock) ────────────────────────────────────
+struct KernelArgs {
+    StructuredBuffer<float> input;
+    StructuredBuffer<float> weight;
+    StructuredBuffer<float> grad_out;
+    // dX/dW/dB are accumulated atomically; bound as uint so we can CAS on
+    // the raw bit pattern (RDNA1 ACO has no native float atomic add).
+    RWStructuredBuffer<uint> grad_input;
+    RWStructuredBuffer<uint> grad_weight;
+/*{%*/ if has_bias /*%}*/
+    RWStructuredBuffer<uint> grad_bias;
+/*{%*/ endif /*%}*/
+};
+ParameterBlock<KernelArgs> args;
+
+// ── CG.M6: Differentiable scalar inner — inlined for standalone compilation ──
+// Uses [BackwardDerivative] to avoid autodiff coverage warnings.
+[Differentiable]
+[BackwardDerivative(conv_inner_madd_bwd)]
+float conv_inner_madd(float a, float b, no_diff float acc)
+{
+    return acc + a * b;
+}
+
+// Hand-written fast backward for conv_inner_madd.
+void conv_inner_madd_bwd(
+    inout DifferentialPair<float> dpa,
+    inout DifferentialPair<float> dpb,
+    no_diff float acc,
+    float dout)
+{
+    dpa = diffPair(dpa.p, dpa.d + dout * dpb.p);
+    dpb = diffPair(dpb.p, dpb.d + dout * dpa.p);
+}
+
+// ── Entry point ─────────────────────────────────────────────────────────
+[shader("compute")]
+[numthreads(/*{{*/ threads_w /*}}16*/, /*{{*/ threads_h /*}}16*/, 1)]
+void computeMain(
+    uint3 gtid : SV_DispatchThreadID,
+    uint3 gid : SV_GroupID,
+    uint3 lid : SV_GroupThreadID)
+{
+    // ── Decode workgroup position ────────────────────────────────────
+    uint tile_w_idx = gid.x;
+    uint tile_h_idx = gid.y;
+    uint batch_co_tile = gid.z;
+
+    uint tile_c_count = (pc.C_out + /*{{*/ tile_c /*}}8*/u - 1u) / /*{{*/ tile_c /*}}8*/u;
+    uint n = batch_co_tile / tile_c_count;
+    uint co_tile = batch_co_tile % tile_c_count;
+
+    if (n >= pc.N || co_tile >= tile_c_count) return;
+
+    uint co_start = co_tile * /*{{*/ tile_c /*}}8*/u;
+    uint co_end = min(co_start + /*{{*/ tile_c /*}}8*/u, pc.C_out);
+
+    uint ow_start = tile_w_idx * /*{{*/ tile_w /*}}8*/u;
+    uint oh_start = tile_h_idx * /*{{*/ tile_h /*}}8*/u;
+    uint ow_end = min(ow_start + /*{{*/ tile_w /*}}8*/u, pc.oW);
+    uint oh_end = min(oh_start + /*{{*/ tile_h /*}}8*/u, pc.oH);
+
+    // ── Per-thread output position ───────────────────────────────────
+    uint local_ow = lid.x;
+    uint local_oh = lid.y;
+
+    uint ow = ow_start + local_ow;
+    uint oh = oh_start + local_oh;
+
+    // ── Precompute bases for this batch ──────────────────────────────
+    uint in_batch_base = n * pc.stride_in_n;
+    uint go_batch_base = n * pc.stride_go_n;
+    uint dx_batch_base = n * pc.stride_in_n;  // grad_input same layout as input
+
+    // ── Per-thread dB accumulator (local to this workgroup tile) ─────
+    float db_local[/*{{*/ tile_c /*}}8*/];
+    [unroll]
+    for (uint ci = 0; ci < /*{{*/ tile_c /*}}8*/; ci++) {
+        db_local[ci] = 0.0f;
+    }
+
+    // ── Iterate over output channels assigned to this workgroup ──────
+    uint co_idx = 0;
+    for (uint co = co_start; co < co_end; co++, co_idx++) {
+        if (ow >= ow_end || oh >= oh_end) {
+            continue;
+        }
+
+        // ── Load grad_output for this (n, co, oh, ow) ───────────────
+        uint go_idx = go_batch_base
+                    + co * pc.stride_go_c
+                    + oh * pc.stride_go_h
+                    + ow * pc.stride_go_w;
+        float dout = args.grad_out[go_idx];
+
+        // Bias gradient: dB[co] accumulates over all spatial+batch dims
+        db_local[co_idx] += dout;
+
+        // Weight base for this output channel
+        uint w_co_base = co * pc.stride_w_out;
+        // grad_weight base for this output channel (same layout as weight)
+        uint dw_co_base = co * pc.stride_w_out;
+
+        // ── Iterate over input channels and kernel ──────────────────
+        for (uint ci = 0; ci < pc.C_in; ci++) {
+            uint in_c_base = in_batch_base + ci * pc.stride_in_c;
+            uint dx_c_base = dx_batch_base + ci * pc.stride_in_c;  // same as input
+            uint w_ci_base = w_co_base + ci * pc.stride_w_in;
+            uint dw_ci_base = dw_co_base + ci * pc.stride_w_in;  // same as weight
+
+            for (uint kh = 0; kh < pc.kH; kh++) {
+                int ih = int(oh * pc.sH + kh * pc.dH) - int(pc.pH);
+                if (ih < 0 || uint(ih) >= pc.iH) continue;
+
+                uint in_h_base = in_c_base + uint(ih) * pc.stride_in_h;
+                uint dx_h_base = dx_c_base + uint(ih) * pc.stride_in_h;  // same as input
+                uint w_kh_base = w_ci_base + kh * pc.stride_w_kh;
+                uint dw_kh_base = dw_ci_base + kh * pc.stride_w_kh;  // same as weight
+
+                for (uint kw = 0; kw < pc.kW; kw++) {
+                    int iw = int(ow * pc.sW + kw * pc.dW) - int(pc.pW);
+                    if (iw < 0 || uint(iw) >= pc.iW) continue;
+
+                    float in_val = args.input[in_h_base + uint(iw) * pc.stride_in_w];
+                    float w_val = args.weight[w_kh_base + kw * pc.stride_w_kw];
+
+                    // ── bwd_diff(conv_inner_madd) ──────────────────
+                    // d_input = dout * w_val, d_weight = dout * in_val
+                    DifferentialPair<float> dp_in = diffPair(in_val, 0.0f);
+                    DifferentialPair<float> dp_w = diffPair(w_val, 0.0f);
+                    bwd_diff(conv_inner_madd)(dp_in, dp_w, 0.0f, dout);
+                    float dx_contrib = dp_in.getDifferential();
+                    float dw_contrib = dp_w.getDifferential();
+
+                    // ── Atomic accumulate into dX (CAS-based, RDNA1-safe) ──
+                    uint dx_idx = dx_h_base + uint(iw) * pc.stride_in_w;
+                    vk_atomic_add(args.grad_input, dx_idx, dx_contrib);
+
+                    // ── Atomic accumulate into dW (CAS-based, RDNA1-safe) ──
+                    uint dw_idx = dw_kh_base + kw * pc.stride_w_kw;
+                    vk_atomic_add(args.grad_weight, dw_idx, dw_contrib);
+                }
+            }
+        }
+    }
+
+    // ── Atomic accumulate dB contributions ────────────────────────────
+/*{%*/ if has_bias /*%}*/
+    [unroll]
+    for (uint ci = 0; ci < /*{{*/ tile_c /*}}8*/; ci++) {
+        uint co = co_start + ci;
+        if (co >= co_end) break;
+        if (db_local[ci] != 0.0f) {
+            vk_atomic_add(args.grad_bias, co, db_local[ci]);  // bias is 1-D contiguous, stride=1
+        }
+    }
+/*{%*/ endif /*%}*/
+}

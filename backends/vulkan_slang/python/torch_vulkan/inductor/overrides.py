@@ -1,0 +1,599 @@
+"""Inductor op overrides → Slang snippets, plus dtype helpers."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+from torch._inductor.codegen.common import OpOverrides
+from torch._inductor.utils import sympy_index_symbol
+from torch._inductor.virtualized import V
+
+
+class _SlangExpr(str):
+    """A Slang source string that also carries a torch dtype.
+
+    Inductor's `DtypePropagationOpsHandler._default` reads `value.dtype` for
+    `masked` ops under the triton/cuda backend code path. Our backend goes
+    through that path (`get_current_backend()` returns `cuda_backend` for
+    non-cpu/mps/xpu devices), so the string we return must satisfy the
+    `.dtype` attribute access. We attach `dtype` (and a no-op `shape`) so the
+    handler doesn't crash with `AttributeError: 'str' object has no attribute
+    'dtype'`.
+    """
+
+    __slots__ = ("dtype", "shape")
+
+    def __new__(cls, value: str, dtype=None, shape=None):
+        s = super().__new__(cls, value)
+        s.dtype = dtype
+        s.shape = shape
+        return s
+
+
+def _infer_dtype(value) -> "torch.dtype | None":
+    if hasattr(value, "dtype") and value.dtype is not None:
+        return value.dtype
+    return None
+
+
+def _masked_dtype(body, other) -> torch.dtype:
+    """Best-effort dtype for the value of an `ops.masked(mask, body, other)`.
+
+    The propagation handler asserts the output dtype is non-None for backends
+    in the triton/cpp tier (which our backend gets routed into). Inputs in
+    our codegen are typically Slang source strings that don't carry the
+    dtype, so we fall back to ``float32`` when neither operand exposes one.
+    """
+    return _infer_dtype(body) or _infer_dtype(other) or torch.float32
+
+
+DTYPE_TO_SLANG: dict[torch.dtype, str] = {
+    torch.bool: "uint",
+    torch.int8: "int",
+    torch.int16: "int",
+    torch.int32: "int",
+    torch.int64: "int64_t",
+    torch.uint8: "uint",
+    torch.float: "float",
+    torch.half: "float16_t",
+    torch.bfloat16: "uint",
+    torch.float64: "double",
+    torch.complex32: "float2",
+    torch.complex64: "float2",
+    torch.complex128: "double2",
+}
+
+
+def value_to_slang(val) -> str:
+    """Render a Python scalar as a Slang literal."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, float):
+        if math.isinf(val):
+            return "(1.0/0.0)" if val > 0 else "(-1.0/0.0)"
+        if math.isnan(val):
+            return "asfloat(0x7FC00000u)"
+        return f"{val!r}f"
+    return str(val)
+
+
+class VulkanOverrides(OpOverrides):
+    """Inductor op → Slang snippet."""
+
+    @staticmethod
+    def to_dtype(x, dtype: torch.dtype, src_dtype=None, use_compute_types=True) -> str:
+        s = DTYPE_TO_SLANG.get(dtype, "float")
+        return f"(({s})({x}))"
+
+    @staticmethod
+    def constant(val, dtype: torch.dtype) -> str:
+        return value_to_slang(val)
+
+    @staticmethod
+    def abs(x) -> str:
+        return f"abs({x})"
+
+    @staticmethod
+    def exp(x) -> str:
+        return f"exp({x})"
+
+    @staticmethod
+    def exp2(x) -> str:
+        return f"exp2({x})"
+
+    @staticmethod
+    def expm1(x) -> str:
+        V.kernel.headers.add("expm1")
+        return f"({x}).expm1()"
+
+    @staticmethod
+    def sqrt(x) -> str:
+        return f"sqrt({x})"
+
+    @staticmethod
+    def rsqrt(x) -> str:
+        return f"rsqrt({x})"
+
+    @staticmethod
+    def log(x) -> str:
+        return f"log({x})"
+
+    @staticmethod
+    def log2(x) -> str:
+        return f"log2({x})"
+
+    @staticmethod
+    def xlog1py(x, y) -> str:
+        V.kernel.headers.add("log1p")
+        return f"((({x}) == 0.0f) ? 0.0f : (({x}) * ({y}).log1p()))"
+
+    @staticmethod
+    def special_xlog1py(x, y) -> str:
+        return VulkanOverrides.xlog1py(x, y)
+
+    @staticmethod
+    def special_xlogy(x, y) -> str:
+        return VulkanOverrides.xlogy(x, y)
+
+    @staticmethod
+    def to_dtype_bitcast(x, dtype: torch.dtype, src_dtype=None) -> str:
+        # N+1.15 — dtype-switch: emits a simple cast expression.
+        # When this grows branching Slang (e.g. runtime dtype dispatch),
+        # annotate the emitted if/switch with `[branch]` to suppress
+        # flatten-by-default penalty. Today all dispatches resolve at
+        # codegen time so the Slang output is branch-free.
+        # The `[branch]` attribute lives on the callees — f16_to_f32 /
+        # f32_to_f16 in dtype_pack.slang already carry it.
+        slang = DTYPE_TO_SLANG.get(dtype, "float")
+        if src_dtype is not None:
+            src_slang = DTYPE_TO_SLANG.get(src_dtype, "float")
+            if src_slang == slang:
+                return f"({x})"
+            if src_slang == "float" and slang == "int":
+                return f"asint({x})"
+            if src_slang == "float" and slang == "uint":
+                return f"asuint({x})"
+            if src_slang == "int" and slang == "float":
+                return f"asfloat({x})"
+            if src_slang == "uint" and slang == "float":
+                return f"asfloat({x})"
+        if slang == "float":
+            return f"asfloat(asuint({x}))"
+        if slang == "int":
+            return f"asint(asuint({x}))"
+        return f"(({slang})({x}))"
+
+    @staticmethod
+    def rand(seed, offset) -> str:
+        V.kernel.headers.add("random")
+        return f"_vk_philox_rand((uint)({offset}), (uint)({seed}))"
+
+    @staticmethod
+    def randn(seed, offset) -> str:
+        V.kernel.headers.add("random")
+        return f"_vk_philox_randn((uint)({offset}), (uint)({seed}))"
+
+    @staticmethod
+    def randint64(seed, offset, low, high) -> str:
+        V.kernel.headers.add("random")
+        return f"((int64_t)(_vk_philox_rand((uint)({offset}), (uint)({seed})) * ((double)({high}) - (double)({low})) + (double)({low})))"
+
+    @staticmethod
+    def rand_eager(seed, base_offset, threads_per_round, tid, vec):
+        V.kernel.headers.add("random")
+        return f"_vk_philox_rand((uint)({base_offset}), (uint)({seed}))"
+
+    @staticmethod
+    def frexp(x):
+        cache_keys = f"frexp({x})[0]", f"frexp({x})[1]"
+        if all(V.kernel.cse.try_get(cache_key) is not None for cache_key in cache_keys):
+            return tuple(V.kernel.cse.try_get(cache_key) for cache_key in cache_keys)
+        from torch._inductor.codegen.common import BracesBuffer
+
+        code = BracesBuffer()
+        exponent = V.kernel.cse.newvar(dtype=torch.int32, shape=x.shape)
+        mantissa = V.kernel.cse.newvar(dtype=x.dtype, shape=x.shape)
+        code.writeline(f"int {exponent};")
+        code.writeline(f"float {mantissa} = frexp((float)({x}), {exponent});")
+        V.kernel.compute.splice(code)
+        cse_vars = (mantissa, exponent)
+        for cache_key, cse_var in zip(cache_keys, cse_vars):
+            V.kernel.cse.put(cache_key, cse_var)
+        return mantissa, exponent
+
+    @staticmethod
+    def ldexp(x, n) -> str:
+        return f"ldexp({x}, (int)({n}))"
+
+    @staticmethod
+    def nextafter(x, y) -> str:
+        return f"nextafter({x}, {y})"
+
+    @staticmethod
+    def minimum(a, b) -> str:
+        return f"((isnan({a}) || isnan({b})) ? asfloat(0x7FC00000u) : min({a}, {b}))"
+
+    @staticmethod
+    def maximum(a, b) -> str:
+        return f"((isnan({a}) || isnan({b})) ? asfloat(0x7FC00000u) : max({a}, {b}))"
+
+    @staticmethod
+    def recip(x) -> str:
+        return f"(1.0f / ({x}))"
+
+    @staticmethod
+    def sign(x) -> str:
+        return f"sign({x})"
+
+    @staticmethod
+    def floor(x) -> str:
+        # Slang has the built-in `floor()` (HLSL-inherited).  Upstream's
+        # `OpOverrides.floor` raises NotImplementedError and the mps
+        # auto-table doesn't cover it.  `aten.frac` decomposes through
+        # `floor`, so this missing override blocked frac compilation
+        # (and any other consumer of `aten.floor.default`).
+        return f"floor({x})"
+
+    @staticmethod
+    def ceil(x) -> str:
+        return f"ceil({x})"
+
+    @staticmethod
+    def round(x) -> str:
+        # Slang `round()` is HLSL banker's-rounding (round-half-to-even),
+        # matching PyTorch's `torch.round` semantics.
+        return f"round({x})"
+
+    @staticmethod
+    def isnan(x) -> str:
+        # Slang has the built-in `isnan()` (HLSL-inherited).  Upstream
+        # `OpsHandler.isnan` raises NotImplementedError.  Used by
+        # `aten.nan_to_num` decomposition (`isnan + isinf` + `where`).
+        return f"isnan({x})"
+
+    @staticmethod
+    def isinf(x) -> str:
+        return f"isinf({x})"
+
+    @staticmethod
+    def isfinite(x) -> str:
+        # `isfinite` not in HLSL; express as `!isnan && !isinf`.
+        return f"(!isnan({x}) && !isinf({x}))"
+
+    @staticmethod
+    def asinh(x) -> str:
+        # `asinh(x) = log(x + sqrt(x^2 + 1))`.  Slang doesn't have a
+        # direct `asinh()` builtin in older targets, so synthesize.
+        return f"log(({x}) + sqrt(({x}) * ({x}) + 1.0f))"
+
+    @staticmethod
+    def acosh(x) -> str:
+        # `acosh(x) = log(x + sqrt(x^2 - 1))` for x >= 1.
+        return f"log(({x}) + sqrt(({x}) * ({x}) - 1.0f))"
+
+    @staticmethod
+    def atanh(x) -> str:
+        # `atanh(x) = 0.5 * log((1+x)/(1-x))` for |x| < 1.
+        return f"(0.5f * log((1.0f + ({x})) / (1.0f - ({x}))))"
+
+    @staticmethod
+    def sinh(x) -> str:
+        # `sinh(x) = (exp(x) - exp(-x)) / 2`.  Slang has `sinh()` as
+        # part of HLSL intrinsics.
+        return f"sinh({x})"
+
+    @staticmethod
+    def cosh(x) -> str:
+        return f"cosh({x})"
+
+    @staticmethod
+    def heaviside(x, values) -> str:
+        # `heaviside(x, values)` = `(x > 0) ? 1 : ((x == 0) ? values : 0)`.
+        # Mirrors PyTorch's torch.heaviside semantics.
+        return f"((({x}) > 0.0f) ? 1.0f : ((({x}) == 0.0f) ? ({values}) : 0.0f))"
+
+    @staticmethod
+    def logaddexp(a, b) -> str:
+        # log(exp(a) + exp(b)) — numerically stable form:
+        # max(a,b) + log1p(exp(-|a-b|)).
+        return f"(max(({a}), ({b})) + log1p(exp(-abs(({a}) - ({b})))))"
+
+    @staticmethod
+    def logaddexp2(a, b) -> str:
+        # log2(2^a + 2^b) — stable form: max(a,b) + log2(1 + 2^(-|a-b|)).
+        # Slang has `log2()`, `exp2()` built-ins.
+        return f"(max(({a}), ({b})) + log2(1.0f + exp2(-abs(({a}) - ({b})))))"
+
+    @staticmethod
+    def rsub(a, b) -> str:
+        return f"(({b}) - ({a}))"
+
+    @staticmethod
+    def clamp(a, min_val, max_val) -> str:
+        return f"clamp({a}, {value_to_slang(min_val)}, {value_to_slang(max_val)})"
+
+    # ── Comparison ops ────────────────────────────────────────────────
+    # Return _SlangExpr with dtype=torch.bool so that CSE declares the
+    # intermediate variable as `bool` (not `float`).  Bool output buffers
+    # are StructuredBuffer<uint>; the store path casts bool→uint.
+
+    @staticmethod
+    def eq(a, b):
+        return _SlangExpr(f"({a} == {b})", dtype=torch.bool)
+
+    @staticmethod
+    def ne(a, b):
+        return _SlangExpr(f"({a} != {b})", dtype=torch.bool)
+
+    @staticmethod
+    def lt(a, b):
+        return _SlangExpr(f"({a} < {b})", dtype=torch.bool)
+
+    @staticmethod
+    def gt(a, b):
+        return _SlangExpr(f"({a} > {b})", dtype=torch.bool)
+
+    @staticmethod
+    def le(a, b):
+        return _SlangExpr(f"({a} <= {b})", dtype=torch.bool)
+
+    @staticmethod
+    def ge(a, b):
+        return _SlangExpr(f"({a} >= {b})", dtype=torch.bool)
+
+    @staticmethod
+    def logical_not(a) -> str:
+        return f"(!({a}))"
+
+    @staticmethod
+    def logical_and(a, b) -> str:
+        return f"(({a}) && ({b}))"
+
+    @staticmethod
+    def logical_or(a, b) -> str:
+        return f"(({a}) || ({b}))"
+
+    @staticmethod
+    def where(cond, x, y) -> str:
+        return f"(({cond}) ? ({x}) : ({y}))"
+
+    @staticmethod
+    def tanh(x) -> str:
+        return f"tanh({x})"
+
+    @staticmethod
+    def prelu(x, weight) -> str:
+        return f"(({x}) >= 0.0f ? ({x}) : ({weight} * ({x})))"
+
+    @staticmethod
+    def gelu(x, approximate="none") -> str:
+        if approximate == "tanh":
+            return (
+                f"(0.5f * ({x}) * (1.0f + tanh(0.7978845608028654f "
+                f"* (({x}) + 0.044715f * ({x}) * ({x}) * ({x})))))"
+            )
+        V.kernel.headers.add("erf")
+        return f"(0.5f * ({x}) * (1.0f + (({x}) * 0.7071067811865475f).erf()))"
+
+    @staticmethod
+    def relu(x) -> str:
+        return f"max(({x}), 0.0f)"
+
+    @staticmethod
+    def relu6(x) -> str:
+        return f"min(max(({x}), 0.0f), 6.0f)"
+
+    @staticmethod
+    def sigmoid(x) -> str:
+        return f"(1.0f / (1.0f + exp(-({x}))))"
+
+    @staticmethod
+    def silu(x) -> str:
+        return f"(({x}) / (1.0f + exp(-({x}))))"
+
+    @staticmethod
+    def hardtanh(x, min_val=-1.0, max_val=1.0) -> str:
+        return f"clamp({x}, {value_to_slang(min_val)}, {value_to_slang(max_val)})"
+
+    @staticmethod
+    def erf(x) -> str:
+        V.kernel.headers.add("erf")
+        return f"({x}).erf()"
+
+    @staticmethod
+    def erfc(x) -> str:
+        V.kernel.headers.add("erf")
+        return f"(1.0f - ({x}).erf())"
+
+    @staticmethod
+    def erfcx(x) -> str:
+        V.kernel.headers.add("erf")
+        return f"(exp(({x}) * ({x})) * (1.0f - ({x}).erf()))"
+
+    @staticmethod
+    def lgamma(x) -> str:
+        V.kernel.headers.add("lgamma")
+        return f"({x}).lgamma()"
+
+    @staticmethod
+    def ndtr(x) -> str:
+        V.kernel.headers.add("erf")
+        return f"(0.5f * (1.0f + (({x}) * 0.7071067811865475f).erf()))"
+
+    @staticmethod
+    def digamma(x) -> str:
+        V.kernel.headers.add("digamma")
+        return f"({x}).digamma()"
+
+    @staticmethod
+    def log1p(x) -> str:
+        V.kernel.headers.add("log1p")
+        return f"({x}).log1p()"
+
+    @staticmethod
+    def xlogy(x, y) -> str:
+        V.kernel.headers.add("log1p")
+        return f"((({x}) == 0.0f) ? 0.0f : (({x}) * log(({y}) + (({y}) == 0.0f ? 1.0f : 0.0f)))))"
+
+    # M30 — extension-method forms for the second batch of helpers.
+    # Free-function aliases (`c10_vulkan_*`) remain in `helpers.slang` for
+    # backward compatibility; T2.10 will retire them.
+    @staticmethod
+    def hypot(x, y) -> str:
+        V.kernel.headers.add("hypot")
+        return f"({x}).hypot({y})"
+
+    @staticmethod
+    def ndtri(x) -> str:
+        V.kernel.headers.add("ndtri")
+        return f"({x}).ndtri()"
+
+    @staticmethod
+    def spherical_bessel_j0(x) -> str:
+        V.kernel.headers.add("spherical_bessel_j0")
+        return f"({x}).spherical_bessel_j0()"
+
+    @staticmethod
+    def zeta(x, q) -> str:
+        # PyTorch / upstream pointwise dispatch: zeta(x=s, q). Slang
+        # extension `(s).zeta(q)` matches torch.special.zeta(s, q).
+        V.kernel.headers.add("zeta")
+        return f"({x}).zeta({q})"
+
+    @staticmethod
+    def polygamma(n, x) -> str:
+        # Inductor calls polygamma(n, x); extension form `(x).polygamma(n)`
+        # mirrors PyTorch's (n, x) ordering at the call site.
+        V.kernel.headers.add("polygamma")
+        return f"({x}).polygamma({n})"
+
+    @staticmethod
+    def igamma(a, x) -> str:
+        # PyTorch torch.igamma(a, x). Extension form `(x).igamma(a)`.
+        V.kernel.headers.add("igamma")
+        return f"({x}).igamma({a})"
+
+    @staticmethod
+    def erfinv(x) -> str:
+        # Upstream `OpsHandler.erfinv` raises NotImplementedError; the
+        # `mps` upstream-overrides table doesn't include erfinv, so we
+        # need an explicit Slang override.  Routes to the `(x).erfinv()`
+        # extension method in `shaders/lib/special_math.slang` (Mike
+        # Giles approximation, single-precision matching CUDA `erfinvf`).
+        V.kernel.headers.add("erfinv")
+        return f"({x}).erfinv()"
+
+    @staticmethod
+    def i0(x) -> str:
+        # `(x).i0()` extension in `shaders/lib/special_math.slang`.
+        V.kernel.headers.add("i0")
+        return f"({x}).i0()"
+
+    @staticmethod
+    def i0e(x) -> str:
+        V.kernel.headers.add("i0e")
+        return f"({x}).i0e()"
+
+    @staticmethod
+    def i1(x) -> str:
+        V.kernel.headers.add("i1")
+        return f"({x}).i1()"
+
+    @staticmethod
+    def i1e(x) -> str:
+        V.kernel.headers.add("i1e")
+        return f"({x}).i1e()"
+
+    @staticmethod
+    def trunc(x) -> str:
+        # Slang has the built-in `trunc()` (HLSL-inherited).  Upstream's
+        # mps override table doesn't cover trunc, so add an explicit
+        # mapping here so `aten.trunc` compiles cleanly under
+        # `torch.compile`.
+        return f"trunc({x})"
+
+    @staticmethod
+    def frac(x) -> str:
+        # Slang has the built-in `frac()` (HLSL-inherited): returns
+        # `x - floor(x)`.  PyTorch's `aten.frac` is `x - trunc(x)`,
+        # which differs for negative non-integers (e.g. -2.5 → -0.5
+        # vs +0.5).  Use `x - trunc(x)` to match PyTorch semantics.
+        return f"(({x}) - trunc({x}))"
+
+    @staticmethod
+    def atan2(y, x) -> str:
+        # Slang has the built-in `atan2(y, x)` (HLSL-inherited).
+        return f"atan2({y}, {x})"
+
+    @staticmethod
+    def xlogy(x, y) -> str:
+        # `xlogy(x, y) = x * log(y)` with the convention `0 * log(0) = 0`
+        # and NaN propagation.  Mirrors `torch.special.xlogy` and the
+        # upstream `OpsHandler.xlogy` (which raises NotImplementedError
+        # by default).
+        return (
+            f"((({x}) == 0.0f) ? 0.0f : "
+            f"((({y}) <= 0.0f) ? "
+            f"(0.0f / 0.0f) : "
+            f"(({x}) * log({y}))))"
+        )
+
+    @staticmethod
+    def xlog1py(x, y) -> str:
+        # `x * log1p(y)` with the same `0 * log1p(-1) = 0` convention.
+        return (
+            f"((({x}) == 0.0f) ? 0.0f : "
+            f"((({y}) <= -1.0f) ? "
+            f"(0.0f / 0.0f) : "
+            f"(({x}) * ({y}).log1p())))"
+        )
+
+    @staticmethod
+    def pow(a, b) -> str:
+        # Slang has no `**` operator. The default `OpOverrides.pow` returns
+        # `a ** b` (Python form), which slangc rejects with `unexpected
+        # token ('**')`. Adam's update emits `beta ** step` patterns whose
+        # CSE locals are float, so `pow(a, b)` (the HLSL/Slang built-in)
+        # is the right replacement; it accepts non-integer exponents and
+        # mirrors what `metal::pow` does on the MPS backend.
+        return f"pow(({a}), ({b}))"
+
+    @staticmethod
+    def fmod(a, b) -> str:
+        return f"fmod({a}, {b})"
+
+    @staticmethod
+    def remainder(a, b) -> str:
+        return f"(({a}) - ({b}) * trunc(({a}) / ({b})))"
+
+    @staticmethod
+    def copysign(a, b) -> str:
+        return f"((({b}) >= 0.0f || (({b}) == -0.0f && ({b}) < 0.0f)) ? abs({a}) : -abs({a}))"
+
+    @staticmethod
+    def signbit(x) -> str:
+        return f"(({x}) < 0.0f || (asuint({x}) == 0x80000000u))"
+
+    @staticmethod
+    def index_expr(expr, dtype):
+        with V.kernel._vk_printer.subscript():
+            return f"((int)({V.kernel.kexpr(expr)}))"
+
+    @staticmethod
+    def indirect_indexing(index_var, size, check=True, wrap_neg=True):
+        return sympy_index_symbol(str(index_var))
+
+    @staticmethod
+    def masked(mask, body, other) -> str:
+        b = body()
+        dtype = _infer_dtype(b) or _infer_dtype(other) or torch.float32
+        return _SlangExpr(f"(({mask}) ? ({b}) : ({other}))", dtype=dtype)
+
+
+# Upstream's `_initialize_pointwise_overrides` hard-codes its target names to
+# {triton, cpp, cppvec, halide, mps}. We reuse the "mps" entries since Metal
+# and Slang are both C-like and share most intrinsic names (sin, cos, sqrt,
+# etc.). Ops where the Metal form uses `metal::xxx` get shadowed by the
+# explicit @staticmethod definitions above.
+VulkanOverrides._initialize_pointwise_overrides("mps")

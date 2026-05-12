@@ -1,0 +1,324 @@
+// Tiled matmul: C[M,N] = A[M,K] @ B[K,N]
+// Optionally fused: C = alpha*(A@B) + beta*C with bias / activation / clamp epilogue.
+//
+// Two codegen paths share this template:
+//
+// (1) 1-output-per-thread (default, M_PER_THREAD=1 N_PER_THREAD=1):
+//     numthreads(WG_N, WG_M, 1). Workgroup size must be ≤ device limit
+//     (RDNA1 = 1024).
+//
+// (2) Register-tiled (M_PER_THREAD>1 or N_PER_THREAD>1):
+//     numthreads(WG_N, WG_M, 1) where WG_M = TILE_M/M_PER_THREAD,
+//     WG_N = TILE_N/N_PER_THREAD. Each thread holds an
+//     (M_PER_THREAD x N_PER_THREAD) accumulator in registers. Cuts global
+//     memory traffic by M_PER_THREAD*N_PER_THREAD for the same K work and
+//     unlocks 64×64 / 128×64 / 64×128 output tiles within the 1024 limit.
+//
+// Buffer binding order (num_outputs tracking):
+//   has_bias=false: [a(0), b(1), c(2)]              num_outputs=1 → c dirty
+//   has_bias=true:  [a(0), b(1), bias(2), c(3)]      num_outputs=1 → c dirty
+
+{# Resolve register-tile shape with backward-compatible defaults. #}
+{% set m_per_thread = m_per_thread | default(1) %}
+{% set n_per_thread = n_per_thread | default(1) %}
+
+import pointwise;
+
+// N+1.11: Tile sizes are specialization constants (`[[vk::constant_id]]`).
+// They determine groupshared array sizes, numthreads, and local array
+// dimensions at SPIR-V compile time.  Actual loop bounds use push-constant
+// values from `pc.tile_m`, `pc.tile_n`, `pc.tile_k`, `pc.m_per_thread`,
+// `pc.n_per_thread`.  This lets a single SPIR-V module serve multiple tile
+// configurations that share the same shape class — different (TILE_M,
+// TILE_N, TILE_K) combos that produce identical groupshared footprints
+// and workgroup dimensions share ONE compilation.
+[[vk::constant_id(20)]] const uint TILE_M = {{ tile_m }};
+[[vk::constant_id(21)]] const uint TILE_N = {{ tile_n }};
+[[vk::constant_id(22)]] const uint TILE_K = {{ tile_k }};
+[[vk::constant_id(23)]] const uint M_PER_THREAD = {{ m_per_thread }};
+[[vk::constant_id(24)]] const uint N_PER_THREAD = {{ n_per_thread }};
+static const uint WG_M = TILE_M / M_PER_THREAD;
+static const uint WG_N = TILE_N / N_PER_THREAD;
+
+struct PC {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a_m;
+    uint stride_a_k;
+    uint stride_b_k;
+    uint stride_b_n;
+    uint stride_c_m;
+    uint stride_c_n;
+{% if has_bias %}
+    uint stride_bias_n;
+{% endif %}
+{% if has_batch %}
+    // Batch (BMM) strides — element offsets between consecutive batches in
+    // each operand. For mm (no batch), these fields are absent and `gid.z`
+    // is unused (grid_z=1). The shader unconditionally adds the batch
+    // contribution only when `has_batch` is set.
+    uint stride_a_b;
+    uint stride_b_b;
+    uint stride_c_b;
+{% endif %}
+    // N+1.11: Runtime tile sizes — loop bounds use these push-constant
+    // values so the same SPIR-V module (with fixed groupshared / numthreads
+    // from specialization constants) handles multiple tile configurations.
+    uint tile_m;
+    uint tile_n;
+    uint tile_k;
+    uint m_per_thread;
+    uint n_per_thread;
+{% if has_alpha %}
+    float alpha;
+{% endif %}
+{% if has_beta %}
+    float beta;
+{% endif %}
+{% if has_scale %}
+    float scale;
+{% endif %}
+{% if has_clamp %}
+    float clamp_min;
+    float clamp_max;
+{% endif %}
+};
+
+[[vk::push_constant]] PC pc;
+
+// N+1.10 — Buffer bindings are wrapped in a single
+// ``ParameterBlock<KernelArgs>``.  Slang assigns one descriptorTableSlot
+// per struct field in declaration order (set 0, binding 0..N-1),
+// matching the descriptorCount=1 layout the runtime expects.  The
+// dispatch caller (``_slang_tile_mm`` / ``_slang_tile_addmm`` /
+// ``_slang_tile_addmm_gelu`` / ``_slang_tile_bmm`` in
+// ``vulkan_template_caller.py``) passes tensors in struct-field order
+// (a, b, [bias,] c).  No `[[vk::binding(N)]]` literals are emitted.
+struct KernelArgs {
+    StructuredBuffer<{{ dtype_a }}> a;
+    StructuredBuffer<{{ dtype_b }}> b;
+{% if has_bias %}
+    StructuredBuffer<{{ dtype_bias | default(dtype_c) }}> bias;
+{% endif %}
+    RWStructuredBuffer<{{ dtype_c }}> c;
+};
+ParameterBlock<KernelArgs> args;
+{% if num_stages > 1 %}
+// Double-buffered: stage 0 occupies the first half, stage 1 the second half.
+// Flat 1-D layout (rather than `[2][N]`) so helpers can index with a single
+// computed offset without slang's array-slice typing.
+// +32 bank-conflict padding (M20)
+// N+1.11: Array dimensions use `[[vk::constant_id]]` values (TILE_M, TILE_K,
+// TILE_N) so the same SPIR-V module serves multiple tile configs.
+groupshared {{ dtype_acc }} tile_a[2 * TILE_M * TILE_K + 32];
+groupshared {{ dtype_acc }} tile_b[2 * TILE_K * TILE_N + 32];
+{% else %}
+// +32 bank-conflict padding (M20)
+groupshared {{ dtype_acc }} tile_a[TILE_M * TILE_K + 32];
+groupshared {{ dtype_acc }} tile_b[TILE_K * TILE_N + 32];
+{% endif %}
+
+// `lid` (SV_GroupThreadID) is only in scope inside the entry point, so the
+// helpers take it as an explicit parameter. Without this, slangc errors with
+// "undefined identifier 'lid'" — which silently disabled this template for
+// months until the loader filename mismatch (P1.4) was fixed and the template
+// path actually became reachable.
+[ForceInline]
+void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
+                uint batch_a_off, uint batch_b_off, uint3 lid) {
+{% if num_stages > 1 %}
+    // N+1.11: LDS offsets use spec-constant TILE_M, TILE_K, TILE_N.
+    uint off_a = stage * TILE_M * TILE_K;
+    uint off_b = stage * TILE_K * TILE_N;
+{% else %}
+    uint off_a = 0;
+    uint off_b = 0;
+{% endif %}
+    // Each thread cooperates to load tile elements into LDS, striding by the
+    // workgroup size.  N+1.11: tid/wg_size use spec-constant WG_N, WG_M;
+    // loop bounds use spec-constant TILE_M, TILE_K, TILE_N (must match
+    // groupshared array dimensions).
+    uint tid = lid.y * WG_N + lid.x;
+    uint wg_size = WG_M * WG_N;
+
+    // Load A tile: TILE_M * TILE_K floats.
+    [unroll]
+    for (uint i = tid; i < TILE_M * TILE_K; i += wg_size) {
+        uint local_m = i / TILE_K;
+        uint local_k = i % TILE_K;
+        uint global_m = row_base + local_m;
+        uint global_k = k_base + local_k;
+        {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
+        if (global_m < pc.M && global_k < pc.K) {
+            v = ({{ dtype_acc }})args.a[batch_a_off + global_m * pc.stride_a_m + global_k * pc.stride_a_k];
+        }
+        tile_a[off_a + i] = v;
+    }
+    // Load B tile: TILE_K * TILE_N floats.
+    [unroll]
+    for (uint j = tid; j < TILE_K * TILE_N; j += wg_size) {
+        uint local_k = j / TILE_N;
+        uint local_n = j % TILE_N;
+        uint global_k = k_base + local_k;
+        uint global_n = col_base + local_n;
+        {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
+        if (global_k < pc.K && global_n < pc.N) {
+            v = ({{ dtype_acc }})args.b[batch_b_off + global_k * pc.stride_b_k + global_n * pc.stride_b_n];
+        }
+        tile_b[off_b + j] = v;
+    }
+}
+
+[ForceInline]
+void mma_tile(uint stage, uint k_base, uint3 lid, inout {{ dtype_acc }} acc[M_PER_THREAD][N_PER_THREAD]) {
+{% if num_stages > 1 %}
+    // N+1.11: LDS offsets use spec-constant TILE_M, TILE_K, TILE_N.
+    uint off_a = stage * TILE_M * TILE_K;
+    uint off_b = stage * TILE_K * TILE_N;
+{% else %}
+    uint off_a = 0;
+    uint off_b = 0;
+{% endif %}
+    // N+1.11: k_end uses pc.tile_k for the inner-product loop bound.
+    uint k_end = min(pc.tile_k, pc.K - k_base);
+    // Inner-product loop: each k-step pulls one row of A and one col of B from
+    // LDS into per-thread registers, then does an outer product into `acc`.
+    // Cap the unroll factor at 16 — full-unroll on tile_k=64 with a 4x4
+    // register tile balloons to 1024 FMAs per thread and blows the VGPR
+    // budget on RDNA1 (drops occupancy from 8 → 2 waves). 16 keeps the
+    // per-thread instruction count manageable while still letting the
+    // scheduler pipeline FMAs.
+    // N+1.11: unroll cap uses spec-constant TILE_K (ceiling from Jinja).
+    [unroll({{ tile_k if tile_k <= 16 else 16 }})]
+    for (uint kk = 0; kk < k_end; kk++) {
+        // Load M_PER_THREAD A values (one column of the register tile).
+        {{ dtype_acc }} a_reg[M_PER_THREAD];
+        [unroll]
+        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
+            uint local_m = lid.y * pc.m_per_thread + mi;
+            a_reg[mi] = tile_a[off_a + local_m * TILE_K + kk];
+        }
+        // Load N_PER_THREAD B values (one row of the register tile).
+        {{ dtype_acc }} b_reg[N_PER_THREAD];
+        [unroll]
+        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
+            uint local_n = lid.x * pc.n_per_thread + ni;
+            b_reg[ni] = tile_b[off_b + kk * TILE_N + local_n];
+        }
+        // Outer-product accumulate.
+        [unroll]
+        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
+            [unroll]
+            for (uint ni = 0; ni < pc.n_per_thread; ni++) {
+                acc[mi][ni] += a_reg[mi] * b_reg[ni];
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(WG_N, WG_M, 1)]
+void computeMain<Epilogue : IDifferentiable>(
+                 uint3 gtid : SV_DispatchThreadID,
+                 uint3 lid : SV_GroupThreadID,
+                 uint3 gid : SV_GroupID) {
+    // N+1.11: row_base/col_base use pc.tile_m/pc.tile_n for correct grid offset.
+    uint row_base = gid.y * pc.tile_m;
+    uint col_base = gid.x * pc.tile_n;
+{% if has_batch %}
+    // BMM: each grid_z slice maps to one batch. The PC carries per-tensor
+    // batch strides (element offsets). For a contiguous [B,M,K] A this is
+    // M*K, for [B,K,N] B it's K*N, etc. Without this offset every output
+    // batch was reading batch 0 of A and B — silent miscompute.
+    uint batch_a_off = gid.z * pc.stride_a_b;
+    uint batch_b_off = gid.z * pc.stride_b_b;
+    uint batch_c_off = gid.z * pc.stride_c_b;
+{% else %}
+    uint batch_a_off = 0u;
+    uint batch_b_off = 0u;
+    uint batch_c_off = 0u;
+{% endif %}
+
+    // N+1.11: Early exit for threads outside the runtime workgroup.
+    // Spec-constant WG_M, WG_N may be larger than needed for smaller
+    // tile configs.  Threads beyond the actual wg dimensions skip all work.
+    if (lid.y >= pc.tile_m / pc.m_per_thread || lid.x >= pc.tile_n / pc.n_per_thread) return;
+
+    // Per-thread register accumulator: holds an (M_PER_THREAD x N_PER_THREAD)
+    // sub-tile of the workgroup's TILE_M x TILE_N output block.
+    // N+1.11: Array dimensions use spec-constant M_PER_THREAD, N_PER_THREAD.
+    {{ dtype_acc }} acc[M_PER_THREAD][N_PER_THREAD];
+    [unroll]
+    for (uint _mi = 0; _mi < pc.m_per_thread; _mi++) {
+        [unroll]
+        for (uint _ni = 0; _ni < pc.n_per_thread; _ni++) {
+            acc[_mi][_ni] = ({{ dtype_acc }})0.0;
+        }
+    }
+
+    // N+1.11: k_blocks uses pc.tile_k for the K-loop bound.
+    uint k_blocks = (pc.K + pc.tile_k - 1u) / pc.tile_k;
+{% if num_stages > 1 %}
+
+    // Prefetch stage 0
+    if (k_blocks >= 1) {
+        load_tiles(0, 0, row_base, col_base, batch_a_off, batch_b_off, lid);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        // Compute on current stage
+        mma_tile(kb & 1u, kb * pc.tile_k, lid, acc);
+        // Prefetch next stage (if any)
+        if (kb + 1 < k_blocks) {
+            load_tiles((kb + 1u) & 1u, (kb + 1u) * pc.tile_k, row_base, col_base,
+                       batch_a_off, batch_b_off, lid);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+{% else %}
+
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        uint k_base = kb * pc.tile_k;
+        load_tiles(0, k_base, row_base, col_base, batch_a_off, batch_b_off, lid);
+        GroupMemoryBarrierWithGroupSync();
+        mma_tile(0, k_base, lid, acc);
+        GroupMemoryBarrierWithGroupSync();
+    }
+{% endif %}
+
+    // Epilogue + store: each thread writes its M_PER_THREAD x N_PER_THREAD
+    // register block to the output tensor.
+    // N+1.11: Loop bounds use pc.m_per_thread, pc.n_per_thread.
+    [unroll]
+    for (uint mi = 0; mi < pc.m_per_thread; mi++) {
+        uint row = row_base + lid.y * pc.m_per_thread + mi;
+        if (row >= pc.M) continue;
+        [unroll]
+        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
+            uint col = col_base + lid.x * pc.n_per_thread + ni;
+            if (col >= pc.N) continue;
+            {{ dtype_acc }} v = acc[mi][ni];
+{% if has_alpha %}
+            v *= pc.alpha;
+{% endif %}
+{% if has_bias %}
+            v += ({{ dtype_acc }})args.bias[col * pc.stride_bias_n];
+{% endif %}
+{% if has_beta %}
+            v += pc.beta * ({{ dtype_acc }})args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
+{% endif %}
+{% if epilogue %}
+            v = ({{ dtype_acc }})Epilogue::apply((float)v);
+{% endif %}
+{% if has_scale %}
+            v *= pc.scale;
+{% endif %}
+{% if has_clamp %}
+            v = clamp(v, ({{ dtype_acc }})pc.clamp_min, ({{ dtype_acc }})pc.clamp_max);
+{% endif %}
+            args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = ({{ dtype_c }})v;
+        }
+    }
+}

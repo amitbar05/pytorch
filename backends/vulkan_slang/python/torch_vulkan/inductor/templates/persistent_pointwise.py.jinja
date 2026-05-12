@@ -1,0 +1,133 @@
+// Persistent pointwise micro-batching template — GPU.5
+//
+// Grid-stride loop kernel that processes multiple small pointwise
+// operations in a single dispatch.  Instead of N separate dispatches
+// (each with ~5 µs Python→C++ overhead), one kernel stays resident
+// and loops over all N operations.
+//
+// Dispatch: 1D grid.  X = total_elements across all op batches.
+// Each thread processes multiple elements via grid-stride loop.
+//
+// pc.op_selector chooses which operation to apply for each element
+// range (e.g. op=0→relu, op=1→add, op=2→mul).
+
+struct OpRange {
+    uint start_idx;   // offset into the flat element space
+    uint numel;       // number of elements for this op
+    uint op_type;     // operation selector (0=copy, 1=relu, 2=sigmoid, ...)
+    uint in_buf_id;   // input buffer binding index
+    uint out_buf_id;  // output buffer binding index
+    float scalar;     // scalar argument (e.g. alpha for mul, beta for add)
+};
+
+struct PushConstants {
+    uint total_elements;   // sum of all numels
+    uint num_ops;          // number of OpRange entries
+    uint _pad0;
+    uint _pad1;
+    OpRange ranges[{{ max_ops }}];
+};
+[[vk::push_constant]] PushConstants pc;
+
+// Buffer bindings — allocated as a pool of N input + N output buffers.
+// The kernel indexes into these via pc.ranges[op].in_buf_id / out_buf_id.
+{% for i in range(num_input_bufs) %}
+[[vk::binding({{ i }})]] StructuredBuffer<float> in_buf_{{ i }};
+{% endfor %}
+{% for i in range(num_output_bufs) %}
+[[vk::binding({{ num_input_bufs + i }})]] RWStructuredBuffer<float> out_buf_{{ i }};
+{% endfor %}
+
+// ── Operation implementations ──────────────────────────────────────
+// Each op_impl function takes a float input and the OpRange config,
+// returns the result.  The op_selector dispatch happens inside the
+// grid-stride loop.
+
+float op_relu(float x, OpRange cfg) {
+    return max(x, 0.0f);
+}
+
+float op_sigmoid(float x, OpRange cfg) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+float op_tanh(float x, OpRange cfg) {
+    return tanh(x);
+}
+
+float op_gelu_tanh(float x, OpRange cfg) {
+    float sqrt_2_over_pi = 0.7978845608f;
+    float coeff = 0.044715f;
+    float x3 = x * x * x;
+    float inner = sqrt_2_over_pi * (x + coeff * x3);
+    return 0.5f * x * (1.0f + tanh(inner));
+}
+
+float op_add_scalar(float x, OpRange cfg) {
+    return x + cfg.scalar;
+}
+
+float op_mul_scalar(float x, OpRange cfg) {
+    return x * cfg.scalar;
+}
+
+float op_identity(float x, OpRange cfg) {
+    return x;
+}
+
+// ── Main kernel ────────────────────────────────────────────────────
+[shader("compute")]
+[numthreads({{ threadgroup_size }}, 1, 1)]
+void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint tid = gid.x * {{ threadgroup_size }}u + lid.x;
+    uint total_elements = pc.total_elements;
+
+    // Grid-stride loop: each thread processes multiple elements,
+    // potentially spanning multiple operations.
+    for (uint i = tid; i < total_elements; i += {{ threadgroup_size }}u * pc.num_wgs) {
+        // Find which operation this element belongs to (linear scan
+        // over OpRange entries — small N, overhead negligible).
+        uint offset = 0u;
+        uint op_idx = pc.num_ops;  // sentinel
+        for (uint o = 0u; o < pc.num_ops; o++) {
+            if (i >= pc.ranges[o].start_idx && i < pc.ranges[o].start_idx + pc.ranges[o].numel) {
+                op_idx = o;
+                offset = pc.ranges[o].start_idx;
+                break;
+            }
+        }
+        if (op_idx >= pc.num_ops) continue;  // shouldn't happen
+
+        OpRange cfg = pc.ranges[op_idx];
+        uint local_i = i - offset;
+
+        // Read input
+        float x;
+        switch (cfg.in_buf_id) {
+{% for j in range(num_input_bufs) %}
+            case {{ j }}: x = in_buf_{{ j }}[local_i]; break;
+{% endfor %}
+            default: x = 0.0f; break;
+        }
+
+        // Apply operation
+        float y;
+        switch (cfg.op_type) {
+            case 0u: y = op_identity(x, cfg); break;
+            case 1u: y = op_relu(x, cfg); break;
+            case 2u: y = op_sigmoid(x, cfg); break;
+            case 3u: y = op_tanh(x, cfg); break;
+            case 4u: y = op_gelu_tanh(x, cfg); break;
+            case 5u: y = op_add_scalar(x, cfg); break;
+            case 6u: y = op_mul_scalar(x, cfg); break;
+            default: y = x; break;
+        }
+
+        // Write output
+        switch (cfg.out_buf_id) {
+{% for j in range(num_output_bufs) %}
+            case {{ j }}: out_buf_{{ j }}[local_i] = y; break;
+{% endfor %}
+        }
+    }
+}

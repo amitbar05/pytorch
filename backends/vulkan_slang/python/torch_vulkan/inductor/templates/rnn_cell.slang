@@ -1,0 +1,188 @@
+// RNN cell template: fused LSTM/GRU/RNN-tanh/RNN-relu forward kernel.
+//
+// CP.3 / OP.6: Replaces the CPU-roundtrip in lowerings/rnn.py with a
+// Vulkan-native compute shader.  One dispatch per (time_step, layer,
+// direction) tuple; the workgroup cooperatively computes all hidden
+// units for one batch element.  Inner reduction uses WaveActiveSum
+// for the dot-product accumulate step.
+//
+// Cell types:
+//   LSTM (gate_size=4):  i, f, g, o gates  → c_t, h_t
+//   GRU  (gate_size=3):  r, z, n gates     → h_t
+//   RNN  (gate_size=1):  single gate        → h_t
+//
+// Weight layout (PyTorch convention, contiguous gate blocks):
+//   w_ih: [gate_size * hidden_size, input_size]
+//     LSTM: rows 0..hs-1=i, hs..2hs-1=f, 2hs..3hs-1=g, 3hs..4hs-1=o
+//     GRU:  rows 0..hs-1=r, hs..2hs-1=z, 2hs..3hs-1=n
+//     RNN:  rows 0..hs-1 = single gate
+//   w_hh: [gate_size * hidden_size, hidden_size] — same gate ordering
+//   b_ih: [gate_size * hidden_size]
+//   b_hh: [gate_size * hidden_size]
+//
+// Dispatch grid:  (batch_size, 1, 1)
+// Workgroup:      (hidden_size, 1, 1)
+//
+// Each thread (lid.x = hidden_unit) computes the cell outputs for its
+// hidden unit: it runs a serial dot product over input_size for the
+// input→hidden transform and over hidden_size for the hidden→hidden
+// transform, then applies the cell update equations.
+//
+// For batched execution: the grid's gid.x dimension enumerates batch
+// elements.  Each workgroup processes one batch element independently.
+
+/*# ── Cell-type specific constants ── #*/
+/*{%*/ if cell_type == "lstm" /*%}*/
+/*{%*/ set gate_size = 4 /*%}*/
+/*{%*/ set has_cell_state = true /*%}*/
+/*{%*/ elif cell_type == "gru" /*%}*/
+/*{%*/ set gate_size = 3 /*%}*/
+/*{%*/ set has_cell_state = false /*%}*/
+/*{%*/ elif cell_type in ("rnn_tanh", "rnn_relu") /*%}*/
+/*{%*/ set gate_size = 1 /*%}*/
+/*{%*/ set has_cell_state = false /*%}*/
+/*{%*/ else /*%}*/
+/*{%*/ set gate_size = 1 /*%}*/
+/*{%*/ set has_cell_state = false /*%}*/
+/*{%*/ endif /*%}*/
+
+struct PC {
+    uint hidden_size;
+    uint input_size;
+    uint stride_w_ih;   // = input_size (row-major)
+    uint stride_w_hh;   // = hidden_size (row-major)
+    uint stride_x;      // batch stride for x_t = input_size
+    uint stride_h;      // batch stride for h = hidden_size
+/*{%*/ if has_cell_state /*%}*/
+    uint stride_c;      // batch stride for c = hidden_size
+/*{%*/ endif /*%}*/
+    uint has_bias;      // boolean: 0=no bias, 1=has bias
+};
+
+[[vk::push_constant]] PC pc;
+
+struct KernelArgs {
+    StructuredBuffer</*{{*/ dtype /*}}float*/> x_t;       // [batch, input_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> h_prev;    // [batch, hidden_size]
+/*{%*/ if has_cell_state /*%}*/
+    StructuredBuffer</*{{*/ dtype /*}}float*/> c_prev;    // [batch, hidden_size]
+/*{%*/ endif /*%}*/
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_ih;      // [gate_size*hidden_size, input_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_hh;      // [gate_size*hidden_size, hidden_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> b_ih;      // [gate_size*hidden_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> b_hh;      // [gate_size*hidden_size]
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> h_t;     // [batch, hidden_size]
+/*{%*/ if has_cell_state /*%}*/
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> c_t;     // [batch, hidden_size]
+/*{%*/ endif /*%}*/
+};
+ParameterBlock<KernelArgs> args;
+
+// ── Activation helpers ─────────────────────────────────────────────────
+
+[ForceInline]
+float _sigmoid(float v) {
+    // tanh-based fast sigmoid: sigmoid(x) = 0.5 + 0.5 * tanh(x/2)
+    return 0.5f + 0.5f * tanh(v * 0.5f);
+}
+
+// ── Dot-product helpers (file-scope, called from computeMain) ──────────
+
+[ForceInline]
+float _dot_ih(
+    StructuredBuffer</*{{*/ dtype /*}}float*/> x_t, uint x_off,
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_ih, uint stride_w_ih,
+    uint gate_row, uint input_size)
+{
+    float acc = 0.0f;
+    for (uint k = 0u; k < input_size; k++) {
+        acc += (float)x_t[x_off + k]
+             * (float)w_ih[gate_row * stride_w_ih + k];
+    }
+    return acc;
+}
+
+[ForceInline]
+float _dot_hh(
+    StructuredBuffer</*{{*/ dtype /*}}float*/> h_prev, uint h_off,
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_hh, uint stride_w_hh,
+    uint gate_row, uint hidden_size)
+{
+    float acc = 0.0f;
+    for (uint k = 0u; k < hidden_size; k++) {
+        acc += (float)h_prev[h_off + k]
+             * (float)w_hh[gate_row * stride_w_hh + k];
+    }
+    return acc;
+}
+
+// ── Entry point ─────────────────────────────────────────────────────────
+
+[shader("compute")]
+[numthreads(/*{{*/ hidden_size /*}}256*/, 1, 1)]
+void computeMain(uint3 gtid : SV_DispatchThreadID,
+                 uint3 lid : SV_GroupThreadID,
+                 uint3 gid : SV_GroupID) {
+    uint batch = gid.x;
+    uint hid = lid.x;  // which hidden unit this thread owns
+
+    if (hid >= pc.hidden_size) {
+        return;
+    }
+
+    // Batch offsets into the input/hidden tensors.
+    uint x_off = batch * pc.stride_x;
+    uint h_off = batch * pc.stride_h;
+/*{%*/ if has_cell_state /*%}*/
+    uint c_off = batch * pc.stride_c;
+/*{%*/ endif /*%}*/
+
+    // ── Compute input-part + hidden-part + bias for each gate ──────
+    // Each gate = sum_k(x[k] * W_ih[gate_row, k]) + bias_ih[gate_row]
+    //           + sum_k(h[k] * W_hh[gate_row, k]) + bias_hh[gate_row]
+    //
+    // We accumulate in float (even for half inputs) for numerical
+    // stability across the dot-product reduction.
+    float ih_gate[/*{{*/ gate_size /*}}4*/];
+    float hh_gate[/*{{*/ gate_size /*}}4*/];
+    for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
+        uint gate_row = g * pc.hidden_size + hid;
+        ih_gate[g] = _dot_ih(args.x_t, x_off, args.w_ih, pc.stride_w_ih,
+                             gate_row, pc.input_size);
+        hh_gate[g] = _dot_hh(args.h_prev, h_off, args.w_hh, pc.stride_w_hh,
+                              gate_row, pc.hidden_size);
+        if (pc.has_bias != 0u) {
+            ih_gate[g] += (float)args.b_ih[gate_row];
+            hh_gate[g] += (float)args.b_hh[gate_row];
+        }
+    }
+
+    // ── Cell update ───────────────────────────────────────────────
+/*{%*/ if cell_type == "lstm" /*%}*/
+    // LSTM: i = sigmoid(x_part + h_part), f = sigmoid(...), g = tanh(...), o = sigmoid(...)
+    float i = _sigmoid(ih_gate[0] + hh_gate[0]);
+    float f = _sigmoid(ih_gate[1] + hh_gate[1]);
+    float g = tanh(ih_gate[2] + hh_gate[2]);
+    float o = _sigmoid(ih_gate[3] + hh_gate[3]);
+    float c_prev_val = (float)args.c_prev[c_off + hid];
+    float c_new = f * c_prev_val + i * g;
+    float h_new = o * tanh(c_new);
+    args.c_t[c_off + hid] = (/*{{*/ dtype /*}}float*/)c_new;
+    args.h_t[h_off + hid] = (/*{{*/ dtype /*}}float*/)h_new;
+/*{%*/ elif cell_type == "gru" /*%}*/
+    // GRU: r = sigmoid(x_part + h_part), z = sigmoid(...),
+    //      n = tanh(x_part + r * h_part)
+    float r = _sigmoid(ih_gate[0] + hh_gate[0]);
+    float z = _sigmoid(ih_gate[1] + hh_gate[1]);
+    float n = tanh(ih_gate[2] + r * hh_gate[2]);
+    float h_prev_val = (float)args.h_prev[h_off + hid];
+    float h_new = (1.0f - z) * n + z * h_prev_val;
+    args.h_t[h_off + hid] = (/*{{*/ dtype /*}}float*/)h_new;
+/*{%*/ elif cell_type == "rnn_tanh" /*%}*/
+    float h_new = tanh(ih_gate[0] + hh_gate[0]);
+    args.h_t[h_off + hid] = (/*{{*/ dtype /*}}float*/)h_new;
+/*{%*/ elif cell_type == "rnn_relu" /*%}*/
+    float h_new = max(0.0f, ih_gate[0] + hh_gate[0]);
+    args.h_t[h_off + hid] = (/*{{*/ dtype /*}}float*/)h_new;
+/*{%*/ endif /*%}*/
+}

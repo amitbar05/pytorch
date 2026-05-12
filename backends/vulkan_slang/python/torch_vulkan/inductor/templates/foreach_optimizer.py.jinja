@@ -1,0 +1,243 @@
+// Foreach optimizer template — parameterized over optimizer formula.
+//
+// T4.8: Replaces optimizer_ops.cpp body + sgd_batch*.slang / adamw_batch*.slang
+// with a single jinja template parameterized over:
+//   algorithm    — "sgd", "sgd_momentum", "adamw", "lion"
+//   batch_size   — number of parameters per dispatch (1, 7, 15, 21, 32)
+//   output_dtype — f32, f16, bf16
+//   parameter_array — bool (N+1.5.b). When True, emit
+//                     ``ParamSlot params[BATCH_SIZE]`` array-of-structs
+//                     inside the ParameterBlock and index directly via
+//                     ``args.params[param_idx].p[idx]``. When False
+//                     (default), fall back to the round-3 layout with
+//                     ``param0..paramN-1`` flat fields and a
+//                     ``switch (param_idx)`` cascade to dispatch
+//                     dynamically.
+//
+// Dispatch: 2D grid.  X = element index (256 threads/wg).
+//                       Y = parameter index (0..n_params-1).
+//
+// Push constants carry per-param config: {numel, lr, wd, [momentum/β₁/β₂/ε]}.
+//
+// N+1.10 / N+1.5.b — Buffer bindings are wrapped in a single
+// ``ParameterBlock<KernelArgs>``.  Slang assigns one descriptorTableSlot
+// per struct field in declaration order (set 0, binding 0..N-1).
+//
+// Layout selection:
+//   * parameter_array=False (default, working path):
+//       Flat ``RWStructuredBuffer<T> param0..paramN-1`` etc., one
+//       binding per buffer with ``descriptorCount=1``.  Per-param
+//       dynamic indexing uses a ``switch (param_idx)`` cascade.  This
+//       is the layout the round-3 N+1.10 ParameterBlock migration
+//       shipped — it stays the working path until N+1.5.a (Python
+//       wiring of ``_jit_dispatch_indexed``) lands.
+//   * parameter_array=True (N+1.5.b, opt-in):
+//       Single ``ParamSlot params[BATCH_SIZE]`` array-of-structs of
+//       buffers; slangc emits ONE binding per buffer family (p, g,
+//       [m,] [v,]) with ``descriptorCount=BATCH_SIZE``.  Requires
+//       VK_EXT_descriptor_indexing on the device AND the C++ runtime
+//       indexed-dispatch path (``_C._jit_dispatch_indexed``).  All
+//       per-param-buffer ``switch (param_idx)`` cascades collapse to
+//       direct ``args.params[param_idx].p[idx]`` indexing.
+
+// Per-param config (12 bytes per param, packed for GPU alignment).
+struct ParamConfig {
+    uint  numel;
+    float lr;
+    float weight_decay;
+{% if algorithm in ("sgd_momentum", "adamw", "lion") %}
+    float momentum;   // SGD: momentum factor; AdamW: β₁; Lion: β₁
+{% endif %}
+{% if algorithm == "adamw" %}
+    float beta2;
+    float eps;
+{% endif %}
+};
+
+struct PushConstants {
+    uint n_params;
+    uint _pad0; uint _pad1; uint _pad2;  // align ParamConfig to 16B
+    ParamConfig cfg[{{ batch_size }}];
+};
+[[vk::push_constant]] PushConstants pc;
+
+// All buffer bindings live in this ParameterBlock.  Field order is the
+// canonical binding order; the dispatch caller passes tensors in the
+// same order.  No `[[vk::binding(N)]]` literals appear anywhere in this
+// template.
+{% if parameter_array %}
+// N+1.5.b — array-of-structs path. slangc emits one binding per
+// buffer family with ``descriptorCount={{ batch_size }}``.
+struct ParamSlot {
+    RWStructuredBuffer<{{ output_dtype }}> p;
+    StructuredBuffer<{{ output_dtype }}>   g;
+{% if algorithm == "sgd_momentum" %}
+    RWStructuredBuffer<{{ output_dtype }}> m;
+{% elif algorithm == "adamw" %}
+    RWStructuredBuffer<{{ output_dtype }}> m;
+    RWStructuredBuffer<{{ output_dtype }}> v;
+{% elif algorithm == "lion" %}
+    RWStructuredBuffer<{{ output_dtype }}> m;
+{% endif %}
+};
+struct KernelArgs {
+    ParamSlot params[{{ batch_size }}];
+};
+{% else %}
+// Round-3 / N+1.10 flat layout — one binding per buffer
+// (descriptorCount=1), per-param dynamic dispatch via switch cascade.
+struct KernelArgs {
+{% for i in range(batch_size) %}
+    RWStructuredBuffer<{{ output_dtype }}> param{{ i }};
+    StructuredBuffer<{{ output_dtype }}>   grad{{ i }};
+{% endfor %}
+{% if algorithm == "sgd_momentum" %}
+{% for i in range(batch_size) %}
+    RWStructuredBuffer<{{ output_dtype }}> momentum{{ i }};
+{% endfor %}
+{% elif algorithm == "adamw" %}
+{% for i in range(batch_size) %}
+    RWStructuredBuffer<{{ output_dtype }}> m{{ i }};
+{% endfor %}
+{% for i in range(batch_size) %}
+    RWStructuredBuffer<{{ output_dtype }}> v{{ i }};
+{% endfor %}
+{% elif algorithm == "lion" %}
+{% for i in range(batch_size) %}
+    RWStructuredBuffer<{{ output_dtype }}> momentum{{ i }};
+{% endfor %}
+{% endif %}
+};
+{% endif %}
+ParameterBlock<KernelArgs> args;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint param_idx = gid.y;
+    if (param_idx >= pc.n_params) return;
+
+    ParamConfig cfg = pc.cfg[param_idx];
+    uint elem = gid.x * 256u + lid.x;
+    if (elem >= cfg.numel) return;
+
+{% if parameter_array %}
+    // N+1.5.b — direct array indexing, no switch cascade.
+    float p = (float)args.params[param_idx].p[elem];
+    float g = (float)args.params[param_idx].g[elem];
+{% else %}
+    float p, g;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: p = (float)args.param{{ i }}[elem]; g = (float)args.grad{{ i }}[elem]; break;
+{% endfor %}
+        default: return;
+    }
+{% endif %}
+
+    // Weight decay (applied to all algorithms).
+    if (cfg.weight_decay != 0.0f) {
+        g += cfg.weight_decay * p;
+    }
+
+{% if algorithm == "sgd" %}
+    // SGD: p = p - lr * g
+    float p_new = p - cfg.lr * g;
+
+{% elif algorithm == "sgd_momentum" %}
+    // SGD + Momentum: buf = μ * buf + g;  p = p - lr * buf
+{% if parameter_array %}
+    float buf = (float)args.params[param_idx].m[elem];
+    buf = cfg.momentum * buf + g;
+    float p_new = p - cfg.lr * buf;
+    args.params[param_idx].m[elem] = ({{ output_dtype }})buf;
+{% else %}
+    float buf;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: buf = (float)args.momentum{{ i }}[elem]; break;
+{% endfor %}
+        default: buf = 0.0f;
+    }
+    buf = cfg.momentum * buf + g;
+    float p_new = p - cfg.lr * buf;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: args.momentum{{ i }}[elem] = ({{ output_dtype }})buf; break;
+{% endfor %}
+    }
+{% endif %}
+
+{% elif algorithm == "adamw" %}
+    // AdamW: m = β₁*m + (1-β₁)*g;  v = β₂*v + (1-β₂)*g²
+    //        p = p - lr * (m_hat / (√v_hat + ε) + wd * p)
+{% if parameter_array %}
+    float m_val = (float)args.params[param_idx].m[elem];
+    float v_val = (float)args.params[param_idx].v[elem];
+    m_val = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
+    v_val = cfg.beta2 * v_val + (1.0f - cfg.beta2) * g * g;
+    float p_new = p - cfg.lr * (m_val / (sqrt(v_val) + cfg.eps) + cfg.weight_decay * p);
+    args.params[param_idx].m[elem] = ({{ output_dtype }})m_val;
+    args.params[param_idx].v[elem] = ({{ output_dtype }})v_val;
+{% else %}
+    float m_val, v_val;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: m_val = (float)args.m{{ i }}[elem]; v_val = (float)args.v{{ i }}[elem]; break;
+{% endfor %}
+        default: m_val = 0.0f; v_val = 0.0f;
+    }
+    m_val = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
+    v_val = cfg.beta2 * v_val + (1.0f - cfg.beta2) * g * g;
+    float p_new = p - cfg.lr * (m_val / (sqrt(v_val) + cfg.eps) + cfg.weight_decay * p);
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: args.m{{ i }}[elem] = ({{ output_dtype }})m_val; args.v{{ i }}[elem] = ({{ output_dtype }})v_val; break;
+{% endfor %}
+    }
+{% endif %}
+
+{% elif algorithm == "lion" %}
+    // Lion: update = β₁ * momentum + (1-β₁) * g;  (sign(update))
+    //        p = p - lr * sign(β₁ * momentum + (1-β₁) * g)
+    //        momentum = β₂ * momentum + (1-β₂) * g
+{% if parameter_array %}
+    float buf = (float)args.params[param_idx].m[elem];
+    float update = cfg.momentum * buf + (1.0f - cfg.momentum) * g;
+    float step = (update > 0.0f) ? cfg.lr : -cfg.lr;
+    float p_new = p - step;
+    // Lion β₂ for momentum decay
+    buf = cfg.beta2 * buf + (1.0f - cfg.beta2) * g;
+    args.params[param_idx].m[elem] = ({{ output_dtype }})buf;
+{% else %}
+    float buf;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: buf = (float)args.momentum{{ i }}[elem]; break;
+{% endfor %}
+        default: buf = 0.0f;
+    }
+    float update = cfg.momentum * buf + (1.0f - cfg.momentum) * g;
+    float step = (update > 0.0f) ? cfg.lr : -cfg.lr;
+    float p_new = p - step;
+    // Lion β₂ for momentum decay
+    buf = cfg.beta2 * buf + (1.0f - cfg.beta2) * g;
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: args.momentum{{ i }}[elem] = ({{ output_dtype }})buf; break;
+{% endfor %}
+    }
+{% endif %}
+
+{% endif %}
+
+{% if parameter_array %}
+    args.params[param_idx].p[elem] = ({{ output_dtype }})p_new;
+{% else %}
+    switch (param_idx) {
+{% for i in range(batch_size) %}
+        case {{ i }}: args.param{{ i }}[elem] = ({{ output_dtype }})p_new; break;
+{% endfor %}
+    }
+{% endif %}
+}

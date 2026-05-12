@@ -1,0 +1,232 @@
+// Flash Attention forward template — parameterized fused QK^T + softmax + @V.
+//
+// T4.7: Replaces 25 hand-tuned attention shaders with a single generic template.
+// Parameters:
+//   head_dim      — D ∈ {32, 64, 128, 256}
+//   head_layout   — "bhsd" (head-major) or "bshd" (seq-major)
+//   is_causal     — bool: apply causal mask (k > q positions get -inf)
+//   num_stages    — pipeline depth for K/V tile prefetch (1 or 2)
+//   output_dtype  — f32, f16, bf16
+//
+// Algorithm (online softmax, no intermediate S×N attention matrix):
+//   1. Load Q tile into shared memory (D elements per thread).
+//   2. For each K/V tile (size BK along S axis):
+//      a. Load K tile into shared memory.
+//      b. Compute S = Q @ K^T * scale for all q × k in the tile.
+//      c. Apply causal mask if needed.
+//      d. Online softmax: update running max m, running sum l.
+//      e. Load V tile. Accumulate O += P @ V per thread.
+//   3. Write output tile.
+
+/*{%*/ set wg_size = head_dim if head_dim <= 256 else 256 /*%}*/
+// T4.10: BK and BQ are now template kwargs supplied by the caller
+// (defaults BK=64, BQ=32 preserve pre-T4.10 behaviour).  The values
+// flow through as Jinja /*{{*/ BK /*}}64*/ / /*{{*/ BQ /*}}32*/ below — no hard-coded
+// literals remain.
+
+struct PC {
+    uint B;           // batch size
+    uint H;           // number of query heads
+    uint KV_H;        // number of KV heads (for GQA: KV_H <= H)
+    uint N;           // query sequence length
+    uint S;           // key/value sequence length
+    uint D;           // head dimension
+    float scale;       // 1/sqrt(D) or user-specified
+    uint is_causal;   // 1 = apply causal mask
+    uint q_layout;    // 0 = [B,H,N,D], 1 = [B,N,H,D]
+};
+
+[[vk::push_constant]] PC pc;
+
+// N+1.10 — Buffer bindings are wrapped in a single
+// ``ParameterBlock<KernelArgs>``. Slang assigns one descriptorTableSlot
+// per struct field in declaration order (set 0, binding 0..4),
+// matching the descriptorCount=1 layout the runtime expects.  The
+// dispatch caller (``_slang_tile_flash_attention`` in
+// ``vulkan_template_caller.py``) passes tensors in the same order as
+// struct fields here (q, k, v, out, lse), so no
+// `[[vk::binding(N)]]` literals are emitted.  Mirrors the
+// foreach_optimizer + philox_rng + scatter_atomic + slang_mm
+// migrations.
+struct KernelArgs {
+    StructuredBuffer</*{{*/ output_dtype /*}}float*/> q;
+    StructuredBuffer</*{{*/ output_dtype /*}}float*/> k;
+    StructuredBuffer</*{{*/ output_dtype /*}}float*/> v;
+    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> o;
+    RWStructuredBuffer<float> lse;       // [B, H, N] log-sum-exp
+};
+ParameterBlock<KernelArgs> args;
+
+groupshared float Q_smem[/*{{*/ BQ /*}}32*/ * /*{{*/ head_dim /*}}64*/];
+groupshared float K_smem[/*{{*/ BK /*}}64*/ * /*{{*/ head_dim /*}}64*/];
+groupshared float V_smem[/*{{*/ BK /*}}64*/ * /*{{*/ head_dim /*}}64*/];
+
+// ── Layout helpers ───────────────────────────────────────────────────────
+
+[ForceInline]
+uint _q_offset(uint b, uint h, uint q_pos, uint d) {
+    if (pc.q_layout != 0u) {
+        return b * pc.N * pc.H * pc.D + q_pos * pc.H * pc.D + h * pc.D + d;
+    } else {
+        return b * pc.H * pc.N * pc.D + h * pc.N * pc.D + q_pos * pc.D + d;
+    }
+}
+
+[ForceInline]
+uint _kv_offset(uint b, uint kv_h, uint pos, uint d) {
+    if (pc.q_layout != 0u) {
+        return b * pc.S * pc.KV_H * pc.D + pos * pc.KV_H * pc.D + kv_h * pc.D + d;
+    } else {
+        return b * pc.KV_H * pc.S * pc.D + kv_h * pc.S * pc.D + pos * pc.D + d;
+    }
+}
+
+[ForceInline]
+uint _o_offset(uint b, uint h, uint q_pos, uint d) {
+    // Output follows Q layout: seq-major if q_layout, else head-major.
+    if (pc.q_layout != 0u) {
+        return b * pc.N * pc.H * pc.D + q_pos * pc.H * pc.D + h * pc.D + d;
+    } else {
+        return b * pc.H * pc.N * pc.D + h * pc.N * pc.D + q_pos * pc.D + d;
+    }
+}
+
+// ── Entry point — one workgroup per (b, h, q_tile) ────────────────────────
+
+[shader("compute")]
+[numthreads(/*{{*/ wg_size /*}}256*/, 1, 1)]
+void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint tid = lid.x;
+
+    // Decode global id: gid.x = b (batch), gid.y = h * N_q_tiles + q_tile
+    uint b = gid.x;
+    // T4.9 Defect 1 fix: divide by N_q_tiles (not BQ) — caller's grid encodes
+    // gid.y = h * N_q_tiles + q_tile, so previous /BQ aliased h with q_tile.
+    uint N_q_tiles = (pc.N + /*{{*/ BQ /*}}32*/ - 1u) / /*{{*/ BQ /*}}32*/;
+    uint h = gid.y / N_q_tiles;
+    uint q_start = (gid.y % N_q_tiles) * /*{{*/ BQ /*}}32*/;
+    // T4.9 Defect 2 fix: (h * KV_H) / H is robust to non-divisible groups
+    // (and equals h / (H/KV_H) when KV_H divides H).
+    uint kv_h = (h * pc.KV_H) / pc.H;  // GQA: map query head to KV head
+
+    if (b >= pc.B || h >= pc.H) return;
+
+    // ── Load Q into shared memory (coalesced along D) ─────────────────
+    float Qi[/*{{*/ BQ /*}}32*/];  // one per q_pos in this tile, thread t loads q_pos * D + tid
+    [unroll]
+    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        uint q_pos = q_start + qi;
+        float v = 0.0f;
+        if (q_pos < pc.N && tid < pc.D) {
+            v = (float)args.q[_q_offset(b, h, q_pos, tid)];
+        }
+        Q_smem[qi * /*{{*/ head_dim /*}}64*/ + tid] = v;
+        Qi[qi] = v;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // ── Online softmax state (one per q_pos in this tile) ─────────────
+    float m[/*{{*/ BQ /*}}32*/];
+    float l[/*{{*/ BQ /*}}32*/];
+    float Oi[/*{{*/ BQ /*}}32*/];
+    [unroll]
+    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        m[qi] = -1e38f;
+        l[qi] = 0.0f;
+        Oi[qi] = 0.0f;
+    }
+
+    uint kv_tiles = (pc.S + /*{{*/ BK /*}}64*/ - 1u) / /*{{*/ BK /*}}64*/;
+    for (uint kvt = 0; kvt < kv_tiles; kvt++) {
+        uint kv_start = kvt * /*{{*/ BK /*}}64*/;
+
+        // Load K tile into shared memory.
+        // Each thread loads elements in a strided pattern across the D dimension.
+        for (uint ki_load = 0; ki_load < /*{{*/ BK /*}}64*/; ki_load++) {
+            uint k_pos = kv_start + ki_load;
+            if (k_pos < pc.S) {
+                for (uint d = 0; d < pc.D; d += /*{{*/ wg_size /*}}256*/) {
+                    uint d_idx = d + tid;
+                    if (d_idx < pc.D) {
+                        K_smem[ki_load * /*{{*/ head_dim /*}}64*/ + d_idx] = (float)args.k[_kv_offset(b, kv_h, k_pos, d_idx)];
+                    }
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Load V tile into shared memory (needed for Phase 1 V accumulation).
+        for (uint ki_load = 0; ki_load < /*{{*/ BK /*}}64*/; ki_load++) {
+            uint k_pos = kv_start + ki_load;
+            if (k_pos < pc.S) {
+                for (uint d = 0; d < pc.D; d += /*{{*/ wg_size /*}}256*/) {
+                    uint d_idx = d + tid;
+                    if (d_idx < pc.D) {
+                        V_smem[ki_load * /*{{*/ head_dim /*}}64*/ + d_idx] = (float)args.v[_kv_offset(b, kv_h, k_pos, d_idx)];
+                    }
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // T4.9 Defect 3 fix: single-pass online softmax with full-D score.
+        // Each thread `tid` owns d-slot `tid` of Oi (wg_size == head_dim, so
+        // 1 thread per d). The score is computed redundantly across all
+        // threads via a full d=[0..D) loop so every thread agrees on m, l,
+        // and weight — previously each thread saw only its tid-th partial
+        // score, giving inconsistent softmax state and a one-component-only
+        // V writeback (Phase-2 wrote `Oi[qi] += w * V_smem[ki*D + tid]` but
+        // with a per-thread weight derived from a partial score).
+        [unroll]
+        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+            uint q_pos = q_start + qi;
+            if (q_pos >= pc.N) break;
+
+            [unroll]
+            for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+                uint k_pos = kv_start + ki;
+                if (k_pos >= pc.S) break;
+
+                // Causality check.
+                if (pc.is_causal != 0u && k_pos > q_pos) continue;
+
+                // Full Q·K dot product (redundant across threads → consistent
+                // m/l/weight on every lane).
+                float score = 0.0f;
+                for (uint d = 0; d < pc.D; d++) {
+                    score += Q_smem[qi * /*{{*/ head_dim /*}}64*/ + d]
+                           * K_smem[ki * /*{{*/ head_dim /*}}64*/ + d];
+                }
+                score *= pc.scale;
+
+                // Online softmax: rescale running output and sum, then add
+                // current contribution. p = exp(score - m_new).
+                float m_new = max(m[qi], score);
+                float alpha = exp(m[qi] - m_new);
+                float p = exp(score - m_new);
+                // Each thread accumulates its own d-slot of V.
+                if (tid < pc.D) {
+                    Oi[qi] = Oi[qi] * alpha + p * V_smem[ki * /*{{*/ head_dim /*}}64*/ + tid];
+                }
+                l[qi] = l[qi] * alpha + p;
+                m[qi] = m_new;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // ── Write output and LSE ─────────────────────────────────────────────
+    [unroll]
+    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        uint q_pos = q_start + qi;
+        if (q_pos >= pc.N) break;
+        // Final normalization by accumulated softmax denominator.
+        float inv_l = (l[qi] > 0.0f) ? (1.0f / l[qi]) : 0.0f;
+        if (tid < pc.D) {
+            args.o[_o_offset(b, h, q_pos, tid)] = (/*{{*/ output_dtype /*}}float*/)(Oi[qi] * inv_l);
+        }
+        if (tid == 0) {
+            args.lse[b * pc.H * pc.N + h * pc.N + q_pos] = m[qi] + log(l[qi]);
+        }
+    }
+}
