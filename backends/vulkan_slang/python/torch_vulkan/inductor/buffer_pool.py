@@ -114,8 +114,23 @@ _release_counts: dict[str, int] = {cls: 0 for cls in LIFETIME_CLASSES}
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _numel(size) -> int:
+    n = 1
+    for d in size:
+        n *= int(d)
+    return n
+
+
 def _key(size, dtype, lifetime_class: str) -> tuple:
-    return (tuple(size), dtype, lifetime_class)
+    # M9.1: key on storage element count, not shape. The wrapper-codegen
+    # path allocates with ``allocation_shape`` (e.g. ``(1, 8, 64)``) and
+    # then ``.as_strided((8, 64), …)``-rewraps. By release-time the tensor
+    # carries the view shape, so a shape-keyed bucket sees acquires with
+    # ``(1, 8, 64)`` and releases with ``(8, 64)`` and never matches —
+    # silent 0 % hit rate. ``as_strided`` is a view-only operation; the
+    # underlying storage has the same element count on both sides, so
+    # keying on numel is the correct invariant.
+    return (_numel(size), dtype, lifetime_class)
 
 
 def _compute_contiguous_stride(size: tuple[int, ...]) -> tuple[int, ...]:
@@ -306,7 +321,14 @@ def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None
         if _POOL_STATS_ENABLED:
             _POOL_BYTES_EVICTED += tensor.element_size() * tensor.numel()
         return
-    key = _key(tensor.size(), tensor.dtype, lifetime_class)
+    # M9.1: use the underlying storage element count, not the view's
+    # ``tensor.size()``. A buffer allocated as ``(1, 8, 64)`` and then
+    # ``.as_strided((8, 64), …)``-rewrapped reports ``tensor.size() ==
+    # (8, 64)`` but its storage still holds 512 elements — the next
+    # acquire keys on 512 and must find this bucket.
+    elem = tensor.element_size()
+    storage_numel = tensor.untyped_storage().nbytes() // elem if elem else tensor.numel()
+    key = _key((storage_numel,), tensor.dtype, lifetime_class)
     bucket = _buckets.get(key)
     if bucket is None:
         bucket = deque()

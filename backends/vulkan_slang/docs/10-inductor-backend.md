@@ -54,8 +54,8 @@ probe scripts under `agent_space/probe_*.py` and `agent_space/vk_validation_swee
 |-------|--------|----------|
 | MLP train warm step | **75 µs kernel / 1.63 ms wall** | 96 % host overhead — feeds M9 |
 | SmallCNN train warm step | **191 µs kernel / 43.9 ms wall** | 230× host/kernel — feeds M9 |
-| SmallCNN cold compile | **9.0 s for 8 dispatches** (8 slangc, 800 ms ea) | Prewarm-on-import — feeds M9 |
-| MLP buffer pool, 10 steps | **0 / 50 hits (0 %)**, 20 releases, peak 8 | Pool key bug — M9 P0 |
+| SmallCNN cold compile | ✅ **prewarmed on import** (M9.3 closed 2026-05-13) — shader-lib `.slang-module` cache primed in a bg daemon thread before user's first dispatch; first-compile path short-circuits the precompile pass | M9.3 closed |
+| MLP buffer pool, 10 steps | ✅ **18 / 50 hits (36 %)** (fixed 2026-05-13; was 0/50 — see M9.1) | M9.1 closed |
 | GN + ReLU + GlobalAvg | **2 kernels (target: 1)** | Reduction-boundary fusion gap — M9 |
 | Transformer (d=64, h=4, s=32) compile | **`UnboundLocalError: buf10`** in wrapper | combo-batcher bug — file + M9 |
 | Validation sweep (10 paths) | **0 VUIDs** (post 4 fixes earlier in 2026-05-13) | Clean |
@@ -100,9 +100,9 @@ probe scripts under `agent_space/probe_*.py` and `agent_space/vk_validation_swee
 
 **M9 — Host-overhead reduction (1w, P0 for perf)**
 
-- [ ] **M9.1** Buffer-pool 0 % hit rate root-cause (the 50/0 result over 10 MLP steps). Acquire/release count mismatch (50 vs 20) — most outputs escape. Inspect `_key()` and `vulkan_pool_release` flow; ensure outputs released after step. (1-2d)
+- [x] **M9.1** Buffer-pool 0 % hit rate root-cause — **FIXED 2026-05-13**. Acquire-side keyed on `allocation_shape` (e.g. `(1, 8, 64)`); release-side keyed on `tensor.size()` after the wrapper's `.as_strided((8, 64), …)` view, so buckets never matched (50 acquires / 0 hits / 20 releases on 10-step MLP train). Fix: switch the pool key to *storage element count* (`numel` of the underlying buffer, invariant under `as_strided`) — `_key()` and `vulkan_pool_release()` in `python/torch_vulkan/inductor/buffer_pool.py`. Probe `agent_space/probe_buffer_pool.py` now reports **18/50 hits (36 %)** on the same MLP loop; 90 % of releasable buffers recycle. Floor locked in `tests/test_inductor_regression.py::TestBufferPool::{test_m9_1_allocation_shape_vs_view_shape_round_trip, test_m9_1_mlp_train_hit_rate_floor}` (≥ 25 %).
 - [ ] **M9.2** Deferred command-buffer batching: stop per-dispatch `submit_and_wait`; submit 4-8 dispatches per `vkQueueSubmit`. (`Stream.cpp` has a skeleton.) Target: -5 to -10 ms / SmallCNN step. (2-3d)
-- [ ] **M9.3** Prewarm-on-import: shader-lib precompile runs at first `torch_vulkan` import, not first dispatch. Eliminates the 9 s cold step on SmallCNN. (0.5d)
+- [x] **M9.3** Prewarm-on-import — **FIXED 2026-05-13**. `precompile_shader_libs()` now runs in a background daemon thread from `inductor/__init__.py::_legacy_register()` via `prewarm_shader_libs(sync=False)`. The pass writes `<lib>.slang-module` artefacts to `~/.cache/torch_vulkan/slang-modules/` before any `torch.compile` dispatch fires — the audit-measured 9 s cold step on SmallCNN (8 slangc × ~800 ms re-parsing lib imports) now overlaps with the user's first kernel compile rather than serialising before it. Module-cache writes are guarded by `_shader_lib_modules_lock` so the bg thread and lazy first-compile path can't double-emit `.slang-module` files. The precompile is now `lax=True` at the lazy path too, so a stale/dead lib (e.g. `norm.slang` references the legacy 3-arg `wg_reduce<…>` API) no longer aborts the whole pass — failing libs are listed in the result's `failed` field; kernels that `import` them fall through to slangc's source-parse path. Locked in `tests/test_inductor_regression.py::TestAtomicsLibModule::{test_m9_3_prewarm_shader_libs_runs_before_first_dispatch, test_m9_3_prewarm_shader_libs_respects_opt_out}`. Empirical: bg thread flips `_shader_lib_modules_ready=True` ~8 s after `import torch_vulkan` (one-time cold-cache write; cached on subsequent runs).
 - [ ] **M9.4** Push-constant in-place updates: pre-allocate bytearray per kernel; update fields, don't `bytes(pc_data)` per dispatch. (1d)
 - [ ] **M9.5** Cached `_jit_dispatch_indexed`: codegen prefers indexed variant when any binding has count > 1. (1d)
 - [ ] **M9.6** Adaptive `_PER_KEY_CAP` in `buffer_pool.py` (scratch=8, transient=6, save_for_backward=4). (1d)

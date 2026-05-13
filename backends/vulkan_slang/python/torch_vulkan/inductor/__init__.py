@@ -511,6 +511,20 @@ def _legacy_register() -> None:
         # Pre-warm is best-effort — never let it block backend registration.
         pass
 
+    # M9.3: precompile `shaders/lib/*.slang` → `.slang-module` artifacts at
+    # import time so the first user dispatch doesn't pay the cold cost.
+    # The audit measured 9 s for the first 8 SmallCNN dispatches (~800 ms
+    # each) — most of that is slangc parsing the lib imports on every
+    # kernel compile. Pre-emitting the modules amortises that to import
+    # time. Background thread, best-effort, opt-out via the same
+    # TORCH_VULKAN_NO_PREWARM env var as the matmul prewarm.
+    try:
+        from .runtime import prewarm_shader_libs
+
+        prewarm_shader_libs(sync=False)
+    except Exception:
+        pass
+
     _registered = True
 
 

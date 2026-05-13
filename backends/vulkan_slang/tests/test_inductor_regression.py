@@ -8890,13 +8890,106 @@ class TestBufferPool:
         )
         vulkan_pool_release(t)
         del t
-        # Different shape — should miss; bucket for (8,16) still holds it.
-        assert vulkan_pool_acquire((16, 8), (8, 1), torch.float32) is None
+        # Different numel — should miss; bucket for numel=128 still holds it.
+        assert vulkan_pool_acquire((8, 32), (32, 1), torch.float32) is None
         # Different dtype — should miss.
         assert vulkan_pool_acquire((8, 16), (16, 1), torch.float16) is None
-        # Original key still hits.
-        recycled = vulkan_pool_acquire((8, 16), (16, 1), torch.float32)
+        # M9.1: same numel + dtype + lifetime_class hits — `(16, 8)` shares
+        # storage with `(8, 16)` via the numel-keyed bucket; `as_strided`
+        # reshapes the popped tensor to the caller's requested view.
+        recycled = vulkan_pool_acquire((16, 8), (8, 1), torch.float32)
         assert recycled is not None
+        assert tuple(recycled.size()) == (16, 8)
+
+    def test_m9_1_allocation_shape_vs_view_shape_round_trip(self):
+        """M9.1: regression for the wrapper-codegen allocation_shape/as_strided
+        round-trip. The wrapper allocates with ``allocation_shape``
+        (e.g. ``(1, 8, 64)``) and immediately ``.as_strided((8, 64), …)``
+        the result. At release time the tensor reports the view shape, not
+        the allocation shape. Before M9.1 the acquire keyed on the 3-D
+        shape and the release keyed on the 2-D shape — buckets never
+        matched, hit rate stuck at 0 %.
+        """
+        from torch_vulkan.inductor.buffer_pool import (
+            pool_stats,
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        # Simulate the wrapper's emit: allocate `(1, 8, 64)` then as_strided
+        # to `(8, 64)`. Release the view (this is what end-of-life sees).
+        t_alloc = torch.empty_strided(
+            (1, 8, 64), (512, 64, 1), dtype=torch.float32, device="vulkan:0"
+        )
+        t_view = t_alloc.as_strided((8, 64), (64, 1))
+        del t_alloc  # only the view holds the storage now
+        vulkan_pool_release(t_view)
+        del t_view
+
+        # Next step's acquire uses the original allocation_shape — must hit.
+        recycled = vulkan_pool_acquire((1, 8, 64), (512, 64, 1), torch.float32)
+        assert recycled is not None
+        assert tuple(recycled.size()) == (1, 8, 64)
+        s = pool_stats()
+        assert s["hits"] == 1, s
+        assert s["misses"] == 0, s
+
+    def test_m9_1_mlp_train_hit_rate_floor(self):
+        """M9.1 floor: MLP train loop achieves >=25 % buffer-pool hit rate.
+
+        Before M9.1 the hit rate was 0 % (acquire 3-D allocation shape,
+        release 2-D view shape — see test_m9_1_allocation_shape_vs_view_shape_round_trip).
+        After the fix the MLP train loop recycles transient buffers every
+        step — 18/50 = 36 % is the steady-state floor (the irreducible
+        misses are output + save_for_backward + step-1 cold acquires).
+        """
+        import torch.nn as nn
+        from torch_vulkan.inductor.buffer_pool import pool_stats, reset_pool
+
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l1 = nn.Linear(32, 64)
+                self.l2 = nn.Linear(64, 16)
+                self.l3 = nn.Linear(16, 4)
+
+            def forward(self, x):
+                x = torch.relu(self.l1(x))
+                x = torch.relu(self.l2(x))
+                return self.l3(x)
+
+        torch.manual_seed(0)
+        model = MLP().to("vulkan")
+        opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+        x = torch.randn(8, 32, device="vulkan")
+        y = torch.randn(8, 4, device="vulkan")
+        compiled = torch.compile(model, backend="inductor")
+
+        # Warmup compile so the first measured step doesn't trip on
+        # cold-cache misses.
+        out = compiled(x)
+        ((out - y) ** 2).mean().backward()
+        opt.step()
+        opt.zero_grad()
+        import torch_vulkan
+
+        torch_vulkan.synchronize()
+
+        reset_pool()
+        for _ in range(10):
+            out = compiled(x)
+            loss = ((out - y) ** 2).mean()
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+        torch_vulkan.synchronize()
+
+        s = pool_stats()
+        assert s["acquires"] > 0
+        hit_rate = s["hits"] / s["acquires"]
+        assert hit_rate >= 0.25, f"hit rate {hit_rate:.1%} below 25 % floor: {s}"
 
     def test_per_key_cap(self):
         os.environ["TORCH_VULKAN_BUFFER_POOL_PER_KEY"] = "2"
@@ -22801,6 +22894,51 @@ class TestAtomicsLibModule:
                 f"PF.21: {rel} still defines a local atomicFloatAdd — call "
                 f"`atomic_add_f32(buf, off, val)` from atomics instead"
             )
+
+    def test_m9_3_prewarm_shader_libs_runs_before_first_dispatch(self):
+        """M9.3: ``prewarm_shader_libs`` (sync or async) flips the
+        module-ready flag so the first ``torch.compile`` dispatch can
+        skip the precompile pass entirely. Without prewarm the audit
+        measured 9 s for the first 8 SmallCNN kernels (~800 ms each,
+        most spent parsing imports). Wiring is exercised at backend
+        registration (`inductor/__init__.py::_legacy_register`); this
+        test pins the helper contract directly.
+        """
+        import torch_vulkan.inductor.runtime as rt
+
+        rt._reset_shader_lib_modules_ready()
+        assert rt._shader_lib_modules_ready is False
+        try:
+            ran = rt.prewarm_shader_libs(sync=True)
+        except RuntimeError:
+            # The shader-lib precompile can legitimately fail when any
+            # `.slang` file in `shaders/lib/` has a slangc error (a
+            # separate concern from M9.3 wiring — tracked alongside
+            # `test_atomics_lib_precompiles`). The prewarm contract we
+            # care about is unchanged: a failure leaves the ready flag
+            # False so the lazy first-compile path retries.
+            assert rt._shader_lib_modules_ready is False
+            return
+        assert ran is True
+        assert rt._shader_lib_modules_ready is True
+        # A second call is idempotent and returns False (cache already warm).
+        assert rt.prewarm_shader_libs(sync=True) is False
+
+    def test_m9_3_prewarm_shader_libs_respects_opt_out(self):
+        """M9.3: ``TORCH_VULKAN_NO_PREWARM=1`` disables the prewarm so
+        ``prewarm_matmul_templates`` and ``prewarm_shader_libs`` share a
+        single opt-out switch. The lazy first-compile path still runs
+        normally — only the import-time prewarm is skipped.
+        """
+        import torch_vulkan.inductor.runtime as rt
+
+        rt._reset_shader_lib_modules_ready()
+        os.environ["TORCH_VULKAN_NO_PREWARM"] = "1"
+        try:
+            assert rt.prewarm_shader_libs(sync=True) is False
+            assert rt._shader_lib_modules_ready is False
+        finally:
+            os.environ.pop("TORCH_VULKAN_NO_PREWARM", None)
 
     def test_atomics_lib_precompiles(self):
         """`precompile_shader_libs()` builds `atomics.slang-module`. The

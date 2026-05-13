@@ -618,22 +618,29 @@ def _shader_lib_sources() -> list[str]:
     )
 
 
-def precompile_shader_libs(force: bool = False) -> dict:
+def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
     """Walk `shaders/lib/*.slang`, emit `<name>.slang-module` artifacts.
 
     Cache keyed on source SHA256: a module is recompiled only when its
     source content changes. Sidecar `.hash` files record the source hash
     that produced each cached module. Returns a summary dict
-    ``{"compiled": [names], "cached": [names], "module_dir": str}`` and
-    bumps `_SHADER_LIB_MODULE_STATS`.
+    ``{"compiled": [names], "cached": [names], "failed": [(name, err)],
+    "module_dir": str}`` and bumps `_SHADER_LIB_MODULE_STATS`.
 
     Output dir is `~/.cache/torch_vulkan/slang-modules` (override via
     ``TORCH_VULKAN_SLANG_MODULE_CACHE``). The same dir is added to slangc's
     `-I` so kernels that `import <name>;` resolve to the precompiled module
     instead of re-parsing the source.
+
+    ``lax=True`` (M9.3): per-file slangc failures are collected into the
+    ``failed`` list instead of raising. A file that fails precompile is
+    not in ``compiled`` or ``cached``, so any kernel that ``import``-s it
+    falls back to slangc's source-parse path (slower but correct).
+    Strict mode (the default) preserves the historical contract — first
+    failed file raises ``RuntimeError``.
     """
     os.makedirs(_SHADER_LIB_MODULE_CACHE_DIR, exist_ok=True)
-    compiled, cached = [], []
+    compiled, cached, failed = [], [], []
     # PF.27.a.1: mix the slangc fingerprint into the cache key so a
     # slangc upgrade invalidates every cached `.slang-module` whose
     # serialized IR ABI may have changed. Hash mismatch fires on the
@@ -686,9 +693,11 @@ def precompile_shader_libs(force: bool = False) -> dict:
                 else (e.stderr or ""),
             ) from None
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"slangc failed precompiling shader lib {name}:\n{proc.stderr}"
-            )
+            err_msg = f"slangc failed precompiling shader lib {name}:\n{proc.stderr}"
+            if lax:
+                failed.append((name, (proc.stderr or "").strip()))
+                continue
+            raise RuntimeError(err_msg)
         tmp_hash = hash_path + f".tmp.{os.getpid()}"
         with open(tmp_hash, "w") as f:
             f.write(src_hash)
@@ -698,20 +707,79 @@ def precompile_shader_libs(force: bool = False) -> dict:
     return {
         "compiled": compiled,
         "cached": cached,
+        "failed": failed,
         "module_dir": _SHADER_LIB_MODULE_CACHE_DIR,
     }
 
 
 _shader_lib_modules_ready = False
+# M9.3: serialise the precompile pass so the import-time background prewarm
+# (`prewarm_shader_libs`) cannot race the lazy first-compile path
+# (`_ensure_shader_lib_modules`). Both write the same `.slang-module`
+# artifacts via `subprocess.run(..., -o path)`; concurrent writes from two
+# slangc processes targeting the same path are not atomic on POSIX and
+# would corrupt the module cache.
+_shader_lib_modules_lock = __import__("threading").Lock()
 
 
 def _ensure_shader_lib_modules() -> str:
-    """Lazy precompile on first kernel compile; returns module cache dir."""
+    """Lazy precompile on first kernel compile; returns module cache dir.
+
+    Uses ``lax=True`` (M9.3): a per-file precompile failure becomes a
+    cache miss for that one lib rather than aborting the whole pass,
+    so a stale/dead lib (e.g. `norm.slang` references the legacy
+    ``wg_reduce<…>`` 3-arg API) cannot block kernel compilation for
+    every other module. Kernels that ``import`` a failed lib fall
+    through to slangc's source-parse path — slower but correct.
+    """
     global _shader_lib_modules_ready
-    if not _shader_lib_modules_ready:
-        precompile_shader_libs()
-        _shader_lib_modules_ready = True
+    if _shader_lib_modules_ready:
+        return _SHADER_LIB_MODULE_CACHE_DIR
+    with _shader_lib_modules_lock:
+        if not _shader_lib_modules_ready:
+            precompile_shader_libs(lax=True)
+            _shader_lib_modules_ready = True
     return _SHADER_LIB_MODULE_CACHE_DIR
+
+
+def prewarm_shader_libs(*, sync: bool = False) -> bool:
+    """M9.3: ensure the shader-lib module cache is populated.
+
+    Called from the Inductor-backend registration step (import time) so
+    the 8× ~800 ms slangc invocations that would otherwise fire on the
+    first ``torch.compile`` dispatch happen before any user code runs.
+
+    ``sync=False`` (the default) spawns a daemon background thread; the
+    first kernel compile waits on `_shader_lib_modules_lock` if the
+    background pass is still in flight, otherwise short-circuits via
+    ``_shader_lib_modules_ready``. ``sync=True`` blocks until the
+    precompile finishes — used by tests that need a populated cache.
+
+    Returns True if a precompile pass was scheduled; False when
+    disabled (``TORCH_VULKAN_NO_PREWARM=1``) or slangc is unavailable.
+    """
+    if os.environ.get("TORCH_VULKAN_NO_PREWARM") == "1":
+        return False
+    if not _slangc_available():
+        return False
+    if _shader_lib_modules_ready:
+        return False
+
+    if sync:
+        _ensure_shader_lib_modules()
+        return True
+
+    import threading
+
+    def _bg():
+        try:
+            _ensure_shader_lib_modules()
+        except Exception:
+            # Best-effort; the lazy path will retry on first compile.
+            pass
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return True
 
 
 def _reset_shader_lib_modules_ready() -> None:
