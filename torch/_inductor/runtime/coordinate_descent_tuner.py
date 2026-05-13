@@ -135,8 +135,8 @@ class CoordescTuner:
         # For early termination: track best timing per iteration
         self._timing_history: list[float] = []
 
-    def _init_step_size(self, name: str, orig_val: int) -> int:
-        """Initialize the step size for a field based on its starting value."""
+    def _init_step_size(self, name: str) -> int:
+        """Initialize the step size for a field."""
         if name in ("num_stages", "NUM_STAGES"):
             return 2  # start coarser for stages
         elif name == "num_warps":
@@ -277,7 +277,7 @@ class CoordescTuner:
             "NUM_STAGES",
         ):
             if name not in self._step_sizes:
-                self._step_sizes[name] = self._init_step_size(name, orig_val)
+                self._step_sizes[name] = self._init_step_size(name)
             step_factor = self._step_sizes[name]
         else:
             step_factor = 2  # default: double/halve
@@ -420,6 +420,10 @@ class CoordescTuner:
 
             for next_a in neighbours_a:
                 for next_b in neighbours_b:
+                    # Skip the current config — already benchmarked
+                    if next_a == val_a and next_b == val_b:
+                        continue
+
                     candidate_config = copy.deepcopy(best_config)
                     set_field(candidate_config, field_a, next_a)
                     set_field(candidate_config, field_b, next_b)
@@ -488,36 +492,49 @@ class CoordescTuner:
             baseline_timing,
         )
 
-        for i in range(cfg.warmup_samples):
-            candidate_config = copy.deepcopy(baseline_config)
-            # Randomly perturb some fields
-            fields_to_perturb = random.sample(
-                tunable_fields,
-                k=min(len(tunable_fields), random.randint(1, len(tunable_fields))),
-            )
-            for field in fields_to_perturb:
-                cur_val = get_field(candidate_config, field)
-                if cur_val is None:
+        # Seed random with kernel name for deterministic warmup across runs.
+        # Save/restore global state to avoid interfering with other randomness.
+        rng_state = random.getstate()
+        try:
+            # Hash the kernel name to get a deterministic seed
+            seed_val = hash(self.name) & 0xFFFFFFFF
+            random.seed(seed_val)
+
+            for i in range(cfg.warmup_samples):
+                candidate_config = copy.deepcopy(baseline_config)
+                # Randomly perturb some fields
+                fields_to_perturb = random.sample(
+                    tunable_fields,
+                    k=min(len(tunable_fields), random.randint(1, len(tunable_fields))),
+                )
+                for field in fields_to_perturb:
+                    cur_val = get_field(candidate_config, field)
+                    if cur_val is None:
+                        continue
+                    neighbours = self.get_neighbour_values(
+                        field, cur_val, radius=self.tuner_config.search_radius
+                    )
+                    if neighbours:
+                        new_val = random.choice(neighbours)
+                        set_field(candidate_config, field, new_val)
+
+                if not self.is_valid_config(candidate_config):
                     continue
-                neighbours = self.get_neighbour_values(field, cur_val, radius=1)
-                if neighbours:
-                    new_val = random.choice(neighbours)
-                    set_field(candidate_config, field, new_val)
 
-            if not self.is_valid_config(candidate_config):
-                continue
+                try:
+                    timing = self.call_func(func, candidate_config)
+                except Exception as e:
+                    log.debug("  Warmup config %d failed: %s", i, e)
+                    continue
 
-            try:
-                timing = self.call_func(func, candidate_config)
-            except Exception as e:
-                log.debug("  Warmup config %d failed: %s", i, e)
-                continue
+                log.debug("  Warmup config %d: %f", i, timing)
+                if self.has_improvement(best_timing, timing):
+                    best_config = candidate_config
+                    best_timing = timing
+                    log.debug("  Warmup found better config: %f", timing)
 
-            log.debug("  Warmup config %d: %f", i, timing)
-            if self.has_improvement(best_timing, timing):
-                best_config = candidate_config
-                best_timing = timing
-                log.debug("  Warmup found better config: %f", timing)
+        finally:
+            random.setstate(rng_state)
 
         return best_config, best_timing
 
@@ -645,14 +662,10 @@ class CoordescTuner:
                         old_best_timing / best_timing,
                     )
 
-            # Early termination check
+            # Early termination check (also tracks timing history internally)
             if not improved and self._check_early_termination(best_timing):
                 log.debug("  Stopping early at iteration %d", iteration)
                 break
-
-            # Track timing for early termination
-            if not improved:
-                self._timing_history.append(best_timing)
 
         log.debug(
             "%s: Improve from %s %f -> %s %f, %.3fx (iterations: %d)",

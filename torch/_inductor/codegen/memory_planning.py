@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import heapq
 import itertools
+import logging
 import pprint
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
+log = logging.getLogger(__name__)
 @dataclasses.dataclass
 class LiveRange:
     """
@@ -756,14 +758,23 @@ class MemoryPlanner:
 
         Models each buffer's lifetime as a LiveRange interval, constructs
         an interval graph where overlapping intervals conflict, and uses a
-        greedy coloring algorithm with the "smallest available color"
-        heuristic. Colors represent shared memory allocations.
+        greedy coloring algorithm. Colors represent shared memory allocations.
 
-        Prefers reusing buffers with similar sizes to minimize fragmentation.
+        The algorithm:
+        1. Sorts allocations by start time
+        2. Maintains a min-heap of active intervals keyed by end time
+        3. When an interval ends, its color becomes available for reuse
+        4. When choosing among available colors, picks the one whose last
+           allocation was closest in size to minimize fragmentation
+        5. If no colors are available, allocates a new one
+
+        For interval graphs, any greedy coloring by start time produces an
+        optimal coloring (number of colors = maximum overlap). The size-based
+        preference is a tie-breaking heuristic that doesn't affect optimality.
 
         Complexity: O(n log n + n * d) where n is number of allocations and
-        d is the maximum number of simultaneously available colors (typically
-        small, bounded by the maximum overlap of intervals).
+        d is the maximum number of simultaneously active colors (bounded by
+        the maximum interval overlap, typically small in practice).
 
         Returns groups of allocations (by color) that can share memory.
         """
@@ -854,6 +865,13 @@ class MemoryPlanner:
 
             can_expand = config.memory_pool != "none"
 
+            # Total bytes if every allocation got its own buffer (no reuse).
+            # `dev_allocs` already includes both `dev_outputs` and
+            # `dev_intermediates`, so a single sum is enough — adding
+            # `dev_outputs` again would double-count and inflate the
+            # savings ratio logged below.
+            total_size_no_reuse = sum(a.size_hint for a in dev_allocs)
+
             if config.memory_pool == "combined":
                 # Color all allocations together
                 color_groups = self.assign_reuse_candidates(dev_allocs)
@@ -904,6 +922,21 @@ class MemoryPlanner:
                             can_expand=can_expand,
                         )
                         self.pools.get_pools(group[0]).append(pool)
+
+            # Log memory savings for this device
+            peak_pool_size = sum(
+                p.root.get_size_hint() for p in self.pools.get_pools(dev_allocs[0])
+            )
+            if total_size_no_reuse > 0:
+                savings_pct = 100.0 * (1.0 - peak_pool_size / total_size_no_reuse)
+                log.debug(
+                    "Memory planning [%s]: %d allocs, total=%d, peak=%d, saved=%.1f%%",
+                    device,
+                    len(dev_allocs),
+                    total_size_no_reuse,
+                    peak_pool_size,
+                    savings_pct,
+                )
 
     def allocate_groups(self):
         """
