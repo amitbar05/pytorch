@@ -1,194 +1,260 @@
-# Vulkan-Slang Inductor Backend Roadmap v6.1
+# Vulkan-Slang Inductor Backend Roadmap v6.2
 
 > **v5 North Star achieved (2026-05-10).** SmallCNN trains end-to-end.
-> 16 waves, 57 items shipped. v5 completion details archived in
+> **v6.1 closeouts (2026-05-11 / 2026-05-13):** M6 Phase 1 (Conv1d),
+> M9.1 (buffer-pool key bug), M9.3 (prewarm-on-import), M10.4 / CG.M10
+> (mm epilogue generic) → archived in
 > [10-inductor-backend-history.md](10-inductor-backend-history.md).
 >
-> **v6 focuses on the 4 remaining blockers and production hardening.**
-> **v6.1 (2026-05-13) adds M9–M12** based on a 4-track audit (codegen quality,
-> GPU utilization, Slang feature exploitation, profiling). See § 0.5 below
-> for the full audit summary.
+> **v6.2 (2026-05-13) refresh** following a four-track parallel audit
+> (codegen / op-coverage / scheduler / training). Active milestones grow
+> by **M13–M16** to capture audit-derived gaps. See § 0.5 for the
+> refreshed audit numbers.
 >
 > **Last updated: 2026-05-13.**
 >
-> **Live state:** 39,182 lines of test code, 66 e2e model tests, 4 strict xfails.
-> Feature flags ON: spec_constants, descriptor_indexing, static_specialization,
-> bank_conflict_pad, dynamic_shapes, batch_dispatch, wrapper_fastpath,
-> grid_aware_wg, persistent_pointwise.
+> **Live state:** 9 model architectures train end-to-end under
+> `torch.compile`; 47 lowerings + 24 explicit decomp suppressions;
+> 57/58 `aten.*_backward` ops route through `bwd_diff_table`; buffer
+> pool at 36 % hit rate on MLP train.
+>
+> **Feature flags ON by default:** spec_constants, descriptor_indexing,
+> static_specialization, bank_conflict_pad, dynamic_shapes,
+> batch_dispatch, wrapper_fastpath, grid_aware_wg,
+> persistent_pointwise, buffer_pool, prewarm_on_import.
 
 ---
 
-## 0. What Remains (v6)
+## 0. What Remains (v6.2)
 
-### The 4 Remaining Blockers
+### The 4 Remaining External Blockers
 
 | # | Item | Blocker | Actionable? |
 |---|------|---------|-------------|
-| 1 | **T4.12** Conv1d/3D/depthwise/transposed conv | Template generality work | ✅ **Yes — implement now** |
-| 2 | **N+1.9** Link-time tile specialization | slangc upstream bug (E30600) | ❌ Monitor slangc releases |
+| 1 | **T4.12 Phase 2-4** Conv3d KD>1 / depthwise (groups=C arbitrary) / transposed (1D/3D) | Template generality | ✅ **Yes — implement now** |
+| 2 | **N+1.9** Link-time tile specialization | slangc upstream bug E30600 | ❌ Monitor slangc releases |
 | 3 | **T7.2** Full .so subprocess load | C++ build infrastructure | ❌ Needs build system |
 | 4 | **Track CI** GPU hardware | No CI runner with Vulkan GPU | ❌ Needs hardware |
 
-### v6 Milestones
+### Active milestones (in priority order)
 
-| # | Milestone | Key Deliverable | Effort |
-|---|-----------|----------------|--------|
-| **M6** | **Conv generality (T4.12)** | Conv1d/3D/depthwise/transposed conv via template parameterization | 1-2w |
-| **M7** | **Production hardening** | Link-time spec (when slangc ships), AOTI .so packaging, CI gate | gated |
-| **M8** | **Model zoo expansion** | More real-world models compiling end-to-end | ongoing |
-| **M9** | **Host-overhead reduction** | Buffer pool fix, fence batching, prewarm-on-import — close the 96% host/kernel gap | 1w |
-| **M10** | **Anti-goal cleanup** | Split monoliths (5786L+3902L); ✅ anti-goal #6 closed (M10.4 / CG.M10, mm epilogue generic) | 1-2w |
-| **M11** | **Occupancy-aware codegen** | Reflection-routed WG sizing (DR.7), subgroup reductions, LDS bank-padding rigour | 1-2w |
-| **M12** | **Reduction backward via autodiff (CG.M3)** | `[Differentiable]` on 8 reduction ops; auto-generate backward, retire hand-written | 1w |
+| # | Milestone | Goal | Effort |
+|---|-----------|------|--------|
+| **M9** | **Host-overhead reduction** | Close the 96 %/230× host/kernel gap. M9.1 / M9.3 closed; M9.2 / M9.4 / M9.7-M9.9 remain. | 1-2w remaining |
+| **M11** | **Occupancy-aware codegen** | Wire reflection → WG sizing; subgroup reductions; LDS bank rigour. | 1-2w |
+| **M12** | **Reduction backward via autodiff** | 6/8 reduction ops `[Differentiable]`; route through `bwd_diff_table`. | 1w |
+| **M13** | **Slang feature saturation (NEW)** | Bring conv / SDPA / reduction / pointwise up to the mm gold standard: generics, interfaces, `ParameterBlock`, link-time spec, capabilities, wave intrinsics. | 2-3w |
+| **M14** | **Op coverage gaps (NEW)** | Complex-dtype binary, sparse / scatter-atomic, dynamic-shape reduction, foreach element-wise, quantized int8, RNN backward. | 2-3w |
+| **M15** | **Anti-goal #5/#7 cleanup (expanded M10)** | Split 6 newly-discovered monoliths; audit `meta_patches.py` for symptom-fixes. | 1-2w |
+| **M16** | **Track 4 finish (NEW)** | Delete `csrc/ops/model_ops.cpp` (925 L of legacy eager ops). Irreversible. | 1w |
+| **M6** | **Conv generality** | Phase 1 done (Conv1d); Phase 2-4 remain (depthwise/3D/transposed-1D/3D). | 1-2w |
+| **M7** | **Production hardening** | Link-time spec (gated on slangc), AOTI .so packaging, CI gate. | gated |
+| **M8** | **Model zoo expansion** | More real-world models end-to-end. | ongoing |
+| **M10** | **Anti-goal #7 cleanup** | M10.1-3 originally listed; M10.5-8 small fixes; M10.4 closed. Subsumed under M15 — see there. | merged into M15 |
 
 ---
 
-## 0.5. Audit Findings (2026-05-13)
+## 0.5. Audit findings (2026-05-13 refresh)
 
-Four-track audit synthesised from parallel sub-agents. Numbers verified by
-probe scripts under `agent_space/probe_*.py` and `agent_space/vk_validation_sweep*.py`.
+Four parallel sub-agents audited codegen, op coverage, scheduler, and
+training. Numbers verified by probe scripts under `agent_space/probe_*.py`
+and `agent_space/vk_validation_sweep*.py`. Source: this turn's session.
 
 ### 0.5.1 Headline numbers
 
 | Probe | Result | Reaction |
 |-------|--------|----------|
-| MLP train warm step | **75 µs kernel / 1.63 ms wall** | 96 % host overhead — feeds M9 |
-| SmallCNN train warm step | **191 µs kernel / 43.9 ms wall** | 230× host/kernel — feeds M9 |
-| SmallCNN cold compile | ✅ **prewarmed on import** (M9.3 closed 2026-05-13) — shader-lib `.slang-module` cache primed in a bg daemon thread before user's first dispatch; first-compile path short-circuits the precompile pass | M9.3 closed |
-| MLP buffer pool, 10 steps | ✅ **18 / 50 hits (36 %)** (fixed 2026-05-13; was 0/50 — see M9.1) | M9.1 closed |
-| GN + ReLU + GlobalAvg | **2 kernels (target: 1)** | Reduction-boundary fusion gap — M9 |
-| Transformer (d=64, h=4, s=32) compile | **`UnboundLocalError: buf10`** in wrapper | combo-batcher bug — file + M9 |
-| Validation sweep (10 paths) | **0 VUIDs** (post 4 fixes earlier in 2026-05-13) | Clean |
-| Validation sweep best-practices | **0 hints** (post CommandPool fix) | Clean |
-| CPU eager MLP / Vulkan | 0.033 ms vs 1.63 ms = **49× slower** | Host overhead, not kernels |
-| CPU eager SmallCNN / Vulkan | 0.634 ms vs 43.9 ms = **69× slower** | Host overhead, not kernels |
+| MLP train warm step | 75 µs kernel / 1.63 ms wall | **96 % host overhead** — M9.2 / M9.4 |
+| SmallCNN train warm step | 191 µs kernel / 43.9 ms wall | 230× host/kernel — M9.2 / M9.4 / M9.8 |
+| SmallCNN cold compile | ✅ prewarmed on import (M9.3, 2026-05-13) | — |
+| MLP buffer pool, 10 steps | ✅ 18 / 50 hits (36 %) — M9.1, 2026-05-13 | 90 % of releasable buffers recycle |
+| GN + ReLU + GlobalAvg | 2 kernels (target: 1) | Reduction-boundary fusion gap — M9.8 |
+| Transformer combo-kernel | `UnboundLocalError: buf10` in `vulkan_combo_kernel.py:987-1019` token rewriter | M9.9 (root cause located) |
+| Models that train end-to-end | **9 architectures** (MLP, SmallCNN, Transformer, Qwen3.5 GatedDeltaNet, ViT, Mamba-2, Llama MLP+block, Mixtral MoE) | North star — sustain |
+| Backward op coverage | **57/58** `aten.*_backward` via `bwd_diff_table` | Only legacy `embedding_dense_backward` hand-rolled (not Slang-eligible) |
+| `csrc/ops/model_ops.cpp` line drift | 885 L → **925 L** (+40 since v6.1 audit) | Reverse drift — see M16 |
+| Files > 800 L | **10 violators** (was 4 in v6.1) | M10 expanded → M15 |
 
-### 0.5.2 Anti-goal violations confirmed
+### 0.5.2 Slang feature saturation (per-feature %)
 
-| Anti-goal | State | Where | Fix milestone |
-|-----------|-------|-------|---------------|
-| #6 — no string template params | ✅ **FIXED 2026-05-13** | mm template now uses `computeMain<Epilogue : IDifferentiable>` Slang generic in `templates/slang_mm.{slang,py.jinja}`; verified by `tests/test_cgm10_idifferentiable.py` (11 tests, all passing) | M10.4 / CG.M10 — closed |
-| #7 — files ≤ 800 L | **VIOLATED 4×** | `vulkan_template_caller.py` 5786 L, `meta_patches.py` 3902 L, `kernel/pointwise.py` 1555 L, `fx_passes/eager_patches.py` 1159 L | M10.1-3 |
-| #3 — no `aten.*_backward` lowerings | **PARTIAL** | Reduction bwd: 6 `[Differentiable]` in `lib/reduction.slang`; `tests/test_cgm3_reduction_backward.py` has 13 tests / 11 xfailed — code present, dispatch wiring incomplete | M12 |
-| #2 — `csrc/ops/model_ops.cpp` = 0 L | **VIOLATED** | 885 L remain | Track-4 close (existing) |
+| Feature | Score | Top blocker / what to do |
+|---------|-------|---------|
+| Generics `<T : Float>` / `<Op : I…>` | 70 % | mm uses `<Epilogue : IDifferentiable>`; conv/SDPA/reduction still string-templated (CG.M12-M13) |
+| Interfaces `IPointwise` etc. | 80 % | Defined; reduction codegen still passes `op_template="OpSum"` as string (CG.M13) |
+| `[Differentiable]` / `bwd_diff()` | 80 % | 80 ops carry annotation; reduction dispatch wiring partial (M12.2) |
+| `[BackwardDerivative]` | 30 % | Only `pointwise.slang` has perf overrides (29 ops); other libs zero. CG.M11 |
+| `ParameterBlock<T>` | 30 % | mm only. Pointwise/reduction still emit manual `[[vk::binding(N)]]`. CG.M14 |
+| Reflection metadata (VGPR/LDS) | **0 %** | Parsed by `_extract_linktime_spec_constants`, never consumed at codegen. M11.1 |
+| Link-time specialisation | 40 % | mm only (TILE_M/N/K, M/N_PER_THREAD); conv / SDPA / reduction hardcoded. CG.M15 |
+| Capabilities `[require(…)]` | **0 %** | No subgroup-size or shader-model gating anywhere. CG.M16 |
+| `[[vk::constant_id]]` | 20 % | mm only. Others use push constants exclusively. CG.M15 |
+| vec2/vec4 packing | 60 % | Codegen does string `replace(…)` to vectorise — fragile; no Slang struct abstraction. CG.M14 |
+| Subgroup ops (`WaveActiveSum`) | 50 % | `wave_sum` helper exists; no automatic emission in reduction kernels. CG.M16 |
+| Persistent kernels | 40 % | Only small-numel pointwise. Multi-wave persistent reductions not auto-selected. M11.4 |
+| Grid-aware WG sizing | 100 % | Pointwise only; reductions don't query grid. Documented as "on by default" — verified. |
 
-### 0.5.3 Slang feature exploitation (updated 2026-05-13 post-CG.M10)
+### 0.5.3 Anti-goal accounting (refreshed)
 
-| Feature | Score | Top blocker |
-|---------|-------|-------------|
-| Generics `<T : Float>` / `<Op : I…>` | 70 % | mm now uses `<Epilogue : IDifferentiable>`; conv/SDPA templates still need same treatment (CG.M5-M7) |
-| Interfaces | 80 % | mm/reduction shipped; `IConvBias`, `INormAffine` defined but not yet consumed by templates |
-| `[Differentiable]` + `bwd_diff()` | 75 % | Reduction (6/8 ops `[Differentiable]`, dispatch wiring partial — M12), conv (CG.M6 in `tests/test_cgm6_*`), SDPA (CG.M7 in `tests/test_cgm7_*`) |
-| `[BackwardDerivative(fast_bwd)]` | 38 % | CG.M9 audit live; PF.11 benchmark not wired |
-| `ParameterBlock<T>` | 100 % | shipped, locked by `TestTemplateParameterBlockInvariant` |
-| Reflection metadata | 35 % | VGPR/LDS parsed but never consumed at codegen (DR.7 dormant) |
-| Link-time specialisation | 15 % | slangc upstream E30600 |
-| Capabilities `[require(…)]` | 78 % | No systematic audit for non-RDNA1 targets |
-| `[SpecializationConstant]` | n/a | Vulkan `[[vk::constant_id]]` preferred — correct by accident |
+| # | Anti-goal | State | Where | Fix milestone |
+|---|-----------|-------|-------|---------------|
+| #2 | `csrc/ops/model_ops.cpp` = 0 L | **VIOLATED** (925 L, +40 drift) | 22 legacy eager kernels (triu/tril, constant_pad_nd, index_tensor, repeat, stack, erf, narrow, flip, roll, as_strided, sin/cos, mse_loss fwd+bwd, …) | **M16** |
+| #3 | No `aten.*_backward` lowerings | ✅ **CLOSED** | 57/58 via `bwd_diff_table`; only legacy `embedding_dense_backward` (not Slang-eligible) | — |
+| #5 | No symptom-patches in `meta_patches` | **VIOLATED** | 3902 L; 120+ `@register_fake` hooks; `_fuse_sdpa_to_flash_attention` is a symptom-fix for missing native attention primitive | M15.2 / M14.6 |
+| #6 | No string-template params | **PARTIAL** | mm fixed (M10.4); conv / SDPA still Jinja-conditional on `has_bias` / `has_activation`; reduction still string-keyed `op_template="OpSum"`; `generic_pointwise_dispatch.py` Jinja2-templates raw Slang source | CG.M12 / CG.M13 |
+| #7 | Files ≤ 800 L | **VIOLATED 10×** | See table § 0.5.4 | **M15.1** |
 
-### 0.5.4 Vulkan-spec spec hygiene (closed 2026-05-13)
+### 0.5.4 File-size violators (full list)
 
-| VUID / hint | Was | Fix |
-|-------------|-----|-----|
-| `VUID-VkDeviceCreateInfo-pNext-02830` | pNext chain mixed `Vulkan12Features` + legacy `DescriptorIndexingFeatures` | Collapsed to Vulkan 1.2 struct (`Context.cpp`) |
-| `VUID-VkDescriptorSetLayoutCreateInfo-flags-03000` | per-binding `UPDATE_AFTER_BIND_BIT` w/o matching layout flag | Set layout flag unconditionally when desc-indexing on (`Pipeline.cpp`) |
-| `VUID-VkShaderModuleCreateInfo-pCode-08740` | SPIR-V `Int64` used, `shaderInt64` never enabled | Added cap query + enable (`Context.{h,cpp}`) |
-| `BestPractices-vkCreateCommandPool-command-buffer-reset` | `RESET_COMMAND_BUFFER_BIT` set, unused | Dropped flag (`CommandBuffer.cpp`) |
-| **non-fatal SPIR-V validation: `OpULessThan` operand class** | Surfaces during SmallCNN cold compile | File — needs codegen-side fix (probably emitting signed compare with unsigned operand) |
+| File | Lines | Cap multiple | Already in roadmap? | Milestone |
+|------|------:|-------------:|---------------------|-----------|
+| `vulkan_template_caller.py` | 5786 | 7.2× | ✅ M10.1 | M15.1 |
+| `meta_patches.py` | 3902 | 4.9× | ✅ M10.2 | M15.1 / M15.2 |
+| `runtime.py` | 2955 | 3.7× | ❌ NEW | **M15.1** |
+| `kernel/pointwise.py` | 1555 | 1.9× | ✅ M10.3 | M15.1 |
+| `fx_passes/eager_patches.py` | 1159 | 1.4× | ❌ NEW | **M15.1** |
+| `vulkan_combo_kernel.py` | 1106 | 1.4× | ❌ NEW | **M15.1** |
+| `kernel/reduction.py` | 981 | 1.2× | ❌ NEW | **M15.1** |
+| `bwd_diff_dispatch.py` | 913 | 1.1× | ❌ NEW | **M15.1** |
+| `validate.py` | 813 | 1.0× | ❌ NEW (borderline) | M15.1 |
+| `lowerings/rnn.py` | 805 | 1.0× | ❌ NEW (borderline) | M15.1 |
 
-### 0.5.5 New punch list (work into M9-M12)
+### 0.5.5 New items added by this audit
 
-**M9 — Host-overhead reduction (1w, P0 for perf)**
+Counted: **22 new items** across M9 (1), M11 (1), M13 (6), M14 (6), M15 (6), M16 (1), M6 (1).
 
-- [x] **M9.1** Buffer-pool 0 % hit rate root-cause — **FIXED 2026-05-13**. Acquire-side keyed on `allocation_shape` (e.g. `(1, 8, 64)`); release-side keyed on `tensor.size()` after the wrapper's `.as_strided((8, 64), …)` view, so buckets never matched (50 acquires / 0 hits / 20 releases on 10-step MLP train). Fix: switch the pool key to *storage element count* (`numel` of the underlying buffer, invariant under `as_strided`) — `_key()` and `vulkan_pool_release()` in `python/torch_vulkan/inductor/buffer_pool.py`. Probe `agent_space/probe_buffer_pool.py` now reports **18/50 hits (36 %)** on the same MLP loop; 90 % of releasable buffers recycle. Floor locked in `tests/test_inductor_regression.py::TestBufferPool::{test_m9_1_allocation_shape_vs_view_shape_round_trip, test_m9_1_mlp_train_hit_rate_floor}` (≥ 25 %).
-- [ ] **M9.2** Deferred command-buffer batching: stop per-dispatch `submit_and_wait`; submit 4-8 dispatches per `vkQueueSubmit`. (`Stream.cpp` has a skeleton.) Target: -5 to -10 ms / SmallCNN step. (2-3d)
-- [x] **M9.3** Prewarm-on-import — **FIXED 2026-05-13**. `precompile_shader_libs()` now runs in a background daemon thread from `inductor/__init__.py::_legacy_register()` via `prewarm_shader_libs(sync=False)`. The pass writes `<lib>.slang-module` artefacts to `~/.cache/torch_vulkan/slang-modules/` before any `torch.compile` dispatch fires — the audit-measured 9 s cold step on SmallCNN (8 slangc × ~800 ms re-parsing lib imports) now overlaps with the user's first kernel compile rather than serialising before it. Module-cache writes are guarded by `_shader_lib_modules_lock` so the bg thread and lazy first-compile path can't double-emit `.slang-module` files. The precompile is now `lax=True` at the lazy path too, so a stale/dead lib (e.g. `norm.slang` references the legacy 3-arg `wg_reduce<…>` API) no longer aborts the whole pass — failing libs are listed in the result's `failed` field; kernels that `import` them fall through to slangc's source-parse path. Locked in `tests/test_inductor_regression.py::TestAtomicsLibModule::{test_m9_3_prewarm_shader_libs_runs_before_first_dispatch, test_m9_3_prewarm_shader_libs_respects_opt_out}`. Empirical: bg thread flips `_shader_lib_modules_ready=True` ~8 s after `import torch_vulkan` (one-time cold-cache write; cached on subsequent runs).
+---
+
+## 1. M9 — Host-overhead reduction (P0 for perf, 1-2w remaining)
+
+Closes the 96 % / 230× host/kernel gap. M9.1 (buffer pool) and M9.3
+(prewarm) closed 2026-05-13.
+
+- [x] **M9.1** — buffer-pool key bug ✅ closed 2026-05-13 (see history doc)
+- [ ] **M9.2** Deferred command-buffer batching: stop per-dispatch `submit_and_wait`; submit 4–8 dispatches per `vkQueueSubmit`. Skeleton in `Stream.cpp`. Target: −5 to −10 ms / SmallCNN step. **Next-largest perf win.** (2-3d)
+- [x] **M9.3** — prewarm-on-import ✅ closed 2026-05-13 (see history doc)
 - [ ] **M9.4** Push-constant in-place updates: pre-allocate bytearray per kernel; update fields, don't `bytes(pc_data)` per dispatch. (1d)
 - [ ] **M9.5** Cached `_jit_dispatch_indexed`: codegen prefers indexed variant when any binding has count > 1. (1d)
 - [ ] **M9.6** Adaptive `_PER_KEY_CAP` in `buffer_pool.py` (scratch=8, transient=6, save_for_backward=4). (1d)
-- [ ] **M9.7** Pool non-extern Inductor outputs (currently only extern-kernel outputs are pooled). (1-2d)
-- [ ] **M9.8** Reduction-boundary fusion: GN + ReLU + GlobalAvg should fuse into 1 kernel, not 2. (2-3d)
-- [ ] **M9.9** Transformer combo-batcher `UnboundLocalError: buf10` — `vulkan_combo_kernel` emits buf reference before assignment. Repro: `agent_space/probe_transformer.py`. (1-2d)
+- [ ] **M9.7** Pool non-extern Inductor outputs (currently only extern-kernel outputs are pooled). Closes the residual ~64 % miss rate. (1-2d)
+- [ ] **M9.8** Reduction-boundary fusion: GN + ReLU + GlobalAvg should fuse into 1 kernel, not 2. Relax `rnumel_fuse_cap` gate in `scheduling.py:248-261`, or change gate to predicate on consumer pattern rather than rnumel. (2-3d)
+- [ ] **M9.9** Transformer combo-batcher `UnboundLocalError: buf10`. **Root cause located**: `vulkan_combo_kernel.py:987-1019` `_rewrite_body()` token-based renaming runs before the buffer-name map is fully seeded; if a buffer name isn't in `per_sub_maps[idx]`, the rewriter emits the original name and collides with a renamed local from a previous subkernel. Fix: pre-seed buffer names via `_build_global_binding_map()` (line 689-795) before the rewrite loop. (1-2d)
 
-**M10 — Anti-goal cleanup (1-2w, debt reduction)**
+---
 
-- [ ] **M10.1** Split `vulkan_template_caller.py` (5786 L → 4-5 files of ≤ 800 L each), one per template family (gemm, scatter, optimizer, flash_attn, rng). (1-2d)
-- [ ] **M10.2** Split `meta_patches.py` (3902 L) into `meta_patches/{shape_ops,dtype_ops,faketensor_hooks}.py`. Audit for stale patches now that Track-1 codegen is clean. (1d)
-- [ ] **M10.3** Split `kernel/pointwise.py` (1555 L): extract `PointwiseLoadMixin` + `PointwiseVec4Mixin`. (1.5d)
-- [x] **M10.4** **CG.M10** — promoted mm epilogue from `{{ epilogue }}::apply()` Jinja string interp to Slang `<Epilogue : IDifferentiable>` generic. ✅ **Shipped 2026-05-13** (`templates/slang_mm.{slang,py.jinja}` line 219/222; `tests/test_cgm10_idifferentiable.py` 11 tests passing). Closes anti-goal #6.
-- [ ] **M10.5** Lift `_VALID_IPOINTWISE_STRUCTS` frozenset to auto-parse `lib/pointwise.slang` at startup; drop manual sync. (0.5d)
-- [ ] **M10.6** Remove redundant outer cast in `kernel/pointwise.py:68-81` int8 load dispatch (`((float)((int(…) << 24) >> 24))` → `((int(…) << 24) >> 24)`). (0.5d)
-- [ ] **M10.7** Audit & remove stale TODO gate at `vulkan_template_caller.py:754` (P3.2/M14 dead flag). (0.5d)
-- [ ] **M10.8** Extract pickle/repr boilerplate from `_SlangTile{MM,AddMM,BMM}` into a common base. (1d)
+## 2. M11 — Occupancy-aware codegen (1-2w, throughput)
 
-**M11 — Occupancy-aware codegen (1-2w, throughput)**
+The headline finding of this audit: **reflection metadata is 0 % used**
+despite roadmap text. `occupancy_audit.py` hardcodes shapes per kernel
+category. `_extract_linktime_spec_constants` parses VGPR / LDS counts but
+they're never fed into WG sizing. Wiring this up is M11.1's whole point.
 
-- [ ] **M11.1** **DR.7 wire-up**: feed reflection VGPR/LDS into `_pick_threadgroup_size_*` instead of leaving `estimate_occupancy()` as a debug-only tool. Default flag → on. Target: +10-20 % on reduction/normalisation kernels. (2-3d)
+- [ ] **M11.1** **DR.7 wire-up (THE 0 % gap)**: feed reflection VGPR/LDS into `_pick_threadgroup_size_*` instead of leaving `estimate_occupancy()` as a debug-only tool. Default flag → on. Target: +10–20 % on reduction/normalisation kernels. (2-3d)
 - [ ] **M11.2** Subgroup reductions for WG ≤ wave64: emit `WaveActiveSum`/`WaveActiveMax` instead of LDS reduce. (2d)
 - [ ] **M11.3** Register-tile pointwise: load+compute+store unrolled ×2-4. (3d)
-- [ ] **M11.4** Persistent-mode WG autotune: scale WG size by `numel / CU_count`; today the persistent path uses a fixed WG. (1-2d)
+- [ ] **M11.4** Persistent-mode WG autotune: scale WG size by `numel / CU_count`; today the persistent path uses a fixed WG. Extend persistent path to multi-wave reductions (currently small-numel pointwise only). (1-2d)
 - [ ] **M11.5** Round non-multiple-of-64 WG sizes up to next multiple on RDNA1 (auto-fix `slang_validator.py` advisory). (0.5d)
 - [ ] **M11.6** LDS bank-padding rigour: auto-pad WG-shared arrays > 1 KB to nearest power of 2 to avoid stride-1 bank conflicts. (1-2d)
 - [ ] **M11.7** Occupancy gate in `codegen.py`: warn (or `--strict` fail) if estimated occupancy < 50 %. (1-2d)
 - [ ] **M11.8** Extend `_KERNEL_STATS` to capture grid, WG, VGPR, LDS, descriptor count (populated from reflection). (1-2d)
-
-**M12 — Reduction backward via autodiff (CG.M3, ~1w remaining)**
-
-- [~] **M12.1** Partial: 6 `[Differentiable]` annotations in `shaders/lib/reduction.slang` (sum/mean/var fold paths shipped). Still need: prod, max, min, argmax, argmin coverage. (1-2d)
-- [ ] **M12.2** Route `aten.{sum,mean,prod,…}_backward` through `bwd_diff_table.py` instead of hand-rolled lowering. `tests/test_cgm3_reduction_backward.py` has 13 tests / 11 xfailed — dispatch wiring is the gate. Closes anti-goal #3 for the reduction class. (2d)
-- [ ] **M12.3** Retire any `aten.*_backward` reduction shaders still living outside `lib/`. (1d)
-
-### 0.5.6 Items downgraded / re-classified
-
-- **CG.M3** (reduction backward via `[Differentiable]`) — promoted to M12 (was loose in CLAUDE.md "next").
-- **DR.7** (reflection-routed WG) — promoted to M11.1; previously code-present-but-dormant.
-- **N+1.9** (link-time spec) — stays gated on slangc E30600; no change.
-- **CG.M4–M7** (norm/matmul/conv/SDPA via `[Differentiable]`) — stay in CLAUDE.md tactical list; M12 (reduction) is the natural first hop.
+- [ ] **M11.9 (NEW)** Reduction WG sizing: `kernel/reduction.py:725+` has no grid-aware path. Add one — feed `numel/CU_count` like pointwise does. (1d)
 
 ---
 
-## 1. M6 — Conv Generality (T4.12) — ✅ Phase 1 SHIPPED
+## 3. M12 — Reduction backward via autodiff (CG.M3, ~1w remaining)
 
-### Current State
-- ✅ Conv2d fwd+bwd: full support via `slang_conv2d.slang` + CG.M6 bwd template
-- ✅ Dilation > 1: supported via im2col decomposition
-- ✅ **Conv1d: fwd+bwd via reshape to Conv2d (M6 Phase 1 — DONE 2026-05-11)**
-- ✅ Conv3d KD=1: shipped. Grouped conv (arbitrary groups>1): per-group decomposition
-- ✅ Depthwise (groups>1): per-channel fwd+bwd shipped
-- ✅ Transposed conv: lowering registered (aten.conv_transpose2d.input)
+`reduction.slang` has 6 `[Differentiable]` annotations (sum/mean/var fold
+paths shipped) but the dispatch wiring is incomplete: 11/13 tests in
+`tests/test_cgm3_reduction_backward.py` are xfailed. Routing through
+`bwd_diff_table` would close anti-goal #3 for the reduction class
+(already closed for activations/losses/conv/mm).
 
-### Plan (updated 2026-05-10)
-
-**Phase 1 — Conv1d support ✅ DONE (2026-05-11):**
-- Conv1d lowered by reshaping [N,C,L] → [N,C,L,1], dispatching to Conv2d, squeezing back
-- Automatically inherits backward from Conv2d's CG.M6 bwd template
-- Stride, padding, dilation, groups all handled via the 2D parameter expansion
-- Lowering lives in `lowerings/conv.py` (`_vulkan_conv1d_with_optional_bias`)
-- Tests in `TestConv1dCompile`: fwd correctness, backward, grouped, causal conv1d
-- Unblocks: Whisper encoder, Mamba causal conv1d, audio models
-
-**Phase 2 — Depthwise conv (groups=C):**
-- Depthwise is Conv2d where each input channel has its own kernel
-- Can be lowered to group Conv2d with groups=C
-- The existing im2col path should handle this with correct groups parameter
-
-**Phase 3 — Conv3d:**
-- Conv3d can be lowered to Conv2d by merging spatial dims
-- Or implement directly by extending the 2D template
-
-**Phase 4 — Transposed conv:**
-- Transposed conv = backward of regular conv
-- Can reuse CG.M6's conv backward template with swapped roles
-
-### Files
-- `lowerings/conv.py` — add reshape-based lowering for Conv1d
-- `templates/slang_conv2d.py.jinja` — extend for groups>1
-- `tests/test_inductor_regression.py` — flip Conv1d/3D/depthwise xfails
-- `tests/test_e2e_models.py` — enable Whisper/Mamba conv1d tests
+- [~] **M12.1** 6 `[Differentiable]` annotations in `shaders/lib/reduction.slang` (sum/mean/var). Still need: prod, max, min, argmax, argmin. (1-2d)
+- [ ] **M12.2** Route `aten.{sum,mean,prod,max,min}_backward` through `bwd_diff_table.py` instead of hand-rolled lowerings. `tests/test_cgm3_reduction_backward.py` 11/13 xfailed — dispatch wiring is the gate. (2d)
+- [ ] **M12.3** Retire any `aten.*_backward` reduction shaders living outside `lib/`. (1d)
 
 ---
 
-## 2. M7 — Production Hardening (gated)
+## 4. M13 — Slang feature saturation (NEW, 2-3w)
+
+The mm template (M10.4 / CG.M10) is the gold standard. Bring conv, SDPA,
+reduction, and pointwise dispatch up to the same bar.
+
+- [ ] **CG.M11 BackwardDerivative coverage outside `pointwise.slang`**: `norm.slang` 8 forward `[Differentiable]` but 4 backward; `losses.slang` 12/10 split (gap is small); `reduction.slang` 6 forward / 0 backward; `mm_tile.slang` 1 forward / 0 backward. Add explicit `[BackwardDerivative(...)]` overrides for the perf-critical ops (avoids autodiff fallback). (3-4d)
+- [ ] **CG.M12 Pointwise dispatch via Slang generics**: `generic_pointwise_dispatch.py` Jinja2-templates raw Slang source and compiles a fresh module per op. Replace with a single Slang generic `<Op : IPointwise>` instantiated via specialization constants or slangc generic-specialisation at link time. Closes anti-goal #6 for pointwise. (3d)
+- [ ] **CG.M13 Reduction codegen via interface**: `reduction.py:76-100` uses `op_template="OpSum"` strings. Switch to `<W : IWaveReduction>` constraint on a single `wg_reduce<W>` template; per-op variants become type instantiations. (3d)
+- [ ] **CG.M14 ParameterBlock in pointwise/reduction**: kernels still emit manual `[[vk::binding(N)]]` literals. Wrap bindings in `struct KernelArgs` + `ParameterBlock<KernelArgs>` like `slang_mm.slang:87-100` does. Saves ~5 LOC per kernel and unlocks reflection. (2-3d)
+- [ ] **CG.M15 Link-time spec constants for conv / SDPA**: only mm uses `[[vk::constant_id]]` for tile / per-thread params. Conv (`slang_conv2d.slang`), SDPA (`flash_attention.slang`), and the reduction template family hardcode loop bounds. Extract them to spec constants so a single SPIR-V module covers many tile choices. Reduces slangc invocations from N×tile_count to N. Gated on M13's slangc-bug status. (3-4d)
+- [ ] **CG.M16 Capabilities `[require(...)]` audit**: zero usage. Add explicit gates for `subgroupSize == 64` on the RDNA1 paths and ladder up to `subgroupSize == 32` for RDNA2/3 / NVIDIA. Today everything assumes wave64. (1-2d)
+- [ ] **CG.M17 Replace string `.replace()` vec4 codegen**: `kernel/pointwise.py:964-967` does `body.replace(f"{inner}[{a}]", f"_v_{inner}[_k]")` — fragile token surgery. Move to a typed Slang `vec4<float>` struct abstraction. (2d)
+
+---
+
+## 5. M14 — Op coverage gaps (NEW, 2-3w)
+
+Closes the "any PyTorch model" story by filling categorical holes the
+audit found.
+
+- [ ] **OP.20 Complex-dtype binary elementwise**: complex64/128 matmul + softmax work, but `complex_add`, `complex_mul`, `complex_div` have no `IPointwise` struct in `shaders/lib/pointwise.slang`. They fall through to `ExternKernel` (eager dispatch). Add 4-5 complex-valued op structs; lower via `generic_pointwise_dispatch`. **Unblocks**: vision/audio models using `torch.view_as_complex`. (2-3d)
+- [ ] **OP.21 Sparse / scatter-atomic backward**: `scatter_atomic.py.jinja` is a placeholder (`codegen.py:164-172`). Backward of `index_put_`, `scatter_add_`, and `embedding_bag` all currently go through eager. **Unblocks**: sparse attention, embedding-bag training, retrieval/RecSys workloads. (8-10d — biggest item)
+- [ ] **OP.22 Dynamic-shape reduction codegen**: D.4 forward partial; backward fails on symbolic `B`. `kernel/symbolic.py` raises `NotImplementedError` on symbolic-stride reductions. **Unblocks**: variable-batch training without per-shape recompilation. (5-7d)
+- [ ] **OP.23 Foreach element-wise ops**: `install_external_optimizer` covers SGD/AdamW/Lion. Missing: `foreach_add`, `foreach_mul`, `foreach_div`, `foreach_lerp`, `foreach_clip_grad_norm`. Reuse the foreach template plumbing. **Unblocks**: gradient-clipping codepaths, multi-param updates. (2-3d)
+- [ ] **OP.24 Quantized int8 matmul (inference)**: No int8 GEMM kernel. Falls to CPU/external. **Unblocks**: GPTQ / AWQ / quantized Llama inference. Forward only — quantized training is out of scope. (5-7d)
+- [ ] **OP.25 RNN backward via Slang autodiff**: `bwd_lowerings.py:687L` decomposes RNN grads manually; GRU backward marked "more complex" and incomplete. **Unblocks**: LSTM/GRU training parity. (6-8d)
+- [ ] **OP.26 Anti-symptom: native attention primitive**: `_fuse_sdpa_to_flash_attention` is currently a symptom-fix for the absence of a native `aten.scaled_dot_product_attention` lowering. Promote the FlashAttention template to a real primitive lowering registered via `@register_lowering(aten.scaled_dot_product_attention)`. Closes anti-goal #5 for SDPA. (3d)
+
+---
+
+## 6. M15 — Anti-goal #5/#7 cleanup (NEW, 1-2w)
+
+Expanded successor to v6.1's M10. Six newly-discovered file-size
+violators plus a `meta_patches.py` symptom-fix audit.
+
+- [ ] **M15.1 File splits (10 violators):**
+  - [ ] M15.1.a `vulkan_template_caller.py` (5786 L) → `templates/caller/{gemm,scatter,optimizer,flash_attn,rng}.py` (was M10.1). (1-2d)
+  - [ ] M15.1.b `meta_patches.py` (3902 L) → `meta_patches/{shape_ops,dtype_ops,faketensor_hooks}.py` + audit for stale patches (was M10.2). (1d)
+  - [ ] M15.1.c `runtime.py` (2955 L) → `runtime/{slangc,dispatch,batcher,profile,prewarm}.py`. **NEW.** (1-2d)
+  - [ ] M15.1.d `kernel/pointwise.py` (1555 L) → extract `PointwiseLoadMixin` + `PointwiseVec4Mixin` (was M10.3). (1.5d)
+  - [ ] M15.1.e `fx_passes/eager_patches.py` (1159 L) → `fx_passes/eager/{addmm,sdpa,swiglu,qkv,optimizer}.py`. **NEW.** (1d)
+  - [ ] M15.1.f `vulkan_combo_kernel.py` (1106 L) → split body-rewriter from binding-map / grid-builder. **NEW** (also fixes M9.9 indirectly). (1d)
+  - [ ] M15.1.g `kernel/reduction.py` (981 L) → extract `ReductionLoadMixin` + per-axis tile picker. **NEW.** (1d)
+  - [ ] M15.1.h `bwd_diff_dispatch.py` (913 L) → split unary/binary dispatch + emit helpers. **NEW.** (1d)
+- [ ] **M15.2 `meta_patches.py` symptom-fix audit**: 120+ `@register_fake` hooks. Classify each as (a) genuine FakeTensor shape-inference patch, (b) workaround for missing primitive, (c) drift from upstream. Promote (b) to real lowerings or FX rewrites; delete (c) and re-validate against upstream. Closes anti-goal #5. (2-3d)
+- [ ] **M15.3 Small fixes carried over from v6.1:**
+  - [ ] Lift `_VALID_IPOINTWISE_STRUCTS` frozenset to auto-parse `lib/pointwise.slang` at startup; drop manual sync. (0.5d)
+  - [ ] Remove redundant outer cast in `kernel/pointwise.py:68-81` int8 load dispatch. (0.5d)
+  - [ ] Audit & remove stale TODO gate at `vulkan_template_caller.py:754` (P3.2/M14 dead flag). (0.5d)
+  - [ ] Extract pickle/repr boilerplate from `_SlangTile{MM,AddMM,BMM}` into a common base. (1d)
+
+---
+
+## 7. M16 — Track 4 finish (NEW, 1w, IRREVERSIBLE)
+
+`csrc/ops/model_ops.cpp` is 925 L (drift from 885 since v6.1 audit). 22
+legacy eager kernels — these block the "no per-model `csrc/ops/*.cpp`
+entries" anti-goal. Track 4 was meant to delete this file. The drift
+suggests new ops are still landing here despite the anti-goal.
+
+- [ ] **M16.1** Inventory `model_ops.cpp` — categorise each of the 22 ops as (a) covered by an Inductor lowering already (delete from cpp), (b) needs a new Inductor lowering before delete, (c) genuinely eager-only (move to `csrc/ops/legacy_eager.cpp` to make the boundary explicit). (1d)
+- [ ] **M16.2** Add eager-mode lowering parity for category (b) ops. (3-4d)
+- [ ] **M16.3** Delete `model_ops.cpp` and lock with a regression test that fails the build if it returns. (0.5d)
+- [ ] **M16.4** Lock the boundary: pre-commit hook or `build.py` check that fails when any new `*_backward` or `*_op` symbol lands under `csrc/ops/` outside the allowed list. (0.5d)
+
+---
+
+## 8. M6 — Conv generality (Phase 2-4)
+
+Phase 1 (Conv1d) closed 2026-05-11 — see history doc.
+
+- [ ] **Phase 2 — Depthwise conv (groups=C, arbitrary)**: existing per-group decomposition handles up to groups=4; needs extension. (2-3d)
+- [ ] **Phase 3 — Conv3d (KD>1)**: merge spatial dims or extend the 2D template. (3-4d)
+- [ ] **Phase 4 — Transposed conv (1D / 3D)**: reuse CG.M6's conv backward template with swapped roles. (2-3d)
+
+Files: `lowerings/conv.py`, `templates/slang_conv2d.py.jinja`,
+`tests/test_inductor_regression.py` (flip xfails), `tests/test_e2e_models.py`.
+
+---
+
+## 9. M7 — Production hardening (gated)
 
 ### N+1.9 Link-time tile spec
 - **Blocker:** slangc `E30600` cross-module generic specialization bug
@@ -207,94 +273,129 @@ probe scripts under `agent_space/probe_*.py` and `agent_space/vk_validation_swee
 
 ---
 
-## 3. M8 — Model Zoo Expansion (ongoing)
+## 10. M8 — Model zoo expansion (ongoing)
 
-### Currently covered (85 tests — Llama-3 block added)
-ViT encoder, Llama MLP, Llama-3 full block, Mixtral MoE, Stable Diffusion (RMSNorm+RoPE+SwiGLU), UNet block, Whisper full encoder, Mamba-2 selective scan,
-MiniGPT, ResNet, Transformer block, Qwen3.5 GatedDeltaNet, SmallCNN training
+### Currently trains end-to-end under `torch.compile` (9 architectures)
+MLP, SmallCNN, Transformer block, Qwen3.5 GatedDeltaNet, ViT encoder,
+Mamba-2, Llama MLP + full block, Mixtral MoE. (66 e2e tests total
+including forward-only.)
 
-### Candidates for expansion
+### Candidates blocked on specific milestones
 | Model | Key ops | Blocker |
 |-------|---------|---------|
-| Whisper full encoder | Conv1d + attention | ✅ ADDED (full pipeline) |
-| Mamba/Mamba2 | Causal conv1d | ✅ ADDED |
-| Stable Diffusion UNet | Conv2d + GroupNorm + attention + upsample | ✅ ADDED (attention+upsample, GN xfail) |
-| Llama-3 full | RoPE + RMSNorm + SwiGLU | ✅ ADDED (8 tests) |
-| Mixtral MoE | Top-k routing + experts | ✅ ADDED (6 tests) |
+| Stable Diffusion UNet full | GroupNorm backward + conv-transpose decoder | M14 (GN bwd) + M6 Phase 4 (transposed) |
+| LSTM/GRU language model | RNN backward | OP.25 |
+| Quantized Llama inference | int8 matmul | OP.24 |
+| Sparse attention models | scatter-atomic bwd | OP.21 |
+| Variable-batch fine-tune | dynamic-shape reduction bwd | OP.22 |
 
 ---
 
-## 4. Heuristic Improvements (2026-05-11)
+## 11. Heuristic / GPU-utilization flags (state)
 
-| Feature | Gate | Impact |
-|---------|------|--------|
-| Aggressive fusion | `TORCH_VULKAN_AGGRESSIVE_FUSION=1` | Relaxed memory threshold, reduction+pointwise tails, multi-consumer fusion |
-| Persistent kernel v2 | `TORCH_VULKAN_PERSISTENT_POINTWISE=1` | Per-thread work + op-count scaling, cap raised to 16384 |
-| Grid-aware WG v2 | `TORCH_VULKAN_GRID_AWARE_WG=1` | Targets num_cus × waves_per_cu wave slots |
-| Dispatch ratchet | `TestDispatchCountRatchet` | MLP fwd ≤8, SmallCNN train ≤25 |
-
----
-
-## 5. GPU Utilization (Wave 16, all active by default)
-
-| Feature | Gate | Impact |
-|---------|------|--------|
-| Batch dispatch | `TORCH_VULKAN_BATCH_DISPATCH=1` | Single `vkQueueSubmit` per graph |
-| Wrapper fast-path | `TORCH_VULKAN_WRAPPER_FASTPATH=1` | Cached imports, skipped validation |
-| Dispatch profiling | `TORCH_VULKAN_PROFILE_DISPATCHES=1` | Per-kernel timing stats |
-| Grid-aware WG | `TORCH_VULKAN_GRID_AWARE_WG=1` | Smaller WGs for small grids |
-| Persistent pointwise | `TORCH_VULKAN_PERSISTENT_POINTWISE=1` | Grid-stride loop fusion |
-| Occupancy estimator | `estimate_occupancy()` | VGPR/LDS/thread bottleneck report |
+| Feature | Gate | Default | Audit verdict |
+|---------|------|---------|---------------|
+| Aggressive fusion | `TORCH_VULKAN_AGGRESSIVE_FUSION` | OFF | Verified working; relaxes rnumel cap |
+| Persistent kernel v2 | `TORCH_VULKAN_PERSISTENT_POINTWISE` | ON | Pointwise only; reduction extension pending M11.4 |
+| Grid-aware WG v2 | `TORCH_VULKAN_GRID_AWARE_WG` | ON | Pointwise only; reduction extension pending M11.9 |
+| Batch dispatch | `TORCH_VULKAN_BATCH_DISPATCH` | ON | Single `vkQueueSubmit` per graph; M9.2 takes it further (multi-graph batching) |
+| Wrapper fast-path | `TORCH_VULKAN_WRAPPER_FASTPATH` | ON | Cached imports, skipped validation |
+| Dispatch profiling | `TORCH_VULKAN_PROFILE_DISPATCHES` | OFF | On-demand per-kernel timing |
+| Async compile | `TORCH_VULKAN_ASYNC_COMPILE` | ON | ThreadPoolExecutor; in-flight dedup |
+| Buffer pool | `TORCH_VULKAN_BUFFER_POOL` | ON | 36 % hit rate on MLP train (M9.1 closed 2026-05-13) |
+| Prewarm-on-import | `TORCH_VULKAN_NO_PREWARM=1` to disable | ON | Shader-lib `.slang-module` precompiled in bg thread (M9.3 closed 2026-05-13) |
+| Dispatch ratchet | `TestDispatchCountRatchet` | — | MLP fwd ≤ 8, SmallCNN train ≤ 25 |
 
 ---
 
-## 5. Reference Files
+## 12. Critical path (dependency chart)
+
+```
+M9.2 (cmd-buf batch) ──→ closes 96 % host overhead (training perf)
+M9.8 (red-bound fusion) ──→ unblocks GN+ReLU+GlobalAvg → 1 kernel
+M9.9 (combo-batcher) ──→ unblocks Transformer compile
+
+M11.1 (DR.7 wire-up) ──→ +10-20 % on reductions   ┐
+M11.2 (subgroup red.) ──→ +sum/mean/max perf      ├─ throughput phase
+M11.4 (persistent reduction) ──→ small-rnumel perf┘
+
+M12.1-3 (red. bwd) ──→ closes anti-goal #3 for reductions
+
+CG.M12 (pointwise generic) ┐
+CG.M13 (reduction generic) ├─→ closes anti-goal #6 fully
+CG.M15 (conv/SDPA spec constants) ┘
+
+OP.21 (sparse) ──→ unblocks sparse attention / embedding-bag bwd
+OP.22 (dyn-shape red.) ──→ variable-batch training
+OP.25 (RNN bwd) ──→ LSTM/GRU training
+OP.26 (native SDPA prim) ──→ closes anti-goal #5 for attention
+
+M15.1 (file splits) ──→ closes anti-goal #7 (parallel-safe; no semantic risk)
+M15.2 (meta_patches audit) ──→ closes anti-goal #5
+
+M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
+```
+
+---
+
+## 13. Reference files
 
 | Concern | Primary file(s) |
 |---------|----------------|
 | Backend registration | `python/torch_vulkan/inductor/__init__.py` |
 | Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` |
+| Combo kernel | `python/torch_vulkan/inductor/vulkan_combo_kernel.py` |
 | Kernel codegen | `python/torch_vulkan/inductor/kernel/` |
 | Lowerings | `python/torch_vulkan/inductor/lowerings/` |
 | FX passes | `python/torch_vulkan/inductor/fx_passes/` |
 | Runtime / slangc | `python/torch_vulkan/inductor/runtime.py` |
+| Buffer pool | `python/torch_vulkan/inductor/buffer_pool.py` |
 | bwd_diff dispatch | `python/torch_vulkan/inductor/bwd_diff_dispatch.py` |
 | bwd_diff table | `python/torch_vulkan/inductor/bwd_diff_table.py` |
 | Templates | `python/torch_vulkan/inductor/templates/` |
+| Template caller | `python/torch_vulkan/inductor/vulkan_template_caller.py` |
+| meta patches | `python/torch_vulkan/inductor/meta_patches.py` |
 | C++ AOTI runtime | `csrc/backend/AotiRuntime.cpp` |
-| Slang lib modules | `shaders/lib/` |
-| Regression tests | `tests/test_inductor_regression.py` |
+| C++ legacy eager ops | `csrc/ops/model_ops.cpp` (slated for deletion — M16) |
+| Slang lib modules | `shaders/lib/{helpers,dtype_pack,philox,special_math,bucket,mm,mm_tile,atomics,conv,norm,pointwise,reduction,losses,tensor_layout}.slang` |
+| Slang templates | `python/torch_vulkan/inductor/templates/*.{jinja,slang}` |
+| Regression tests | `tests/test_inductor_regression.py` (39 k lines, 66 e2e model tests, 9 training-grade architectures) |
 | E2E model tests | `tests/test_e2e_models.py` |
 
 ---
 
-## 6. Building, Testing, Profiling
+## 14. Building, testing, profiling
 
 ### Build
 ```bash
-python -m pip install --no-build-isolation -v -e .
+cd backends/vulkan_slang
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=8 python setup.py build_ext --inplace
 ```
 
-### Regression suite
+### Regression suite (~90 s with xdist)
 ```bash
-python -m pytest backends/vulkan_slang/tests/test_inductor_regression.py -x -q
+python -m pytest tests/ -n 4 --timeout=120 -p no:faulthandler
 ```
 
 ### E2E model tests
 ```bash
-python -m pytest backends/vulkan_slang/tests/test_e2e_models.py -x -q
+python -m pytest tests/test_e2e_models.py -x -q -p no:faulthandler
 ```
 
 ### Useful environment knobs
 ```bash
-TORCH_VULKAN_DYNAMIC_SHAPES=1      # Variable-batch support (default ON)
+TORCH_VULKAN_DYNAMIC_SHAPES=1      # Variable-batch (default ON)
 TORCH_VULKAN_BATCH_DISPATCH=1      # Batch dispatch (default ON)
 TORCH_VULKAN_PERSISTENT_POINTWISE=1 # Persistent kernels (default ON)
-TORCH_VULKAN_GRID_AWARE_WG=1       # Grid-aware WG sizing (default ON)
+TORCH_VULKAN_GRID_AWARE_WG=1       # Grid-aware WG (default ON)
 TORCH_VULKAN_PROFILE_DISPATCHES=1  # Dispatch timing
 TORCH_VULKAN_SPEC_CONSTANTS=1      # Spec constants (default ON)
 TORCH_VULKAN_DESCRIPTOR_INDEXING=1 # >16 bindings (default ON)
 TORCH_VULKAN_BANK_CONFLICT_PAD=1   # LDS bank padding (default ON)
 TORCH_VULKAN_STATIC_SPECIALIZATION=1 # Static const (default ON)
 TORCH_VULKAN_ASYNC_COMPILE=1       # Parallel slangc (default ON)
+TORCH_VULKAN_BUFFER_POOL=1         # Output buffer recycle (default ON)
+TORCH_VULKAN_NO_PREWARM=0          # Set =1 to disable bg shader-lib precompile
+TORCH_VULKAN_POOL_STATS=1          # Detailed per-event pool stats
+TORCH_VULKAN_INDUCTOR_STATS=1      # Per-kernel call_count / total_us
 ```

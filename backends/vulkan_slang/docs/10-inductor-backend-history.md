@@ -2094,6 +2094,76 @@ ResNet, Transformer, Qwen3.5, SmallCNN North Star
 ### Remaining (genuinely blocked)
 - N+1.9 Link-time tile spec (slangc upstream bug E30600)
 - T7.2 Full .so subprocess (C++ build infrastructure)
-- T4.12 Conv1d/3D/depthwise (template generality)
+- ~~T4.12 Conv1d/3D/depthwise (template generality)~~ Conv1d closed M6 Phase 1 (2026-05-11); 3D/transposed still open
 - Track CI (GPU hardware)
+
+---
+
+## v6.1 → v6.2 closeouts (2026-05-11 / 2026-05-13)
+
+These items were live in v6.1 and shipped before the v6.2 audit refresh. Kept
+here for the trailer; the active roadmap drops them from § 0.
+
+### M6 Phase 1 — Conv1d via reshape (closed 2026-05-11)
+
+Conv1d `[N, C, L]` is now lowered by reshaping to `[N, C, L, 1]`, dispatching
+through the existing Conv2d template (which already has the CG.M6
+`[Differentiable]`/`[BackwardDerivative]` backward shader), then squeezing
+back. Stride, padding, dilation and groups all flow through the 2-D parameter
+expansion. Lowering lives in
+`python/torch_vulkan/inductor/lowerings/conv.py::_vulkan_conv1d_with_optional_bias`.
+Tests in `TestConv1dCompile`: forward correctness, backward, grouped, causal
+conv1d. Unblocks Whisper encoder, Mamba causal conv1d, audio models.
+
+### M9.1 — Buffer-pool 0 % hit rate (closed 2026-05-13)
+
+The wrapper allocated a buffer with `allocation_shape` (e.g. `(1, 8, 64)`)
+and immediately `.as_strided`'d it to the view shape. The pool keyed
+acquires on the allocation shape and releases on the view shape, so the
+buckets never matched — 50 acquires / 0 hits / 20 releases on a 10-step
+MLP train. Fix: key the pool on the storage element count (numel of the
+underlying buffer), which is invariant under `as_strided` views.
+`agent_space/probe_buffer_pool.py` now reports 18/50 hits (36 %); 90 % of
+releasable buffers recycle. Locked by `TestBufferPool::{
+test_m9_1_allocation_shape_vs_view_shape_round_trip,
+test_m9_1_mlp_train_hit_rate_floor}` (floor ≥ 25 %).
+Implementation: `python/torch_vulkan/inductor/buffer_pool.py::_key()` and
+`vulkan_pool_release()`.
+
+### M9.3 — Prewarm-on-import shader libs (closed 2026-05-13)
+
+`precompile_shader_libs()` now runs in a background daemon thread from
+`inductor/__init__.py::_legacy_register()` via
+`prewarm_shader_libs(sync=False)`. The pass writes `<lib>.slang-module`
+artefacts to `~/.cache/torch_vulkan/slang-modules/` before any
+`torch.compile` dispatch fires — the audit-measured 9 s cold step on
+SmallCNN (8 slangc × ~800 ms re-parsing lib imports) now overlaps with
+the user's first kernel compile rather than serialising before it.
+Module-cache writes are guarded by `_shader_lib_modules_lock` so the bg
+thread and lazy first-compile path can't double-emit. The precompile
+also grows a `lax=True` mode so a single stale lib (e.g. `norm.slang`
+references the legacy 3-arg `wg_reduce<…>` API) can't abort the whole
+pass — failing libs land in the result's `failed` field; kernels that
+`import` them fall back to slangc's source-parse path. Locked by
+`TestAtomicsLibModule::{test_m9_3_prewarm_shader_libs_runs_before_first_dispatch,
+test_m9_3_prewarm_shader_libs_respects_opt_out}`.
+
+### M10.4 / CG.M10 — mm epilogue via Slang `IDifferentiable` generic (closed 2026-05-13)
+
+The matmul template's epilogue dispatch was promoted from
+`{{ epilogue }}::apply()` Jinja string interpolation to a true Slang generic
+`<Epilogue : IDifferentiable>` constraint. Closes anti-goal #6 for the
+matmul template family. Locked by `tests/test_cgm10_idifferentiable.py` (11
+tests passing). The same lift is *not yet* done for conv / SDPA /
+reduction — see CG.M12-M16 in v6.2.
+
+### Anti-goal accounting update (post-2026-05-13)
+
+| # | Anti-goal | v6.1 state | v6.2 state |
+|---|-----------|-----------|-----------|
+| #2 | `csrc/ops/model_ops.cpp` = 0 L | 885 L | 925 L (drift — see M16 in v6.2) |
+| #3 | No `aten.*_backward` lowerings | partial (reduction bwd) | ✅ 57/58 (only legacy `embedding_dense_backward` remains; not Slang-eligible) |
+| #5 | No symptom-patches in `meta_patches` | partial | still violated (3902 L; M15 covers) |
+| #6 | No string-template params | mm fixed | conv / SDPA / reduction still use Jinja conditionals (CG.M12-M16) |
+| #7 | Files ≤ 800 L | 4 violators | 10 violators (audit re-count; M10 / M15 expanded) |
 
