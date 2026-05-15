@@ -14,6 +14,9 @@
 
 namespace torch_vulkan { namespace ops {
 
+// CG.M15: SpecConstant = (spec_id, value) pair for VkSpecializationInfo.
+using SpecConstant = std::pair<uint32_t, uint32_t>;
+
 // Per-device runtime state (stream, descriptor pool)
 struct DeviceRuntime {
     std::unique_ptr<vulkan::Stream> stream;
@@ -48,6 +51,10 @@ BufferInfo get_buffer_info(const at::Tensor& tensor);
 //   Default 1: last tensor is the output.
 //   Use 2+ for shaders with multiple output bindings (e.g. rms_norm, max_pool2d_indices).
 //   Used for smart barrier insertion: barrier emitted only when a read depends on a prior write.
+//
+// CG.M15: spec_constants are (constant_id, value) pairs that override
+// ``[[vk::constant_id]]`` defaults at pipeline-creation time.  A single
+// SPIR-V module can serve multiple tile configurations this way.
 void dispatch_shader(
     const std::string& key,
     const uint32_t* spirv_code,
@@ -58,7 +65,8 @@ void dispatch_shader(
     uint32_t num_workgroups_z = 1,
     const void* push_constants = nullptr,
     uint32_t push_constants_size = 0,
-    uint32_t num_outputs = 1);
+    uint32_t num_outputs = 1,
+    const std::vector<SpecConstant>& spec_constants = {});
 
 // N+1.5: dispatch with descriptor-array bindings.
 // `descriptor_counts.size()` = number of bindings; sum = total buffers,
@@ -66,6 +74,8 @@ void dispatch_shader(
 // `descriptor_counts[i]` consecutive entries from `buffers`.
 //
 // Falls back to the flat path when all counts are 1.
+//
+// CG.M15: spec_constants are (constant_id, value) pairs for specialization.
 void dispatch_shader_indexed(
     const std::string& key,
     const uint32_t* spirv_code,
@@ -77,7 +87,8 @@ void dispatch_shader_indexed(
     uint32_t num_workgroups_z = 1,
     const void* push_constants = nullptr,
     uint32_t push_constants_size = 0,
-    uint32_t num_outputs = 1);
+    uint32_t num_outputs = 1,
+    const std::vector<SpecConstant>& spec_constants = {});
 
 // Convenience: dispatch element-wise shader with numel push constant
 inline void dispatch_elementwise(

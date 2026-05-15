@@ -32,6 +32,7 @@ from .lowerings.bwd_diff import (
     _ensure_binary_loss_bwd_diff_op,
     _ensure_unary_bwd_diff_op,
 )
+from .lowerings.embedding import _register_embedding_bag_backward
 
 
 def _is_vulkan(x) -> bool:
@@ -637,6 +638,121 @@ def _register_batch_norm_backward() -> None:
         return outputs
 
 
+def _register_reduction_backward() -> None:
+    """CG.M3 — Reduction backward lowerings decomposed into primitives.
+
+    Decomposes ``aten.{sum,mean,var,prod}_backward`` into pointwise
+    and reduction primitives that the Vulkan backend already supports.
+    This closes anti-goal #3 for the reduction class — backward routes
+    through the decomposition here rather than hand-rolled lowerings.
+
+    The [Differentiable] fold functions in shaders/lib/reduction.slang
+    (reduce_fold_sum / reduce_fold_prod) provide the autodiff proof;
+    the runtime dispatch for the broadcast step goes through
+    bwd_diff_dispatch.dispatch_reduction_bwd when the decomposition
+    is suppressed.
+    """
+    import torch
+    from torch._inductor import lowering as L
+    from torch._inductor.lowering import register_lowering
+
+    aten = torch.ops.aten
+
+    # ── sum_backward(grad, sizes, dim, keepdim) ──────────────────────
+    # Just expand grad to match the input shape.
+    try:
+        _sum_bwd_target = aten.sum_backward.default
+    except AttributeError:
+        _sum_bwd_target = None
+
+    if _sum_bwd_target is not None:
+
+        @register_lowering(_sum_bwd_target, type_promotion_kind=None)
+        def _vulkan_sum_backward(grad_output, sizes, dim, keepdim):
+            if not _is_vulkan(grad_output):
+                return NotImplemented
+            # expand grad_output to sizes
+            return L.lowerings[aten.expand.default](grad_output, list(sizes))
+
+    # ── mean_backward(grad, sizes, dim, numel, keepdim) ──────────────
+    # grad / numel expanded to sizes.
+    try:
+        _mean_bwd_target = aten.mean_backward.default
+    except AttributeError:
+        _mean_bwd_target = None
+
+    if _mean_bwd_target is not None:
+
+        @register_lowering(_mean_bwd_target, type_promotion_kind=None)
+        def _vulkan_mean_backward(grad_output, sizes, dim, numel, keepdim):
+            if not _is_vulkan(grad_output):
+                return NotImplemented
+            inv_numel = 1.0 / float(numel)
+            scaled = L.lowerings[aten.mul.Scalar](grad_output, inv_numel)
+            return L.lowerings[aten.expand.default](scaled, list(sizes))
+
+    # ── var_backward(grad, self, dim, correction, keepdim) ───────────
+    # grad * 2 * (self - mean) / (N - correction)
+    # Registered for both aten.var_backward and aten.var.correction_backward.
+    for _var_bwd_name in ("var_backward", "var.correction_backward"):
+        try:
+            _var_bwd_target = getattr(aten, _var_bwd_name).default
+        except AttributeError:
+            continue
+
+        @register_lowering(_var_bwd_target, type_promotion_kind=None)
+        def _vulkan_var_backward(
+            grad_output,
+            self,
+            dim,
+            correction,
+            keepdim,
+            _var_name=_var_bwd_name,
+        ):
+            if not _is_vulkan(grad_output):
+                return NotImplemented
+            # Compute mean over the reduced dimensions.
+            mean = L.lowerings[aten.mean.dim](self, dim, True)
+            # centered = self - mean
+            centered = L.lowerings[aten.sub.Tensor](self, mean)
+            # N = product of sizes over dim
+            dims = dim if dim is not None else list(range(self.get_ndim()))
+            N = 1
+            for d in dims:
+                N *= self.get_size()[d]
+            denom = float(N) - float(correction)
+            if denom <= 0.0:
+                denom = 1.0
+            scale = 2.0 / denom
+            # grad_in = grad_output * centered * scale
+            scaled_grad = L.lowerings[aten.mul.Scalar](grad_output, scale)
+            return L.lowerings[aten.mul.Tensor](scaled_grad, centered)
+
+    # ── prod_backward(grad, self, result[, dim, keepdim]) ────────────
+    # grad * result.expand_as(self) / self
+    for _prod_bwd_name in ("prod_backward", "prod.dim_int_backward"):
+        try:
+            _prod_bwd_target = getattr(aten, _prod_bwd_name).default
+        except AttributeError:
+            continue
+
+        @register_lowering(_prod_bwd_target, type_promotion_kind=None)
+        def _vulkan_prod_backward(
+            grad_output,
+            self,
+            result,
+            *args,
+            _prod_name=_prod_bwd_name,
+        ):
+            if not _is_vulkan(grad_output):
+                return NotImplemented
+            # result may be a scalar or reduced tensor; expand to match self.
+            if result.get_ndim() < self.get_ndim():
+                result = L.lowerings[aten.expand.default](result, list(self.get_size()))
+            div = L.lowerings[aten.div.Tensor](result, self)
+            return L.lowerings[aten.mul.Tensor](grad_output, div)
+
+
 def _register_softmax_backward() -> None:
     """P0.1 — ``_softmax_backward_data`` / ``_log_softmax_backward_data``.
 
@@ -681,7 +797,9 @@ def register() -> None:
     """
     _register_bwd_diff_lowerings()
     _register_algebraic_backward_lowerings()
+    _register_reduction_backward()
     _register_layer_norm_backward()
     _register_group_norm_backward()
     _register_batch_norm_backward()
     _register_softmax_backward()
+    _register_embedding_bag_backward()  # OP.21 — scatter backward via decomposition

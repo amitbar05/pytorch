@@ -77,8 +77,18 @@ _SCRATCH_LIFETIME = "scratch"
 
 
 _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
-_PER_KEY_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
+_PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
 _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
+# M9.6: adaptive per-key caps per lifetime class. Higher caps for high-churn
+# classes (scratch/transient) reduce eviction pressure; lower caps for
+# long-lived classes (save_for_backward) bound memory without hurting reuse.
+# The env var TORCH_VULKAN_BUFFER_POOL_PER_KEY sets the fallback for classes
+# not in this table (default 4).
+_PER_KEY_CAPS: dict[str, int] = {
+    _SCRATCH_LIFETIME: 8,
+    "transient": 6,
+    "save_for_backward": 4,
+}
 # TRAIN.8: detailed per-event pool stats, opt-in via TORCH_VULKAN_POOL_STATS=1.
 # Tracks per-event timing (acquire/release hit/miss/evict), per-bucket histograms,
 # and total bytes recycled. Access via :func:`pool_stats_detailed()`.
@@ -112,6 +122,22 @@ _release_counts: dict[str, int] = {cls: 0 for cls in LIFETIME_CLASSES}
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def _per_key_cap_for(lifetime_class: str) -> int:
+    """Return the per-key capacity for a given lifetime class.
+
+    M9.6: adaptive caps — scratch=8, transient=6, save_for_backward=4.
+    If ``TORCH_VULKAN_BUFFER_POOL_PER_KEY`` is explicitly set in the
+    environment, that value overrides all classes (preserving the legacy
+    behaviour for tests and tuning). Otherwise, each class uses its own cap;
+    classes not in ``_PER_KEY_CAPS`` fall back to ``_PER_KEY_CAP_DEFAULT``
+    (4, or the env-var override).
+    """
+    # When the env var is explicitly set (not default), use it for all classes.
+    if "TORCH_VULKAN_BUFFER_POOL_PER_KEY" in os.environ:
+        return _PER_KEY_CAP_DEFAULT
+    return _PER_KEY_CAPS.get(lifetime_class, _PER_KEY_CAP_DEFAULT)
 
 
 def _numel(size) -> int:
@@ -327,16 +353,20 @@ def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None
     # (8, 64)`` but its storage still holds 512 elements — the next
     # acquire keys on 512 and must find this bucket.
     elem = tensor.element_size()
-    storage_numel = tensor.untyped_storage().nbytes() // elem if elem else tensor.numel()
+    storage_numel = (
+        tensor.untyped_storage().nbytes() // elem if elem else tensor.numel()
+    )
     key = _key((storage_numel,), tensor.dtype, lifetime_class)
     bucket = _buckets.get(key)
     if bucket is None:
         bucket = deque()
         _buckets[key] = bucket
-    elif len(bucket) >= _PER_KEY_CAP:
+    elif len(bucket) >= _per_key_cap_for(lifetime_class):
         _stats["evictions"] += 1
         _record_pool_event(
-            "release_evict_per_key", key=str(key), per_key_cap=_PER_KEY_CAP
+            "release_evict_per_key",
+            key=str(key),
+            per_key_cap=_per_key_cap_for(lifetime_class),
         )
         if _POOL_STATS_ENABLED:
             _POOL_BYTES_EVICTED += tensor.element_size() * tensor.numel()
@@ -454,7 +484,7 @@ def pool_stats_detailed() -> dict:
 
 def _reset_disabled_cache() -> None:
     """Re-read ``TORCH_VULKAN_BUFFER_POOL`` from the env. Test hook."""
-    global _POOL_DISABLED, _PER_KEY_CAP, _GLOBAL_CAP
+    global _POOL_DISABLED, _PER_KEY_CAP_DEFAULT, _GLOBAL_CAP
     _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
-    _PER_KEY_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
+    _PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
     _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))

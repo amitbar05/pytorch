@@ -701,6 +701,91 @@ public struct OpCopysign : IPointwiseBinary {
     static float apply(float a, float b) { return copysign_fwd(a, b); }
 };
 
+// ── Complex-valued pointwise interfaces ────────────────────────────────────
+// Complex numbers are stored as interleaved float2 (real=x, imag=y) in the
+// SSBO.  Each complex element occupies one float2 slot.  The complex tensor
+// numel is the number of complex elements (not the number of float scalars).
+
+public interface IComplexPointwise {
+    static float2 apply(float2 x);
+};
+
+public interface IComplexPointwiseBinary {
+    static float2 apply(float2 a, float2 b);
+};
+
+// Complex addition: component-wise (a.x + b.x, a.y + b.y)
+public struct OpComplexAdd : IComplexPointwiseBinary {
+    static float2 apply(float2 a, float2 b) {
+        return a + b;
+    }
+};
+
+// Complex subtraction: component-wise (a.x - b.x, a.y - b.y)
+public struct OpComplexSub : IComplexPointwiseBinary {
+    static float2 apply(float2 a, float2 b) {
+        return a - b;
+    }
+};
+
+// Complex multiplication: (a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x)
+public struct OpComplexMul : IComplexPointwiseBinary {
+    static float2 apply(float2 a, float2 b) {
+        return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+    }
+};
+
+// Complex division: a / b = (a * conj(b)) / |b|^2
+public struct OpComplexDiv : IComplexPointwiseBinary {
+    static float2 apply(float2 a, float2 b) {
+        float denom = b.x * b.x + b.y * b.y;
+        float inv = denom != 0.0f ? 1.0f / denom : 0.0f;
+        return float2(
+            (a.x * b.x + a.y * b.y) * inv,
+            (a.y * b.x - a.x * b.y) * inv
+        );
+    }
+};
+
+// Complex conjugate: (x.x, -x.y)
+public struct OpComplexConj : IComplexPointwise {
+    static float2 apply(float2 x) {
+        return float2(x.x, -x.y);
+    }
+};
+
+// Complex absolute value: sqrt(x.x^2 + x.y^2).  Returns (|x|, 0): the
+// caller is responsible for extracting the real component when writing
+// back to a real-valued output buffer.
+public struct OpComplexAbs : IComplexPointwise {
+    static float2 apply(float2 x) {
+        return float2(sqrt(x.x * x.x + x.y * x.y), 0.0f);
+    }
+};
+
+// ── Complex dispatch helpers ───────────────────────────────────────────────
+
+[ForceInline]
+public void pointwise_complex_unary_apply<Op : IComplexPointwise>(
+    StructuredBuffer<float2> input,
+    RWStructuredBuffer<float2> output,
+    uint idx, uint n
+) {
+    if (idx < n) output[idx] = Op::apply(input[idx]);
+}
+
+[ForceInline]
+public void pointwise_complex_binary_apply<Op : IComplexPointwiseBinary>(
+    StructuredBuffer<float2> in_a,
+    StructuredBuffer<float2> in_b,
+    RWStructuredBuffer<float2> output,
+    uint idx, uint n
+) {
+    if (idx < n) output[idx] = Op::apply(in_a[idx], in_b[idx]);
+}
+
+// ── Float (real-valued) dispatch ───────────────────────────────────────────
+
 [ForceInline]
 public void pointwise_unary_apply<Op : IPointwise>(
     StructuredBuffer<float> input,

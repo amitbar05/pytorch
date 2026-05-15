@@ -316,114 +316,14 @@ at::Tensor& vulkan_masked_scatter_(at::Tensor& self, const at::Tensor& mask, con
 // Falls back to CPU roundtrip when the input is not on Vulkan or cannot
 // be converted to float32.
 at::Tensor vulkan_nonzero(const at::Tensor& self) {
-    // Fallback for non-Vulkan tensors
-    if (self.device().type() != c10::DeviceType::PrivateUse1) {
-        auto cpu_input = self.cpu();
-        auto cpu_result = at::nonzero(cpu_input);
-        return cpu_result.to(self.device());
-    }
-
-    // GPU path: two-pass scan
-    auto self_c = self.contiguous();
-    int64_t ndim = self_c.dim();
-    // Fall back to CPU for 0D or >4D tensors (shader supports 1D-4D)
-    if (ndim == 0 || ndim > 4) {
-        auto cpu_input = self.cpu();
-        auto cpu_result = at::nonzero(cpu_input);
-        return cpu_result.to(self.device());
-    }
-
-    // Ensure float32 for the shader (handles f16/bf16 via GPU cast)
-    auto orig_dtype = self_c.scalar_type();
-    if (!is_supported_float(orig_dtype) && orig_dtype != at::kBool) {
-        // For integer types not easily cast to float, fall back to CPU
-        auto cpu_input = self.cpu();
-        auto cpu_result = at::nonzero(cpu_input);
-        return cpu_result.to(self.device());
-    }
-    self_c = ensure_float32(self_c);
-
-    uint32_t numel = static_cast<uint32_t>(self_c.numel());
-    if (numel == 0) {
-        return at::empty({0, ndim}, self_c.options().dtype(at::kLong));
-    }
-
-    uint32_t num_workgroups = (numel + 255) / 256;
-
-    // ── Allocate workspace buffer (uint32, one per workgroup) ──
-    auto workspace = at::empty({static_cast<int64_t>(num_workgroups)},
-                               self_c.options().dtype(at::kInt));
-
-    // ── Pass 1: count nonzero elements per workgroup ──
-    {
-        struct { uint32_t numel; } count_params{numel};
-        dispatch_shader("nonzero_count",
-                        shaders::indexing_nonzero_count_fwd,
-                        shaders::indexing_nonzero_count_fwd_size,
-                        {self_c, workspace},
-                        num_workgroups, 1, 1,
-                        &count_params, sizeof(count_params));
-    }
-
-    // Flush GPU work and read workspace back to CPU for prefix sum
-    flush_stream();
-    auto workspace_cpu = workspace.cpu().to(at::kInt);
-    auto* ws_ptr = workspace_cpu.data_ptr<int32_t>();
-
-    // ── CPU: compute exclusive prefix sum over per-WG counts ──
-    uint32_t total_nonzero = 0;
-    std::vector<uint32_t> prefix(num_workgroups);
-    for (uint32_t i = 0; i < num_workgroups; i++) {
-        prefix[i] = total_nonzero;
-        total_nonzero += static_cast<uint32_t>(ws_ptr[i]);
-    }
-
-    // Handle empty result
-    if (total_nonzero == 0) {
-        return at::empty({0, ndim}, self_c.options().dtype(at::kLong));
-    }
-
-    // Write exclusive prefix sum back to workspace on GPU
-    {
-        auto& alloc = VulkanAllocator::instance();
-        auto* buf = alloc.get_buffer(workspace.data_ptr());
-        TORCH_CHECK(buf, "Failed to get Vulkan buffer for workspace");
-        buf->write(prefix.data(),
-                   static_cast<VkDeviceSize>(num_workgroups * sizeof(uint32_t)));
-    }
-
-    // ── Allocate output tensor: (total_nonzero, ndim) int64 ──
-    // The shader writes int64 as pairs of uint32, so we allocate
-    // int64 buffer and treat it as uint32 in the shader.
-    auto output = at::empty({static_cast<int64_t>(total_nonzero), ndim},
-                            self_c.options().dtype(at::kLong));
-
-    // ── Pass 2: scatter nonzero indices to output ──
-    {
-        // Build shape array for push constants (up to 4D)
-        uint32_t s0 = static_cast<uint32_t>(self_c.size(0));
-        uint32_t s1 = ndim >= 2 ? static_cast<uint32_t>(self_c.size(1)) : 1u;
-        uint32_t s2 = ndim >= 3 ? static_cast<uint32_t>(self_c.size(2)) : 1u;
-        uint32_t s3 = ndim >= 4 ? static_cast<uint32_t>(self_c.size(3)) : 1u;
-
-        struct {
-            uint32_t ndim;
-            uint32_t shape0;
-            uint32_t shape1;
-            uint32_t shape2;
-            uint32_t shape3;
-            uint32_t numel;
-        } scatter_params{static_cast<uint32_t>(ndim), s0, s1, s2, s3, numel};
-
-        dispatch_shader("nonzero_scatter",
-                        shaders::indexing_nonzero_scatter_fwd,
-                        shaders::indexing_nonzero_scatter_fwd_size,
-                        {self_c, workspace, output},
-                        num_workgroups, 1, 1,
-                        &scatter_params, sizeof(scatter_params));
-    }
-
-    return output;
+    // CPU fallback: move input to CPU, call nonzero, move result to Vulkan.
+    // TODO(OP.1.a-fast-GPU): replace with GPU-native two-pass scan when
+    // shaders (indexing_nonzero_count_fwd, indexing_nonzero_scatter_fwd)
+    // are generated.
+    auto self_cpu = self.cpu();
+    auto result_cpu = at::nonzero(self_cpu);
+    return result_cpu.to(self.device());
 }
+
 
 }} // namespace torch_vulkan::ops

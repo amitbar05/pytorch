@@ -275,6 +275,11 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             )
         return VulkanPythonWrapperCodegen()
 
+    def __init__(self):
+        super().__init__()
+        # M9.7: track lifetime_class per output buffer name for the stash.
+        self._output_lifetime_map: dict[str, str] = {}
+
     def write_header(self):
         super().write_header()
         self.header.splice(
@@ -309,6 +314,9 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
                 "def assert_alignment(*args, **kwargs):\n"
                 "    return None\n"
             )
+        # M9.7: per-function output stash for lookback recycling.
+        # Populated at return-time; drained at the start of the next call.
+        self.header.splice("_stashed_outputs = []\n")
 
     def write_prefix(self) -> None:
         super().write_prefix()
@@ -316,6 +324,15 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         if _batch_dispatch_enabled():
             self.writeline("_batcher = DispatchBatcher()")
             self.writeline("_batcher.__enter__()")
+        # M9.7: release outputs stashed by the previous call.
+        # Drained before any new allocations so the pool can re-vend
+        # same-sized output buffers immediately (lookback depth 1).
+        # Manual 4-space indentation relative to function body —
+        # the assembly wraps wrapper_call with 1 level of indent.
+        self.writeline("if _stashed_outputs:")
+        self.writeline("    for _t, _lt in _stashed_outputs:")
+        self.writeline("        vulkan_pool_release(_t, lifetime_class=_lt)")
+        self.writeline("    _stashed_outputs.clear()")
 
     def generate_end_graph(self):
         # GPU.1: Exit the DispatchBatcher before graph end — flushes all.
@@ -327,6 +344,17 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         # GPU.1: Flush batcher before return so kernels execute.
         if _batch_dispatch_enabled():
             self.wrapper_call.writeline("_batcher.__exit__(None, None, None)")
+        # M9.7: stash outputs for next-call recycling (lookback depth 1).
+        # Emit (tensor, lt) tuples so release reuses the correct pool key.
+        if output_refs:
+            stash_entries = []
+            for ref in output_refs:
+                base_name = ref.split(".")[0].split("(")[0].strip()
+                lt = self._output_lifetime_map.get(base_name, "transient")
+                stash_entries.append(f"({ref}, {lt!r})")
+            self.wrapper_call.writeline(
+                f"_stashed_outputs[:] = [{', '.join(stash_entries)}]"
+            )
         super().generate_return(output_refs)
 
     def codegen_input_size_asserts(self) -> None:
@@ -385,6 +413,8 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         stride = layout.stride
         dtype = layout.dtype
         lifetime_class = _lifetime_class_for_name(name)
+        # M9.7: track lifetime class for output stash.
+        self._output_lifetime_map[name] = lifetime_class
 
         # Emit pool-aware pre-allocation.
         size_tuple = self.codegen_python_shape_tuple(size)
@@ -475,6 +505,8 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             # IR buffer has no annotated origin (legacy graphs, meta-
             # device fallback path, allocations without an FX preimage).
             lifetime_class = _lifetime_class_for_name(name)
+            # M9.7: track lifetime class for output stash.
+            self._output_lifetime_map[name] = lifetime_class
             out = (
                 f"{name} = empty_strided_vulkan("
                 f"{codegen_alloc_tuple}, "

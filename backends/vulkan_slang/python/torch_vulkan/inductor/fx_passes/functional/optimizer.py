@@ -562,5 +562,59 @@ def _route_foreach_add_to_template(
         _debug(f"T4.8 routing: no nodes routed (scanned {total_foreach} foreach nodes)")
 
 
+# OP.23: Decompose _foreach_lerp variants into ops that work with the
+# Vulkan backend. Inductor's ForeachKernelSchedulerNode creates per-tensor
+# sub-kernels using *_out ops (lerp.Scalar_out, lerp.Tensor_out) which
+# aren't implemented for Vulkan. Decomposing at the FX graph level avoids
+# this path entirely.
+def _decompose_foreach_lerp(
+    gm: "torch.fx.GraphModule",
+) -> "torch.fx.GraphModule":
+    """Decompose aten._foreach_lerp.* into sub + mul + add foreach ops."""
+    import torch
+
+    aten = torch.ops.aten
+    targets = {
+        aten._foreach_lerp.Scalar,
+        aten._foreach_lerp.ScalarList,
+        aten._foreach_lerp.List,
+    }
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target not in targets:
+            continue
+        start_tensors = node.args[0]
+        end_tensors = node.args[1]
+        weight = node.args[2] if len(node.args) > 2 else None
+
+        # Decompose: lerp(start, end, w) = start + w * (end - start)
+        with gm.graph.inserting_before(node):
+            diff = gm.graph.call_function(
+                aten._foreach_sub.List, (end_tensors, start_tensors)
+            )
+            if node.target is aten._foreach_lerp.Scalar:
+                scaled = gm.graph.call_function(
+                    aten._foreach_mul.Scalar, (diff, weight)
+                )
+            elif node.target is aten._foreach_lerp.ScalarList:
+                scaled = gm.graph.call_function(
+                    aten._foreach_mul.ScalarList, (diff, weight)
+                )
+            else:  # List (tensor weights)
+                scaled = gm.graph.call_function(aten._foreach_mul.List, (diff, weight))
+            result = gm.graph.call_function(
+                aten._foreach_add.List, (start_tensors, scaled)
+            )
+            result.meta = dict(node.meta)
+        node.replace_all_uses_with(result)
+        gm.graph.erase_node(node)
+        changed = True
+
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
 _DUMP_FX_DIR = None
 _DUMP_FX_COUNTER = 0

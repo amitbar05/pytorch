@@ -8,29 +8,34 @@ Pipeline::Pipeline(VkDevice device,
                    const uint32_t* spirv_code,
                    size_t spirv_size,
                    uint32_t num_buffers,
-                   uint32_t push_constant_size)
+                   uint32_t push_constant_size,
+                   const std::vector<SpecConstant>& spec_constants)
     : device_(device),
       descriptor_counts_(num_buffers, 1u),
       total_buffers_(num_buffers) {
-    create_pipeline_objects(spirv_code, spirv_size, push_constant_size);
+    create_pipeline_objects(spirv_code, spirv_size, push_constant_size,
+                            spec_constants);
 }
 
 Pipeline::Pipeline(VkDevice device,
                    const uint32_t* spirv_code,
                    size_t spirv_size,
                    const std::vector<uint32_t>& descriptor_counts,
-                   uint32_t push_constant_size)
+                   uint32_t push_constant_size,
+                   const std::vector<SpecConstant>& spec_constants)
     : device_(device), descriptor_counts_(descriptor_counts) {
     total_buffers_ = 0;
     for (uint32_t c : descriptor_counts_) {
         total_buffers_ += c;
     }
-    create_pipeline_objects(spirv_code, spirv_size, push_constant_size);
+    create_pipeline_objects(spirv_code, spirv_size, push_constant_size,
+                            spec_constants);
 }
 
 void Pipeline::create_pipeline_objects(const uint32_t* spirv_code,
                                        size_t spirv_size,
-                                       uint32_t push_constant_size) {
+                                       uint32_t push_constant_size,
+                                       const std::vector<SpecConstant>& spec_constants) {
     // Create shader module
     VkShaderModuleCreateInfo sm_ci{};
     sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -129,6 +134,30 @@ void Pipeline::create_pipeline_objects(const uint32_t* spirv_code,
         throw std::runtime_error("Failed to create pipeline layout");
     }
 
+    // Build specialization info (CG.M15: [[vk::constant_id]] overrides).
+    // Spec constants let a single SPIR-V module serve multiple tile
+    // configurations — the specialization happens at pipeline-creation
+    // time (fast, no slangc recompilation).
+    std::vector<VkSpecializationMapEntry> spec_entries;
+    std::vector<uint32_t> spec_data;
+    VkSpecializationInfo spec_info{};
+    if (!spec_constants.empty()) {
+        spec_entries.reserve(spec_constants.size());
+        spec_data.reserve(spec_constants.size());
+        for (const auto& sc : spec_constants) {
+            VkSpecializationMapEntry entry{};
+            entry.constantID = sc.first;
+            entry.offset = static_cast<uint32_t>(spec_data.size() * sizeof(uint32_t));
+            entry.size = sizeof(uint32_t);
+            spec_entries.push_back(entry);
+            spec_data.push_back(sc.second);
+        }
+        spec_info.mapEntryCount = static_cast<uint32_t>(spec_entries.size());
+        spec_info.pMapEntries = spec_entries.data();
+        spec_info.dataSize = spec_data.size() * sizeof(uint32_t);
+        spec_info.pData = spec_data.data();
+    }
+
     // Create compute pipeline
     VkComputePipelineCreateInfo cp_ci{};
     cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -136,6 +165,7 @@ void Pipeline::create_pipeline_objects(const uint32_t* spirv_code,
     cp_ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cp_ci.stage.module = shader_module_;
     cp_ci.stage.pName = "main";
+    cp_ci.stage.pSpecializationInfo = spec_constants.empty() ? nullptr : &spec_info;
     cp_ci.layout = layout_;
 
     result = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &pipeline_);
@@ -173,7 +203,8 @@ Pipeline* PipelineCache::get_or_create(
     const uint32_t* spirv_code,
     size_t spirv_size,
     uint32_t num_buffers,
-    uint32_t push_constant_size) {
+    uint32_t push_constant_size,
+    const std::vector<Pipeline::SpecConstant>& spec_constants) {
 
     // Fast path: check without lock (safe because cache_ is never modified
     // after initial population, and pointer reads are atomic on x86/ARM)
@@ -194,7 +225,8 @@ Pipeline* PipelineCache::get_or_create(
     }
 
     auto pipeline = std::make_unique<Pipeline>(
-        device, spirv_code, spirv_size, num_buffers, push_constant_size);
+        device, spirv_code, spirv_size, num_buffers, push_constant_size,
+        spec_constants);
     auto* ptr = pipeline.get();
     cache_[key] = std::move(pipeline);
     return ptr;
@@ -206,7 +238,8 @@ Pipeline* PipelineCache::get_or_create(
     const uint32_t* spirv_code,
     size_t spirv_size,
     const std::vector<uint32_t>& descriptor_counts,
-    uint32_t push_constant_size) {
+    uint32_t push_constant_size,
+    const std::vector<Pipeline::SpecConstant>& spec_constants) {
 
     {
         auto it = cache_.find(key);
@@ -223,7 +256,8 @@ Pipeline* PipelineCache::get_or_create(
     }
 
     auto pipeline = std::make_unique<Pipeline>(
-        device, spirv_code, spirv_size, descriptor_counts, push_constant_size);
+        device, spirv_code, spirv_size, descriptor_counts, push_constant_size,
+        spec_constants);
     auto* ptr = pipeline.get();
     cache_[key] = std::move(pipeline);
     return ptr;

@@ -4,6 +4,7 @@
 Priority 12 — runs before bmm-oriented patterns so the SDPA is caught
 before its decomposition to bmm + softmax.
 """
+
 from __future__ import annotations
 
 from typing import Any, Iterable
@@ -85,9 +86,18 @@ def _rewrite_sdpa(gm: GraphModule, root: Node, ctx: dict[str, Any]) -> GraphModu
     return gm
 
 
-register_fx_pattern(
-    "sdpa",
-    _match_sdpa,
-    _rewrite_sdpa,
-    priority=12,
-)
+# OP.26: The native aten.scaled_dot_product_attention lowering (attention.py)
+# is registered as an additional path, but the FX pattern matcher below is
+# the primary path (it runs earlier, at the FX graph level, replacing SDPA
+# with flash_attention_fused before Inductor lowerings fire). Both paths are
+# active: the pattern matcher covers the standard torch.compile path; the
+# lowering handles cases where the pattern matcher doesn't fire.
+_LEGACY_PATTERN_ENABLED = True
+
+if _LEGACY_PATTERN_ENABLED:
+    register_fx_pattern(
+        "sdpa",
+        _match_sdpa,
+        _rewrite_sdpa,
+        priority=12,
+    )

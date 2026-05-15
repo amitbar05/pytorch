@@ -206,6 +206,10 @@ class VulkanKernel(
         self._packed16: Optional[bool] = None
         self.has_welford = False  # P5.1: set before _pick_threadgroup_size
         self.max_threadgroup_size = self._pick_threadgroup_size()
+        # M11.7: occupancy gate — warn if estimated occupancy < 50 %.
+        self._check_occupancy_gate()
+        # M11.3: register-tile size (0 = disabled, set during codegen_kernel).
+        self._register_tile_size: int = 0
         # TRAIN.6-F1: Per-instance multistage_reduction_entry to prevent
         # state leakage between VulkanKernel instances. Previously a class
         # variable, causing entries from one kernel to persist into the next
@@ -267,6 +271,13 @@ class VulkanKernel(
         # is wrapped in a grid-stride loop so one kernel handles multiple
         # small operations.  Set by the scheduler via _enable_persistent_mode().
         self._persistent_mode: bool = False
+        # P3.1/M9: MUST be set BEFORE node.codegen() → load()/store()
+        # calls (during codegen_node_schedule_with_kernel) so that
+        # _buf_path() can prefix buffer accesses with ``args.`` when
+        # ParameterBlock is active.
+        from .. import config
+
+        self._use_parameter_block: bool = config.parameter_block()
         for _rn in self.features.reduction_nodes():
             _rt = (
                 _rn.get_reduction_type() if hasattr(_rn, "get_reduction_type") else None
@@ -408,6 +419,79 @@ class VulkanKernel(
         if self.inside_reduction:
             return self._pick_threadgroup_size_reduction()
         return self._pick_threadgroup_size_pointwise()
+
+    @staticmethod
+    def _round_wg_to_wave(wg_size: int, max_wg: int, sgs: int) -> int:
+        """M11.5: Round WG size up to next wave-size multiple.
+
+        RDNA1 (wave64) hardware pads partial waves; a WG of 100 threads
+        spans 2 waves (128 lanes) wasting 28 lanes.  Rounding up to the
+        next multiple guarantees full-wave occupancy.  Never exceeds max_wg.
+        Call sites should only invoke when :func:`~config.round_wg_to_wave`
+        returns True and ``wg_size % sgs != 0``.
+        """
+        rounded = ((wg_size + sgs - 1) // sgs) * sgs
+        return min(rounded, max_wg)
+
+    def _check_occupancy_gate(self) -> None:
+        """M11.7: Warn/fail if estimated occupancy falls below 50 %.
+
+        Called after ``_pick_threadgroup_size`` when WG size is final.
+        Uses :func:`~gpu_utilization.estimate_occupancy` with the best
+        available VGPR/shared-memory data (reflection if available,
+        fallback heuristic otherwise).
+
+        Behaviour is controlled by ``TORCH_VULKAN_STRICT_OCCUPANCY``:
+        - unset or ``0``: log a warning via ``trace_structured``.
+        - ``1``: raise ``RuntimeError``, failing compilation.
+        """
+        from .. import config
+        from ..gpu_utilization import estimate_occupancy
+
+        if not config.occupancy_gate():
+            return
+
+        wg_size = self.max_threadgroup_size
+        sgs = self.simd_group_size or 64
+
+        # Best-effort VGPR estimate
+        vgprs = self._get_actual_vgprs()
+        if vgprs is None:
+            vgprs = self._estimate_vgprs()
+        if vgprs is None:
+            vgprs = 32  # conservative default for float workloads
+        vgprs_per_thread = max(1, vgprs // wg_size if wg_size > 0 else vgprs // sgs)
+
+        # Best-effort shared memory estimate
+        shared_mem_bytes = getattr(self, "_cached_shared_mem", None) or 0
+
+        est = estimate_occupancy(
+            threadgroup_size=wg_size,
+            vgprs_per_thread=vgprs_per_thread,
+            shared_mem_bytes=shared_mem_bytes,
+            simd_size=sgs,
+        )
+
+        occupancy_pct = est["occupancy_pct"]
+        if occupancy_pct < 50.0:
+            msg = (
+                f"[M11.7] Low estimated occupancy: {occupancy_pct:.0f}% "
+                f"(WG={wg_size}, VGPR={vgprs}, LDS={shared_mem_bytes}B, "
+                f"limit={est['limiting_factor']})"
+            )
+            if config.strict_occupancy():
+                raise RuntimeError(msg)
+            else:
+                from torch._logging import trace_structured
+
+                trace_structured(
+                    "artifact",
+                    metadata_fn=lambda: {
+                        "name": "occupancy_gate",
+                        "encoding": "string",
+                    },
+                    payload_fn=lambda: msg,
+                )
 
     # ── DR.3: Shared helpers for threadgroup-size picking ───────────
 
@@ -717,10 +801,16 @@ class VulkanKernel(
                     while rounded * 2 <= target_wg:
                         rounded *= 2
                     wg_size = min(wg_size, max(sgs, rounded))
+            # M11.5: round WG size up to wave-size multiple.
+            if config.round_wg_to_wave() and wg_size % sgs != 0:
+                wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
             return wg_size
 
-        pt_caps = {"light": 256, "normal": 256, "heavy": 128}
-        return min(max_wg, pt_caps.get(vgpr_class, 256))
+        wg_size = min(max_wg, pt_caps.get(vgpr_class, 256))
+        # M11.5: round WG size up to wave-size multiple.
+        if config.round_wg_to_wave() and wg_size % sgs != 0:
+            wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
+        return wg_size
 
     def _pick_threadgroup_size_reduction(self) -> int:
         """DR.3: Workgroup size for reduction kernels.
@@ -769,7 +859,10 @@ class VulkanKernel(
                 rnumel = rnumel * numel
         if is_dynamic(rnumel):
             dyn_caps = {"light": 256, "normal": 256, "heavy": 128}
-            return min(max_wg, dyn_caps.get(vgpr_class, 256))
+            wg_size = min(max_wg, dyn_caps.get(vgpr_class, 256))
+            if config.round_wg_to_wave() and wg_size % sgs != 0:
+                wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
+            return wg_size
         rn = int(rnumel)
         effective_rn = rn if dtype_bytes >= 4 else max(rn // 2, 1)
 
@@ -782,11 +875,53 @@ class VulkanKernel(
             "heavy": (sgs, sgs // 2, max(sgs // 2, 32)),
         }
         cap_large, cap_medium, cap_small = rn_caps.get(vgpr_class, (sgs * 2, sgs, sgs))
+
+        # M11.9: Grid-aware WG sizing for reductions.
+        # Reductions have a fixed dispatch grid (one WG per output element),
+        # so we can't increase grid count by shrinking WG like pointwise.
+        # Instead, scale the WG cap based on total work per CU:
+        #   work_per_cu = rnumel * grid_size / num_cus
+        # When per-CU work is small, use fewer threads per WG to avoid
+        # wasting wave slots.  When per-CU work is large, allow more
+        # threads for faster per-element reduction.
+        if config.grid_aware_wg():
+            try:
+                from torch._dynamo.device_interface import get_interface_for_device
+
+                iface = get_interface_for_device("vulkan")
+                props = iface.Worker.get_device_properties()
+                num_cus = getattr(props, "num_compute_units", 20)
+            except Exception:
+                num_cus = 20
+            # Dispatch grid = product of non-reduction dimensions
+            non_red_numel = sympy.S.One
+            for prefix, numel in self.numels.items():
+                if not prefix_is_reduction(prefix):
+                    non_red_numel = non_red_numel * numel
+            if not is_dynamic(non_red_numel):
+                grid_size = int(non_red_numel)
+                # Total reduction elements per CU
+                work_per_cu = (rn * grid_size) // num_cus
+                if grid_size >= num_cus:
+                    # Grid fills all CUs — allow full throughput
+                    pass
+                elif work_per_cu <= sgs:
+                    # Very small problem: use single-wave WG
+                    cap_large = cap_medium = cap_small = min(cap_small, sgs)
+                elif work_per_cu <= sgs * 2:
+                    cap_large = min(cap_large, sgs * 2)
+                    cap_medium = min(cap_medium, sgs)
+
         if effective_rn > cap_large:
-            return min(max_wg, 256)
-        if effective_rn > cap_medium:
-            return min(max_wg, cap_medium)
-        return min(max_wg, cap_small)
+            wg_size = min(max_wg, 256)
+        elif effective_rn > cap_medium:
+            wg_size = min(max_wg, cap_medium)
+        else:
+            wg_size = min(max_wg, cap_small)
+        # M11.5: round WG size up to wave-size multiple.
+        if config.round_wg_to_wave() and wg_size % sgs != 0:
+            wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
+        return wg_size
 
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return DTYPE_TO_SLANG.get(dtype, "float")

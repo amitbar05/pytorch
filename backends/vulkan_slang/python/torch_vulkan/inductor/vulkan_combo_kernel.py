@@ -15,6 +15,11 @@ Each subkernel emits its body referencing local identifiers (`xindex`, `x0`,
   3. A lightweight tokenizer distinguishes declarations from references so
      renaming is precise — a variable named `xindex_sub0` in a subkernel body
      is left alone instead of being corrupted by the old regex approach.
+
+Implementation split across ``combo_kernel/`` subpackage:
+- ``body_rewriter.py`` — tokenizer, identifier classifier, body rewriting
+- ``binding_map.py`` — global binding-map construction
+- ``grid_builder.py`` — grid dimensions and numthreads computation
 """
 
 from __future__ import annotations
@@ -25,476 +30,52 @@ import sympy
 from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.virtualized import V
 
+from .combo_kernel.binding_map import build_global_binding_map
+from .combo_kernel.body_rewriter import (
+    _KEYWORDS,
+    _NEVER_RENAME,
+    _T_COMMENT,
+    _T_IDENT,
+    _T_KEYWORD,
+    _T_NUMBER,
+    _T_OPERATOR,
+    _T_PUNCT,
+    _T_SPACE,
+    _T_STRING,
+    _TYPE_KEYWORDS,
+    _is_buffer_name,
+    _is_local_to_rename,
+    _rewrite_body,
+    _Token,
+    _tokenize,
+)
+from .combo_kernel.grid_builder import (
+    _wg_count,
+    compute_grid_dims,
+    compute_max_threadgroup_size,
+    compute_max_workgroups,
+)
 from .kernel import VulkanKernel
 from .slang_helpers import emit_helpers
 
-# Identifiers we leave alone (combo-kernel-scope or shader builtins).
-_NEVER_RENAME = frozenset(
-    {
-        "gid",
-        "lid",
-        "gtid",
-        "_vk_gtid",
-        "_vk_gtid_local",
-        "gtid_lin",
-        "tid",
-        "subgroup_id",
-        "lane_id",
-        # PF.13.b.4-CODG: _vk_linear / _vk_linear_orig are per-subkernel
-        # scoped locals emitted by the combo-kernel seed for multi-dimensional
-        # index decomposition.  They must not be renamed.
-        "_vk_linear",
-        "_vk_linear_orig",
-    }
-)
-
-# Slang type keywords that introduce variable declarations.
-_TYPE_KEYWORDS = frozenset(
-    {
-        "float",
-        "int",
-        "uint",
-        "bool",
-        "half",
-        "double",
-        "void",
-        "int64_t",
-        "float16_t",
-        "int8_t",
-        "uint8_t",
-        "int16_t",
-        "uint16_t",
-        "float2",
-        "float3",
-        "float4",
-        "int2",
-        "int3",
-        "int4",
-        "uint2",
-        "uint3",
-        "uint4",
-    }
-)
-
-# All known Slang keywords (superset of type keywords).
-_KEYWORDS = _TYPE_KEYWORDS | frozenset(
-    {
-        "for",
-        "while",
-        "do",
-        "if",
-        "else",
-        "switch",
-        "case",
-        "default",
-        "return",
-        "break",
-        "continue",
-        "static",
-        "const",
-        "struct",
-        "uniform",
-        "in",
-        "out",
-        "inout",
-        "true",
-        "false",
-        "sizeof",
-        "typedef",
-        "StructuredBuffer",
-        "RWStructuredBuffer",
-        "ByteAddressBuffer",
-        "RWByteAddressBuffer",
-        "groupshared",
-        "nointerpolation",
-        "linear",
-        "centroid",
-        "sample",
-        "discard",
-        "cbuffer",
-        "tbuffer",
-        "register",
-        "packoffset",
-        "unroll",
-        "loop",
-        "branch",
-        "flatten",
-    }
-)
-
-# ---- lightweight Slang/HLSL tokenizer -----------------------------------
-
-# Token type constants (small integers for fast comparison).
-_T_KEYWORD = 1
-_T_IDENT = 2
-_T_OPERATOR = 3
-_T_NUMBER = 4
-_T_PUNCT = 5
-_T_STRING = 6
-_T_SPACE = 7
-_T_COMMENT = 8
-
-
-class _Token:
-    """A single token from the Slang/HLSL source."""
-
-    __slots__ = ("type", "value")
-
-    def __init__(self, typ: int, value: str) -> None:
-        self.type = typ
-        self.value = value
-
-
-def _tokenize(source: str):
-    """Yield _Token objects from a Slang/HLSL source string.
-
-    Handles: identifiers, keywords, numeric literals (decimal, hex, float
-    with suffixes), string literals, line comments (``//``), block comments
-    (``/* … */``), multi-character operators, and single-character
-    punctuation. Whitespace is preserved as ``_T_SPACE`` tokens so the
-    rewriter can reconstruct exact formatting.
-    """
-    i = 0
-    n = len(source)
-
-    while i < n:
-        ch = source[i]
-
-        # Whitespace — collapse contiguous runs into one token.
-        if ch in " \t\n\r":
-            j = i
-            while j < n and source[j] in " \t\n\r":
-                j += 1
-            yield _Token(_T_SPACE, source[i:j])
-            i = j
-            continue
-
-        # Line comment  // …
-        if ch == "/" and i + 1 < n and source[i + 1] == "/":
-            j = i
-            while j < n and source[j] != "\n":
-                j += 1
-            yield _Token(_T_COMMENT, source[i:j])
-            i = j
-            continue
-
-        # Block comment  /* … */
-        if ch == "/" and i + 1 < n and source[i + 1] == "*":
-            j = source.find("*/", i + 2)
-            if j == -1:
-                j = n
-            else:
-                j += 2
-            yield _Token(_T_COMMENT, source[i:j])
-            i = j
-            continue
-
-        # String literal  "…"  (with backslash escapes).
-        if ch == '"':
-            j = i + 1
-            while j < n and source[j] != '"':
-                if source[j] == "\\":
-                    j += 1  # skip escaped char
-                j += 1
-            j += 1  # closing quote
-            yield _Token(_T_STRING, source[i:j])
-            i = j
-            continue
-
-        # Numeric literal: decimal / hex / float with optional suffix.
-        if ch.isdigit() or (ch == "." and i + 1 < n and source[i + 1].isdigit()):
-            j = i
-            if source[j] == "0" and j + 1 < n and source[j + 1] in ("x", "X"):
-                j += 2
-                while j < n and source[j] in "0123456789abcdefABCDEF":
-                    j += 1
-            else:
-                while j < n and source[j].isdigit():
-                    j += 1
-                if j < n and source[j] == ".":
-                    j += 1
-                    while j < n and source[j].isdigit():
-                        j += 1
-                if j < n and source[j] in ("e", "E"):
-                    j += 1
-                    if j < n and source[j] in "+-":
-                        j += 1
-                    while j < n and source[j].isdigit():
-                        j += 1
-            if j < n and source[j] in "fFuU":
-                j += 1
-            yield _Token(_T_NUMBER, source[i:j])
-            i = j
-            continue
-
-        # Identifier or keyword.
-        if ch.isalpha() or ch == "_":
-            j = i
-            while j < n and (source[j].isalnum() or source[j] == "_"):
-                j += 1
-            ident = source[i:j]
-            typ = _T_KEYWORD if ident in _KEYWORDS else _T_IDENT
-            yield _Token(typ, ident)
-            i = j
-            continue
-
-        # Multi-character operators (longest match first).
-        for op in (
-            ">>=",
-            "<<=",
-            "<=",
-            ">=",
-            "==",
-            "!=",
-            "&&",
-            "||",
-            "++",
-            "--",
-            "<<",
-            ">>",
-            "+=",
-            "-=",
-            "*=",
-            "/=",
-            "%=",
-            "&=",
-            "|=",
-            "^=",
-        ):
-            if source.startswith(op, i):
-                yield _Token(_T_OPERATOR, op)
-                i += len(op)
-                break
-        else:
-            # Single-character operator or punctuation.
-            if ch in "=+-*/%&|^~!<>?:.,;(){}[]":
-                typ = _T_OPERATOR if ch in "=+-*/%&|^~!<>?:" else _T_PUNCT
-                yield _Token(typ, ch)
-            else:
-                # Any unrecognized char — emit verbatim so we never drop bytes.
-                yield _Token(_T_SPACE, ch)
-            i += 1
-
-
-# ---- local-variable classifier (zero regex) -----------------------------
-
-
-def _is_buffer_name(name: str) -> bool:
-    """Internal Inductor buffer slot names like in_ptr0 / out_ptr1 / inout_ptr2."""
-    for prefix in ("in_ptr", "out_ptr", "inout_ptr"):
-        if name.startswith(prefix) and name[len(prefix) :].isdigit():
-            return True
-    return False
-
-
-def _is_local_to_rename(name: str) -> bool:
-    """Return True if *name* is an Inductor-generated scalar local that needs
-    per-subkernel namespacing.  Deliberately zero regex — uses only
-    character-class inspection and ``str.isdigit``."""
-    if name in _NEVER_RENAME:
-        return False
-
-    # xindex / yindex / rindex
-    if name in ("xindex", "yindex", "rindex"):
-        return True
-
-    # tmp\d+   (tmp0, tmp1, ..., tmp123)
-    if name.startswith("tmp") and len(name) > 3 and name[3:].isdigit():
-        return True
-
-    # x\d+ / y\d+   (x0, x1, y0, y1, ...)
-    if len(name) >= 2 and name[0] in ("x", "y") and name[1:].isdigit():
-        return True
-
-    # r\d+_\d+   (r0_0, r1_123, ...)
-    if name.startswith("r") and "_" in name:
-        rest = name[1:]
-        digit_part, sep, suffix = rest.partition("_")
-        if sep and digit_part.isdigit() and suffix.isdigit():
-            return True
-
-    # r\d+_index   (r0_index, r1_index, ...)
-    if name.startswith("r") and name.endswith("_index"):
-        rest = name[1:-6]
-        if rest.isdigit():
-            return True
-
-    # tmp_acc_\d+   (tmp_acc_0, tmp_acc_1, ...)
-    if name.startswith("tmp_acc_") and len(name) > 8 and name[8:].isdigit():
-        return True
-
-    return False
-
-
-# ---- token-based body rewriter ------------------------------------------
-
-
-def _rewrite_body(
-    body_src: str,
-    name_map: dict[str, str],
-    idx: int,
-    cross_decls: list[dict[str, str]] | None = None,
-    debug_assert: bool = False,
-) -> tuple[str, dict[str, str]]:
-    """Token-based rename of buffer names and Inductor-generated locals.
-
-    Replaces the old regex approach with a lightweight tokenization pass
-    that distinguishes declarations from references and never corrupts
-    identifiers that happen to contain a matching substring (e.g.
-    ``xindex_sub0``).
-
-    Uses a single pass — safe because HLSL requires declarations to
-    precede references within every scope.
-
-    M16 additions:
-      - Struct member access (``obj.field``) is preserved — identifiers
-        following a ``.`` operator are never renamed.
-      - ``debug_assert=True`` enables a collision check that verifies
-        renamed variables don't shadow any existing declaration in the
-        current scope chain.
-    """
-    tokens = list(_tokenize(body_src))
-    parts: list[str] = []
-
-    # Scope stack: each scope is a dict mapping original_name → renamed_name.
-    # The top-level scope is pre-seeded with the index locals that the combo
-    # kernel wrapper declares *outside* the body (xindex, x0, …).
-    scopes: list[dict[str, str]] = [
-        {
-            n: f"{n}_sub{idx}"
-            for n in ("xindex", "yindex", "rindex", "x0", "x1", "y0", "y1")
-            if n not in _NEVER_RENAME
-        }
-    ]
-
-    # Declaration-context state machine.
-    # ``in_decl_stmt`` is True from a type keyword until a statement
-    # terminator (``;``, ``{``, ``}``) or a non-type keyword.  This keeps
-    # commas inside function-call argument lists from being mistaken for
-    # declaration-list commas (e.g. ``foo(x, y)`` vs ``float x, y;``).
-    in_decl_stmt = False
-    saw_type = False  # just consumed a type keyword; next IDENT is a declarator
-
-    # M16: track the previous non-space/non-comment token to detect
-    # struct member access (``obj.field``) and array subscript context.
-    # Identifiers following ``.`` are member names — never rename them.
-    prev_significant_type: int | None = None
-    prev_significant_value: str = ""
-
-    for tok in tokens:
-        if tok.type in (_T_SPACE, _T_COMMENT):
-            parts.append(tok.value)
-            continue
-
-        if tok.type == _T_KEYWORD:
-            parts.append(tok.value)
-            if tok.value in _TYPE_KEYWORDS:
-                in_decl_stmt = True
-                saw_type = True
-            else:
-                # Non-type keyword (for, while, if, else, return, …)
-                # ends any ongoing declaration statement.
-                in_decl_stmt = False
-                saw_type = False
-
-        elif tok.type == _T_PUNCT:
-            parts.append(tok.value)
-            if tok.value == "{":
-                scopes.append({})
-                in_decl_stmt = False
-                saw_type = False
-            elif tok.value == "}":
-                if len(scopes) > 1:
-                    scopes.pop()
-                in_decl_stmt = False
-                saw_type = False
-            elif tok.value == ";":
-                in_decl_stmt = False
-                saw_type = False
-            elif tok.value == "," and in_decl_stmt:
-                # Comma inside a declaration statement: next IDENT is
-                # another declarator (e.g. ``float x, y, z;`` or
-                # ``for (int i = 0, j = 0; …)``).
-                saw_type = True
-            # Other punctuation ``( ) [ ]`` does not affect decl tracking.
-            # ``.`` is tracked via prev_significant_type below.
-
-        elif tok.type == _T_OPERATOR:
-            parts.append(tok.value)
-            # Operators never affect declaration tracking — the ``=`` in
-            # ``float x = …`` does *not* end the declaration statement
-            # (commas after the initializer still extend the declarator list).
-
-        elif tok.type == _T_IDENT:
-            name = tok.value
-
-            # M16: if the previous significant token was a ``.``, this
-            # identifier is a struct/object member name — never rename it.
-            is_member_access = (
-                prev_significant_type == _T_PUNCT and prev_significant_value == "."
-            )
-
-            if is_member_access:
-                # Member access: emit verbatim, do NOT track as declaration
-                # or apply rename maps.
-                parts.append(name)
-                saw_type = False
-            else:
-                is_decl = saw_type and in_decl_stmt
-
-                if is_decl:
-                    # Declaration: record in current scope and emit.
-                    if _is_local_to_rename(name):
-                        new_name = f"{name}_sub{idx}"
-                        # M16 debug assertion: verify renamed name doesn't
-                        # collide with any existing declaration.
-                        if debug_assert:
-                            for scope in scopes:
-                                if name in scope and scope[name] == new_name:
-                                    continue  # same rename, ok
-                            for scope in scopes:
-                                if new_name in scope or new_name == name:
-                                    raise RuntimeError(
-                                        f"Combo kernel sub{idx}: renamed "
-                                        f"variable '{name}' → '{new_name}' "
-                                        f"collides with existing "
-                                        f"declaration in scope."
-                                    )
-                        scopes[-1][name] = new_name
-                        parts.append(new_name)
-                    else:
-                        scopes[-1][name] = name
-                        parts.append(name)
-                    saw_type = False  # first declarator consumed
-                else:
-                    # Reference: buffer rename map has priority, then scope chain.
-                    if name in name_map and name_map[name] != name:
-                        parts.append(name_map[name])
-                    else:
-                        renamed = name
-                        for scope in reversed(scopes):
-                            if name in scope:
-                                renamed = scope[name]
-                                break
-                        if renamed == name and cross_decls:
-                            # Check previous subkernels' declarations
-                            for prev_scope in reversed(cross_decls):
-                                if name in prev_scope:
-                                    renamed = prev_scope[name]
-                                    break
-                        parts.append(renamed)
-
-        else:
-            # NUMBER, STRING — emit verbatim.
-            parts.append(tok.value)
-
-        prev_significant_type = tok.type
-        prev_significant_value = tok.value
-
-    all_decls: dict[str, str] = {}
-    for scope in scopes:
-        all_decls.update(scope)
-    return "".join(parts), all_decls
+# Re-export all public symbols from submodules so existing imports continue
+# to work (e.g. ``from torch_vulkan.inductor.vulkan_combo_kernel import
+# VulkanComboKernel``).
+__all__ = [
+    "VulkanComboKernel",
+    "_rewrite_body",
+    "_tokenize",
+    "_is_buffer_name",
+    "_is_local_to_rename",
+    "_Token",
+    "_NEVER_RENAME",
+    "_TYPE_KEYWORDS",
+    "_KEYWORDS",
+    "build_global_binding_map",
+    "compute_grid_dims",
+    "compute_max_threadgroup_size",
+    "compute_max_workgroups",
+]
 
 
 class VulkanComboKernel:
@@ -699,129 +280,45 @@ class VulkanComboKernel:
     ]:
         """Build the global binding map across all subkernels.
 
-        Each outer buffer name (the wrapper-visible buf name) gets one binding,
-        even if multiple subkernels reference it. Inner names (`in_ptr0`,
-        `out_ptr1`, `inout_ptr0`) collide across subkernels and get prefixed
-        with `s{idx}_` if already taken. Inplace buffers are declared `RW` so
-        the body's `<inner>[idx] = ...` writes are valid l-values.
+        Delegates to ``combo_kernel.binding_map.build_global_binding_map``.
         """
-        import torch
-        from torch._inductor.codegen.common import InplacedBuffer
-
-        from .overrides import DTYPE_TO_SLANG
-
-        outer_to_global: dict[str, str] = {}
-        outer_is_rw: dict[str, bool] = {}
-        in_decls: list[tuple[str, str, str]] = []
-        rw_decls: list[tuple[str, str, str]] = []
-        per_sub_maps: list[dict[str, str]] = []
-        used_globals: set[str] = set()
-
-        def _dtype_str(outer: str) -> str:
-            dtype = V.graph.get_dtype(outer)
-            if dtype in (torch.float16, torch.bfloat16):
-                return "float"
-            base = DTYPE_TO_SLANG.get(dtype, "float")
-            # int64_t buffers must be declared as uint2 because the
-            # pointwise store emits uint2(...) for int64 values (Slang
-            # on Vulkan lacks native 64-bit integer atomics, so we
-            # bitcast through uint2).  Matches _binding_dtype in
-            # kernel/header.py.
-            if base == "int64_t":
-                return "uint2"
-            return base
-
-        # First pass: discover which outer buffers are used as outputs anywhere
-        # (so we know to declare them as RW). An outer that appears in BOTH
-        # input_buffers and output_buffers in the same subkernel is a
-        # read-modify-write (inplace) — we must declare it RW even though
-        # `inplace_buffers` is empty.
-        outers_written: set[str] = set()
-        for kernel, _ in self.subkernels:
-            for outer, inplaced in kernel.args.inplace_buffers.items():
-                if isinstance(inplaced, InplacedBuffer):
-                    outers_written.add(outer)
-            for outer in kernel.args.output_buffers:
-                if outer in kernel.removed_buffers:
-                    continue
-                outers_written.add(outer)
-
-        for idx, (kernel, _) in enumerate(self.subkernels):
-            name_map: dict[str, str] = {}
-
-            def _declare(outer: str, inner: str) -> None:
-                if outer in outer_to_global:
-                    name_map[inner] = outer_to_global[outer]
-                    return
-                # GAP-1.1-B: loop until we find a name not in used_globals.
-                # The naive f"s{idx}_{inner}" can itself collide when
-                # the same subkernel has TWO different outer buffers that
-                # share the same inner name (e.g. both input and output
-                # buffers named "in_out_ptr0" in subkernel 1).
-                candidate = inner
-                while candidate in used_globals:
-                    candidate = f"s{idx}_{candidate}"
-                global_name = candidate
-                used_globals.add(global_name)
-                outer_to_global[outer] = global_name
-                name_map[inner] = global_name
-                if outer in outers_written:
-                    outer_is_rw[outer] = True
-                    rw_decls.append((_dtype_str(outer), global_name, outer))
-                else:
-                    outer_is_rw[outer] = False
-                    in_decls.append((_dtype_str(outer), global_name, outer))
-
-            for outer, inplaced in kernel.args.inplace_buffers.items():
-                if not isinstance(inplaced, InplacedBuffer):
-                    continue
-                _declare(outer, inplaced.inner_name)
-
-            for outer, inner in kernel.args.input_buffers.items():
-                if outer in kernel.args.inplace_buffers:
-                    continue
-                _declare(outer, inner)
-
-            for outer, inner in kernel.args.output_buffers.items():
-                if (
-                    outer in kernel.removed_buffers
-                    or outer in kernel.args.inplace_buffers
-                ):
-                    continue
-                _declare(outer, inner)
-
-            per_sub_maps.append(name_map)
-
-        return in_decls, rw_decls, per_sub_maps
+        return build_global_binding_map(self.subkernels)
 
     def codegen_kernel(self) -> str:
         code = IndentedBuffer()
-        in_decls, rw_decls, per_sub_maps = self._build_global_binding_map()
+        in_decls, rw_decls, per_sub_maps = build_global_binding_map(self.subkernels)
         self.n_inputs = len(in_decls)
         self.n_outputs = len(rw_decls)
         self.n_buffers = self.n_inputs + self.n_outputs
 
-        # T5.5 (future cleanup): The `slot += 1` pattern below duplicates the
-        # binding-counter logic in `kernel/header.py:HeaderMixin.codegen_kernel`.
-        # Both places maintain their own counter and emit `[[vk::binding(N)]]`
-        # annotations.  When we introduce reflection-driven binding (P0.4),
-        # unify this into a single shared helper so the two paths can't
-        # drift apart.
-        slot = 0
-        for dtype_str, name, _outer in in_decls:
-            code.writeline(
-                f"[[vk::binding({slot})]] StructuredBuffer<{dtype_str}> {name};"
-            )
-            slot += 1
-        for dtype_str, name, _outer in rw_decls:
-            code.writeline(
-                f"[[vk::binding({slot})]] RWStructuredBuffer<{dtype_str}> {name};"
-            )
-            slot += 1
+        # CG.M14: Use ParameterBlock<KernelArgs> for clean binding emission
+        # (matching the single-kernel codegen path in kernel/header.py).
+        # Slang auto-assigns binding indices in struct field declaration order.
+        from . import config as _cfg
 
-        max_tgs = 256
-        for kernel, _ in self.subkernels:
-            max_tgs = max(max_tgs, kernel.max_threadgroup_size)
+        if _cfg.parameter_block():
+            code.writeline("struct KernelArgs {")
+            with code.indent():
+                for dtype_str, name, _outer in in_decls:
+                    code.writeline(f"StructuredBuffer<{dtype_str}> {name};")
+                for dtype_str, name, _outer in rw_decls:
+                    code.writeline(f"RWStructuredBuffer<{dtype_str}> {name};")
+            code.writeline("};")
+            code.writeline("ParameterBlock<KernelArgs> args;")
+        else:
+            slot = 0
+            for dtype_str, name, _outer in in_decls:
+                code.writeline(
+                    f"[[vk::binding({slot})]] StructuredBuffer<{dtype_str}> {name};"
+                )
+                slot += 1
+            for dtype_str, name, _outer in rw_decls:
+                code.writeline(
+                    f"[[vk::binding({slot})]] RWStructuredBuffer<{dtype_str}> {name};"
+                )
+                slot += 1
+
+        max_tgs = compute_max_threadgroup_size(self.subkernels)
 
         # Emit module-scope helpers (imports + inline) as the union of every
         # subkernel's required headers. Without this, bodies that reference
@@ -1025,9 +522,7 @@ class VulkanComboKernel:
         wrapper = V.graph.wrapper_code
         import torch
 
-        max_tgs = 256
-        for kernel, _ in self.subkernels:
-            max_tgs = max(max_tgs, kernel.max_threadgroup_size)
+        max_tgs = compute_max_threadgroup_size(self.subkernels)
 
         for kernel, _ in self.subkernels:
             for v in kernel.args.sizevars:
@@ -1036,8 +531,8 @@ class VulkanComboKernel:
         # Args must be passed in the same order the Slang shader binds them:
         # all in_decls (read-only) first, then rw_decls (read-write). The
         # `_outer` field on each decl is the wrapper-visible buffer name, so we
-        # just emit those in the same order `_build_global_binding_map` did.
-        in_decls, rw_decls, _ = self._build_global_binding_map()
+        # just emit those in the same order `build_global_binding_map` did.
+        in_decls, rw_decls, _ = build_global_binding_map(self.subkernels)
         all_args: list[str] = [outer for _, _, outer in in_decls]
         all_args.extend(outer for _, _, outer in rw_decls)
 
@@ -1074,24 +569,10 @@ class VulkanComboKernel:
             wrapper.generate_workspace_allocation(ws)
 
         # TRAIN.6-F1: Multi-dimensional grid dispatch.
-        # X = max workgroups needed by any single subkernel.
-        # Y = number of subkernels (gid.y selects which subkernel runs).
-        # Each workgroup (x, y) runs subkernel y, with gid.x as the
-        # subkernel's own workgroup ID. This preserves wave uniformity.
-        # Reduction subkernels need one workgroup per output element (gid.x
-        # indexes the non-reduction axis). Pointwise uses ceil(numel/TGS).
-        def _wg_count(kernel, numel):
-            if getattr(kernel, "inside_reduction", False):
-                return numel  # one workgroup per output element
-            return (numel + max_tgs - 1) // max_tgs
-
-        max_wgs = max(_wg_count(k, n) for k, n in self.subkernels)
-        wg_x = str(max_wgs)
-        wg_y = str(len(self.subkernels))
-
-        all_args.append(wg_x)
-        all_args.append(wg_y)
-        all_args.append("1")
+        wg_x, wg_y, wg_z = compute_grid_dims(self.subkernels)
+        all_args.append(str(wg_x))
+        all_args.append(str(wg_y))
+        all_args.append(str(wg_z))
 
         wrapper.generate_kernel_call(
             name,

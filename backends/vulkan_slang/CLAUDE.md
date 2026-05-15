@@ -78,11 +78,11 @@ Companion docs:
 cd backends/vulkan_slang
 
 # Incremental rebuild (~3 s, 1 file + relink)
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=8 python setup.py build_ext --inplace
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=4 python setup.py build_ext --inplace
 
 # Full clean build (~5 min)
 rm -rf build/temp.linux-x86_64-cpython-312
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=8 python setup.py build_ext --inplace
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=4 python setup.py build_ext --inplace
 
 # Recompile Slang shader libs (after editing shaders/lib/*.slang)
 python -c "from torch_vulkan.inductor.runtime import precompile_shader_libs; precompile_shader_libs(force=True)"

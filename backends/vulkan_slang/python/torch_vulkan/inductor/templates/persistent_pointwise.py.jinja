@@ -30,13 +30,18 @@ struct PushConstants {
 [[vk::push_constant]] PushConstants pc;
 
 // Buffer bindings — allocated as a pool of N input + N output buffers.
+// CG.M14: ParameterBlock<KernelArgs> groups all bindings into a single
+// descriptor table (no `[[vk::binding(N)]]` literals).
 // The kernel indexes into these via pc.ranges[op].in_buf_id / out_buf_id.
+struct KernelArgs {
 {% for i in range(num_input_bufs) %}
-[[vk::binding({{ i }})]] StructuredBuffer<float> in_buf_{{ i }};
+    StructuredBuffer<float> in_buf_{{ i }};
 {% endfor %}
 {% for i in range(num_output_bufs) %}
-[[vk::binding({{ num_input_bufs + i }})]] RWStructuredBuffer<float> out_buf_{{ i }};
+    RWStructuredBuffer<float> out_buf_{{ i }};
 {% endfor %}
+};
+ParameterBlock<KernelArgs> args;
 
 // ── Operation implementations ──────────────────────────────────────
 // Each op_impl function takes a float input and the OpRange config,
@@ -105,7 +110,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         float x;
         switch (cfg.in_buf_id) {
 {% for j in range(num_input_bufs) %}
-            case {{ j }}: x = in_buf_{{ j }}[local_i]; break;
+            case {{ j }}: x = args.in_buf_{{ j }}[local_i]; break;
 {% endfor %}
             default: x = 0.0f; break;
         }
@@ -126,7 +131,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         // Write output
         switch (cfg.out_buf_id) {
 {% for j in range(num_output_bufs) %}
-            case {{ j }}: out_buf_{{ j }}[local_i] = y; break;
+            case {{ j }}: args.out_buf_{{ j }}[local_i] = y; break;
 {% endfor %}
         }
     }

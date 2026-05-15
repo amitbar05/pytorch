@@ -45,7 +45,7 @@ _REFLECTION_ENABLED = os.environ.get("TORCH_VULKAN_REFLECTION", "1") != "0"
 # range-tree numels that are sympy Symbols (dynamic) are passed through
 # the push-constant struct so the shader can adapt at runtime.  When
 # disabled, all numels are assumed static and integer casts are used.
-#
+
 # D.4 exit gate (2026-05-09): dynamic-batch MLP fwd+bwd passes with
 # correct gradients across B ∈ {1, 4, 16, 64}.  Pointwise dynamic shapes
 # work; reductions (D.2.a) also compile.  Still experimental — set
@@ -68,15 +68,15 @@ _SPEC_CONSTANTS = os.environ.get("TORCH_VULKAN_SPEC_CONSTANTS", "1") != "0"
 # pruning. Set TORCH_VULKAN_DCE=0 to disable for debugging.
 _DCE_ENABLED = os.environ.get("TORCH_VULKAN_DCE", "1") != "0"
 
-# P3.1 / M9 — Slang ParameterBlock<KernelArgs> emission.
-# When enabled, buffer bindings are declared as fields of a
+# P3.1 / M9 / CG.M14 — Slang ParameterBlock<KernelArgs> emission.
+# When enabled (default 1), buffer bindings are declared as fields of a
 # ``struct KernelArgs`` wrapped in ``ParameterBlock<KernelArgs> args;``
 # instead of manual ``[[vk::binding(N)]]`` annotations. Slang
 # auto-assigns binding indices; the SPIR-V reflection JSON contains
-# the canonical mapping.  This unlocks auto-derived VkPipelineLayouts.
-# Opt-in (default 0) until stable across all Vulkan devices.
-# Set ``TORCH_VULKAN_PARAMETER_BLOCK=1`` to enable.
-_PARAMETER_BLOCK = os.environ.get("TORCH_VULKAN_PARAMETER_BLOCK", "0") == "1"
+# the canonical mapping.  This unlocks auto-derived VkPipelineLayouts
+# and future reflection improvements (M11 occupancy-aware codegen).
+# Set ``TORCH_VULKAN_PARAMETER_BLOCK=0`` to disable.
+_PARAMETER_BLOCK = os.environ.get("TORCH_VULKAN_PARAMETER_BLOCK", "1") == "1"
 
 # DR.6 — Bank-conflict padding for groupshared arrays.
 # RDNA1 LDS has 32 banks.  Without padding, strided access patterns
@@ -92,8 +92,8 @@ _BANK_CONFLICT_PAD = os.environ.get("TORCH_VULKAN_BANK_CONFLICT_PAD", "1") == "1
 # after Pass 1, adjusts numthreads based on VGPR count, and re-compiles
 # with optimized workgroup sizing.  Default OFF until validated across
 # all Vulkan devices.
-# Set TORCH_VULKAN_REFLECTION_ROUTING=1 to enable.
-_REFLECTION_ROUTING = os.environ.get("TORCH_VULKAN_REFLECTION_ROUTING", "0") == "1"
+# Set TORCH_VULKAN_REFLECTION_ROUTING=0 to disable.
+_REFLECTION_ROUTING = os.environ.get("TORCH_VULKAN_REFLECTION_ROUTING", "1") != "0"
 
 # DR.6 — Vec4/packed16 vectorization audit.
 # When enabled (default 0), the codegen counts total loads/stores and
@@ -150,6 +150,29 @@ _GRID_AWARE_WG = os.environ.get("TORCH_VULKAN_GRID_AWARE_WG", "1") != "0"
 # Only active for numels < 4096.  Set ``TORCH_VULKAN_PERSISTENT_POINTWISE=0``
 # to disable.
 _PERSISTENT_POINTWISE = os.environ.get("TORCH_VULKAN_PERSISTENT_POINTWISE", "1") != "0"
+
+# M11.5 — Wave-aligned workgroup size rounding.
+# When enabled (default ON), the final WG size from _pick_threadgroup_size
+# is rounded UP to the next multiple of the SIMD group size (64 for
+# wave64/RDNA1).  Partial waves waste VGPR lanes; aligning eliminates
+# the slang_validator.py M27 advisory.  Respects max_wg cap.
+# Set ``TORCH_VULKAN_ROUND_WG_TO_WAVE=0`` to disable.
+_ROUND_WG_TO_WAVE = os.environ.get("TORCH_VULKAN_ROUND_WG_TO_WAVE", "1") != "0"
+
+# M11.7 — Occupancy gate. When enabled (default ON), the codegen
+# estimates GPU occupancy after WG size selection and warns when
+# occupancy falls below 50 %.  Set ``TORCH_VULKAN_STRICT_OCCUPANCY=1``
+# to promote the warning to a hard error.  Set ``TORCH_VULKAN_OCCUPANCY_GATE=0``
+# to disable the gate entirely.
+_OCCUPANCY_GATE = os.environ.get("TORCH_VULKAN_OCCUPANCY_GATE", "1") != "0"
+_STRICT_OCCUPANCY = os.environ.get("TORCH_VULKAN_STRICT_OCCUPANCY", "0") == "1"
+
+# M11.3 — Register-tile pointwise: each thread processes 2-4 consecutive
+# elements instead of 1, reducing thread count and improving ILP.
+# Set to 2, 3, or 4 to enable; 0 disables (default: off until validated).
+# Only applies to simple single-axis pointwise kernels not eligible for
+# vec4 or packed16 paths.
+_REGISTER_TILE = int(os.environ.get("TORCH_VULKAN_REGISTER_TILE", "0"))
 
 # N+1.5.c — Descriptor indexing feature gate for >16 storage buffer bindings.
 # When enabled (default) and VK_EXT_descriptor_indexing is available on the
@@ -346,13 +369,13 @@ def bank_conflict_pad() -> bool:
 
 
 def reflection_routing() -> bool:
-    """Whether compile-time reflection routing is enabled (DR.7).
+    """Whether compile-time reflection routing is enabled (DR.7 / M11.1).
 
-    When True, the two-pass compilation flow peeks at SPIR-V reflection
-    after Pass 1, adjusts numthreads based on VGPR count, and re-compiles
-    with optimized workgroup sizing.  This avoids cold-compile autotune
-    cycles; halves cold-compile latency on first dispatch.
-    Set ``TORCH_VULKAN_REFLECTION_ROUTING=1`` to enable.  Default: off.
+    When True (default), the two-pass compilation flow peeks at SPIR-V
+    reflection after Pass 1, adjusts numthreads based on VGPR count, and
+    re-compiles with optimized workgroup sizing.  This avoids cold-compile
+    autotune cycles; halves cold-compile latency on first dispatch.
+    Set ``TORCH_VULKAN_REFLECTION_ROUTING=0`` to disable.
     """
     return _REFLECTION_ROUTING
 
@@ -448,6 +471,49 @@ def persistent_pointwise() -> bool:
     to disable.
     """
     return _PERSISTENT_POINTWISE
+
+
+def round_wg_to_wave() -> bool:
+    """Whether WG sizes are rounded up to wave-size multiples (M11.5).
+
+    When True (default), the final WG size from _pick_threadgroup_size
+    is rounded UP to the next multiple of the SIMD group size (64 for
+    wave64/RDNA1), capped at max_wg.  Eliminates the M27 advisory from
+    slang_validator.py.  Set ``TORCH_VULKAN_ROUND_WG_TO_WAVE=0`` to disable.
+    """
+    return _ROUND_WG_TO_WAVE
+
+
+def occupancy_gate() -> bool:
+    """Whether the occupancy gate is active (M11.7).
+
+    When True (default), the codegen estimates GPU occupancy after WG
+    size selection and warns via ``trace_structured`` when occupancy
+    falls below 50 %.  Set ``TORCH_VULKAN_OCCUPANCY_GATE=0`` to disable.
+    """
+    return _OCCUPANCY_GATE
+
+
+def strict_occupancy() -> bool:
+    """Whether low-occupancy warnings promote to hard errors (M11.7).
+
+    When True, estimated occupancy below 50 % raises ``RuntimeError``
+    instead of logging a warning.  Set ``TORCH_VULKAN_STRICT_OCCUPANCY=1``
+    to enable.
+    """
+    return _STRICT_OCCUPANCY
+
+
+def register_tile() -> int:
+    """Return the register-tile size for pointwise kernels (M11.3).
+
+    Returns 2, 3, or 4 when ``TORCH_VULKAN_REGISTER_TILE`` is set;
+    returns 0 (disabled) by default.  When > 0, each thread processes
+    this many consecutive elements in scalar pointwise kernels.
+    """
+    if _REGISTER_TILE in (2, 3, 4):
+        return _REGISTER_TILE
+    return 0
 
 
 # DR.1+ — Aggressive fusion scheduling. When enabled (default ON),

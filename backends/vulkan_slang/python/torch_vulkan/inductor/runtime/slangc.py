@@ -46,12 +46,13 @@ def _resolve_slangc(raw: str) -> str:
     which = shutil.which(raw)
     if which:
         return which
-    # Resolve relative to backend root (runtime.py is at
-    # backends/vulkan_slang/python/torch_vulkan/inductor/runtime.py
+    # Resolve relative to backend root (slangc.py is at
+    # backends/vulkan_slang/python/torch_vulkan/inductor/runtime/slangc.py
     # → 4 dirname() steps up = backend root).
     backend_root = os.path.normpath(
         os.path.join(
             os.path.dirname(__file__),
+            "..",
             "..",
             "..",
             "..",
@@ -78,6 +79,21 @@ def _resolve_slangc(raw: str) -> str:
 
 
 _SLANGC = _resolve_slangc(os.environ.get("SLANGC", "slangc"))
+
+
+def _get_slangc() -> str:
+    """Return the current slangc path, re-reading SLANGC from the env var.
+
+    This ensures the path is fresh even when the env var is set after
+    module import time (e.g. via conftest.py's pytest_configure).
+    """
+    env_val = os.environ.get("SLANGC")
+    if env_val:
+        resolved = _resolve_slangc(env_val)
+        if resolved != "slangc":
+            return resolved
+    return _SLANGC
+
 
 # PF.18: hard timeout on every `slangc` subprocess invocation so a hung
 # slangc (rare, but possible — deeply nested generic specializations have
@@ -201,14 +217,6 @@ _ASYNC_MAX_WORKERS = _default_max_workers()
 # _ASYNC_MAX_WORKERS so callers have a stable, self-documenting handle.
 _MAX_SLANGC_WORKERS = _ASYNC_MAX_WORKERS
 
-# Per-kernel stats dict, populated only when _INDUCTOR_STATS is True.
-# Key: kernel name (cache key). Value: dict with call_count, total_us, shapes.
-_KERNEL_STATS: dict[str, dict] = {}
-# Maps each Inductor-generated kernel cache_key to the 12-char prefix of its
-# SPIR-V SHA256. Populated whenever a kernel is built; lets observability
-# tooling (e.g. `inductor_stats.summary()`) correlate per-kernel timing back
-# to specific compiled binaries when debugging cache-miss / autotune churn.
-_KERNEL_SPIRV_HASH: dict[str, str] = {}
 # SPIR-V cache, keyed by the stable cache_key the generated wrapper already owns.
 # Falls back to SHA256(src) only for callers that don't supply a key.
 _cache_by_key: dict[str, bytes] = {}
@@ -256,31 +264,6 @@ def reset_compile_stats() -> None:
         )
 
 
-def reset_per_test_caches() -> None:
-    """GAP 7.3 / PF.27.a.2 — clear in-memory caches that leak across tests.
-
-    Called by the ``conftest.py`` per-test fixture so that dispatch-count
-    and cold-compile-budget tests see deterministic cache state regardless
-    of test ordering within a single xdist worker. Does *not* clear the
-    on-disk SPIR-V cache (that's intentionally persistent across sessions).
-
-    PF.27.a.2 extension (2026-05-02): also resets shader-lib module
-    readiness, reflection cache, and async pool — globals that previously
-    leaked worker-id-dependent state across tests within an xdist worker.
-    """
-    global _slangc_available_cache, _shader_lib_modules_ready
-    _cache_by_key.clear()
-    _cache_by_hash.clear()
-    _KERNEL_SPIRV_HASH.clear()
-    _reflection_cache.clear()
-    _SHADER_LIB_MODULE_STATS["compiles"] = 0
-    _SHADER_LIB_MODULE_STATS["cache_hits"] = 0
-    reset_compile_stats()
-    _slangc_available_cache = None
-    _shader_lib_modules_ready = False
-    _DISPATCH_TIMES.clear()
-
-
 def cache_hit_rate() -> float:
     """Ratio of compile requests that hit cache (in-memory + disk) vs
     total slangc-bound compiles. P5.6 — `0.9` is the post-warmup
@@ -300,32 +283,26 @@ _DISK_CACHE_DIR = os.environ.get(
 )
 
 
-def _wrap_stats(key: str, inner):
-    """Wrap a kernel callable to collect per-kernel timing + call count.
+def _get_disk_cache_dir() -> str:
+    """Return _DISK_CACHE_DIR, resolving via the package for monkeypatch compatibility.
 
-    The stats entry is looked up by key on every call rather than captured
-    at wrap-time so that `reset_stats()` (which clears `_KERNEL_STATS`)
-    correctly repopulates entries for already-wrapped kernels — otherwise
-    cached kernels would write to a dangling dict that's no longer in
-    `_KERNEL_STATS` and `get_stats()` would always report empty.
+    Tests monkeypatch ``torch_vulkan.inductor.runtime._DISK_CACHE_DIR``;
+    since this module is now a sub-package, the patch lands on
+    ``__init__.py``.  This getter checks there first, falling back to
+    the module-level default.
     """
+    import sys
 
-    def stats_kernel(*args):
-        entry = _KERNEL_STATS.get(key)
-        if entry is None:
-            entry = {"call_count": 0, "total_us": 0.0, "last_args_len": 0}
-            _KERNEL_STATS[key] = entry
-        t0 = time.perf_counter()
-        inner(*args)
-        entry["total_us"] += (time.perf_counter() - t0) * 1e6
-        entry["call_count"] += 1
-        entry["last_args_len"] = len(args)
-
-    return stats_kernel
+    pkg = sys.modules.get("torch_vulkan.inductor.runtime")
+    if pkg is not None:
+        val = getattr(pkg, "_DISK_CACHE_DIR", None)
+        if val is not None:
+            return val
+    return _DISK_CACHE_DIR
 
 
 def _disk_cache_read(hash_key: str) -> Optional[bytes]:
-    path = os.path.join(_DISK_CACHE_DIR, hash_key[:2], hash_key[2:] + ".spv")
+    path = os.path.join(_get_disk_cache_dir(), hash_key[:2], hash_key[2:] + ".spv")
     try:
         with open(path, "rb") as f:
             return f.read()
@@ -334,7 +311,7 @@ def _disk_cache_read(hash_key: str) -> Optional[bytes]:
 
 
 def _disk_cache_write(hash_key: str, spv: bytes) -> None:
-    path = os.path.join(_DISK_CACHE_DIR, hash_key[:2], hash_key[2:] + ".spv")
+    path = os.path.join(_get_disk_cache_dir(), hash_key[:2], hash_key[2:] + ".spv")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # Atomic write: rename from a pid-suffixed temp so we never leave a
@@ -345,80 +322,6 @@ def _disk_cache_write(hash_key: str, spv: bytes) -> None:
         os.replace(tmp, path)
     except OSError:
         pass  # cache is best-effort; fall back to recompiling next time
-
-
-# Pre-resolved pybind entries — avoids a package import on every dispatch.
-_jit_dispatch = None
-_jit_dispatch_cached = None
-_jit_dispatch_cached_nopc = None
-_jit_dispatch_indexed = None
-_jit_pipeline = None
-_descriptor_indexing_probe: Optional[bool] = None
-
-
-def _get_jit_dispatch():
-    global _jit_dispatch
-    if _jit_dispatch is None:
-        from torch_vulkan import _C as _c
-
-        _jit_dispatch = _c._jit_dispatch
-    return _jit_dispatch
-
-
-def _get_jit_dispatch_indexed():
-    """Resolve the descriptor-array variant of `_jit_dispatch` (N+1.5).
-
-    Returns the C++ pybind entry that accepts a per-binding
-    ``descriptor_counts: vector<uint32_t>``. Auto-falls-back to the flat
-    path inside the C++ runtime when every count == 1, so callers may use
-    it unconditionally — but Python codegen still prefers the cheaper
-    flat ``_jit_dispatch`` when all counts are 1, to skip the extra
-    pybind conversion on the hot path.
-    """
-    global _jit_dispatch_indexed
-    if _jit_dispatch_indexed is None:
-        from torch_vulkan import _C as _c
-
-        _jit_dispatch_indexed = getattr(_c, "_jit_dispatch_indexed", None)
-    return _jit_dispatch_indexed
-
-
-def _descriptor_indexing_supported() -> bool:
-    """Cached probe of `VK_EXT_descriptor_indexing` availability.
-
-    Returns ``True`` when the C++ runtime reports the extension is
-    enabled and the FFI shim is present. False on older builds (no
-    ``_descriptor_indexing_enabled`` symbol) or when the device driver
-    rejected the extension.
-    """
-    global _descriptor_indexing_probe
-    if _descriptor_indexing_probe is not None:
-        return _descriptor_indexing_probe
-    try:
-        from torch_vulkan import _C as _c
-
-        probe = getattr(_c, "_descriptor_indexing_enabled", None)
-        _descriptor_indexing_probe = bool(probe()) if probe is not None else False
-    except Exception:
-        _descriptor_indexing_probe = False
-    return _descriptor_indexing_probe
-
-
-def _get_jit_dispatch_cached():
-    """Resolve the cached-pipeline fast-path dispatches (no key lookup per call).
-
-    Returns (dispatch_with_pc, dispatch_no_pc, get_pipeline). Generated
-    kernels pick the no-pc entry when n_pc=0 (the common pointwise case),
-    avoiding a pybind bytes conversion on every dispatch.
-    """
-    global _jit_dispatch_cached, _jit_dispatch_cached_nopc, _jit_pipeline
-    if _jit_dispatch_cached is None:
-        from torch_vulkan import _C as _c
-
-        _jit_dispatch_cached = _c._jit_dispatch_cached
-        _jit_dispatch_cached_nopc = _c._jit_dispatch_cached_nopc
-        _jit_pipeline = _c._jit_pipeline
-    return _jit_dispatch_cached, _jit_dispatch_cached_nopc, _jit_pipeline
 
 
 # PF.14: re-entrant submission guard. The slangc thread pool dispatches
@@ -529,7 +432,7 @@ def _slangc_available() -> bool:
         return _slangc_available_cache
     try:
         subprocess.run(
-            [_SLANGC, "--version"],
+            [_get_slangc(), "-help"],
             capture_output=True,
             check=False,
             timeout=5,
@@ -571,15 +474,15 @@ def _slangc_fingerprint() -> str:
     unreachable (e.g. CI environments where slangc isn't on PATH).
     """
     try:
-        st = os.stat(_SLANGC)
-        stat_key = f"{os.path.realpath(_SLANGC)}:{st.st_size}:{st.st_mtime_ns}"
+        st = os.stat(_get_slangc())
+        stat_key = f"{os.path.realpath(_get_slangc())}:{st.st_size}:{st.st_mtime_ns}"
     except OSError:
-        return f"unresolved:{_SLANGC}"
+        return f"unresolved:" + _get_slangc()
     version = _slangc_fingerprint_cache.get(stat_key)
     if version is None and _slangc_available():
         try:
             proc = subprocess.run(
-                [_SLANGC, "--version"],
+                [_get_slangc(), "--version"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -597,7 +500,7 @@ _slangc_fingerprint_cache: dict[str, str] = {}
 
 
 _SHADERS_LIB_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "shaders", "lib")
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "shaders", "lib")
 )
 
 _SHADER_LIB_MODULE_CACHE_DIR = os.environ.get(
@@ -673,7 +576,7 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
                 "precompile shader-lib modules at "
                 f"{_SHADERS_LIB_DIR}."
             )
-        argv = [_SLANGC, src_path, "-emit-ir", "-o", mod_path]
+        argv = [_get_slangc(), src_path, "-emit-ir", "-o", mod_path]
         try:
             proc = subprocess.run(
                 argv,
@@ -847,7 +750,7 @@ def _slangc_supports_modules() -> bool:
                 f.write(probe_src)
             proc = subprocess.run(
                 [
-                    _SLANGC,
+                    _get_slangc(),
                     src_path,
                     "-target",
                     "spirv",
@@ -939,7 +842,9 @@ def _build_specialize_const_args(constants: dict[str, int]) -> list[str]:
 
 
 def _disk_reflection_path(hash_key: str) -> str:
-    return os.path.join(_DISK_CACHE_DIR, hash_key[:2], hash_key[2:] + ".refl.json")
+    return os.path.join(
+        _get_disk_cache_dir(), hash_key[:2], hash_key[2:] + ".refl.json"
+    )
 
 
 def _disk_reflection_read(hash_key: str) -> Optional[str]:
@@ -969,7 +874,9 @@ _reflection_cache: dict[str, str] = {}
 
 
 def _disk_metrics_path(hash_key: str) -> str:
-    return os.path.join(_DISK_CACHE_DIR, hash_key[:2], hash_key[2:] + ".metrics.json")
+    return os.path.join(
+        _get_disk_cache_dir(), hash_key[:2], hash_key[2:] + ".metrics.json"
+    )
 
 
 def _disk_metrics_read(hash_key: str):
@@ -1356,7 +1263,7 @@ def get_reflection_metrics(
     Callers (e.g. kernel/main.py) can use the returned vgprs field
     to drive workgroup-size selection.
     """
-    from ..inductor import config
+    from .. import config
 
     if not config.reflection_enabled():
         return None
@@ -1397,7 +1304,7 @@ def get_cached_metrics_for_key(cache_key: str):
     a cache_key. Returns None on miss (caller falls back to
     heuristic).
     """
-    from ..inductor import config
+    from .. import config
 
     if not config.reflection_enabled():
         return None
@@ -1422,6 +1329,11 @@ def reset_reflection_baselines() -> None:
 
 _NUMTHREADS_SRC_RE = re.compile(r"\[numthreads\((\d+),\s*(\d+),\s*(\d+)\)\]")
 
+# DR.7 / M11.1: After Pass-2 optimizes numthreads, store the final value
+# so the dispatch grid can be divided by the actual WG size instead of the
+# codegen-time estimate.  Keyed by hash_key (same key as the SPV cache).
+_optimized_numthreads_by_hash: dict[str, tuple[int, int, int]] = {}
+
 
 def _parse_numthreads_from_source(src: str) -> tuple[int, int, int] | None:
     """Extract numthreads tuple from Slang source.
@@ -1440,27 +1352,45 @@ def _rewrite_numthreads_in_source(src: str, new_nt: tuple[int, int, int]) -> str
     return _NUMTHREADS_SRC_RE.sub(replacement, src, count=1)
 
 
+def get_optimized_numthreads(hash_key: str) -> tuple[int, int, int] | None:
+    """DR.7 / M11.1: Return the Pass-2 optimized numthreads for a kernel.
+
+    Returns ``(x, y, z)`` if a Pass-2 recompile succeeded and stored
+    optimized numthreads, or ``None`` if no optimization was applied.
+    Callers (e.g. dispatch-grid codegen) use this to divide total numel
+    by the ACTUAL workgroup size instead of the codegen-time estimate.
+    """
+    return _optimized_numthreads_by_hash.get(hash_key)
+
+
 def _pick_numthreads_from_reflection(
     vgprs: int | None,
     shared_mem: int | None = None,
     loop_depth: int | None = None,
     current_numthreads: tuple[int, int, int] = (256, 1, 1),
 ) -> tuple[int, int, int]:
-    """DR.7: Pick optimal numthreads based on SPIR-V reflection metrics.
+    """DR.7 / M11.1: Pick optimal numthreads based on SPIR-V reflection metrics.
 
-    RDNA1 occupancy heuristic (wave64, 256 VGPRs/CU, 1024 max threads/CU):
+    RDNA1 occupancy heuristic (wave64, 256 VGPRs/CU, 1024 max threads/CU,
+    64 KiB LDS/CU):
 
     - VGPRs ≤ 32  → 256 threads (4 waves/CU → high occupancy)
     - VGPRs 33–64 → 128 threads (2 waves/CU → balance)
     - VGPRs 65–128 → 64 threads  (1 wave/CU → avoid register spilling)
     - VGPRs > 128  → 32 threads  (minimum occupancy, avoid scratch)
 
+    When *shared_mem* exceeds 16 KiB (25 % of LDS budget), drop one tier
+    to leave headroom for groupshared allocations.
+
+    When *loop_depth* ≥ 3, drop one tier (deep loops increase register
+    pressure beyond what the VGPR count captures). When ≥ 5, drop two.
+
     Falls back to *current_numthreads* when *vgprs* is ``None``.
 
     Args:
         vgprs: VGPR count from slangc reflection (numRegisters / usedRegisters).
-        shared_mem: Groupshared / LDS bytes used (reserved for future use).
-        loop_depth: Maximum nested loop depth (reserved for future use).
+        shared_mem: Groupshared / LDS bytes used (from reflection).
+        loop_depth: Maximum nested loop depth (from reflection).
         current_numthreads: The numthreads currently in the source.
 
     Returns:
@@ -1469,14 +1399,43 @@ def _pick_numthreads_from_reflection(
     if vgprs is None:
         return current_numthreads
 
+    # Base tier from VGPR count
     if vgprs <= 32:
-        return (256, 1, 1)
+        base = 256
     elif vgprs <= 64:
-        return (128, 1, 1)
+        base = 128
     elif vgprs <= 128:
-        return (64, 1, 1)
+        base = 64
     else:
-        return (32, 1, 1)
+        base = 32
+
+    # M11.1: Shared-memory penalty — when LDS usage is high, drop a tier
+    # to leave more LDS per workgroup for groupshared allocations.
+    if shared_mem is not None and shared_mem > 16384:  # > 16 KiB
+        if base == 256:
+            base = 128
+        elif base == 128:
+            base = 64
+
+    # M11.1: Loop-depth penalty — deep nests blow register pressure.
+    if loop_depth is not None:
+        if loop_depth >= 5:
+            for _ in range(2):
+                if base == 256:
+                    base = 128
+                elif base == 128:
+                    base = 64
+                elif base == 64:
+                    base = 32
+        elif loop_depth >= 3:
+            if base == 256:
+                base = 128
+            elif base == 128:
+                base = 64
+            elif base == 64:
+                base = 32
+
+    return (base, 1, 1)
 
 
 # ── Core compilation ────────────────────────────────────────────────────
@@ -1531,7 +1490,7 @@ def _compile_slang_to_spirv_inner(
         except RuntimeError:
             module_includes = []
         cmd = [
-            _SLANGC,
+            _get_slangc(),
             src_path,
             "-target",
             "spirv",
@@ -1589,7 +1548,7 @@ def _compile_slang_to_spirv_inner(
             _invalidate_shader_lib_modules()
             used_module_includes = False  # DR.7: retry without module includes
             cmd2 = [
-                _SLANGC,
+                _get_slangc(),
                 src_path,
                 "-target",
                 "spirv",
@@ -1676,7 +1635,7 @@ def _compile_slang_to_spirv_inner(
                             with open(new_src_path, "w") as f:
                                 f.write(new_src)
                             cmd3 = [
-                                _SLANGC,
+                                _get_slangc(),
                                 new_src_path,
                                 "-target",
                                 "spirv",
@@ -1708,6 +1667,8 @@ def _compile_slang_to_spirv_inner(
                                 if proc3.returncode == 0:
                                     with open(new_out_path, "rb") as f:
                                         spv = f.read()
+                                    # M11.1: Store optimized numthreads for dispatch grid
+                                    _optimized_numthreads_by_hash[hash_key] = optimal_nt
                                     try:
                                         with open(new_refl_path) as f:
                                             refl_blob2 = f.read()
@@ -1723,6 +1684,9 @@ def _compile_slang_to_spirv_inner(
                                             )
                                     except (FileNotFoundError, OSError):
                                         pass
+                        else:
+                            # M11.1: Store Pass-1 numthreads when no change needed
+                            _optimized_numthreads_by_hash[hash_key] = current_nt
         except (FileNotFoundError, OSError):
             pass
     _COMPILE_STATS["cold_compiles"] += 1
@@ -2022,122 +1986,6 @@ def parse_spec_constants(spv: bytes) -> list[tuple[int, int]]:
     return out
 
 
-def get_reflection_json(hash_key: str) -> Optional[str]:
-    """Look up the cached slangc reflection JSON blob for a given key.
-
-    First checks the in-memory cache, then the on-disk sidecar
-    (`<spirv_cache_dir>/<prefix>/<rest>.refl.json`). Returns ``None`` when
-    no reflection has ever been emitted for that key (e.g. compiled
-    pre-P0.4 or via a slangc that doesn't support `-reflection-json`).
-    """
-    hit = _reflection_cache.get(hash_key)
-    if hit is not None:
-        return hit
-    blob = _disk_reflection_read(hash_key)
-    if blob is not None:
-        _reflection_cache[hash_key] = blob
-    return blob
-
-
-def _binding_descriptor_count(param: dict) -> int:
-    """Return the ``descriptorCount`` for a single reflection parameter.
-
-    Looks for one of the recognised array shapes the slangc reflection
-    JSON emits for ``RWStructuredBuffer<T> name[N]`` / nested
-    ``ParameterBlock`` array members:
-
-    - ``param["type"]["kind"] == "array"`` with ``elementCount: N`` —
-      flat top-level array binding (the common case post-N+1.5).
-    - ``param["binding"]["size"] >= 1`` — slangc occasionally inlines
-      the count there for `descriptorTableSlot` kinds.
-    - ``param["binding"]["subBindings"][...]`` — nested layout where the
-      array element count lives one level deep (older slangc shapes).
-
-    Returns ``1`` when none of the above match (i.e. a plain scalar
-    binding).
-    """
-    t = param.get("type") or {}
-    if t.get("kind") == "array":
-        ec = t.get("elementCount")
-        if ec is not None:
-            try:
-                n = int(ec)
-                return n if n >= 1 else 1
-            except (TypeError, ValueError):
-                pass
-    b = param.get("binding") or {}
-    sz = b.get("size")
-    if sz is not None:
-        try:
-            n = int(sz)
-            if n >= 1:
-                return n
-        except (TypeError, ValueError):
-            pass
-    sub = b.get("subBindings") or []
-    for s in sub:
-        sb = s.get("binding") or {}
-        ssz = sb.get("size")
-        if ssz is not None:
-            try:
-                n = int(ssz)
-                if n >= 1:
-                    return n
-            except (TypeError, ValueError):
-                continue
-        st = s.get("type") or {}
-        if st.get("kind") == "array":
-            ec = st.get("elementCount")
-            if ec is not None:
-                try:
-                    n = int(ec)
-                    if n >= 1:
-                        return n
-                except (TypeError, ValueError):
-                    continue
-    return 1
-
-
-def reflection_layout(reflection_json: str) -> dict:
-    """Extract the descriptor + push-constant layout from a slangc reflection JSON.
-
-    Returns ``{"bindings": [(set, index, name), ...],
-    "descriptor_counts": [int, ...], "push_constant_size": int}``.
-    The ``descriptor_counts`` list is parallel to ``bindings`` (same
-    length, same order after sort) and carries the per-binding
-    ``descriptorCount`` extracted from the slangc reflection. A flat
-    binding has count ``1``; an array binding (e.g.
-    ``RWStructuredBuffer<float> outs[4]``) has count ``4``.
-
-    Lets callers populate `VkDescriptorSetLayoutBinding` arrays without
-    having to count tensors or guess push-constant sizes manually.
-    """
-    import json
-
-    data = json.loads(reflection_json)
-    paired: list[tuple[tuple[int, int, str], int]] = []
-    pc_size = 0
-    for p in data.get("parameters", []):
-        b = p.get("binding") or {}
-        kind = b.get("kind")
-        if kind == "descriptorTableSlot":
-            key = (b.get("space", 0), b.get("index", 0), p.get("name", ""))
-            paired.append((key, _binding_descriptor_count(p)))
-        elif kind == "pushConstantBuffer":
-            t = p.get("type", {})
-            elv = t.get("elementVarLayout", {})
-            elb = elv.get("binding", {})
-            pc_size = max(pc_size, int(elb.get("size", 0)))
-    paired.sort(key=lambda kv: kv[0])
-    bindings = [k for k, _ in paired]
-    descriptor_counts = [c for _, c in paired]
-    return {
-        "bindings": bindings,
-        "descriptor_counts": descriptor_counts,
-        "push_constant_size": pc_size,
-    }
-
-
 def compile_slang_to_spirv_with_reflection(
     src: str,
     entry: str = "computeMain",
@@ -2157,410 +2005,13 @@ def compile_slang_to_spirv_with_reflection(
     hash_key = hashlib.sha256(
         (entry + "\n" + _normalize_slang_source(src) + inc_tag).encode()
     ).hexdigest()
+    # Lazy import from sibling reflection module within the runtime package.
+    from .reflection import get_reflection_json, reflection_layout
+
     refl = get_reflection_json(hash_key)
     if refl is None:
         return spv, {"bindings": [], "push_constant_size": 0}
     return spv, reflection_layout(refl)
-
-
-# ── D.3: Reflection-based buffer counting ───────────────────────────────────
-
-
-def get_reflected_binding_count(spv: bytes) -> int | None:
-    """Extract the number of storage-buffer bindings from SPIR-V reflection.
-
-    Returns ``None`` when no reflection JSON is cached for this SPV (e.g.
-    compiled with a slangc that doesn't support ``-reflection-json``).
-    Callers should fall back to the hand-counted ``n_buffers`` in that case.
-    """
-    hash_key = hashlib.sha256(spv).hexdigest()
-    refl_json = get_reflection_json(hash_key)
-    if refl_json is None:
-        # Try the full-src hash — the SPV hash alone may not match if the
-        # reflection was keyed by (entry + src), not by SPV bytes.
-        return None
-    layout = reflection_layout(refl_json)
-    return len(layout["bindings"])
-
-
-def _get_reflected_buffer_count_from_cache_key(
-    src: str,
-    entry: str = "computeMain",
-    include_paths: tuple[str, ...] = (),
-) -> int | None:
-    """Like :func:`get_reflected_binding_count` but keyed by source hash."""
-    inc_tag = "" if not include_paths else "\nINC=" + "|".join(include_paths)
-    hash_key = hashlib.sha256(
-        (entry + "\n" + _normalize_slang_source(src) + inc_tag).encode()
-    ).hexdigest()
-    refl = get_reflection_json(hash_key)
-    if refl is None:
-        return None
-    return len(reflection_layout(refl)["bindings"])
-
-
-def get_reflected_descriptor_counts(spv: bytes) -> Optional[list[int]]:
-    """N+1.5.a — extract per-binding ``descriptorCount`` from SPV reflection.
-
-    Returns a list parallel to the binding list (same order as
-    :func:`reflection_layout`'s ``bindings``). Each entry is the
-    ``descriptorCount`` for that binding — ``1`` for a flat binding,
-    ``N`` for an array binding (e.g. ``RWStructuredBuffer<T> arr[N]``).
-
-    Returns ``None`` when no reflection JSON is cached for this SPV
-    (e.g. compiled with a slangc that doesn't support
-    ``-reflection-json``). Callers should fall back to ``[1] * n_buffers``
-    in that case.
-    """
-    hash_key = hashlib.sha256(spv).hexdigest()
-    refl_json = get_reflection_json(hash_key)
-    if refl_json is None:
-        return None
-    layout = reflection_layout(refl_json)
-    return list(layout.get("descriptor_counts") or [])
-
-
-def _get_reflected_descriptor_counts_from_src(
-    src: str,
-    entry: str = "computeMain",
-    include_paths: tuple[str, ...] = (),
-) -> Optional[list[int]]:
-    """Source-hash variant of :func:`get_reflected_descriptor_counts`.
-
-    The reflection JSON is keyed by ``sha256(entry + normalized_src)``
-    (see :func:`compile_slang_to_spirv`), so a SPV-hash lookup will
-    miss. This helper performs the same lookup but using the source hash
-    that ``compile_slang_to_spirv`` actually wrote.
-    """
-    inc_tag = "" if not include_paths else "\nINC=" + "|".join(include_paths)
-    hash_key = hashlib.sha256(
-        (entry + "\n" + _normalize_slang_source(src) + inc_tag).encode()
-    ).hexdigest()
-    refl_json = get_reflection_json(hash_key)
-    if refl_json is None:
-        return None
-    layout = reflection_layout(refl_json)
-    return list(layout.get("descriptor_counts") or [])
-
-
-def _validate_no_null_storage(key: str, tensors: list[torch.Tensor]) -> bool:
-    """PF.51 — fail-fast guard against null-storage (FakeTensor) leakage.
-
-    A vulkan-tagged null-storage tensor (PF.13's ``make_vulkan_null``) reaches
-    this layer only if an FX pass or wrapper-codegen step propagated a
-    FakeTensor through to dispatch. The C++ layer would otherwise raise
-    ``RuntimeError: Tensor has no backing Vulkan buffer`` with no
-    indication of which arg was responsible. We surface the offender by
-    name (and dispatch key) so the bug roots straight to the producing
-    pipeline stage instead of to the runtime.
-    """
-    offenders: list[str] = []
-    fake_count = 0
-    vulkan_count = 0
-    for i, t in enumerate(tensors):
-        if t is None:
-            continue
-        # ``has_storage`` returns True for vulkan-null tensors (PF.13's
-        # invariant — they carry a real Storage with a null DataPtr).
-        # ``data_ptr() == 0`` is the canonical null-storage signal.
-        try:
-            dev_type = t.device.type
-        except Exception:  # noqa: BLE001
-            continue
-        if dev_type not in ("vulkan", "privateuseone"):
-            continue
-        vulkan_count += 1
-        try:
-            ptr = t.data_ptr()
-        except RuntimeError:
-            # ``data_ptr`` raises on FakeTensor — tracing mode.
-            fake_count += 1
-            offenders.append(
-                f"arg{i}: <FakeTensor> shape={list(t.shape)} dtype={t.dtype}"
-            )
-            continue
-        if ptr == 0:
-            offenders.append(
-                f"arg{i}: shape={list(t.shape)} dtype={t.dtype} device={t.device}"
-            )
-    # If ALL Vulkan tensors are FakeTensors, we are in AOT Autograd tracing.
-    # Skip the dispatch — outputs already have correct shapes.
-    if fake_count > 0 and fake_count == vulkan_count:
-        return True
-    if offenders:
-        raise RuntimeError(
-            f"PF.51: vulkan-null-storage tensor reached dispatch '{key}' — "
-            f"an FX pass or wrapper-codegen step is propagating a "
-            f"FakeTensor through to the runtime. Offenders:\n  "
-            + "\n  ".join(offenders)
-        )
-    return False
-
-
-def dispatch(
-    key: str,
-    spirv: bytes,
-    tensors: list[torch.Tensor],
-    wg_x: int,
-    wg_y: int = 1,
-    wg_z: int = 1,
-    push_constants: bytes = b"",
-    num_outputs: int = 1,
-) -> None:
-    """Dispatch a pre-compiled SPIR-V compute shader on the Vulkan stream.
-
-    Thin wrapper around the C++ `_jit_dispatch` pybind entry. Requires that
-    every tensor is on the vulkan device and already contiguous.
-    """
-    if _TRACE:
-        import sys
-
-        print(
-            f"[vk-jit] key={key} tensors={len(tensors)} wg=({wg_x},{wg_y},{wg_z}) "
-            f"pc_bytes={len(push_constants)} num_out={num_outputs}",
-            file=sys.stderr,
-            flush=True,
-        )
-    if _validate_no_null_storage(key, tensors):
-        return  # tracing mode, skip actual dispatch
-    _get_jit_dispatch()(
-        key, spirv, tensors, wg_x, wg_y, wg_z, push_constants, num_outputs
-    )
-
-
-def dispatch_indexed(
-    key: str,
-    spirv: bytes,
-    tensors: list[torch.Tensor],
-    descriptor_counts: list[int],
-    wg_x: int,
-    wg_y: int = 1,
-    wg_z: int = 1,
-    push_constants: bytes = b"",
-    num_outputs: int = 1,
-) -> None:
-    """N+1.5.a — descriptor-array variant of :func:`dispatch`.
-
-    Routes through the C++ ``_jit_dispatch_indexed`` pybind entry, which
-    writes Vulkan descriptor sets with ``descriptorCount`` taken from
-    ``descriptor_counts`` (parallel to the binding order). When every
-    count is ``1`` the C++ runtime auto-falls-back to the flat path —
-    callers may still want to use :func:`dispatch` directly for that
-    case to skip the extra pybind list conversion.
-
-    Raises ``RuntimeError`` when any count > 1 but
-    ``VK_EXT_descriptor_indexing`` is unavailable on the device.
-    """
-    if any(c > 1 for c in descriptor_counts):
-        if not _descriptor_indexing_supported():
-            raise RuntimeError(
-                f"N+1.5: dispatch '{key}' uses a descriptor-array binding "
-                f"(descriptor_counts={list(descriptor_counts)}) but the "
-                f"Vulkan runtime reports VK_EXT_descriptor_indexing is "
-                f"unavailable on this device."
-            )
-    indexed_fn = _get_jit_dispatch_indexed()
-    if indexed_fn is None:
-        raise RuntimeError(
-            f"N+1.5: `_jit_dispatch_indexed` FFI symbol not present. "
-            f"Rebuild the C++ extension."
-        )
-    if _TRACE:
-        import sys
-
-        print(
-            f"[vk-jit-idx] key={key} tensors={len(tensors)} "
-            f"counts={list(descriptor_counts)} "
-            f"wg=({wg_x},{wg_y},{wg_z}) pc_bytes={len(push_constants)} "
-            f"num_out={num_outputs}",
-            file=sys.stderr,
-            flush=True,
-        )
-    if _validate_no_null_storage(key, tensors):
-        return  # tracing mode, skip actual dispatch
-    indexed_fn(
-        key,
-        spirv,
-        tensors,
-        list(int(c) for c in descriptor_counts),
-        wg_x,
-        wg_y,
-        wg_z,
-        push_constants,
-        num_outputs,
-    )
-
-
-def compile_and_dispatch(
-    src: str,
-    tensors: list[torch.Tensor],
-    wg_x: int,
-    wg_y: int = 1,
-    wg_z: int = 1,
-    push_constants: bytes = b"",
-    num_outputs: int = 1,
-    entry: str = "computeMain",
-    cache_key: str = "",
-) -> None:
-    """Compile Slang source (cached) and dispatch in one call.
-
-    `cache_key` is required (used as both the SPIR-V cache key and the
-    pipeline cache key). All in-tree callers supply one — the previous
-    SHA1-of-SPIRV fallback was dead code.
-    """
-    if not cache_key:
-        raise ValueError("compile_and_dispatch requires a non-empty cache_key")
-    spv = compile_slang_to_spirv(src, entry=entry, cache_key=cache_key)
-    dispatch(cache_key, spv, tensors, wg_x, wg_y, wg_z, push_constants, num_outputs)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# GPU.1 — Batch Dispatch Submission
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Per-dispatch timing ring buffer for GPU.3 profiling.
-# Keyed by kernel cache_key; stores list of (elapsed_us,) tuples.
-_DISPATCH_TIMES: dict[str, list[float]] = {}
-_DISPATCH_TIMES_MAX_SAMPLES = 10_000  # per-key cap
-
-
-def _record_dispatch_time(kernel_key: str, elapsed_us: float) -> None:
-    """Record a single dispatch's wall-clock time for profiling (GPU.3)."""
-    times = _DISPATCH_TIMES.get(kernel_key)
-    if times is None:
-        times = []
-        _DISPATCH_TIMES[kernel_key] = times
-    if len(times) < _DISPATCH_TIMES_MAX_SAMPLES:
-        times.append(elapsed_us)
-
-
-def dispatch_times() -> dict[str, dict]:
-    """Return per-kernel dispatch timing summaries.
-
-    Returns a dict mapping kernel_key → {"min_us", "mean_us", "max_us",
-    "count", "stdev_us"}.  Empty when GPU.3 profiling is disabled or no
-    dispatches have been recorded.
-    """
-    import math
-
-    result: dict[str, dict] = {}
-    for key, times in list(_DISPATCH_TIMES.items()):
-        if not times:
-            continue
-        n = len(times)
-        mean = sum(times) / n
-        variance = sum((t - mean) ** 2 for t in times) / n if n > 1 else 0.0
-        result[key] = {
-            "min_us": min(times),
-            "mean_us": mean,
-            "max_us": max(times),
-            "count": n,
-            "stdev_us": math.sqrt(variance),
-        }
-    return result
-
-
-def _reset_dispatch_times() -> None:
-    """Clear the dispatch timing buffer. Test hook."""
-    _DISPATCH_TIMES.clear()
-
-
-class DispatchBatcher:
-    """Batch multiple kernel dispatches into a single Vulkan submission.
-
-    GPU.1 — When the wrapper codegen enters this context manager, calls to
-    ``add(kernel_fn, *args)`` are collected instead of dispatched immediately.
-    On ``__exit__``, all pending dispatches are submitted back-to-back with
-    minimal Python overhead between them.
-
-    Usage (emitted by wrapper codegen)::
-
-        _batcher = DispatchBatcher()
-        with _batcher:
-            _batcher.add(kernel_0, arg0_0, arg0_1, ...)
-            _batcher.add(kernel_1, arg1_0, arg1_1, ...)
-        # All dispatches submitted on context exit.
-
-    When the C++ ``_jit_dispatch_batch`` FFI is available, all dispatches are
-    recorded into a single Vulkan command buffer and submitted with one
-    ``vkQueueSubmit``.  Otherwise falls back to sequential individual dispatches
-    (still beneficial: eliminates Python bytecode overhead between dispatches).
-    """
-
-    # Cached lookup of the batch FFI entry point (lazy, once per process).
-    _batch_ffi = None
-    _batch_ffi_probed: bool = False
-
-    def __init__(self):
-        self._pending: list[tuple] = []  # (kernel_callable, args_tuple)
-        self._active: bool = False
-
-    def __enter__(self):
-        self._active = True
-        self._pending.clear()
-        return self
-
-    def __exit__(self, *args):
-        self._active = False
-        if self._pending:
-            self._flush()
-        return False  # propagate exceptions
-
-    def add(self, kernel_handle, *dispatch_args):
-        """Collect a kernel dispatch for batched submission.
-
-        When the batcher is active (inside a ``with`` block), the call is
-        queued.  When inactive, dispatches immediately — this ensures
-        correctness for callers that do not nest inside the batcher.
-        """
-        if self._active:
-            self._pending.append((kernel_handle, dispatch_args))
-        else:
-            # Dispatch immediately (non-batched path).
-            kernel_handle(*dispatch_args)
-
-    def _flush(self):
-        """Submit all pending dispatches.
-
-        Tries the C++ ``_jit_dispatch_batch`` fast path first (single
-        ``vkQueueSubmit`` for all kernels).  Falls back to sequential
-        individual dispatches when the C++ FFI is unavailable.
-        """
-        if not self._pending:
-            return
-
-        # Try the C++ batch FFI path.
-        batch_fn = self._resolve_batch_ffi()
-        if batch_fn is not None:
-            try:
-                handles = [h for h, _ in self._pending]
-                arg_lists = [list(a) for _, a in self._pending]
-                batch_fn(handles, arg_lists)
-                self._pending.clear()
-                return
-            except Exception:
-                # Fall through to sequential path on any C++ error.
-                pass
-
-        # Sequential fallback: call each kernel in a tight loop.
-        # Still beneficial vs. full Python wrapper overhead per dispatch.
-        for kernel_handle, dispatch_args in self._pending:
-            kernel_handle(*dispatch_args)
-        self._pending.clear()
-
-    @classmethod
-    def _resolve_batch_ffi(cls):
-        """Lazily resolve the ``_jit_dispatch_batch`` C++ FFI entry."""
-        if cls._batch_ffi_probed:
-            return cls._batch_ffi
-        cls._batch_ffi_probed = True
-        try:
-            from torch_vulkan import _C as _c
-
-            cls._batch_ffi = getattr(_c, "_jit_dispatch_batch", None)
-        except Exception:
-            cls._batch_ffi = None
-        return cls._batch_ffi
 
 
 def gc_spirv_cache(max_mib: int) -> dict:
@@ -2575,9 +2026,10 @@ def gc_spirv_cache(max_mib: int) -> dict:
         raise ValueError("max_mib must be >= 0")
     budget = max_mib * 1024 * 1024
     entries: list[tuple[float, int, str]] = []  # (mtime, size, path)
-    if os.path.isdir(_DISK_CACHE_DIR):
-        for shard in os.listdir(_DISK_CACHE_DIR):
-            shard_dir = os.path.join(_DISK_CACHE_DIR, shard)
+    cache_dir = _get_disk_cache_dir()
+    if os.path.isdir(cache_dir):
+        for shard in os.listdir(cache_dir):
+            shard_dir = os.path.join(cache_dir, shard)
             if not os.path.isdir(shard_dir):
                 continue
             for name in os.listdir(shard_dir):
@@ -2608,348 +2060,3 @@ def gc_spirv_cache(max_mib: int) -> dict:
         "bytes_before": bytes_before,
         "bytes_after": bytes_after,
     }
-
-
-def make_vulkan_kernel(
-    src: str,
-    key: str,
-    n_buffers: int | None,
-    pc_size_bytes: int,
-    n_pc: int,
-    n_outputs: int = 1,
-    config_key: str | None = None,
-):
-    """Build a generated-kernel wrapper that dispatches via _jit_dispatch.
-
-    Uses the raw dispatch path (not cached) because pipeline pre-creation
-    requires passing SPIR-V to _jit_pipeline which the closure doesn't store.
-
-    N+1.5.a: when slangc reflection reports any binding with
-    ``descriptorCount > 1`` (i.e. an array binding such as
-    ``RWStructuredBuffer<T> arr[N]``), the closure routes through the
-    descriptor-array FFI ``_jit_dispatch_indexed`` so each array slot
-    receives its own buffer. Flat layouts (every count == 1) keep the
-    original ``_jit_dispatch`` fast-path to avoid the extra pybind
-    list-conversion per call.
-
-    DR.3: ``config_key`` is threaded through to the SPIR-V compilation
-    path so harvested reflection metrics are cross-indexed under this
-    structural key, enabling ``_get_actual_vgprs`` to find cached data
-    on subsequent compiles.
-    """
-    import struct
-
-    pack = struct.Struct(f"{n_pc}I").pack if n_pc else None
-    spv = compile_slang_to_spirv(src, cache_key=key, config_key=config_key)
-    _KERNEL_SPIRV_HASH[key] = hashlib.sha256(spv).hexdigest()[:12]
-
-    # ── D.3: Reflection-based buffer count ──
-    # When n_buffers is None (or zero), derive the buffer count from
-    # SPIR-V reflection so variable-arity kernels don't need a
-    # hand-counted binding count.  The closure slices tensors from
-    # ``args[:-(3+n_pc)]`` regardless, but callers can use this for
-    # pre-dispatch validation or AOTI metadata.
-    _n_buf = n_buffers
-    if _n_buf is None or _n_buf == 0:
-        _n_buf = get_reflected_binding_count(spv)
-    # Cross-validate when both hand-count and reflection are available.
-    if _n_buf is not None and _n_buf > 0 and n_buffers is not None and n_buffers > 0:
-        if _n_buf != n_buffers:
-            import warnings
-
-            warnings.warn(
-                f"D.3: kernel '{key}' hand-counted n_buffers={n_buffers} "
-                f"but reflection reports {_n_buf} bindings. "
-                f"Using reflection value."
-            )
-    # ── N+1.5.a: pick the dispatch FFI based on reflection ──
-    # Reflection JSON is keyed by source-hash (see compile_slang_to_spirv);
-    # the SPV-hash lookup will miss, so try source-hash first.
-    descriptor_counts = _get_reflected_descriptor_counts_from_src(src)
-    if descriptor_counts is None:
-        descriptor_counts = get_reflected_descriptor_counts(spv)
-    needs_indexed = bool(descriptor_counts) and any(c > 1 for c in descriptor_counts)
-    if needs_indexed:
-        if not _descriptor_indexing_supported():
-            raise RuntimeError(
-                f"N+1.5: kernel '{key}' uses a descriptor-array binding "
-                f"(descriptor_counts={descriptor_counts}) but the Vulkan "
-                f"runtime reports VK_EXT_descriptor_indexing is unavailable. "
-                f"Either rebuild against a driver that exposes the extension, "
-                f"or rewrite the shader to use only flat (descriptorCount=1) "
-                f"bindings."
-            )
-        indexed_fn = _get_jit_dispatch_indexed()
-        if indexed_fn is None:
-            raise RuntimeError(
-                f"N+1.5: kernel '{key}' needs `_jit_dispatch_indexed` but "
-                f"the FFI symbol is missing. Rebuild the C++ extension."
-            )
-        # Freeze a tuple of uint32 for the closure (pybind picks up the
-        # implicit conversion from list-of-int).
-        dc = tuple(int(c) for c in descriptor_counts)
-        if n_pc == 0:
-
-            def kernel(*args):
-                indexed_fn(
-                    key,
-                    spv,
-                    list(args[:-3]),
-                    list(dc),
-                    args[-3],
-                    args[-2],
-                    args[-1],
-                    b"",
-                    n_outputs,
-                )
-        else:
-
-            def kernel(*args):
-                indexed_fn(
-                    key,
-                    spv,
-                    list(args[: -(3 + n_pc)]),
-                    list(dc),
-                    args[-(3 + n_pc)],
-                    args[-(3 + n_pc) + 1],
-                    args[-(3 + n_pc) + 2],
-                    pack(*args[-(3 + n_pc) + 3 : -3]) if pack else b"",
-                    n_outputs,
-                )
-
-        stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-        return kernel if not stats_enabled else _wrap_stats(key, kernel)
-
-    # ── flat path: every binding has descriptorCount == 1 ──
-    dispatch_fn = _get_jit_dispatch()
-
-    # Build closure that captures key + spv + pack function
-    if n_pc == 0:
-
-        def kernel(*args):
-            dispatch_fn(
-                key, spv, list(args[:-3]), args[-3], args[-2], args[-1], b"", n_outputs
-            )
-
-        stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-        return kernel if not stats_enabled else _wrap_stats(key, kernel)
-
-    # With push constants. The wrapper (`kernel/header.py:call_kernel`)
-    # emits ordered_args as ``[bufs..., sizevars..., dyn_numels..., wg_x,
-    # wg_y, wg_z]`` — sizevars / dynamic numels come BEFORE the wg dims.
-    # D.2.a (2026-05-09): the original slice math `args[-(3+n_pc):-(3+n_pc)+3]`
-    # mistakenly treated PCs as if they were appended after the wg dims,
-    # so for n_pc>0 the wg dims were read from the PC region and the PC
-    # bytes came back empty (`args[-n_pc:-3]` is empty when n_pc<=3).
-    # Fix: wg dims always live in the last 3 slots; PCs occupy the
-    # n_pc slots immediately before.
-    def kernel(*args):
-        dispatch_fn(
-            key,
-            spv,
-            list(args[: -(3 + n_pc)]),
-            args[-3],
-            args[-2],
-            args[-1],
-            pack(*args[-(3 + n_pc) : -3]) if pack else b"",
-            n_outputs,
-        )
-
-    stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-    return kernel if not stats_enabled else _wrap_stats(key, kernel)
-
-
-def make_vulkan_kernel_via_aoti(
-    src: str,
-    key: str,
-    n_buffers: int | None,
-    pc_size_bytes: int,
-    n_pc: int,
-    n_outputs: int = 1,
-):
-    """PF.31 — same contract as ``make_vulkan_kernel`` but the dispatch
-    closure routes through the C++ AOTI runtime ABI
-    (``_aoti_make_kernel`` + ``_aoti_dispatch``) instead of the pybind
-    JIT-pipeline path. The Python interpreter is still present to call the
-    pybind wrappers — but the body of the closure is a single ABI call,
-    matching what the AOTI-emitted C++ wrapper will do once PF.32 ships
-    the SPV next to the `.so`. Used by the regression test that asserts
-    a Python-free dispatch path.
-    """
-    import struct
-
-    from torch_vulkan import _C as _c
-
-    pack = struct.Struct(f"{n_pc}I").pack if n_pc else None
-    spv = compile_slang_to_spirv(src, cache_key=key)
-    _KERNEL_SPIRV_HASH[key] = hashlib.sha256(spv).hexdigest()[:12]
-    # D.3: When n_buffers is None, derive from SPIR-V reflection.
-    _nb_aoti = n_buffers
-    if _nb_aoti is None:
-        _nb_aoti = get_reflected_binding_count(spv)
-        if _nb_aoti is None:
-            _nb_aoti = _get_reflected_buffer_count_from_cache_key(src)
-        if _nb_aoti is None:
-            raise RuntimeError(
-                "D.3: Cannot determine buffer count for kernel"
-                f" '{key}' - reflection unavailable."
-            )
-
-    handle = _c._aoti_make_kernel(spv, key, _nb_aoti, pc_size_bytes)
-    _no = n_outputs
-
-    if n_pc == 0:
-
-        def kernel(*args):
-            tensors = list(args[:-3])
-            _c._aoti_dispatch(handle, tensors, args[-3], args[-2], args[-1], b"", _no)
-    else:
-        pc_start = -3 - n_pc
-
-        def kernel(*args):
-            tensors = list(args[:pc_start])
-            pc = pack(*args[pc_start:-3])
-            _c._aoti_dispatch(handle, tensors, args[-3], args[-2], args[-1], pc, _no)
-
-    kernel._aoti_handle = handle  # keep handle alive with the closure
-    stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-    if not stats_enabled:
-        return kernel
-    wrapped = _wrap_stats(key, kernel)
-    wrapped._aoti_handle = handle
-    return wrapped
-
-
-# ── AOTI model export (P3.4) ────────────────────────────────────
-
-
-def export_aoti_model(
-    model: "torch.nn.Module",
-    path: str,
-    example_inputs: "tuple | None" = None,
-) -> None:
-    """Export a compiled model for AOTI deployment.
-
-    Serializes compiled SPIR-V binaries, kernel metadata, buffer layouts,
-    and dispatch order into a directory for later loading via
-    ``_aoti_model_load``. The output is a directory containing:
-        kernels.bin  — binary bundle of kernel SPIR-V + metadata
-        metadata.json — human-readable dispatch order and buffer layouts
-
-    The AOTI runtime can load this directory and execute all kernels
-    without requiring the Python Inductor stack or slangc at runtime.
-
-    Args:
-        model: A ``torch.nn.Module`` compiled with the Vulkan Inductor backend.
-        path: Output directory path. Created if it does not exist.
-        example_inputs: Optional example inputs used to trigger tracing
-                        if the model has not been pre-compiled.
-    """
-    import json
-    import struct
-
-    from torch_vulkan import _C as _c
-
-    os.makedirs(path, exist_ok=True)
-
-    # Collect all compiled kernels referenced by the model's generated code.
-    # The Inductor wrapper calls make_vulkan_kernel which populates
-    # _KERNEL_SPIRV_HASH. We walk the compile cache entries for each key.
-    kernels: "list[dict]" = []
-    seen_keys: "set[str]" = set()
-
-    for key, spv_hash in _KERNEL_SPIRV_HASH.items():
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-
-        # Try to get SPIR-V from disk cache or in-memory compile cache
-        spv = None
-        # Disk cache first (always available if previously compiled)
-        spv = _disk_cache_read(key)
-        if spv is None:
-            # Re-compile if not cached
-            sc = getattr(_get_jit_dispatch, "_source_cache", None)
-            if sc is not None and key in sc:
-                src = sc[key]
-                spv = compile_slang_to_spirv(src, cache_key=key)
-        if spv is None:
-            raise RuntimeError(
-                f"export_aoti_model: cannot find SPIR-V for kernel '{key}'. "
-                f"Run the model forward at least once to compile kernels."
-            )
-
-        # Determine n_buffers from SPIR-V reflection
-        n_buf = get_reflected_binding_count(spv)
-        if n_buf is None:
-            n_buf = _get_reflected_buffer_count_from_cache_key("") or 0
-
-        kernels.append(
-            {
-                "key": key,
-                "spv": spv,
-                "n_buffers": n_buf,
-                "pc_size_bytes": 0,
-                "spv_hash": spv_hash,
-            }
-        )
-
-    if not kernels:
-        raise RuntimeError(
-            "export_aoti_model: no compiled kernels found. "
-            "Run the model forward at least once to compile kernels."
-        )
-
-    # Write kernels.bin
-    bin_path = os.path.join(path, "kernels.bin")
-    with open(bin_path, "wb") as f:
-        f.write(b"vk_aoti\n")
-        f.write(struct.pack("<I", len(kernels)))
-        for k in kernels:
-            spv = k["spv"]
-            spv_words = len(spv) // 4
-            key_bytes = k["key"].encode("utf-8")
-            f.write(
-                struct.pack(
-                    "<IIII",
-                    spv_words,
-                    k["n_buffers"],
-                    k["pc_size_bytes"],
-                    len(key_bytes),
-                )
-            )
-            f.write(key_bytes)
-            f.write(spv)
-
-    # Write metadata.json
-    meta_path = os.path.join(path, "metadata.json")
-    meta = {
-        "version": 1,
-        "kernel_count": len(kernels),
-        "kernels": [
-            {
-                "key": k["key"],
-                "spv_hash": k["spv_hash"],
-                "n_buffers": k["n_buffers"],
-                "spv_size_bytes": len(k["spv"]),
-            }
-            for k in kernels
-        ],
-    }
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-
-    # Verify: load via C++ AOTI runtime, then free
-    model_handle = _c._aoti_model_load(path)
-    try:
-        import sys
-
-        total_spv = sum(len(k["spv"]) for k in kernels)
-        print(
-            f"[vk-aoti] export → {path}  kernels={len(kernels)}  "
-            f"spv_total={total_spv / 1024:.1f} KiB",
-            file=sys.stderr,
-            flush=True,
-        )
-    finally:
-        _c._aoti_model_free(model_handle)

@@ -172,7 +172,10 @@ class HeaderMixin:
         # Skip roots that were already fully processed during multistage
         # reduction codegen to avoid emitting a second empty for-loop.
         for node in getattr(self, "range_tree_nodes", {}).values():
-            if hasattr(node, "codegen") and getattr(node, "root", None).prefix not in _processed_roots:
+            if (
+                hasattr(node, "codegen")
+                and getattr(node, "root", None).prefix not in _processed_roots
+            ):
                 node.codegen()
 
     def _emit_helpers(self, code: IndentedBuffer) -> None:
@@ -427,6 +430,30 @@ class HeaderMixin:
                 body_code = new_body
                 self._vec4_pw_active = True
 
+        # M11.3: Register-tile pointwise — unroll scalar body 2-4×.
+        # Runs after the vec4 check; only applies when vec4/packed16
+        # did NOT activate (register tiling is the fallback).
+        _rt_size = config.register_tile()
+        if (
+            _rt_size > 0
+            and not getattr(self, "_vec4_pw_active", False)
+            and not getattr(self, "_packed16", False)
+            and not getattr(self, "_persistent_mode", False)
+            and not self.inside_reduction
+            and not self.multistage_reduction_entry
+        ):
+            non_red = [t for t in self.range_trees if not t.is_reduction]
+            if (
+                len(non_red) == 1
+                and isinstance(non_red[0].numel, sympy.Integer)
+                and int(non_red[0].numel) % (self.max_threadgroup_size * _rt_size) == 0
+            ):
+                tiled = self._apply_register_tile(body_code.getvalue(), _rt_size)
+                if tiled is not None:
+                    body_code = IndentedBuffer()
+                    body_code.splice(tiled)
+                    self._register_tile_size = _rt_size
+
         # DR.6: Vec4/packed16 vectorization audit — count loads/stores
         # and compute hit rates after the rewrite pass.  Gated by
         # TORCH_VULKAN_VEC4_AUDIT=1 (default: off).
@@ -480,6 +507,11 @@ class HeaderMixin:
                         f"RWStructuredBuffer<{ws_dtype_str}> {ws_arg.inner_name};"
                     )
             code.writeline("};")
+            # CG.M14: ParameterBlock<KernelArgs> groups all buffer bindings
+            # into a single descriptor table. Slang auto-assigns binding
+            # indices in struct-field order. We disable [[vk::constant_id]]
+            # when ParameterBlock is active (see use_spec_constants above)
+            # to keep the descriptor table in set 0.
             code.writeline("ParameterBlock<KernelArgs> args;")
             slot = 0  # unused; keep for compatibility
         else:
@@ -507,7 +539,18 @@ class HeaderMixin:
         # push-constant struct members or ``static const uint``.
         # Slangc constant-folds loop bounds and eliminates dead branches
         # at SPIR-V emission time.
-        use_spec_constants = config.spec_constants() and not dyn_numel and not sv_decls
+        #
+        # CG.M14: Disable spec constants when ParameterBlock is active.
+        # Slang places ParameterBlock in descriptor set 1 when
+        # [[vk::constant_id]] is present anywhere in the module, but the
+        # Vulkan pipeline layout expects all storage buffers at set 0.
+        # Using ``static const uint`` instead avoids the set mismatch.
+        use_spec_constants = (
+            config.spec_constants()
+            and not self._use_parameter_block
+            and not dyn_numel
+            and not sv_decls
+        )
 
         if pc_fields:
             code.writeline("struct PC {")
@@ -715,6 +758,15 @@ class HeaderMixin:
         ordered_args.append(wg_x)
         ordered_args.append(wg_y)
         ordered_args.append(wg_z)
+
+        # M11.3: Register-tile grid adjustment — divide innermost grid
+        # axis by tile_size since each thread processes multiple elements.
+        _tile = getattr(self, "_register_tile_size", 0)
+        if _tile > 0 and not red and non_red:
+            # wg_x currently holds the total numel (or per-dim product).
+            # The C++ dispatch layer divides by WG to get the actual grid,
+            # so we divide by tile_size here to get: numel / (WG * tile).
+            ordered_args[-3] = f"(({ordered_args[-3]}) // {_tile})"
 
         wrapper.generate_kernel_call(
             name,

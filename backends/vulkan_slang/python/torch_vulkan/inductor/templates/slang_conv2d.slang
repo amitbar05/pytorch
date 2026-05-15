@@ -9,12 +9,24 @@
 // numthreads: (THREADS_W, THREADS_H, 1) where THREADS_W*THREADS_H <= 256
 //
 // Supported: groups==1, f32 only.
+//
+// CG.M15: Tile sizes are specialization constants (``[[vk::constant_id]]``).
+// They determine numthreads at SPIR-V compile time.  Actual loop bounds use
+// push-constant values (``pc.tile_w``, ``pc.tile_h``, ``pc.tile_c``) so the
+// same SPIR-V module serves multiple tile configurations.
 
 /*{%*/ set tile_w = tile_w | default(8) /*%}*/
 /*{%*/ set tile_h = tile_h | default(8) /*%}*/
 /*{%*/ set tile_c = tile_c | default(8) /*%}*/
 /*{%*/ set threads_w = threads_w | default(16) /*%}*/
 /*{%*/ set threads_h = threads_h | default(16) /*%}*/
+
+// CG.M15: Specialization constants for workgroup shape.
+[[vk::constant_id(30)]] const uint TILE_W = /*{{*/ tile_w /*}}8*/;
+[[vk::constant_id(31)]] const uint TILE_H = /*{{*/ tile_h /*}}8*/;
+[[vk::constant_id(32)]] const uint TILE_C = /*{{*/ tile_c /*}}8*/;
+[[vk::constant_id(33)]] const uint THREADS_W = /*{{*/ threads_w /*}}16*/;
+[[vk::constant_id(34)]] const uint THREADS_H = /*{{*/ threads_h /*}}16*/;
 
 struct PC {
     uint N;
@@ -47,6 +59,12 @@ struct PC {
     uint stride_out_c;
     uint stride_out_h;
     uint stride_out_w;
+    // CG.M15: Runtime tile sizes — loop bounds use these so the same
+    // SPIR-V module (with fixed numthreads from specialization constants)
+    // handles multiple tile configurations.
+    uint tile_w;
+    uint tile_h;
+    uint tile_c;
 /*{%*/ if has_bias /*%}*/
     uint stride_bias;
     uint _pad; // keep struct size aligned
@@ -73,7 +91,7 @@ struct KernelArgs {
 ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
-[numthreads(/*{{*/ threads_w /*}}16*/, /*{{*/ threads_h /*}}16*/, 1)]
+[numthreads(THREADS_W, THREADS_H, 1)]
 void computeMain(
     uint3 gtid : SV_DispatchThreadID,
     uint3 gid : SV_GroupID,
@@ -84,23 +102,29 @@ void computeMain(
     uint tile_h_idx = gid.y;
     uint batch_co_tile = gid.z;
 
-    uint tile_c_count = (pc.C_out + /*{{*/ tile_c /*}}8*/u - 1u) / /*{{*/ tile_c /*}}8*/u;
+    // CG.M15: tile_c_count uses pc.tile_c so the grid decode is correct
+    // for the chosen specialization.
+    uint tile_c_count = (pc.C_out + pc.tile_c - 1u) / pc.tile_c;
     uint n = batch_co_tile / tile_c_count;
     uint co_tile = batch_co_tile % tile_c_count;
 
     if (n >= pc.N || co_tile >= tile_c_count) return;
 
-    uint co_start = co_tile * /*{{*/ tile_c /*}}8*/u;
-    uint co_end = min(co_start + /*{{*/ tile_c /*}}8*/u, pc.C_out);
+    uint co_start = co_tile * pc.tile_c;
+    uint co_end = min(co_start + pc.tile_c, pc.C_out);
 
-    uint ow_start = tile_w_idx * /*{{*/ tile_w /*}}8*/u;
-    uint oh_start = tile_h_idx * /*{{*/ tile_h /*}}8*/u;
-    uint ow_end = min(ow_start + /*{{*/ tile_w /*}}8*/u, pc.oW);
-    uint oh_end = min(oh_start + /*{{*/ tile_h /*}}8*/u, pc.oH);
+    uint ow_start = tile_w_idx * pc.tile_w;
+    uint oh_start = tile_h_idx * pc.tile_h;
+    uint ow_end = min(ow_start + pc.tile_w, pc.oW);
+    uint oh_end = min(oh_start + pc.tile_h, pc.oH);
 
     // ── Per-thread output position ─────────────────────────────────────
     uint local_ow = lid.x;
     uint local_oh = lid.y;
+
+    // CG.M15: Early exit for threads outside the runtime workgroup
+    // (spec-constant THREADS_W/THREADS_H may be larger than needed).
+    if (local_ow >= pc.tile_w || local_oh >= pc.tile_h) return;
 
     uint ow = ow_start + local_ow;
     uint oh = oh_start + local_oh;

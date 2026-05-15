@@ -210,20 +210,15 @@ def _gru_cell_backward_differentiable(
 ):
     """Decompose ``aten._thnn_differentiable_gru_cell_backward``.
 
-    Mirror of ``aten/src/ATen/native/RNN.cpp`` GRU backward using only
-    Vulkan-supported primitives.
-
-    GRU forward (single layer, no bias shown):
-        gates_x = input @ W_ir^T, W_iz^T, W_in^T   # [batch, 3*hidden]
-        gates_h = hx @ W_hr^T, W_hz^T, W_hn^T     # [batch, 3*hidden]
-        r_x, z_x, n_x = gates_x.chunk(3)  # input contribution
-        r_h, z_h, n_h = gates_h.chunk(3)  # hidden contribution
-        r = sigmoid(r_x + r_h)
-        z = sigmoid(z_x + z_h)
-        n = tanh(n_x + r * n_h)
+    GRU forward (single cell):
+        r = sigmoid(r_x + r_h + b_ir + b_hr)
+        z = sigmoid(z_x + z_h + b_iz + b_hz)
+        n = tanh(n_x + b_in + b_hn + r * (n_h + b_in + b_hn))
         hy = (1 - z) * n + z * hx
+
+    Returns (grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias, grad_hidden_bias).
     """
-    if not grad_hy.defined():
+    if grad_hy.numel() == 0:
         zeros = torch.zeros_like(input_gates)
         zero_hx = torch.zeros_like(hx)
         zero_bias = (
@@ -233,70 +228,55 @@ def _gru_cell_backward_differentiable(
         )
         return zeros, zeros, zero_hx, zero_bias, zero_bias
 
-    # Reconstruct gates
+    # Reconstruct gate pre-activations
     gi = input_gates + hidden_gates
     if input_bias is not None:
         gi = gi + input_bias
     if hidden_bias is not None:
         gi = gi + hidden_bias
 
-    chunked = gi.chunk(3, dim=1)
-    r_gate = chunked[0]
-    z_gate = chunked[1]
-    n_gate = chunked[2]
-
+    r_gate, z_gate, n_gate = gi.chunk(3, dim=1)
     sig_r = r_gate.sigmoid()
     sig_z = z_gate.sigmoid()
     tanh_n = n_gate.tanh()
 
-    # Backward
-    dhy_1mz = grad_hy * (1.0 - sig_z)  # dL/dn * (1-z)
-    dn = torch.ops.aten.tanh_backward(dhy_1mz, tanh_n)
+    # dL/dz:  hy = (1-z)*n + z*hx  =>  dhy/dz = hx - n
+    d_z_raw = torch.ops.aten.sigmoid_backward(grad_hy * (hx - tanh_n), sig_z)
 
-    dhy_hx = grad_hy * (hx - tanh_n)  # dL/dz
-    dz = torch.ops.aten.sigmoid_backward(dhy_hx, sig_z)
+    # dL/dn:  hy = (1-z)*n + z*hx  =>  dhy/dn = 1 - z
+    d_n = torch.ops.aten.tanh_backward(grad_hy * (1.0 - sig_z), tanh_n)
 
-    dnx_r = dn * sig_r
-    dhx = grad_hy * sig_z + dn * (1.0 - sig_z)
+    # dL/dr: through n = tanh(n_x + r * (n_h + bias))
+    #   dn/dr = tanh'(n_raw) * (n_h + hidden_bias_n) = d_n * n_h_total
+    n_h_chunked = hidden_gates.chunk(3, dim=1)
+    n_h_part = n_h_chunked[2]
+    if hidden_bias is not None:
+        n_h_part = n_h_part + hidden_bias.chunk(3, dim=1)[2]
+    d_r_raw = torch.ops.aten.sigmoid_backward(d_n * n_h_part, sig_r)
 
-    dr_contrib = torch.ops.aten.tanh_backward(dn * tanh_n, tanh_n)  # not quite right
-    # Actually, PyTorch's impl uses: dr = sigmoid_backward(dhy * hx + dn * n_hidden_contribution, sig_r)
-    # Let me use the simpler approach from the C++ source.
+    # Split gradients to input_gates / hidden_gates
+    # input_gates  = [r_x, z_x, n_x]: each gets the full gate gradient
+    # hidden_gates = [r_h, z_h, n_h]: r and z get full, n gets scaled by sig_r
+    grad_input_gates = torch.cat([d_r_raw, d_z_raw, d_n], dim=1)
+    grad_hidden_gates = torch.cat([d_r_raw, d_z_raw, d_n * sig_r], dim=1)
 
-    # The correct GRU backward from C++:
-    # gz = sigmoid_backward(grad_hy * (hx - n), z)
-    # gn = tanh_backward(grad_hy * (1 - z), n)
-    # gr = sigmoid_backward(gn * n_h_part, r)  -- this requires n_h part
-    # ghx = grad_hy * z + gn * (1 - sig_r) + ... (the C++ has a complex formula)
+    # dL/d(hx): hy = (1-z)*n + z*hx  =>  dhy/dhx = z (direct only;
+    # the hidden_gates gradient handles the W_hh path)
+    grad_hx = grad_hy * sig_z
 
-    # Since the GRU backward is more complex and the primary deliverable
-    # is LSTM, we fall back to CPU for GRU backward for now.
-    # The CPU fallback path already works through the custom op's
-    # register_autograd backward.
-
-    # For now, return CPU-computed result by calling the eager op on CPU
-    device = grad_hy.device
-    cpu_grad_hy = grad_hy.detach().to("cpu")
-    cpu_input_gates = input_gates.detach().to("cpu")
-    cpu_hidden_gates = hidden_gates.detach().to("cpu")
-    cpu_hx = hx.detach().to("cpu")
-    cpu_input_bias = input_bias.detach().to("cpu") if input_bias is not None else None
-    cpu_hidden_bias = (
-        hidden_bias.detach().to("cpu") if hidden_bias is not None else None
+    # Bias gradients: sum over batch
+    grad_ib = (
+        grad_input_gates.sum(0)
+        if input_bias is not None
+        else torch.zeros(0, device=input_gates.device)
+    )
+    grad_hb = (
+        grad_hidden_gates.sum(0)
+        if hidden_bias is not None
+        else torch.zeros(0, device=input_gates.device)
     )
 
-    with torch.enable_grad():
-        cpu_grad_hy.requires_grad_(True)
-        result = torch.ops.aten._thnn_differentiable_gru_cell_backward(
-            cpu_grad_hy,
-            cpu_input_gates,
-            cpu_hidden_gates,
-            cpu_hx,
-            cpu_input_bias,
-            cpu_hidden_bias,
-        )
-
-    return tuple(r.to(device) if isinstance(r, torch.Tensor) else r for r in result)
+    return grad_input_gates, grad_hidden_gates, grad_hx, grad_ib, grad_hb
 
 
 # ── op-name → decomposer mapping ───────────────────────────────────────────

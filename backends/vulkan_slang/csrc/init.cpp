@@ -243,13 +243,61 @@ PYBIND11_MODULE(_C, m) {
        py::arg("wg_x"), py::arg("wg_y"), py::arg("wg_z"),
        py::arg("push_constants"), py::arg("num_outputs"));
 
+    // M9.5: cached indexed dispatch — same as _jit_dispatch_cached but
+    // routes through the descriptor-array path for kernels with
+    // descriptorCount > 1 bindings.
+    m.def("_jit_dispatch_indexed_cached_nopc", [](int64_t pipeline,
+                                            const std::vector<at::Tensor>& tensors,
+                                            const std::vector<uint32_t>& descriptor_counts,
+                                            int64_t wg_x, int64_t wg_y, int64_t wg_z,
+                                            int64_t num_outputs) {
+        (void)pipeline;
+        std::string key = "vk_" + std::to_string(pipeline);
+        ops::dispatch_shader_indexed(key, nullptr, 0, tensors,
+                                      descriptor_counts,
+                                      static_cast<uint32_t>(wg_x),
+                                      static_cast<uint32_t>(wg_y),
+                                      static_cast<uint32_t>(wg_z),
+                                      nullptr, 0,
+                                      static_cast<uint32_t>(num_outputs));
+    }, py::arg("pipeline"), py::arg("tensors"),
+       py::arg("descriptor_counts"),
+       py::arg("wg_x"), py::arg("wg_y"), py::arg("wg_z"),
+       py::arg("num_outputs"));
+
+    m.def("_jit_dispatch_indexed_cached", [](int64_t pipeline,
+                                       const std::vector<at::Tensor>& tensors,
+                                       const std::vector<uint32_t>& descriptor_counts,
+                                       int64_t wg_x, int64_t wg_y, int64_t wg_z,
+                                       const py::bytes& pc_bytes,
+                                       int64_t num_outputs) {
+        (void)pipeline;
+        std::string key = "vk_" + std::to_string(pipeline);
+        std::string pc = pc_bytes;
+        const void* pc_data = pc.empty() ? nullptr : pc.data();
+        uint32_t pc_size = static_cast<uint32_t>(pc.size());
+        ops::dispatch_shader_indexed(key, nullptr, 0, tensors,
+                                      descriptor_counts,
+                                      static_cast<uint32_t>(wg_x),
+                                      static_cast<uint32_t>(wg_y),
+                                      static_cast<uint32_t>(wg_z),
+                                      pc_data, pc_size,
+                                      static_cast<uint32_t>(num_outputs));
+    }, py::arg("pipeline"), py::arg("tensors"),
+       py::arg("descriptor_counts"),
+       py::arg("wg_x"), py::arg("wg_y"), py::arg("wg_z"),
+       py::arg("push_constants"), py::arg("num_outputs"));
+
     // Raw dispatch with key+spirv (used by dispatch() and compile_and_dispatch()).
+    // CG.M15: spec_constants accepts [(constant_id, value), ...] for
+    // VkSpecializationInfo at pipeline-creation time.
     m.def("_jit_dispatch", [](const std::string& key,
                                const py::bytes& spirv_bytes,
                                const std::vector<at::Tensor>& tensors,
                                int64_t wg_x, int64_t wg_y, int64_t wg_z,
                                const py::bytes& pc_bytes,
-                               int64_t num_outputs) {
+                               int64_t num_outputs,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& spec_constants) {
         std::string spv = spirv_bytes;
         const auto* code = spv.empty() ? nullptr
             : reinterpret_cast<const uint32_t*>(spv.data());
@@ -262,11 +310,13 @@ PYBIND11_MODULE(_C, m) {
                               static_cast<uint32_t>(wg_y),
                               static_cast<uint32_t>(wg_z),
                               pc_data, pc_size,
-                              static_cast<uint32_t>(num_outputs));
+                              static_cast<uint32_t>(num_outputs),
+                              spec_constants);
     }, py::arg("key"), py::arg("spirv"), py::arg("tensors"),
        py::arg("wg_x"), py::arg("wg_y") = 1, py::arg("wg_z") = 1,
        py::arg("push_constants") = py::bytes(),
-       py::arg("num_outputs") = 1);
+       py::arg("num_outputs") = 1,
+       py::arg("spec_constants") = std::vector<std::pair<uint32_t, uint32_t>>{});
 
     // Pipeline factory — returns a callable that creates cached pipelines.
     // Called as: pipeline = get_pipeline(key, spirv, n_buffers, pc_size_bytes)
@@ -291,13 +341,15 @@ PYBIND11_MODULE(_C, m) {
     //       key, spirv, tensors,           # tensors flattened in binding order
     //       descriptor_counts,             # e.g. [1, 4, 4, 4, 4] for adamw_b4
     //       wg_x, wg_y, wg_z, push_constants, num_outputs)
+    // CG.M15: spec_constants for VkSpecializationInfo.
     m.def("_jit_dispatch_indexed", [](const std::string& key,
                                         const py::bytes& spirv_bytes,
                                         const std::vector<at::Tensor>& tensors,
                                         const std::vector<uint32_t>& descriptor_counts,
                                         int64_t wg_x, int64_t wg_y, int64_t wg_z,
                                         const py::bytes& pc_bytes,
-                                        int64_t num_outputs) {
+                                        int64_t num_outputs,
+                                        const std::vector<std::pair<uint32_t, uint32_t>>& spec_constants) {
         std::string spv = spirv_bytes;
         const auto* code = spv.empty() ? nullptr
             : reinterpret_cast<const uint32_t*>(spv.data());
@@ -311,12 +363,14 @@ PYBIND11_MODULE(_C, m) {
                                       static_cast<uint32_t>(wg_y),
                                       static_cast<uint32_t>(wg_z),
                                       pc_data, pc_size,
-                                      static_cast<uint32_t>(num_outputs));
+                                      static_cast<uint32_t>(num_outputs),
+                                      spec_constants);
     }, py::arg("key"), py::arg("spirv"), py::arg("tensors"),
        py::arg("descriptor_counts"),
        py::arg("wg_x"), py::arg("wg_y") = 1, py::arg("wg_z") = 1,
        py::arg("push_constants") = py::bytes(),
-       py::arg("num_outputs") = 1);
+       py::arg("num_outputs") = 1,
+       py::arg("spec_constants") = std::vector<std::pair<uint32_t, uint32_t>>{});
 
     // Probe for whether `descriptorCount > 1` bindings will work on this
     // device (descriptor indexing enabled + extension supported).

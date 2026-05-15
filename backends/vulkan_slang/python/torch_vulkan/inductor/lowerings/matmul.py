@@ -118,6 +118,28 @@ def _register_mm_lowering() -> None:
                 return _orig_mm(tensor1, tensor2, layout=layout)
             return NotImplemented
 
+        # OP.24: For int8 inputs, route through torch_vulkan::mm_int8 custom op.
+        # The op is registered as a fallback kernel via make_fallback, which
+        # means L.lowerings[torch.ops.torch_vulkan.mm_int8] exists and will
+        # create the correct FallbackKernel IR node.  At runtime, the Vulkan
+        # implementation dispatches through the Slang int8 tiled matmul template.
+        # Output is float32 (int8×int8→int32 accumulation→float32).
+        t1_dtype = tensor1.get_dtype()
+        if t1_dtype == torch.int8 or t1_dtype == torch.uint8:
+            from .mm_int8_op import _register_mm_int8_op
+
+            _register_mm_int8_op()  # idempotent
+
+            mm_int8_lowering = L.lowerings.get(torch.ops.torch_vulkan.mm_int8)
+            if mm_int8_lowering is not None:
+                return mm_int8_lowering(tensor1, tensor2, layout=layout)
+
+            # Fallback: if for some reason the lowerings aren't registered,
+            # fall through to the original mm path (will likely error).
+            if _orig_mm is not None:
+                return _orig_mm(tensor1, tensor2, layout=layout)
+            return NotImplemented
+
         # For Vulkan tensors: use our custom kernel that skips
         # realize_input.  We construct the layout from the input
         # shapes (standard mm: M×K @ K×N → M×N).
@@ -262,3 +284,22 @@ def _register_matmul_backward() -> None:
                 op_name,
                 resolved.fwd_key,
             )
+
+
+def _register_mm_int8_lowering() -> None:
+    """OP.24 — Register int8 matmul external callables for autotuning.
+
+    Installs Slang int8 tiled-matmul callables into
+    ``torch._inductor.config.external_matmul`` so that Inductor's
+    ``tuned_mm`` lowering can benchmark them alongside the CPU fallback
+    for int8×int8→float32 gemm.
+
+    The ``_vulkan_mm`` lowering (registered by ``_register_mm_lowering``)
+    detects int8 inputs and falls through to ``tuned_mm``, which picks
+    the best available choice from ``external_matmul``.
+
+    Idempotent — safe to call multiple times.
+    """
+    from ..templates.caller.gemm.install import install_external_mm_int8
+
+    install_external_mm_int8()

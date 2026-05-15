@@ -60,6 +60,7 @@ VkDescriptorSet DescriptorPool::allocate(VkDescriptorSetLayout layout) {
 }
 
 void DescriptorPool::reset() {
+    if (pre_reset_cb_) pre_reset_cb_();
     vkResetDescriptorPool(device_, pool_, 0);
 }
 

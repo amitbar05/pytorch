@@ -99,6 +99,10 @@ void Context::init_instance() {
     std::vector<VkLayerProperties> layers(layer_count);
     vkEnumerateInstanceLayerProperties(&layer_count, layers.data());
 
+    // TORCH_VULKAN_VALIDATION: default ON. Set to 0 to disable for production.
+    const char* val_env = getenv("TORCH_VULKAN_VALIDATION");
+    bool validation_wanted = !val_env || strcmp(val_env, "0") != 0;
+
     bool has_validation = false;
     const char* validation_layer = "VK_LAYER_KHRONOS_validation";
     for (const auto& layer : layers) {
@@ -107,6 +111,7 @@ void Context::init_instance() {
             break;
         }
     }
+    has_validation = has_validation && validation_wanted;
 
     // Check for debug utils extension
     uint32_t ext_count = 0;

@@ -1,4 +1,5 @@
 """Embedding-dense-backward + embedding_bag-forward lowerings (B2 / OP.5)."""
+
 from __future__ import annotations
 
 from . import _is_vulkan
@@ -28,8 +29,9 @@ def _register_embedding_dense_backward() -> None:
     aten = torch.ops.aten
 
     @register_lowering(aten.embedding_dense_backward, type_promotion_kind=None)
-    def _vulkan_embedding_dense_backward(grad_output, indices, num_weights,
-                                         padding_idx, scale_grad_by_freq):
+    def _vulkan_embedding_dense_backward(
+        grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
+    ):
         if not _is_vulkan(grad_output):
             return NotImplemented
 
@@ -59,7 +61,9 @@ def _register_embedding_dense_backward() -> None:
         for s in idx_list:
             idx_numel = idx_numel * s
         flat_indices = L.lowerings[aten.view.default](indices, [idx_numel])
-        flat_grad = L.lowerings[aten.view.default](grad_output, [idx_numel, embedding_dim])
+        flat_grad = L.lowerings[aten.view.default](
+            grad_output, [idx_numel, embedding_dim]
+        )
 
         if padding_idx >= 0:
             mask = L.lowerings[aten.ne.Scalar](flat_indices, padding_idx)
@@ -232,12 +236,13 @@ def _register_embedding_bag_forward() -> None:
         #           PrivateUse1 eager dispatch.
         if int(mode) in (0, 1):
             zero_out = L.lowerings[aten.full.default](
-                [int(num_bags), int(embedding_dim)], 0.0,
-                dtype=weight_dtype, device=weight_device, pin_memory=False,
+                [int(num_bags), int(embedding_dim)],
+                0.0,
+                dtype=weight_dtype,
+                device=weight_device,
+                pin_memory=False,
             )
-            output = L.lowerings[aten.index_put.default](
-                zero_out, [bag_id], rows, True
-            )
+            output = L.lowerings[aten.index_put.default](zero_out, [bag_id], rows, True)
         else:
             # mode == 2 (max).  scatter_reduce(dim=0) needs index of shape
             # [N, D] matching ``rows``.  Two constraints we have to thread:
@@ -259,9 +264,13 @@ def _register_embedding_bag_forward() -> None:
             # ``aten.clone`` so ScatterFallback's ``reinterpret_tensor``
             # path is not hit.
             import math
+
             neg_inf_out = L.lowerings[aten.full.default](
-                [int(num_bags), int(embedding_dim)], -math.inf,
-                dtype=weight_dtype, device=weight_device, pin_memory=False,
+                [int(num_bags), int(embedding_dim)],
+                -math.inf,
+                dtype=weight_dtype,
+                device=weight_device,
+                pin_memory=False,
             )
 
             # Realize the 1-D bag_id so the next Pointwise reads from a
@@ -285,7 +294,11 @@ def _register_embedding_bag_forward() -> None:
             # ``.contiguous()`` through ``vulkan_clone``.
             bag_id_2d = L.lowerings[aten.clone.default](bag_id_2d)
             output = L.lowerings[aten.scatter_reduce.two](
-                neg_inf_out, 0, bag_id_2d, rows, "amax",
+                neg_inf_out,
+                0,
+                bag_id_2d,
+                rows,
+                "amax",
                 include_self=False,
             )
 
@@ -297,12 +310,18 @@ def _register_embedding_bag_forward() -> None:
             # tokens landing in each bag).  Reused for both mean (divisor)
             # and max (empty-bag mask).
             zero_count = L.lowerings[aten.full.default](
-                [int(num_bags)], 0.0,
-                dtype=weight_dtype, device=weight_device, pin_memory=False,
+                [int(num_bags)],
+                0.0,
+                dtype=weight_dtype,
+                device=weight_device,
+                pin_memory=False,
             )
             ones = L.lowerings[aten.full.default](
-                [int(n_tokens)], 1.0,
-                dtype=weight_dtype, device=weight_device, pin_memory=False,
+                [int(n_tokens)],
+                1.0,
+                dtype=weight_dtype,
+                device=weight_device,
+                pin_memory=False,
             )
             bag_size_1d = L.lowerings[aten.index_put.default](
                 zero_count, [bag_id], ones, True
@@ -319,27 +338,37 @@ def _register_embedding_bag_forward() -> None:
                 # Empty bags (bag_size == 0) currently hold -inf; replace
                 # with 0 to match CPU embedding_bag(mode='max') semantics.
                 nonempty = L.lowerings[aten.gt.Scalar](bag_size_1d, 0.0)
-                nonempty_2d = L.lowerings[aten.unsqueeze.default](
-                    nonempty, -1
-                )
+                nonempty_2d = L.lowerings[aten.unsqueeze.default](nonempty, -1)
                 zero_out_max = L.lowerings[aten.full.default](
-                    [int(num_bags), int(embedding_dim)], 0.0,
-                    dtype=weight_dtype, device=weight_device, pin_memory=False,
+                    [int(num_bags), int(embedding_dim)],
+                    0.0,
+                    dtype=weight_dtype,
+                    device=weight_device,
+                    pin_memory=False,
                 )
-                output = L.lowerings[aten.where.self](
-                    nonempty_2d, output, zero_out_max
-                )
+                output = L.lowerings[aten.where.self](nonempty_2d, output, zero_out_max)
 
         # ── Secondary outputs (zero-filled placeholders matching meta schema).
         offset2bag = L.lowerings[aten.full.default](
-            [n_tokens], 0, dtype=idx_dtype, device=weight_device, pin_memory=False,
+            [n_tokens],
+            0,
+            dtype=idx_dtype,
+            device=weight_device,
+            pin_memory=False,
         )
         bag_size_int = L.lowerings[aten.full.default](
-            [num_bags], 0, dtype=idx_dtype, device=weight_device, pin_memory=False,
+            [num_bags],
+            0,
+            dtype=idx_dtype,
+            device=weight_device,
+            pin_memory=False,
         )
         max_indices = L.lowerings[aten.full.default](
             [num_bags, embedding_dim] if int(mode) == 2 else [0],
-            0, dtype=idx_dtype, device=weight_device, pin_memory=False,
+            0,
+            dtype=idx_dtype,
+            device=weight_device,
+            pin_memory=False,
         )
 
         return output, offset2bag, bag_size_int, max_indices
@@ -353,3 +382,113 @@ def _register_embedding_bag_forward() -> None:
     register_lowering(
         aten._embedding_bag_forward_only.default, type_promotion_kind=None
     )(_vulkan_embedding_bag)
+
+
+def _register_embedding_bag_backward() -> None:
+    """OP.21 — Inductor lowering for ``aten._embedding_bag_backward.default``.
+
+    Decomposes the backward into the same primitives the forward uses:
+    - mode=0 (sum):  ``index_put(accumulate=True)`` via offset2bag mapping
+    - mode=1 (mean): sum-mode with per-bag division by bag_size
+    - mode=2 (max):  ``scatter_reduce(reduce='amax')`` via max_indices
+
+    Schema:
+      ``_embedding_bag_backward(grad, indices, offsets, offset2bag, bag_size,
+        max_indices, num_weights, scale_grad_by_freq, mode, sparse,
+        per_sample_weights, padding_idx) -> grad_weight``
+    """
+    import torch
+    from torch._inductor import lowering as L
+    from torch._inductor.lowering import register_lowering
+
+    aten = torch.ops.aten
+
+    @register_lowering(aten._embedding_bag_backward, type_promotion_kind=None)
+    def _vulkan_embedding_bag_backward(
+        grad,
+        indices,
+        offsets,
+        offset2bag,
+        bag_size,
+        max_indices,
+        num_weights,
+        scale_grad_by_freq,
+        mode,
+        sparse,
+        per_sample_weights=None,
+        padding_idx=-1,
+    ):
+        if not _is_vulkan(grad):
+            return NotImplemented
+
+        if bool(scale_grad_by_freq):
+            return NotImplemented
+        if bool(sparse):
+            return NotImplemented
+        if per_sample_weights is not None:
+            return NotImplemented
+
+        num_weights = int(num_weights)
+        padding_idx = int(padding_idx)
+        mode = int(mode)
+        if num_weights <= 0:
+            return NotImplemented
+
+        grad_size = list(grad.get_size())
+        if len(grad_size) != 2:
+            return NotImplemented
+        embedding_dim = grad_size[1]
+        weight_device = grad.get_device()
+        weight_dtype = grad.get_dtype()
+
+        # Create zero grad_weight
+        grad_weight = L.lowerings[aten.full.default](
+            [num_weights, embedding_dim],
+            0.0,
+            dtype=weight_dtype,
+            device=weight_device,
+            pin_memory=False,
+        )
+
+        if mode == 2:
+            # max mode: scatter via max_indices
+            # max_indices shape: [num_bags, embedding_dim]
+            n_tokens = grad_size[0]
+            flat_grad = L.lowerings[aten.view.default](grad, [n_tokens, embedding_dim])
+            result = L.lowerings[aten.scatter_reduce.two](
+                grad_weight,
+                0,
+                max_indices,
+                flat_grad,
+                "amax",
+                False,
+            )
+            return result
+
+        # mode 0 (sum) and mode 1 (mean): index_put with accumulate
+        n_tokens = grad_size[0]
+        flat_grad = L.lowerings[aten.view.default](grad, [n_tokens, embedding_dim])
+
+        if mode == 1:
+            # mean: divide each grad row by corresponding bag_size
+            bag_size_f = L.lowerings[aten.index.Tensor](bag_size, [offset2bag])
+            bag_size_2d = L.lowerings[aten.unsqueeze.default](bag_size_f, -1)
+            flat_grad = L.lowerings[aten.div.Tensor](flat_grad, bag_size_2d)
+
+        # Handle padding_idx by zeroing grads at padding_idx position
+        if padding_idx >= 0:
+            offset2bag_i64 = L.lowerings[aten._to_copy.default](
+                offset2bag, dtype=torch.int64
+            )
+            mask = L.lowerings[aten.eq.Scalar](offset2bag_i64, padding_idx)
+            zero_idx = L.lowerings[aten.mul.Scalar](offset2bag_i64, 0)
+            safe_indices = L.lowerings[aten.where.self](mask, zero_idx, offset2bag_i64)
+        else:
+            safe_indices = L.lowerings[aten._to_copy.default](
+                offset2bag, dtype=torch.int64
+            )
+
+        result = L.lowerings[aten.index_put.default](
+            grad_weight, [safe_indices], flat_grad, True
+        )
+        return result

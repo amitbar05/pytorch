@@ -44,7 +44,10 @@ def _suppress_upstream_decomps() -> None:
     """
     import torch
     from torch._decomp import decomposition_table as _aot_decomps
-    from torch._inductor.decomposition import decompositions, fast_random_decomps
+    from torch._inductor.decomposition import (
+        decompositions,
+        fast_random_decomps,
+    )
 
     aten = torch.ops.aten
     ops_to_suppress = [
@@ -93,10 +96,21 @@ def _suppress_upstream_decomps() -> None:
         # lowerings in ``view.py`` fire instead.
         aten.narrow_copy.default,
         aten.repeat_interleave.self_int,
+        # OP.26: suppress aten.scaled_dot_product_attention decomposition
+        # so our native lowering (attention.py) fires instead of AOT
+        # decomposing it to _scaled_dot_product_attention_math.
+        aten.scaled_dot_product_attention.default,
+        # OP.23: suppress aten.lerp.Tensor decomposition so our lowering
+        # (activation.py) fires instead of the upstream _lerp_tensor→addcmul
+        # path which has scalar*TensorBox typing issues.
+        aten.lerp.Tensor,
     ]
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
     ops_to_suppress.append(aten.matmul.default)
+    # OP.26: also pop from the AOT decomp table so AOT autograd does not
+    # decompose aten.scaled_dot_product_attention before Inductor sees it.
+    _aot_decomps.pop(aten.scaled_dot_product_attention.default, None)
     for op in ops_to_suppress:
         decompositions.pop(op, None)
     # ``aten.native_dropout_backward`` is also installed in the AOT decomp
@@ -109,6 +123,11 @@ def _suppress_upstream_decomps() -> None:
     _aot_decomps.pop(aten.narrow_copy.default, None)
     _aot_decomps.pop(aten.repeat_interleave.self_int, None)
     _aot_decomps.pop(aten.repeat_interleave.self_Tensor, None)
+    # OP.23: also pop from AOT decomp table.
+    _aot_decomps.pop(aten.lerp.Tensor, None)
+
+    # OP.23: Clear the fast_random_decomps cache so subsequent calls
+    # to select_decomp_table() pick up our decomposition additions.
     fast_random_decomps.cache_clear()
 
 
@@ -187,7 +206,9 @@ def register() -> None:
         _register_pointwise_math_lowerings,
         _register_pow_scalar_lowering,
     )
+    from .attention import _register_sdpa_lowering
     from .bool_mask import _register_bool_mask_read_lowering
+    from .complex import _register_complex_lowerings
     from .conv import _register_conv_and_pool_lowerings
     from .embedding import (
         _register_embedding_bag_forward,
@@ -199,8 +220,10 @@ def register() -> None:
         _register_bmm_lowering,
         _register_matmul_backward,
         _register_matmul_lowering,
+        _register_mm_int8_lowering,
         _register_mm_lowering,
     )
+    from .mm_int8_op import _register_mm_int8_op
     from .rng import _register_multinomial_lowering
     from .rnn import _register_rnn_fallbacks
     from .scatter import _register_scatter_family_lowerings
@@ -272,8 +295,14 @@ def register() -> None:
     _register_conv_and_pool_lowerings()
     _register_bmm_lowering()
     _register_mm_lowering()
+    _register_mm_int8_op()
+    _register_mm_int8_lowering()
     _register_matmul_lowering()
     _register_matmul_backward()
+    # OP.26: native SDPA lowering — routes aten.scaled_dot_product_attention
+    # directly to the FlashAttention template, eliminating the symptom-fix
+    # pattern matcher in fx_passes/patterns/sdpa.py (anti-goal #5).
+    _register_sdpa_lowering()
     _register_layer_norm()
     _register_group_norm()
     _register_softmax()
@@ -281,6 +310,7 @@ def register() -> None:
     _register_clamp_lowerings()
     _register_pow_scalar_lowering()
     _register_pointwise_math_lowerings()
+    _register_complex_lowerings()
     # CG.M8: Register inline bwd_diff lowerings FIRST so they take priority
     # over the Python custom-op shim lowerings in bwd_lowerings.py.
     # Inductor's register_lowering is first-come-first-served.
@@ -310,10 +340,13 @@ def register() -> None:
     _register_embedding_bag_forward()
     _register_fft_lowerings()
     _register_scatter_family_lowerings()
-    # OP.1.d: bool-mask read (`x[mask]`) — CPU-roundtrip lowering for
-    # the data-dependent-shape path that Inductor's stock lowering
-    # mis-handles even after `aten::nonzero` (OP.1.a) is wired.
+    # M16.2: bool-mask read (`x[mask]`) — eager override (PrivateUse1)
+    # decomposes to nonzero + index_select; Inductor lowering falls back
+    # to eager for bool masks and delegates to upstream index_impl for int.
     _register_bool_mask_read_lowering()
+    from .bool_mask import _register_index_tensor_lowering
+
+    _register_index_tensor_lowering()
     # N.1.b: ``aten.searchsorted`` (no Vulkan kernel) and
     # ``aten.repeat_interleave.Tensor`` (which needs cumsum +
     # searchsorted) routed through CPU — fastest unblock per the

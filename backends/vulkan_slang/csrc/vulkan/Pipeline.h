@@ -13,12 +13,16 @@ namespace vulkan {
 
 class Pipeline {
 public:
+    // CG.M15: SpecConstant = (spec_id, value) pair for VkSpecializationInfo.
+    using SpecConstant = std::pair<uint32_t, uint32_t>;
+
     // Legacy ctor: every binding has descriptorCount=1 (one buffer per slot).
     Pipeline(VkDevice device,
              const uint32_t* spirv_code,
              size_t spirv_size,
              uint32_t num_buffers,
-             uint32_t push_constant_size = 0);
+             uint32_t push_constant_size = 0,
+             const std::vector<SpecConstant>& spec_constants = {});
 
     // N+1.5 ctor: per-binding descriptorCount (`descriptor_counts.size()`
     // = number of bindings; each entry = how many buffers in that slot's
@@ -28,7 +32,8 @@ public:
              const uint32_t* spirv_code,
              size_t spirv_size,
              const std::vector<uint32_t>& descriptor_counts,
-             uint32_t push_constant_size);
+             uint32_t push_constant_size,
+             const std::vector<SpecConstant>& spec_constants = {});
     ~Pipeline();
 
     Pipeline(const Pipeline&) = delete;
@@ -49,7 +54,8 @@ public:
 private:
     void create_pipeline_objects(const uint32_t* spirv_code,
                                  size_t spirv_size,
-                                 uint32_t push_constant_size);
+                                 uint32_t push_constant_size,
+                                 const std::vector<SpecConstant>& spec_constants);
 
     VkDevice device_;
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
@@ -65,24 +71,29 @@ public:
     static PipelineCache& instance();
 
     // Legacy: all bindings have descriptorCount=1.
+    // CG.M15: spec_constants are (spec_id, value) pairs for VkSpecializationInfo.
     Pipeline* get_or_create(
         VkDevice device,
         const std::string& key,
         const uint32_t* spirv_code,
         size_t spirv_size,
         uint32_t num_buffers,
-        uint32_t push_constant_size = 0);
+        uint32_t push_constant_size = 0,
+        const std::vector<Pipeline::SpecConstant>& spec_constants = {});
 
     // N+1.5: per-binding descriptorCount (descriptor arrays).
     // The cache key must encode the binding shape, otherwise lookups
     // collide between flat and array-of-buffers pipelines.
+    // CG.M15: spec_constants parameter added so different tile configs
+    // can share one SPIR-V module.
     Pipeline* get_or_create(
         VkDevice device,
         const std::string& key,
         const uint32_t* spirv_code,
         size_t spirv_size,
         const std::vector<uint32_t>& descriptor_counts,
-        uint32_t push_constant_size);
+        uint32_t push_constant_size,
+        const std::vector<Pipeline::SpecConstant>& spec_constants = {});
 
     void clear();
 

@@ -7,6 +7,7 @@ Backward lowerings for activation ops have been moved to
 from __future__ import annotations
 
 import math
+
 import torch
 
 
@@ -17,15 +18,12 @@ def _register_pow_scalar_lowering() -> None:
     into ``exp(exponent * log(base))``.  This is used by RoPE frequency
     computation and any model that computes ``theta_base ** freqs``.
     """
-    from torch._inductor.lowering import register_lowering, lowerings
+    from torch._inductor.lowering import lowerings, register_lowering
 
     @register_lowering(torch.ops.aten.pow.Scalar, type_promotion_kind=None)
     def _pow_scalar(exponent, base):
         return lowerings[torch.ops.aten.exp.default](
-            lowerings[torch.ops.aten.mul.Tensor](
-                exponent,
-                math.log(float(base))
-            )
+            lowerings[torch.ops.aten.mul.Tensor](exponent, math.log(float(base)))
         )
 
 
@@ -61,27 +59,56 @@ def _register_pointwise_math_lowerings() -> None:
     These are trivially decomposable ops that the upstream Inductor
     doesn't automatically decompose, causing graph breaks on Vulkan.
     """
-    from torch._inductor.lowering import register_lowering
+    from torch._inductor.lowering import lowerings, register_lowering
 
     # lerp.Scalar: input + weight * (end - input)
     @register_lowering(torch.ops.aten.lerp.Scalar, type_promotion_kind=None)
     def _lerp_scalar(input, end, weight):
-        return input + weight * (end - input)
+        diff = lowerings[torch.ops.aten.sub.Tensor](end, input)
+        scaled = lowerings[torch.ops.aten.mul.Tensor](diff, weight)
+        return lowerings[torch.ops.aten.add.Tensor](input, scaled)
 
     # lerp.Tensor: input + weight * (end - input)
     @register_lowering(torch.ops.aten.lerp.Tensor, type_promotion_kind=None)
     def _lerp_tensor(input, end, weight):
-        return input + weight * (end - input)
+        diff = lowerings[torch.ops.aten.sub.Tensor](end, input)
+        scaled = lowerings[torch.ops.aten.mul.Tensor](diff, weight)
+        return lowerings[torch.ops.aten.add.Tensor](input, scaled)
+
+    # OP.23: Register lowerings for the _out variants of lerp that
+    # Inductor's ForeachKernelSchedulerNode generates for each sub-tensor
+    # when processing _foreach_lerp.{Scalar,List}.  Without these,
+    # the scheduler falls through to eager dispatch which fails because
+    # the Vulkan backend doesn't have C++ kernels for *_out ops.
+    @register_lowering(torch.ops.aten.lerp.Scalar_out, type_promotion_kind=None)
+    def _lerp_scalar_out(input, end, weight, *, out=None):
+        diff = lowerings[torch.ops.aten.sub.Tensor](end, input)
+        scaled = lowerings[torch.ops.aten.mul.Tensor](diff, weight)
+        result = lowerings[torch.ops.aten.add.Tensor](input, scaled)
+        if out is not None:
+            return lowerings[torch.ops.aten.copy_.default](out, result)
+        return result
+
+    @register_lowering(torch.ops.aten.lerp.Tensor_out, type_promotion_kind=None)
+    def _lerp_tensor_out(input, end, weight, *, out=None):
+        diff = lowerings[torch.ops.aten.sub.Tensor](end, input)
+        scaled = lowerings[torch.ops.aten.mul.Tensor](diff, weight)
+        result = lowerings[torch.ops.aten.add.Tensor](input, scaled)
+        if out is not None:
+            return lowerings[torch.ops.aten.copy_.default](out, result)
+        return result
 
     # addcmul: input + value * tensor1 * tensor2
     @register_lowering(torch.ops.aten.addcmul.default, type_promotion_kind=None)
     def _addcmul(input, tensor1, tensor2, value=1):
-        return input + value * tensor1 * tensor2
+        # Use tensor1 * float(value) so Python dispatches through
+        # TensorBox.__mul__(scalar) rather than float.__mul__(TensorBox).
+        return input + tensor1 * tensor2 * float(value)
 
     # addcdiv: input + value * tensor1 / tensor2
     @register_lowering(torch.ops.aten.addcdiv.default, type_promotion_kind=None)
     def _addcdiv(input, tensor1, tensor2, value=1):
-        return input + value * tensor1 / tensor2
+        return input + tensor1 / tensor2 * float(value)
 
     # rot90: k=1 rotates 90deg CCW = flip(transpose(x, 0, 1), 1)
     # k>1 repeats the operation k times
@@ -93,7 +120,6 @@ def _register_pointwise_math_lowerings() -> None:
         result = input
         for _ in range(k):
             result = torch.ops.aten.flip.default(
-                torch.ops.aten.transpose.int(result, dims[0], dims[1]),
-                [dims[1]]
+                torch.ops.aten.transpose.int(result, dims[0], dims[1]), [dims[1]]
             )
         return result

@@ -3,6 +3,7 @@
 Enable via ``TORCH_VULKAN_INDUCTOR_STATS=1`` environment variable.
 Provides :func:`get_stats` / :func:`reset_stats` for programmatic access.
 """
+
 from __future__ import annotations
 
 import os
@@ -15,6 +16,7 @@ def _stats_enabled() -> bool:
 
 def _get_stats_dict() -> dict[str, dict[str, Any]]:
     from .runtime import _KERNEL_STATS
+
     return _KERNEL_STATS
 
 
@@ -39,14 +41,14 @@ def print_stats(top_n: int = 20) -> None:
     stats = get_stats()
     if not stats:
         return
-    sorted_stats = sorted(
-        stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True
-    )
+    sorted_stats = sorted(stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True)
     for i, (key, entry) in enumerate(sorted_stats[:top_n]):
         us = entry["total_us"]
         cnt = entry["call_count"]
         avg = us / cnt if cnt else 0
-        print(f"  [{i+1:2d}] {us:10.1f} us  ({cnt:5d} calls, {avg:7.1f} us/call) {key}")
+        print(
+            f"  [{i + 1:2d}] {us:10.1f} us  ({cnt:5d} calls, {avg:7.1f} us/call) {key}"
+        )
 
 
 def compile_stats() -> dict[str, Any]:
@@ -59,6 +61,7 @@ def compile_stats() -> dict[str, Any]:
     Includes derived ``cache_hit_rate`` for quick eyeballing.
     """
     from .runtime import _COMPILE_STATS
+
     s = dict(_COMPILE_STATS)
     hits = s["in_memory_hits"] + s["disk_cache_hits"]
     total = hits + s["cold_compiles"]
@@ -72,6 +75,7 @@ def compile_stats() -> dict[str, Any]:
 def reset_compile_stats() -> None:
     """Zero out the compile-time profiler counters."""
     from .runtime import _COMPILE_STATS
+
     for k in _COMPILE_STATS:
         _COMPILE_STATS[k] = 0 if isinstance(_COMPILE_STATS[k], int) else 0.0
 
@@ -104,6 +108,7 @@ def print_full_report(top_n: int = 10) -> None:
         f"{cs['prewarm_submits']} prewarm ==="
     )
     from torch_vulkan.inductor.buffer_pool import pool_stats as _pool_stats
+
     p = _pool_stats()
     pool_hit_rate = (p["hits"] / p["acquires"]) if p["acquires"] else 0.0
     print(
@@ -151,15 +156,19 @@ def dump_waterfall(path: str) -> dict[str, Any]:
     }
     if stats:
         denom = payload["total_us"] or 1.0
-        for k, e in sorted(stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True):
+        for k, e in sorted(
+            stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True
+        ):
             cnt = e["call_count"]
-            payload["kernels"].append({
-                "name": k,
-                "dispatches": cnt,
-                "total_us": e["total_us"],
-                "avg_us": e["total_us"] / cnt if cnt else 0.0,
-                "percent_total": 100.0 * e["total_us"] / denom,
-            })
+            payload["kernels"].append(
+                {
+                    "name": k,
+                    "dispatches": cnt,
+                    "total_us": e["total_us"],
+                    "avg_us": e["total_us"] / cnt if cnt else 0.0,
+                    "percent_total": 100.0 * e["total_us"] / denom,
+                }
+            )
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     return payload
@@ -184,6 +193,7 @@ class MemoryTracker:
     and on every ``poll()`` call; if the workload allocates and frees a large
     intermediate between two polls, the peak is missed.
     """
+
     def __init__(self):
         self.start = 0
         self.end = 0
@@ -191,12 +201,14 @@ class MemoryTracker:
 
     def __enter__(self):
         import torch_vulkan
+
         self.start = torch_vulkan.memory_cached()
         self.peak = self.start
         return self
 
     def poll(self) -> int:
         import torch_vulkan
+
         cur = torch_vulkan.memory_cached()
         if cur > self.peak:
             self.peak = cur
@@ -204,6 +216,7 @@ class MemoryTracker:
 
     def __exit__(self, *exc):
         import torch_vulkan
+
         self.end = torch_vulkan.memory_cached()
         if self.end > self.peak:
             self.peak = self.end
@@ -225,6 +238,7 @@ def peak_memory_report() -> dict[str, Any]:
     manager. P2.4.
     """
     import torch_vulkan
+
     return {
         "cached_mib": torch_vulkan.memory_cached() / (1024 * 1024),
         "n_kernels_recorded": len(get_stats()),
@@ -243,26 +257,36 @@ def summary(top_n: int = 20) -> dict[str, Any]:
     stats = get_stats()
     if not stats:
         from torch_vulkan.inductor.buffer_pool import pool_stats as _pool_stats
+
         return {
-            "n_kernels": 0, "total_calls": 0, "total_us": 0.0,
-            "avg_us_per_call": 0.0, "top": [],
+            "n_kernels": 0,
+            "total_calls": 0,
+            "total_us": 0.0,
+            "avg_us_per_call": 0.0,
+            "top": [],
             "buffer_pool": _pool_stats(),
         }
     from torch_vulkan.inductor.runtime import _KERNEL_SPIRV_HASH
+
     total_calls = sum(e["call_count"] for e in stats.values())
     total_us = sum(e["total_us"] for e in stats.values())
-    sorted_stats = sorted(
-        stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True
-    )
+    sorted_stats = sorted(stats.items(), key=lambda kv: kv[1]["total_us"], reverse=True)
     top = [
         (
-            k, e["total_us"], e["call_count"],
+            k,
+            e["total_us"],
+            e["call_count"],
             e["total_us"] / e["call_count"] if e["call_count"] else 0.0,
             _KERNEL_SPIRV_HASH.get(k, ""),
+            # M11.8: occupancy metadata (populated when reflection is available)
+            e.get("wg_x", 0),
+            e.get("vgprs", 0),
+            e.get("lds_bytes", 0),
         )
         for k, e in sorted_stats[:top_n]
     ]
     from torch_vulkan.inductor.buffer_pool import pool_stats as _pool_stats
+
     return {
         "n_kernels": len(stats),
         "total_calls": total_calls,

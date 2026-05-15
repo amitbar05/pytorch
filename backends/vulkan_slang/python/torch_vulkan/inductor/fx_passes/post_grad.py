@@ -343,13 +343,11 @@ def _replace_relu_with_clamp_min(gm: "torch.fx.GraphModule") -> None:
     if replaced:
         gm.graph.lint()
         gm.recompile()
-    # TR.15: rewrite SDPA call_function nodes to our opaque custom_op so
-    # AOTAutograd's fake-trace doesn't dispatch into ``_C._nn.scaled_dot_product_attention``
-    # on FakeTensor inputs (which calls ``data_ptr()`` and crashes when
-    # SDPA is preceded by reshape/transpose chains that produce non-contiguous
-    # FakeTensors). Co-located in the same pre-grad pass entry-point as the
-    # relu rewrite so a single Group H pass handles all pre-AOT Vulkan fixups.
-    _replace_sdpa_with_custom_op(gm)
+    # TR.15: SDPA nodes are NO LONGER decomposed here — OP.26 registers a
+    # native lowering for aten.scaled_dot_product_attention that routes
+    # directly to the FlashAttention template.  The meta_table registration
+    # (_register_sdpa_meta) handles FakeTensorMode dispatch so AOT's
+    # metadata collection succeeds without the data_ptr crash.
     return gm
 
 
@@ -473,9 +471,7 @@ def _replace_sdpa_with_custom_op(gm: "torch.fx.GraphModule") -> None:
             # scores = q @ k_t
             scores = gm.graph.call_function(aten.matmul, args=(q, k_t))
             # scores = scores * scale
-            scores = gm.graph.call_function(
-                aten.mul.Tensor, args=(scores, scale_val)
-            )
+            scores = gm.graph.call_function(aten.mul.Tensor, args=(scores, scale_val))
             if bool(is_causal):
                 # Pull seq_len from the captured FakeTensor (pre-grad graphs
                 # store it under ``example_value``).
@@ -502,7 +498,9 @@ def _replace_sdpa_with_custom_op(gm: "torch.fx.GraphModule") -> None:
                     # No shape info — leave the node alone rather than
                     # generate an incorrect causal mask.
                     continue
-            attn = gm.graph.call_function(aten._softmax.default, args=(scores, -1, False))
+            attn = gm.graph.call_function(
+                aten._softmax.default, args=(scores, -1, False)
+            )
             output = gm.graph.call_function(aten.matmul, args=(attn, v))
             output.meta = node.meta.copy() if hasattr(node, "meta") else {}
 

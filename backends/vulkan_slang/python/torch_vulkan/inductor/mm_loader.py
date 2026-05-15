@@ -7,14 +7,16 @@ The full migration of `vulkan_template_caller.py` away from Jinja
 toward this loader is filed as `P3.4-followup-jinja-retire`; this
 module is the future caller's seam.
 """
+
 from __future__ import annotations
 
 import os
 
-
-_MM_MODULE_PATH = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "shaders", "lib", "mm.slang"
-))
+_MM_MODULE_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "shaders", "lib", "mm.slang"
+    )
+)
 
 
 def generic_mm_kernel_source(epilogue: str = "EpilogueIdentity") -> str:
@@ -22,6 +24,7 @@ def generic_mm_kernel_source(epilogue: str = "EpilogueIdentity") -> str:
     and dispatches `mm_tiled<Epi>(...)` over the standard
     `(A, B, C, M, N, K)` storage-buffer + push-constant layout.
 
+    CG.M14: Uses ParameterBlock<KernelArgs> for clean binding emission.
     The caller can pick spec-constant tile sizes by passing them at
     pipeline-creation time (P0.6); they are NOT hardcoded in the
     rendered source so the same source produces one SPV regardless of
@@ -30,15 +33,18 @@ def generic_mm_kernel_source(epilogue: str = "EpilogueIdentity") -> str:
     return f"""
 import mm;
 
-[[vk::binding(0, 0)]] StructuredBuffer<float> A;
-[[vk::binding(1, 0)]] StructuredBuffer<float> B;
-[[vk::binding(2, 0)]] RWStructuredBuffer<float> C;
+struct KernelArgs {{
+    StructuredBuffer<float> a;
+    StructuredBuffer<float> b;
+    RWStructuredBuffer<float> c;
+}};
+ParameterBlock<KernelArgs> args;
 [[vk::push_constant]] cbuffer Push {{ uint M; uint N; uint K; }};
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {{
-    mm_tiled<{epilogue}>(A, B, C, M, N, K, gid, lid);
+    mm_tiled<{epilogue}>(args.a, args.b, args.c, M, N, K, gid, lid);
 }}
 """
 

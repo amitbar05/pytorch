@@ -312,6 +312,19 @@ class VulkanScheduling(SIMDScheduling):
 
         if fg1 is not None and fg2 is not None:
             if fg1 == fg2:
+                # M6.7: conv_epilogue fusing template (conv) + reduction (norm)
+                # produces invalid Slang in the combo kernel body rewriter.
+                # The combo kernel only handles pointwise subkernels — template
+                # and reduction kernels must use native template epilogues, not
+                # the generic combo kernel path.  Reject this fusion so the
+                # scheduler keeps them as separate dispatches.
+                from .fx_passes.patterns.op_class_fusion import FusionGroup
+
+                if fg1 == FusionGroup.conv_epilogue:
+                    mix_template = node1.is_template() or node2.is_template()
+                    mix_reduction = node1.is_reduction() or node2.is_reduction()
+                    if mix_template and mix_reduction:
+                        return False
                 # Same fusion group — allow fusion even if base
                 # heuristics said no (overrides memory-footprint
                 # rejection for template-compatible epilogues).
@@ -374,6 +387,30 @@ class VulkanScheduling(SIMDScheduling):
                         if not hasattr(n, "meta"):
                             n.meta = {}
                         n.meta["vulkan_epilogue"] = epilogue2
+                    return True
+
+        # M9.8: Reduction-boundary fusion relaxation.
+        # When base heuristics reject reduction↔pointwise fusion (e.g.
+        # due to tiling incompatibility), override if the reduction's
+        # rnumel fits within the wave budget.  This allows patterns like
+        # GN + ReLU + GlobalAvg to fuse into a single kernel.
+        if not base:
+            _, (numel1, rnumel1) = node1.group
+            _, (numel2, rnumel2) = node2.group
+            rnumel_fuse_cap = 256 if config.aggressive_fusion() else 64
+            if node1.is_reduction() and not node2.is_reduction():
+                if (
+                    rnumel1 != 1
+                    and isinstance(rnumel1, sympy.Integer)
+                    and int(rnumel1) <= rnumel_fuse_cap
+                ):
+                    return True
+            if not node1.is_reduction() and node2.is_reduction():
+                if (
+                    rnumel2 != 1
+                    and isinstance(rnumel2, sympy.Integer)
+                    and int(rnumel2) <= rnumel_fuse_cap
+                ):
                     return True
 
         # When no epilogue metadata was found on either node, fall back

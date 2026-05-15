@@ -134,7 +134,7 @@ void cleanup_runtimes() {
     // Flush any pending work before destroying runtimes
     for (auto& [idx, rt] : g_runtimes) {
         if (rt.stream && rt.stream->pending_dispatches() > 0) {
-            try { rt.stream->flush(); } catch (...) {}
+            try { rt.stream->flush_sync(); } catch (...) {}
         }
     }
     g_runtimes.clear();
@@ -161,7 +161,8 @@ void dispatch_shader(
     uint32_t num_workgroups_z,
     const void* push_constants,
     uint32_t push_constants_size,
-    uint32_t num_outputs) {
+    uint32_t num_outputs,
+    const std::vector<SpecConstant>& spec_constants) {
 
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0;
     if (g_profile_enabled) t0 = _now_ns();
@@ -174,7 +175,7 @@ void dispatch_shader(
     auto* pipeline = vulkan::PipelineCache::instance().get_or_create(
         device, key, spirv_code, spirv_size,
         static_cast<uint32_t>(tensors.size()),
-        push_constants_size);
+        push_constants_size, spec_constants);
 
     if (g_profile_enabled) { t1 = _now_ns(); g_profile_pipeline_cache_ns += (t1 - t0); }
 
@@ -183,10 +184,11 @@ void dispatch_shader(
 
     if (g_profile_enabled) { t2 = _now_ns(); g_profile_get_runtime_ns += (t2 - t1); }
 
-    // Flush if descriptor pool is getting full (leave headroom)
-    if (rt.stream->pending_dispatches() >= 900) {
+    // M9.2 batched submission: submit async every 8 dispatches so the
+    // GPU can overlap compute with CPU recording the next batch.
+    if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
-        rt.stream->flush();
+        rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
     }
@@ -286,7 +288,8 @@ void dispatch_shader_indexed(
     uint32_t num_workgroups_z,
     const void* push_constants,
     uint32_t push_constants_size,
-    uint32_t num_outputs) {
+    uint32_t num_outputs,
+    const std::vector<SpecConstant>& spec_constants) {
 
     // Validate: sum(descriptor_counts) == tensors.size()
     uint32_t total = 0;
@@ -319,13 +322,13 @@ void dispatch_shader_indexed(
     // Get or create cached pipeline (descriptor-counts variant).
     auto* pipeline = vulkan::PipelineCache::instance().get_or_create(
         device, key, spirv_code, spirv_size,
-        descriptor_counts, push_constants_size);
+        descriptor_counts, push_constants_size, spec_constants);
 
     auto& rt = get_runtime(device_idx);
 
-    if (rt.stream->pending_dispatches() >= 900) {
+    if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
-        rt.stream->flush();
+        rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
     }
@@ -396,7 +399,13 @@ void flush_stream() {
     for (auto& [idx, rt] : g_runtimes) {
         if (rt.stream->pending_dispatches() > 0) {
             g_flush_count++;
-            rt.stream->flush();
+            rt.stream->flush_sync();
+            rt.desc_pool->reset();
+        } else if (rt.stream->has_in_flight_work()) {
+            // M9.2: work was already submitted async (flush_async) but not
+            // yet completed. Must wait for it before CPU readback.
+            g_flush_count++;
+            rt.stream->synchronize();
             rt.desc_pool->reset();
         }
         rt.dirty_buffers.clear();
@@ -411,7 +420,8 @@ void flush_if_pending() {
     // Quick check without lock — avoid lock overhead when no work pending
     bool any_pending = false;
     for (auto& [idx, rt] : g_runtimes) {
-        if (rt.stream->pending_dispatches() > 0) {
+        if (rt.stream->pending_dispatches() > 0 ||
+            rt.stream->has_in_flight_work()) {
             any_pending = true;
             break;
         }
@@ -462,9 +472,9 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
 
     // Match dispatch_shader's flush-on-near-full-pool behavior so byte copies
     // recorded after many shader dispatches don't blow the descriptor pool budget.
-    if (rt.stream->pending_dispatches() >= 900) {
+    if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
-        rt.stream->flush();
+        rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
     }

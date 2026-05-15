@@ -269,3 +269,17 @@ register_bwd_template(
     "welford_combine",
     "reduction",
 )
+
+# ── OP.25: RNN backward via Jinja2 templates ────────────────────────────
+# The RNN cell backward templates (rnn_cell_bwd.py.jinja) implement BPTT for
+# LSTM, GRU, RNN-tanh, and RNN-relu cells.  Each backward kernel computes ALL
+# gradients for one time step in a single dispatch.
+# Registered as TEMPLATE_JINJA because the backward shader body is emitted
+# from the Jinja template rather than imported from a .slang module.
+for cell_type in ("lstm", "gru", "rnn_tanh", "rnn_relu"):
+    register_bwd_template(
+        f"rnn_cell_{cell_type}",
+        BackwardKind.TEMPLATE_JINJA,
+        f"rnn_cell_{cell_type}_bwd",
+        "__template__",
+    )

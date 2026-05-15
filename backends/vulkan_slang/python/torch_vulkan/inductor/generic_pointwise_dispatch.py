@@ -1,127 +1,101 @@
 """Generic pointwise dispatch via Slang IPointwise/IPointwiseBinary interfaces.
 
-T2.4 — retires ~170 G-category single-op shaders by routing through
-``lib/pointwise.slang`` at runtime. Instead of dispatching a pre-compiled
-standalone shader (``shaders/unary/abs.slang`` etc.), this module:
+CG.M12 — closes anti-goal #6 for pointwise by replacing embedded Slang
+source strings with a single ``pointwise_generic.slang`` module.  Instead
+of rendering a different Slang source per op, this module reads
+``shaders/lib/pointwise_generic.slang`` (one file, four generic entry
+points) and resolves the concrete op struct at SPIR-V compile time via
+slangc's generic specialization — the same pattern the mm template uses
+for its epilogue.
 
-1. Looks up the op in ``POINTWISE_TABLE`` to find its Slang struct name.
-2. Generates a thin Slang shader that calls ``pointwise_unary_apply<Op>(...)``.
-3. Compiles via slangc, caches the SPIR-V, and dispatches.
-
-The generated shader sources are cached by ``(op_struct, arity, dtype)`` so
-repeated calls to the same op use the same compiled binary.
+The source file lives in the shader lib directory so it participates in
+the precompiled-module cache (``precompile_shader_libs()``) and benefits
+from link-time IR re-use.
 
 Usage (eager path — replaces ``ops::vulkan_abs`` etc.)::
 
     from .generic_pointwise_dispatch import dispatch_unary_pointwise
-    output = dispatch_unary_pointwise("aten.abs", input_tensor)
 
-This is a Python-level shim; the C++ per-op functions can be reduced to a
-single call through this dispatcher once it's stable.
+    output = dispatch_unary_pointwise("aten.abs", input_tensor)
 """
+
 from __future__ import annotations
 
 import hashlib
+import os
+import struct
 from typing import Optional
 
 import torch
 
-from .generic_dispatch_table import POINTWISE_TABLE, PointwiseEntry
-from .runtime import _get_jit_dispatch_cached, _normalize_slang_source
+from .generic_dispatch_table import (
+    COMPLEX_POINTWISE_TABLE,
+    POINTWISE_TABLE,
+    PointwiseEntry,
+)
 
-_SRC_CACHE: dict[str, str] = {}
-_SPV_CACHE: dict[str, bytes] = {}
-_KERNEL_CACHE: dict[str, object] = {}
 _THREADGROUP_SIZE = 256
 
-_UNARY_SRC_TEMPLATE = """\
-import pointwise;
-{% if imports %}
-{% for imp in imports %}
-import {{ imp }};
-{% endfor %}
-{% endif %}
+# ═══════════════════════════════════════════════════════════════════════════
+# CG.M12: Single generic Slang source file — ONE file, ONE set of bindings,
+# FOUR generic entry points, ALL pointwise ops.  The concrete op struct is
+# supplied via the ``entry`` parameter to ``compile_slang_to_spirv``
+# (e.g. ``entry="computeMain<OpAbs>"``).  Slang resolves the correct
+# overload via the interface constraint.
+# Anti-goal #6: no string-based template parameters — Slang generics only.
+# ═══════════════════════════════════════════════════════════════════════════
 
-struct PC { uint numel; };
-[[vk::push_constant]] PC pc;
-
-[[vk::binding(0)]] StructuredBuffer<{{ input_dtype }}> input;
-[[vk::binding(1)]] RWStructuredBuffer<{{ output_dtype }}> output;
-
-[numthreads({{ threads }}, 1, 1)]
-void computeMain(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= pc.numel) return;
-    float v = (float)input[tid.x];
-    output[tid.x] = ({{ output_dtype }}){{ op_struct }}::apply(v);
-}
-"""
-
-_BINARY_SRC_TEMPLATE = """\
-import pointwise;
-{% if imports %}
-{% for imp in imports %}
-import {{ imp }};
-{% endfor %}
-{% endif %}
-
-struct PC { uint numel; };
-[[vk::push_constant]] PC pc;
-
-[[vk::binding(0)]] StructuredBuffer<{{ input_dtype }}> input_a;
-[[vk::binding(1)]] StructuredBuffer<{{ input_dtype }}> input_b;
-[[vk::binding(2)]] RWStructuredBuffer<{{ output_dtype }}> output;
-
-[numthreads({{ threads }}, 1, 1)]
-void computeMain(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= pc.numel) return;
-    float a = (float)input_a[tid.x];
-    float b = (float)input_b[tid.x];
-    output[tid.x] = ({{ output_dtype }}){{ op_struct }}::apply(a, b);
-}
-"""
-
-
-def _render_src(entry: PointwiseEntry, input_dtype: str = "float",
-                output_dtype: str = "float") -> str:
-    from jinja2 import Environment
-
-    key = f"unary_{entry.op_struct}_{input_dtype}_{output_dtype}" if entry.arity == 1 \
-        else f"binary_{entry.op_struct}_{input_dtype}_{output_dtype}"
-    if key in _SRC_CACHE:
-        return _SRC_CACHE[key]
-
-    env = Environment()
-    template = _UNARY_SRC_TEMPLATE if entry.arity == 1 else _BINARY_SRC_TEMPLATE
-    tmpl = env.from_string(template)
-    rendered = tmpl.render(
-        op_struct=entry.op_struct,
-        imports=entry.imports,
-        input_dtype=input_dtype,
-        output_dtype=output_dtype,
-        threads=_THREADGROUP_SIZE,
+# Path to the generic kernel source file, resolved relative to this module.
+# (inductor/ → torch_vulkan/ → python/ → backends/vulkan_slang/ → shaders/lib/)
+_POINTWISE_GENERIC_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "shaders",
+        "lib",
+        "pointwise_generic.slang",
     )
-    _SRC_CACHE[key] = rendered
-    return rendered
+)
+
+# Cached source content — read once, shared by all dispatches.
+_pointwise_generic_src_cache: Optional[str] = None
 
 
-def _compile_if_needed(key: str, src: str) -> bytes:
-    cache_key = hashlib.sha256(src.encode()).hexdigest()[:16]
-    if cache_key in _SPV_CACHE:
-        return _SPV_CACHE[cache_key]
+def _get_pointwise_generic_src() -> str:
+    """Return the contents of ``pointwise_generic.slang`` (cached)."""
+    global _pointwise_generic_src_cache
+    if _pointwise_generic_src_cache is None:
+        with open(_POINTWISE_GENERIC_PATH) as f:
+            _pointwise_generic_src_cache = f.read()
+    return _pointwise_generic_src_cache
 
-    try:
-        from torch_vulkan.inductor.runtime import compile_slang_to_spirv
-        spv = compile_slang_to_spirv(
-            src, f"pointwise_{key}",
-            _normalize_slang_source(src),
-        )
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to compile generic pointwise shader for {key}: {e}"
-        ) from e
 
-    _SPV_CACHE[cache_key] = spv
-    return spv
+# ── Entry-point name ───────────────────────────────────────────────────
+# CG.M12: All four entry points share the name ``computeMain`` — slangc
+# resolves the correct overload via the interface constraint in the entry
+# parameter (e.g. ``computeMain<OpAbs>`` matches the ``IPointwise``
+# overload, ``computeMain<OpAdd>`` matches ``IPointwiseBinary``).
+
+
+def _entry_name(entry: PointwiseEntry) -> str:
+    """Return the slangc entry-point name for a specialized generic.
+
+    E.g. ``"computeMain<OpAbs>"`` for aten.abs,
+    ``"computeMain<OpAdd>"`` for aten.add.
+    """
+    return f"computeMain<{entry.op_struct}>"
+
+
+def _make_cache_key(entry: PointwiseEntry, numel: int, complex_valued: bool) -> str:
+    """Return a stable cache key for the (op, arity, numel) combination."""
+    return hashlib.sha256(
+        f"cgm12_{entry.op_struct}_{entry.arity}_{complex_valued}_{numel}".encode()
+    ).hexdigest()[:12]
+
+
+# ── Public dispatch API ──────────────────────────────────────────────────
 
 
 def dispatch_unary_pointwise(
@@ -143,9 +117,7 @@ def dispatch_unary_pointwise(
             f"Generic pointwise dispatch: {aten_op} not in POINTWISE_TABLE"
         )
     if entry.arity != 1:
-        raise RuntimeError(
-            f"dispatch_unary_pointwise called for binary op {aten_op}"
-        )
+        raise RuntimeError(f"dispatch_unary_pointwise called for binary op {aten_op}")
     return _dispatch_pointwise_impl(entry, args=(input_tensor,))
 
 
@@ -169,68 +141,101 @@ def dispatch_binary_pointwise(
             f"Generic pointwise dispatch: {aten_op} not in POINTWISE_TABLE"
         )
     if entry.arity != 2:
-        raise RuntimeError(
-            f"dispatch_binary_pointwise called for unary op {aten_op}"
-        )
+        raise RuntimeError(f"dispatch_binary_pointwise called for unary op {aten_op}")
     return _dispatch_pointwise_impl(entry, args=(input_a, input_b))
+
+
+def dispatch_complex_pointwise(
+    aten_op: str,
+    *args: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch a complex-valued pointwise op via the generic Slang template.
+
+    Supports both unary (float2 -> float2, e.g. conj) and binary
+    (float2 x float2 -> float2, e.g. add/mul/div).  Input tensors must
+    be complex (complex64 or complex128) on Vulkan.
+
+    Args:
+        aten_op: ATen op name (e.g. "aten.add").
+        *args: One tensor for unary, two for binary.
+
+    Returns:
+        Complex-valued output Vulkan tensor.
+    """
+    entry = COMPLEX_POINTWISE_TABLE.get(aten_op)
+    if entry is None:
+        raise RuntimeError(
+            f"Complex pointwise dispatch: {aten_op} not in COMPLEX_POINTWISE_TABLE"
+        )
+    if len(args) != entry.arity:
+        raise RuntimeError(
+            f"Complex pointwise dispatch: {aten_op} expects"
+            f" {entry.arity} argument(s), got {len(args)}"
+        )
+    return _dispatch_pointwise_impl(entry, args=args, complex_valued=True)
+
+
+# ── Implementation ───────────────────────────────────────────────────────
 
 
 def _dispatch_pointwise_impl(
     entry: PointwiseEntry,
     args: tuple[torch.Tensor, ...],
+    complex_valued: bool = False,
 ) -> torch.Tensor:
-    input_dtype = "float"
-    output_dtype = "float"
+    """Compile and dispatch a pointwise kernel via Slang generics.
+
+    CG.M12: Reads the single ``pointwise_generic.slang`` source file
+    and compiles it with the op-specific entry point
+    (e.g. ``computeMain<OpAbs>``).  Slang resolves the correct overload
+    from the interface constraint.  The source is identical for every
+    op — only the ``entry`` parameter changes.  The precompiled-module
+    cache ensures slangc re-uses cached IR for the shared source across ops.
+
+    No Jinja2 templating.  No per-op source variation.
+    """
+    from torch_vulkan.inductor.runtime import compile_and_dispatch
 
     tensor = args[0]
-    if tensor.dtype == torch.float16:
-        # Note: float16_t is IEEE half, not bf16. Templates using this
-        # would need packed16 path. For now widen to float32.
-        input_dtype = "float"
-        output_dtype = "float"
-    elif tensor.dtype == torch.bfloat16:
-        input_dtype = "float"
-        output_dtype = "float"
-
-    src = _render_src(entry, input_dtype, output_dtype)
-    device = tensor.device
     numel = tensor.numel()
 
-    cache_key = hashlib.sha256(
-        f"{entry.op_struct}_{entry.arity}_{input_dtype}_{numel}".encode()
-    ).hexdigest()[:12]
+    src = _get_pointwise_generic_src()
+    cache_key = _make_cache_key(entry, numel, complex_valued)
 
-    spv = _compile_if_needed(cache_key, src)
-
-    from torch_vulkan.inductor.runtime import make_vulkan_kernel
-    n_buffers = entry.arity + 1
-    pc_size = 4
-
-    dispatch_cached, dispatch_nopc, get_pipeline = _get_jit_dispatch_cached()
-
-    if cache_key not in _KERNEL_CACHE:
-        kernel = make_vulkan_kernel(src, cache_key, n_buffers, pc_size, 0, 1)
-        _KERNEL_CACHE[cache_key] = kernel
-
-    kernel = _KERNEL_CACHE[cache_key]
-
-    import struct
     wg_x = (numel + _THREADGROUP_SIZE - 1) // _THREADGROUP_SIZE
     pc_bytes = struct.pack("<I", numel)
 
-    bufs = list(args)
+    # CG.M12: ByteAddressBuffer uses fixed 3-buffer layout:
+    #   binding 0: buf_in0  (first input, or only input for unary)
+    #   binding 1: buf_in1  (second input for binary; dummy for unary)
+    #   binding 2: buf_out  (output)
+    output = torch.empty_like(tensor)
     if entry.arity == 1:
-        output = torch.empty_like(tensor)
-        bufs.append(output)
+        # Unary: buf_in0 = input, buf_in1 = dummy (reuse input), buf_out = output
+        bufs = [args[0], args[0], output]
     else:
-        assert tensor.shape == args[1].shape
-        output = torch.empty_like(tensor)
-        bufs.append(output)
+        # Binary: buf_in0 = input_a, buf_in1 = input_b, buf_out = output
+        bufs = [args[0], args[1], output]
 
-    kernel(bufs, wg_x, 1, 1, pc_bytes)
+    compile_and_dispatch(
+        src=src,
+        tensors=bufs,
+        wg_x=wg_x,
+        wg_y=1,
+        wg_z=1,
+        push_constants=pc_bytes,
+        num_outputs=1,
+        entry=_entry_name(entry),
+        cache_key=cache_key,
+    )
     return output
 
 
 def can_dispatch(aten_op: str) -> Optional[PointwiseEntry]:
     """Check if an aten op is covered by generic pointwise dispatch."""
     return POINTWISE_TABLE.get(aten_op)
+
+
+def can_dispatch_complex(aten_op: str) -> Optional[PointwiseEntry]:
+    """Check if a complex aten op is covered by complex pointwise dispatch."""
+    return COMPLEX_POINTWISE_TABLE.get(aten_op)
