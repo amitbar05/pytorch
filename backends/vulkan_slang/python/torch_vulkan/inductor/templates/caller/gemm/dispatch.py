@@ -505,8 +505,16 @@ def _pick_tile_configs() -> list[tuple[int, int, int]]:
                     pass
         return configs if configs else _MM_TILE_CONFIGS
 
-    # N+1.12: wave32 prefers smaller tiles, wave64 prefers all
+    # N+1.12: wave32 prefers smaller tiles, wave64 prefers single-wave.
+    # M17.1: On wave64 (RDNA1), restrict to tile configs where the workgroup
+    # fits in a single wave (<= 64 threads).  Multi-wave workgroups have a
+    # broken GroupMemoryBarrierWithGroupSync() in slangc 2026.5.2 -- the
+    # barrier appears to use Subgroup scope instead of Workgroup scope,
+    # so threads in different waves cannot see each other's LDS writes.
     sgs = _get_device_subgroup_size()
+    if sgs == 64:
+        # Only include tiles where (tile_m/1) * (tile_n/1) <= 64 for 1-opt path
+        return [c for c in _MM_TILE_CONFIGS if c[0] * c[1] <= 64]
     if sgs == 32:
         # Prefer tiles where max(tile_m, tile_n) <= 32 for wave32
         return [c for c in _MM_TILE_CONFIGS if max(c[0], c[1]) <= 32]
@@ -531,8 +539,14 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
     if os.environ.get("TORCH_VULKAN_NO_REGISTER_TILE") == "1":
         return []
 
-    # N+1.12: wave32 filters out register-heavy configs
+    # N+1.12: wave32/wave64 filter register-tile configs.
+    # M17.1: On wave64, only single-wave workgroups work (barrier bug).
     sgs = _get_device_subgroup_size()
+    if sgs == 64:
+        return [
+            c for c in _MM_REGISTER_TILE_CONFIGS
+            if (c[0] // c[3]) * (c[1] // c[4]) <= 64  # wg threads <= wave size
+        ]
     if sgs == 32:
         return [
             c

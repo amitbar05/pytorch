@@ -162,7 +162,7 @@ void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
 }
 
 [ForceInline]
-void mma_tile(uint stage, uint k_base, uint3 lid, inout /*{{*/ dtype_acc /*}}float*/ acc[M_PER_THREAD][N_PER_THREAD]) {
+void mma_tile(uint stage, uint k_base, uint local_row, uint local_col, uint3 lid, inout /*{{*/ dtype_acc /*}}float*/ acc[M_PER_THREAD][N_PER_THREAD]) {
 /*{%*/ if num_stages > 1 /*%}*/
     // N+1.11: LDS offsets use spec-constant TILE_M, TILE_K, TILE_N.
     uint off_a = stage * TILE_M * TILE_K;
@@ -187,14 +187,14 @@ void mma_tile(uint stage, uint k_base, uint3 lid, inout /*{{*/ dtype_acc /*}}flo
         /*{{*/ dtype_acc /*}}float*/ a_reg[M_PER_THREAD];
         [unroll]
         for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-            uint local_m = lid.y * pc.m_per_thread + mi;
+            uint local_m = local_row * pc.m_per_thread + mi;
             a_reg[mi] = tile_a[off_a + local_m * TILE_K + kk];
         }
         // Load N_PER_THREAD B values (one row of the register tile).
         /*{{*/ dtype_acc /*}}float*/ b_reg[N_PER_THREAD];
         [unroll]
         for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint local_n = lid.x * pc.n_per_thread + ni;
+            uint local_n = local_col * pc.n_per_thread + ni;
             b_reg[ni] = tile_b[off_b + kk * TILE_N + local_n];
         }
         // Outer-product accumulate.
@@ -236,10 +236,17 @@ void computeMain<Epilogue : IDifferentiable>(
     uint batch_c_off = 0u;
 /*{%*/ endif /*%}*/
 
+    // M17.1: Precompute local row/col from linear tid to work around a
+    // slangc 2026.5.2 compiler bug on RDNA1/wave64: using both lid.y and
+    // lid.x directly to index different StructuredBuffers in a shader with
+    // 3+ bindings produces incorrect results for threads with lid.y >= 5.
+    // Computing row/col from a linear tid avoids the triggering pattern.
+    uint tid = lid.y * WG_N + lid.x;
+    uint local_row = tid / WG_N;
+    uint local_col = tid % WG_N;
+
     // N+1.11: Early exit for threads outside the runtime workgroup.
-    // Spec-constant WG_M, WG_N may be larger than needed for smaller
-    // tile configs.  Threads beyond the actual wg dimensions skip all work.
-    if (lid.y >= pc.tile_m / pc.m_per_thread || lid.x >= pc.tile_n / pc.n_per_thread) return;
+    if (local_row >= pc.tile_m / pc.m_per_thread || local_col >= pc.tile_n / pc.n_per_thread) return;
 
     // Per-thread register accumulator: holds an (M_PER_THREAD x N_PER_THREAD)
     // sub-tile of the workgroup's TILE_M x TILE_N output block.
@@ -265,7 +272,7 @@ void computeMain<Epilogue : IDifferentiable>(
 
     for (uint kb = 0; kb < k_blocks; kb++) {
         // Compute on current stage
-        mma_tile(kb & 1u, kb * pc.tile_k, lid, acc);
+        mma_tile(kb & 1u, kb * pc.tile_k, local_row, local_col, lid, acc);
         // Prefetch next stage (if any)
         if (kb + 1 < k_blocks) {
             load_tiles((kb + 1u) & 1u, (kb + 1u) * pc.tile_k, row_base, col_base,
@@ -279,7 +286,7 @@ void computeMain<Epilogue : IDifferentiable>(
         uint k_base = kb * pc.tile_k;
         load_tiles(0, k_base, row_base, col_base, batch_a_off, batch_b_off, lid);
         GroupMemoryBarrierWithGroupSync();
-        mma_tile(0, k_base, lid, acc);
+        mma_tile(0, k_base, local_row, local_col, lid, acc);
         GroupMemoryBarrierWithGroupSync();
     }
 /*{%*/ endif /*%}*/
@@ -289,11 +296,11 @@ void computeMain<Epilogue : IDifferentiable>(
     // N+1.11: Loop bounds use pc.m_per_thread, pc.n_per_thread.
     [unroll]
     for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-        uint row = row_base + lid.y * pc.m_per_thread + mi;
+        uint row = row_base + local_row * pc.m_per_thread + mi;
         if (row >= pc.M) continue;
         [unroll]
         for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint col = col_base + lid.x * pc.n_per_thread + ni;
+            uint col = col_base + local_col * pc.n_per_thread + ni;
             if (col >= pc.N) continue;
             /*{{*/ dtype_acc /*}}float*/ v = acc[mi][ni];
 /*{%*/ if has_alpha /*%}*/

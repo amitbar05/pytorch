@@ -171,12 +171,14 @@ class SlangTemplate(KernelTemplate):
 # path (`_MM_REGISTER_TILE_CONFIGS` below): a (WG_M, WG_N) workgroup where each
 # thread accumulates an (M_PER_THREAD, N_PER_THREAD) sub-tile in registers.
 # WG_M * WG_N must still fit the 1024 cap.
+# M17.1: Restricted to single-wave workgroups (<= 64 threads on wave64)
+# due to a slangc 2026.5.2 barrier bug on multi-wave workgroups.
+# The 1-output-per-thread path only uses 8x8 tiles.
 _MM_TILE_CONFIGS = [
-    (32, 32, 16),
-    (32, 32, 32),
-    (16, 64, 32),
-    (64, 16, 32),
-    (16, 16, 32),
+    (8, 8, 8),
+    (8, 8, 16),
+    (8, 8, 32),
+    (8, 8, 64),
 ]
 
 # Register-tiled configs: (TILE_M, TILE_N, TILE_K, M_PER_THREAD, N_PER_THREAD).
@@ -185,15 +187,16 @@ _MM_TILE_CONFIGS = [
 # the hardware-friendly pattern: large output tiles + small workgroups +
 # big register reuse cuts global memory traffic by `M_PER_THREAD *
 # N_PER_THREAD` for the same K-loop iteration.
+# M17.1: Restricted to single-wave workgroups (<= 64 threads on wave64).
+# Register-tiled configs keep the workgroup within one wave while increasing
+# the output tile per workgroup.
 _MM_REGISTER_TILE_CONFIGS = [
-    # (64, 64) tile, 16×16 = 256 threads, each holds 4×4 = 16 outputs
-    (64, 64, 16, 4, 4),
-    # (128, 64) tile, 16×16 = 256 threads, each holds 8×4 = 32 outputs
-    (128, 64, 16, 8, 4),
-    # (64, 128) tile, 16×16 = 256 threads, each holds 4×8 = 32 outputs
-    (64, 128, 16, 4, 8),
-    # (64, 64) tile, 8×8 = 64 threads (1 wave64 on RDNA1), each holds 8×8 = 64 outputs
+    # (64, 64) tile, 8×8 = 64 threads (1 wave64), each holds 8×8 = 64 outputs
     (64, 64, 16, 8, 8),
+    # (64, 32) tile, 8×4 = 32 threads, each holds 8×8 = 64 outputs
+    (64, 32, 16, 8, 8),
+    # (32, 64) tile, 4×8 = 32 threads, each holds 8×8 = 64 outputs
+    (32, 64, 16, 8, 8),
 ]
 
 _slang_mm_template: Optional[SlangTemplate] = None
