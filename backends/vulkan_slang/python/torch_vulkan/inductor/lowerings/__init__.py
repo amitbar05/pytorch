@@ -104,6 +104,12 @@ def _suppress_upstream_decomps() -> None:
         # (activation.py) fires instead of the upstream _lerp_tensor→addcmul
         # path which has scalar*TensorBox typing issues.
         aten.lerp.Tensor,
+        # M17.3: suppress aten._adaptive_avg_pool2d decomposition so the
+        # upstream Inductor lowering (which decomposes into avg_pool2d or
+        # Pointwise-based adaptive pooling) fires instead of the AOTAutograd
+        # decomp. The upstream lowering produces IR that our reduction
+        # template can fuse with adjacent pointwise ops.
+        aten._adaptive_avg_pool2d.default,
     ]
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
@@ -125,6 +131,8 @@ def _suppress_upstream_decomps() -> None:
     _aot_decomps.pop(aten.repeat_interleave.self_Tensor, None)
     # OP.23: also pop from AOT decomp table.
     _aot_decomps.pop(aten.lerp.Tensor, None)
+    # M17.3: also pop adaptive_avg_pool2d from AOT decomp table.
+    _aot_decomps.pop(aten._adaptive_avg_pool2d.default, None)
 
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.
@@ -293,6 +301,8 @@ def register() -> None:
 
     _register_view_lowerings()
     _register_conv_and_pool_lowerings()
+    # M17.3: adaptive_avg_pool2d backward lowering
+    from . import pool  # noqa: F811
     _register_bmm_lowering()
     _register_mm_lowering()
     _register_mm_int8_op()
