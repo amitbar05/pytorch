@@ -53,7 +53,19 @@ def _make_inline_unary_bwd_diff_lowering(aten_op, register_lowering, aten):
             return NotImplemented
 
         def inner_fn(grad_out_val, x_val):
+            from torch._inductor.virtualized import NullKernelHandler
+
             kernel = V.kernel
+            # ``inner_fn`` is invoked twice: once during real codegen (with
+            # a live VulkanKernel context) and once from
+            # ``Pointwise.inner_fn_opcount`` to count read/write ops with a
+            # NullKernelHandler V.kernel. The opcount call only looks at
+            # ``ops.X(...)`` reads — it doesn't need the actual bwd_diff
+            # body emitted to ``kernel.compute``. Return a constant
+            # placeholder so opcount sees a valid op tree.
+            if isinstance(kernel, NullKernelHandler):
+                return ops.constant(0.0, torch.float32)
+
             _add_module_import(kernel, entry.module)
 
             from torch_vulkan.inductor.kernel.bwd_diff_inline import (
@@ -72,6 +84,8 @@ def _make_inline_unary_bwd_diff_lowering(aten_op, register_lowering, aten):
                 result_expr,
                 dtype=torch.float32,
             )
+
+        from torch._inductor.virtualized import ops
 
         return make_pointwise(inner_fn)(grad_output, self)
 
@@ -107,7 +121,15 @@ def _make_inline_binary_bwd_diff_lowering(aten_op, register_lowering, aten):
         scalar_args = list(args) + [kwargs.get(p) for p in extra_params if p in kwargs]
 
         def inner_fn(grad_out_val, pred_val, target_val, *scalars):
+            from torch._inductor.virtualized import NullKernelHandler, ops
+
             kernel = V.kernel
+            # See unary case above: ``inner_fn_opcount`` calls this without
+            # a real kernel context. Return a constant placeholder for the
+            # opcount pass; only emit real bwd_diff body during codegen.
+            if isinstance(kernel, NullKernelHandler):
+                return ops.constant(0.0, torch.float32)
+
             _add_module_import(kernel, entry.module)
 
             from torch_vulkan.inductor.kernel.bwd_diff_inline import (

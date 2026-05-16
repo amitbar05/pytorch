@@ -672,14 +672,28 @@ class HeaderMixin:
         )
 
         # Substitute buffer aliases (the Inductor memory planner may alias
-        # buffers via buf1 = div; del div before the kernel call).
+        # buffers via ``buf1 = reinterpret_tensor(div); del div`` before
+        # the kernel call). Resolve transitively so a chain
+        # ``buf9 → buf10 → buf11`` (where buf10 is itself reused into
+        # buf11) collapses to the final live name. A naive one-step
+        # substitution leaves the intermediate buf10 in args, which
+        # then references a deleted variable at runtime.
         freed = getattr(wrapper, "freed", set())
         reuses = getattr(wrapper, "reuses", {})
         if freed:
             old_to_new = {}
             for new_name, old_name in reuses.items():
                 old_to_new[old_name] = new_name
-            ordered_args = [old_to_new.get(a, a) for a in ordered_args]
+
+            def _resolve(name):
+                # Walk the alias chain, guarding against cycles.
+                seen = set()
+                while name in old_to_new and name in freed and name not in seen:
+                    seen.add(name)
+                    name = old_to_new[name]
+                return name
+
+            ordered_args = [_resolve(a) for a in ordered_args]
 
         # N+1.7: For fully-static kernels, sizevars are emitted as
         # ``static const uint`` module-scope declarations — no push

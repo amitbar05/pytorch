@@ -37174,9 +37174,6 @@ class TestM99ComboBatcher:
 
     _BUG_ROOT_COMPONENT = "scheduler/fusion"
 
-    @pytest.mark.xfail(
-        reason="Pre-existing: SDPA lowering has upstream stride assertion on Vulkan"
-    )
     def test_m99_combo_kernel_no_unbound_local(self):
         """Combo-kernel codegen must not raise UnboundLocalError."""
         import torch.nn as nn
@@ -37395,3 +37392,229 @@ class TestOP20ComplexPointwise:
                 msg = str(warning.message)
                 if "complex" in msg.lower() and "not supported" in msg.lower():
                     pytest.fail(f"Complex op fell through to eager: {msg}")
+
+
+class TestM6Phase4ConvTranspose:
+    """M6 Phase 4 — Transposed conv 1D / 3D + 2D edge cases.
+
+    Validates the new conv_transpose1d/3d lowerings and the extended 2D
+    path (groups>1, dilation>1, output_padding>0) against CPU.
+
+    **Status (2026-05-15):** Floor xfail. The new lowerings live in
+    ``lowerings/conv_transpose.py`` with an ``aten.convolution.default``
+    interceptor for 1D/3D transposed conv (Inductor decomposes
+    F.conv_transpose1d/3d to ``aten.convolution`` before lowering, so the
+    per-overload registrations on ``aten.conv_transpose{1,2,3}d`` never
+    fire). The decomposition (flip + permute + clone + upsample → conv2d)
+    runs into a chain of Inductor IR realization issues:
+
+      * ``aten.flip`` is in upstream's decomposition table (not the
+        lowering registry) — handled via ``make_fallback(override_decomp=True)``
+      * ``aten.transpose.int`` has no lowering — replaced with permute
+      * ``torch_vulkan::conv2d_with_optional_bias`` OpOverload identity
+        changes after re-registration — handled by string-keyed lookup
+      * ``aten.clone`` returns Pointwise IR; conv2d ExternKernelOut
+        requires realized inputs — handled by ``ExternKernel.realize_input``
+
+    All four issues are addressed but additional codegen-stage IR
+    validation is failing on the per-frame conv2d call. Floor here so
+    the regression suite tracks the work; flip the xfails once
+    end-to-end value parity is reached.
+    """
+
+    _BUG_ROOT_COMPONENT = "lowerings/conv_transpose"
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        try:
+            import torch_vulkan
+
+            if not torch_vulkan.is_available():
+                pytest.skip("No Vulkan device")
+        except ImportError:
+            pytest.skip("torch_vulkan not installed")
+
+    def _check(self, fn_compile, fn_ref, *args_cpu, rtol=1e-4, atol=1e-4):
+        torch._dynamo.reset()
+        args_vk = [a.to("vulkan:0") for a in args_cpu]
+        with torch.no_grad():
+            out = fn_compile(*args_vk).cpu()
+        ref = fn_ref(*args_cpu)
+        assert out.shape == ref.shape, f"shape {out.shape} != {ref.shape}"
+        torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
+
+    _FLOOR_XFAIL_REASON = (
+        "M6 Phase 4 floor: conv_transpose1d/3d decomposition (flip + permute + "
+        "clone + upsample → conv2d) reaches the conv2d ExternKernelOut but "
+        "fails on a downstream IR realization step. Tracked in "
+        "10-inductor-backend.md."
+    )
+
+    # ── 1D ───────────────────────────────────────────────────────────────
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose1d_basic(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 8)
+        w = torch.randn(3, 6, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose1d(x, w)
+
+        self._check(fn, lambda x, w: F.conv_transpose1d(x, w), x, w)
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose1d_stride_padding(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(2, 4, 6)
+        w = torch.randn(4, 3, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose1d(x, w, stride=2, padding=1)
+
+        self._check(
+            fn, lambda x, w: F.conv_transpose1d(x, w, stride=2, padding=1), x, w
+        )
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose1d_with_bias(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 5)
+        w = torch.randn(3, 4, 3)
+        b = torch.randn(4)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w, b):
+            return F.conv_transpose1d(x, w, bias=b)
+
+        self._check(fn, lambda x, w, b: F.conv_transpose1d(x, w, bias=b), x, w, b)
+
+    # ── 2D edge cases ───────────────────────────────────────────────────
+    # 2D paths intentionally fall through to upstream's extern path
+    # (preserving the existing test_transposed_conv_graph_breaks_gracefully
+    # behaviour) — these xfail because dilation/output_padding/groups
+    # variants of the extern path don't all work either.
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose2d_dilation(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 6, 6)
+        w = torch.randn(3, 5, 3, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose2d(x, w, dilation=2)
+
+        self._check(fn, lambda x, w: F.conv_transpose2d(x, w, dilation=2), x, w)
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose2d_output_padding(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 4, 4)
+        w = torch.randn(3, 6, 3, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose2d(x, w, stride=2, padding=1, output_padding=1)
+
+        self._check(
+            fn,
+            lambda x, w: F.conv_transpose2d(
+                x, w, stride=2, padding=1, output_padding=1
+            ),
+            x,
+            w,
+        )
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose2d_groups(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 4, 6, 6)
+        # groups=2 → weight shape [C_in, C_out_per_group, kH, kW] = [4, 3, 3, 3]
+        w = torch.randn(4, 3, 3, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose2d(x, w, groups=2)
+
+        self._check(fn, lambda x, w: F.conv_transpose2d(x, w, groups=2), x, w)
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose2d_groups_with_bias(self):
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 4, 6, 6)
+        w = torch.randn(4, 3, 3, 3)  # groups=2, C_out=6
+        b = torch.randn(6)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w, b):
+            return F.conv_transpose2d(x, w, bias=b, groups=2)
+
+        self._check(
+            fn,
+            lambda x, w, b: F.conv_transpose2d(x, w, bias=b, groups=2),
+            x,
+            w,
+            b,
+        )
+
+    # ── 3D ───────────────────────────────────────────────────────────────
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose3d_kd1(self):
+        """3D transposed conv with KD=1, sD=1, pD=0 reduces to per-frame Conv2d."""
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 4, 6, 6)
+        w = torch.randn(3, 4, 1, 3, 3)  # KD=1
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose3d(x, w)
+
+        self._check(fn, lambda x, w: F.conv_transpose3d(x, w), x, w)
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose3d_kd1_stride_pad(self):
+        """3D transposed conv KD=1 with spatial stride/padding still works."""
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 4, 5, 5)
+        w = torch.randn(3, 6, 1, 3, 3)
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose3d(x, w, stride=(1, 2, 2), padding=(0, 1, 1))
+
+        self._check(
+            fn,
+            lambda x, w: F.conv_transpose3d(
+                x, w, stride=(1, 2, 2), padding=(0, 1, 1)
+            ),
+            x,
+            w,
+        )
+
+    @pytest.mark.xfail(strict=False, reason=_FLOOR_XFAIL_REASON)
+    def test_conv_transpose3d_kd_gt_1_falls_back(self):
+        """3D transposed conv with KD>1: must not crash (falls through to extern)."""
+        import torch.nn.functional as F
+
+        x = torch.randn(1, 3, 4, 4, 4)
+        w = torch.randn(3, 5, 3, 3, 3)  # KD=3
+
+        @torch.compile(backend="inductor")
+        def fn(x, w):
+            return F.conv_transpose3d(x, w)
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            out = fn(x.to("vulkan:0"), w.to("vulkan:0")).cpu()
+        ref = F.conv_transpose3d(x, w)
+        assert out.shape == ref.shape, f"shape {out.shape} != {ref.shape}"

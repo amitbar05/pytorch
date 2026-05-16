@@ -40,6 +40,7 @@
 
 | # | Milestone | Goal | Effort |
 |---|-----------|------|--------|
+| **M17** | **🔥 Inductor VK perf parity with CPU (NEW, HIGHEST PRIORITY)** | SmallCNN+GroupNorm is 5.7× slower than CPU eager (4.68 ms vs 0.82 ms). Cut dispatch count from ~20/step to ≤5, reactivate Slang matmul, fuse conv+gn+relu, fuse linear backward. **Target: 1× CPU parity for SmallCNN+GN, then 2× wins on bigger workloads.** | 3-4w |
 | **M9** | **Host-overhead reduction** | Close the 96 %/230× host/kernel gap. M9.1-M9.5, M9.8-M9.9 closed; M9.6-M9.7 remain. | 1-2w remaining |
 | **M11** | **Occupancy-aware codegen** | Wire reflection → WG sizing; subgroup reductions; LDS bank rigour. | 1-2w |
 | **M12** | **Reduction backward via autodiff** | 6/8 reduction ops `[Differentiable]`; route through `bwd_diff_table`. | 1w |
@@ -125,6 +126,136 @@ Counted: **22 new items** across M9 (1), M11 (1), M13 (6), M14 (6), M15 (6), M16
 
 ---
 
+## 0.9. M17 — 🔥 Inductor VK perf parity with CPU (HIGHEST PRIORITY, 3-4w)
+
+**Baseline (2026-05-16, after the per-step recompile fix landed today):**
+- SmallCNN forward+backward+AdamW step: **4.68 ms VK vs 0.82 ms CPU → CPU 5.7× faster**
+- MLP step: VK 2.79 ms vs CPU 0.43 ms → CPU 6.5× faster
+- Transformer step: VK 6.69 ms vs CPU 1.44 ms → CPU 4.6× faster
+
+Even after closing the Dynamo recompile loop, VK trails CPU on every workload. The 4.68 ms / 5.7× SmallCNN gap decomposes by `agent_space/conv_perf_breakdown.py`:
+
+### M17.0 — Dispatch census (SmallCNN: `Conv2d → GroupNorm → ReLU → AvgPool → Linear` + MSELoss + AdamW, batch=2, image=16×16)
+
+Across 4 compiled wrappers (fwd / bwd / loss / opt), per training step:
+
+| Category | Count | Notes |
+|----------|------:|-------|
+| `extern_kernels.addmm` | 1 | Linear forward — **NOT codegen**, eager Vulkan dispatch (OP.27) |
+| `aten.linear_backward` extern | 7 | Linear backward decomposed into 7 stock-Inductor sub-dispatches (mm+mm+sum+view+...) |
+| `aten._adaptive_avg_pool2d_backward` extern | 3 | Pool backward via eager Vulkan |
+| `torch.ops.torch_vulkan.adaptive_avg_pool2d` custom op | 3 | Pool forward via eager (single dispatch but no fusion) |
+| `torch.ops.torch_vulkan.conv2d_with_optional_bias` custom op | 3 | Conv forward — opaque to Inductor, no Slang fusion with downstream GN/ReLU |
+| Slang batched kernels (`_batcher.add(vulkan_kernel_N, ...)`) | 6 | GN forward (welford+normalize+affine), ReLU, MSELoss fwd/bwd, GN backward — these ARE codegen-fused |
+| `empty_strided_vulkan` allocations | 20 | One per intermediate tensor — buffer pool absorbs most via `lifetime_class` |
+| `vulkan_pool_release` | 14 | Buffer recycling |
+| **Total dispatches per step** | **~20** | Each ~0.2-0.4 ms on the 16 CU NAVI10 = 4-8 ms baseline overhead |
+
+**Root cause analysis:**
+
+1. **Linear (`nn.Linear`) is the worst leak — 8 dispatches/step.** `addmm` extern + 7 backward stock-decomp sub-dispatches. Should be **1 fused mm+bias+epilogue + 1 fused mm+bias backward = 2 dispatches**.
+2. **Conv2d eager-custom-op is opaque to Inductor's fusion pass.** Cannot fuse the Conv → GN → ReLU chain because Conv is a black box. Each is a separate dispatch.
+3. **Adaptive avg pool has both an eager forward and an extern backward.** Should be 1+1 = 2 Slang dispatches (forward is just per-output-cell reduction; backward is broadcast add).
+4. **AdamW per-parameter updates** — not visible in this dispatch census (separate compiled wrapper), but profile shows ~5 ms of optimizer time per step. `install_external_optimizer` registers a foreach AdamW custom op; need to verify it's being chosen over the stock per-parameter loop.
+
+### M17.1 — Reactivate Slang tile matmul (closes OP.27; biggest win, 5-7d)
+
+Currently `extern_kernels.{mm,bmm,addmm}` for every Linear / MultiheadAttention.bmm / etc. Two cascading blockers found 2026-05-15:
+
+  1. `slang_mm.slang:218 [numthreads(WG_N, WG_M, 1)]` — slangc 2026.5+ rejects spec-constant-derived expressions in `numthreads` (`E39999`). **Fix**: hard-code via Jinja `{{ tile_n // n_per_thread }}` literal — different tile configs already render to different SPIR-V modules so no dedup is lost. (1d)
+  2. After fix #1, Vulkan validation fails `VUID-VkComputePipelineCreateInfo-layout-07988`: SPIR-V uses `Set 1 Binding 0/1/2` but pipeline layout only declares `Set 0`. The `ParameterBlock<KernelArgs>` set assignment doesn't match what `_jit_dispatch` reflects. **Fix**: align ParameterBlock set/binding indices with the C++ dispatch layout in `csrc/vulkan/Pipeline.cpp`, OR back out ParameterBlock for mm and emit per-binding decorations. (3-4d)
+  3. Remove `_install_vulkan_aten_only_autotune()` constraint and verify the autotuner picks Slang choices when shape ≥ 64x64. (1d)
+  4. Add a perf regression test for mm: cold compile time, warm step time, vs CPU reference. (1d)
+
+  **Expected gain**: addmm 1 → fused mm+bias + 7 stock-decomp backward → 1 fused mm bwd = **8 dispatches → 2** for Linear alone. For Transformer with 4 Linears + 1 MultiheadAttention bmm = ~16 → 5 dispatches. **Estimated step time 6.69 ms → ~2 ms.**
+
+### M17.2 — Conv → GroupNorm → ReLU fusion (3-4d)
+
+Conv2d uses a `torch_vulkan::conv2d_with_optional_bias` custom op — opaque to Inductor. Inductor sees it as an extern, can't fuse downstream pointwise into it. Result: GN sees a fresh input buffer for every conv output, even though GN normalization is per-channel-then-broadcast (purely Pointwise/Reduction at that stage).
+
+**Plan**:
+  1. Make conv2d a proper Inductor `register_lowering` (not a custom op) for the static-shape case. Use `slang_conv2d` template directly, with `epilogue` parameter for activation. ParameterBlock-based — same gold standard as mm.
+  2. Add a conv epilogue interface (`IConvEpilogue : IDifferentiable`) and emit `OpReLU`, `OpGELU`, `OpGroupNormPlusReLU` as concrete structs that satisfy it.
+  3. Inductor's pattern matcher (`fx_passes/post_grad.py`) already has a pattern for conv+relu via `conv_epilogue` annotation (`scheduling.py:can_fuse_vertical`). Extend it to recognize conv+gn+relu as a triple-fusion.
+  4. Backward: `slang_conv_bwd` already emits one fused kernel. Add a `gn_backward` chained dispatch that consumes the `save_mean/rstd` saved in forward (now correctly shaped after the 2026-05-15 fix).
+
+  **Expected gain**: conv (3) + gn (2 fwd + 2 bwd Slang kernels) + relu (1) = 8 → 3 dispatches. **~2 ms saved per SmallCNN step.**
+
+### M17.3 — Native adaptive_avg_pool2d Slang lowering (1-2d)
+
+`torch.ops.torch_vulkan.adaptive_avg_pool2d.default` is a custom op (forward is 1 dispatch but no fusion); backward is `aten._adaptive_avg_pool2d_backward` extern (3 sub-dispatches). For typical `output_size=(8,8)` with `input_size=(16,16)`, this is a simple 2×2 average + per-output-cell scale.
+
+**Plan**: lower `aten._adaptive_avg_pool2d` as a Reduction over `(kH, kW)` windows. Same for backward (broadcast `grad_out / (kH*kW)` per input pixel). Inductor scheduler will then fuse with adjacent pointwise (ReLU before, Linear-reshape after). **Saves ~6 dispatches/step.**
+
+### M17.4 — AdamW: route eager `_foreach_*_` into the fused Slang custom op (2-3d)
+
+**Measured 2026-05-16** via `agent_space/adamw_dispatch_count.py` — `opt.step()` for a 4-Linear MLP on Vulkan:
+
+| path | 10 steps wall | per step | Slang dispatches |
+|------|---------------|----------|-----------------:|
+| `AdamW(foreach=True)`  | 17.02 ms | **1.70 ms** | 0 (all eager) |
+| `AdamW(foreach=False)` | 21.63 ms | 2.16 ms | 0 (all eager) |
+
+That's 36 % of SmallCNN+GN's 4.68 ms step time burned in optimizer — **and 0 Slang kernels fire** because `opt.step()` runs outside `torch.compile` and dispatches `aten._foreach_*_` directly to the Vulkan eager kernels. `install_external_optimizer` already registers `torch_vulkan::foreach_adamw_step` as a single-dispatch Slang fused kernel, but it's only chosen when Inductor sees the optimizer step — which never happens for a user-written `opt.step()` outside compile.
+
+**Three paths to fix:**
+  1. **Intercept `aten._foreach_addcmul_` / `_foreach_sqrt_` / `_foreach_add_` in Vulkan eager dispatch** and route the typical AdamW sequence (mul-add-mul-addcmul-sqrt-addcdiv chain) into `vulkan_foreach_adamw_step`. C++-level pattern match in the dispatcher. (3d)
+  2. **Replace `torch.optim.AdamW`** with `vulkan_optim.AdamW` that calls our fused custom op directly. Drop-in replacement registered when `torch_vulkan` is imported. (1d, user-visible)
+  3. **Make Dynamo capture `opt.step()`** by wrapping it in `torch.compile(opt.step, mode="reduce-overhead")`. PyTorch supports this in 2.5+. (1d for backend support)
+
+**Expected gain**: 1.70 ms → ~0.2 ms per step = **~1.5 ms saved**, ≈ 32 % of SmallCNN+GN step time.
+
+### M17.5 — Reduce per-dispatch overhead (2-3d)
+
+Even after fusion, per-dispatch wall time is ~0.2-0.4 ms (vkQueueSubmit + driver dispatch). The `DispatchBatcher` (`M9.2`) flushes every 8 dispatches; for ≤10-dispatch graphs it submits once but each dispatch inside still hits per-pipeline-bind overhead.
+
+**Plan**:
+  1. Use `vkCmdDispatchIndirect` to chain N dispatches with shared pipeline layout into a single submit (saves N-1 pipeline binds).
+  2. Pre-record reusable command buffers per compiled graph (cache keyed by graph hash). Re-record only when shapes change.
+  3. Increase `_DEFAULT_BATCH_DISPATCH_CAP` from 8 → 32 for fully static graphs.
+
+  **Expected gain**: per-dispatch overhead ~0.4 → ~0.1 ms × 5 dispatches = **1.5 ms saved**.
+
+### M17.6 — Skip extern fall-through for the few ops that still extern (1-2d)
+
+`extern_kernels.{addmm,bmm,mm,convolution}` all dispatch through `torch._C._nn.X` which itself dispatches through Vulkan eager — paying the eager-kernel overhead (input dtype check, contiguous copy on stride mismatch, etc.). Even if we keep the eager backing, route through a thin Slang wrapper that skips the redundant dispatcher layers.
+
+### M17.7 — Memory: collapse alloc + reinterpret_tensor chains (1-2d)
+
+20 allocations + 14 pool releases per SmallCNN step is high. Many are `reinterpret_tensor` views that get separately allocated. Audit `buffer_pool.py` hit rate per-graph; aim for ≥80 % (currently 36 % MLP).
+
+---
+
+### M17 critical path (dependency chart)
+
+```
+M17.1 Slang matmul reactivation ──┐
+                                  ├──→ Linear / bmm / addmm
+M17.0 dispatch census ────────────┤   8 → 2 dispatches      ─→  CPU parity SmallCNN
+                                  │
+M17.2 conv+gn+relu fusion ────────┼──→ 8 → 3 dispatches
+                                  │
+M17.3 adaptive_avg_pool Slang ────┼──→ 6 → 2 dispatches
+                                  │
+M17.4 AdamW foreach verify ───────┼──→ 6 → 1 dispatch
+                                  │
+M17.5 cmd buf chaining ───────────┘──→ per-dispatch 0.4 → 0.1 ms
+```
+
+### Companion tooling (in `agent_space/`, git-ignored)
+
+| Script | Purpose |
+|--------|---------|
+| `perf_vs_cpu.py` | 7-spec benchmark (incl. SmallCNN-GN), before/after table |
+| `codegen_audit.py` | Greps compiled wrappers for `extern_kernels.X` (leakage tracker) |
+| `perf_profile.py` | Per-kernel timing (`TORCH_VULKAN_INDUCTOR_STATS=1`) |
+| `perf_cprofile.py` | cProfile a warm step to find Python overhead |
+| `slang_mm_correctness.py` | Reproducer for Slang tile mm bugs (OP.27 / M17.1) |
+| `conv_perf_breakdown.py` | Per-wrapper dispatch census for the conv model |
+| `adamw_dispatch_count.py` | Per-step optimizer dispatch + wall-time counter (M17.4) |
+
+---
+
 ## 1. M9 — Host-overhead reduction (P0 for perf, 1-2w remaining)
 
 Closes the 96 % / 230× host/kernel gap. M9.1 (buffer pool) and M9.3
@@ -138,7 +269,7 @@ Closes the 96 % / 230× host/kernel gap. M9.1 (buffer pool) and M9.3
 - [x] **M9.6** Adaptive `_PER_KEY_CAP` in `buffer_pool.py` (scratch=8, transient=6, save_for_backward=4). (1d) ✅
 - [x] **M9.7** Pool non-extern Inductor outputs (currently only extern-kernel outputs are pooled). Closes the residual ~64 % miss rate. (1-2d) ✅
 - [x] **M9.8** Reduction-boundary fusion: GN + ReLU + GlobalAvg should fuse into 1 kernel, not 2. Relax `rnumel_fuse_cap` gate in `scheduling.py:248-261`, or change gate to predicate on consumer pattern rather than rnumel. (2-3d) — **FIX**: Added reduction-boundary fusion relaxation in `can_fuse_vertical`; rnumel cap check now overrides base tiling rejection. Tests in `TestM98ReductionBoundaryFusion`.
-- [x] **M9.9** Transformer combo-batcher `UnboundLocalError: buf10`. **Root cause located**: `vulkan_combo_kernel.py:987-1019` `_rewrite_body()` token-based renaming runs before the buffer-name map is fully seeded; if a buffer name isn't in `per_sub_maps[idx]`, the rewriter emits the original name and collides with a renamed local from a previous subkernel. Fix: pre-seed buffer names via `_build_global_binding_map()` (line 689-795) before the rewrite loop. (1-2d) — **FIX**: `_rewrite_body` now handles unregistered buffer names by applying per-subkernel suffix instead of using cross_decls. Test in `TestM99ComboBatcher`.
+- [x] **M9.9** Transformer combo-batcher `UnboundLocalError: buf10`. **Root cause located**: `vulkan_combo_kernel.py:987-1019` `_rewrite_body()` token-based renaming runs before the buffer-name map is fully seeded; if a buffer name isn't in `per_sub_maps[idx]`, the rewriter emits the original name and collides with a renamed local from a previous subkernel. Fix: pre-seed buffer names via `_build_global_binding_map()` (line 689-795) before the rewrite loop. (1-2d) — **FIX (2026-05-15 reopen)**: `_rewrite_body` per-subkernel suffix change wasn't enough; the runtime `UnboundLocalError` resurfaced on Transformer training. **Real root cause**: `kernel/header.py:call_kernel` and `vulkan_combo_kernel.py:call_kernel` substitute reused-buffer names one step but Inductor's memory planner can chain reuses (`buf9 → buf10 → buf11` — buf10 itself is reused into buf11). One-step substitution leaves the dead intermediate (buf10) in the kernel arg list. **Fix**: walk the alias chain transitively via `_resolve(name)` in both `call_kernel` sites. M9.9 regression test (`test_m99_combo_kernel_no_unbound_local`) now PASSES (was xfail). Transformer 3-step training works end-to-end through `torch.compile`.
 
 ---
 
@@ -202,6 +333,7 @@ audit found.
 - [x] **OP.24 Quantized int8 matmul (inference)**: ✅ — `shaders/lib/mm_int8.slang` (int8 unpack + int32 accumulate + float32 store), `_render_mm_int8_slang()` wrapper, `_slang_tile_mm_int8()` dispatch, `torch_vulkan::mm_int8` custom op, `_register_mm_int8_lowering()` in matmul.py with autotuning. Forward-only. **Unblocks**: GPTQ / AWQ / quantized Llama inference.
 - [x] **OP.25 RNN backward via Slang autodiff**: `bwd_lowerings.py:687L` decomposes RNN grads manually; GRU backward marked "more complex" and incomplete. **Unblocks**: LSTM/GRU training parity. (6-8d)
 - [x] **OP.26 Anti-symptom: native attention primitive**: `_fuse_sdpa_to_flash_attention` is currently a symptom-fix for the absence of a native `aten.scaled_dot_product_attention` lowering. Promote the FlashAttention template to a real primitive lowering registered via `@register_lowering(aten.scaled_dot_product_attention)`. Closes anti-goal #5 for SDPA. (3d) ✅ Done 2026-05-14 — new `lowerings/attention.py` with native SDPA + sdpa_with_optional_mask lowerings routing to FlashAttention template; disabled fx_passes/patterns/sdpa.py pattern matcher; removed pre-grad SDPA decomposition; 9/10 regression tests passing, 1 xfail (pre-existing GQA C++ backend limitation).
+- [ ] **OP.27 Slang tile matmul codegen reactivation (NEW 2026-05-15)**: `_install_vulkan_aten_only_autotune` constrains matmul autotune to `"ATEN"` because Slang tile mm/bmm/addmm "produce incorrect forward output (max diff ~28 vs CPU)". Audit (2026-05-15 via `agent_space/codegen_audit.py`) confirms every `nn.Linear` / `nn.MultiheadAttention` lowers to `extern_kernels.{mm,bmm,addmm}` (eager Vulkan dispatch), not Slang codegen. **Investigation**: `agent_space/slang_mm_correctness.py` shows two compounding blockers: (1) `slang_mm.slang:218` `[numthreads(WG_N, WG_M, 1)]` — slangc 2026.5+ rejects expressions derived from `[[vk::constant_id]]` with `E39999: expression does not evaluate to a compile-time constant`; (2) After hard-coding numthreads via Jinja, slangc compiles but Vulkan validation fails with `VUID-VkComputePipelineCreateInfo-layout-07988`: shader uses `Set 1 Binding 0/1/2` but pipeline layout only declares `Set 0` — the `ParameterBlock<KernelArgs>` set assignment doesn't match what `_jit_dispatch` reflects. Both fixes need landing together: replace spec-constant numthreads with Jinja literals AND align ParameterBlock set/binding indices with the C++ dispatch layout. Until then, matmul stays on extern_kernels (correct, just unfused). (3-5d). Companion test: `agent_space/codegen_audit.py` greps every compiled wrapper for `extern_kernels.X` calls per model — current numbers: MLP 2 (bmm,addmm), SmallCNN 1 (addmm), Transformer 3 (2×bmm, 1×addmm).
 
 ---
 
@@ -251,12 +383,13 @@ Phase 1 (Conv1d) closed 2026-05-11 — see history doc.
 
 - [x] **Phase 2 — Depthwise conv (groups=C, arbitrary)**: ✅ — per-group decomposition in `fx_passes/patterns/conv_im2col.py` handles arbitrary groups via `aten.slice.Tensor` + per-group `torch_vulkan::conv2d_with_optional_bias` (groups=1) + `aten.cat`. No hardcoded group limit. Backward inherited from Conv2d bwd template.
 - [ ] **Phase 3 — Conv3d (KD>1)**: **Audit (2026-05-15):** Current `_conv3d_to_conv2d_lowering` handles KD==1 only. Approach: merge depth into spatial batch (N*D) and kernel depth into kernel height (KD*KH), with depth padding/striding as pre-processing. No template changes needed — the existing Conv2d tiled template handles the reshaped input. Edge cases: strided/dilated depth, depth padding. (3-4d)
-- [ ] **Phase 4 — Transposed conv (1D / 3D)**: **Audit (2026-05-15):** Existing `_vulkan_conv_transpose2d` decomposition (flip+transpose+upsample→conv2d) already works for common 2D case. Extend for dilation>1, groups>1, output_padding>0. Add 1D (reshape→2D transposed→squeeze) and 3D (merge spatial dims) lowerings. Reuses existing `slang_conv2d` forward template — no new Slang needed. (2-3d)
+- [ ] **Phase 4 — Transposed conv (1D / 3D)**: **PARTIAL (2026-05-15):** New `lowerings/conv_transpose.py` (~330 L) ships `_impl_2d/1d/3d` decomposition (flip + channel-swap + zero-upsample → Conv2d, post-pad for output_padding). Registered against `aten.conv_transpose1d/2d/3d` overloads (unreachable — see below) and `aten.convolution.default` (the real path — `F.conv_transpose*` decomposes to `aten.convolution(transposed=True)` before reaching the lowering registry). 2D path falls through to upstream extern (preserving the existing test_transposed_conv_graph_breaks_gracefully behavior); 1D/3D paths route through the decomposition. Tests in `TestM6Phase4ConvTranspose` (10 tests, all `xfail(strict=False)`). conv.py shrunk 795→690 L. **Blockers found this session** (filed in xfail reasons): (1) `aten.flip` only in upstream's decomposition table — added `make_fallback(override_decomp=True)`; (2) `aten.transpose.int` no lowering — replaced with `aten.permute`; (3) `torch_vulkan::conv2d_with_optional_bias` OpOverload identity changes after `register_eager_patch_custom_ops` re-registration — added string-keyed lookup (`_get_conv2d_lowering`); (4) `aten.clone` returns Pointwise IR while `_VulkanConv2dExternKernel` requires realized inputs — added `ExternKernel.realize_input`. All four issues addressed but downstream IR validation still asserts on the per-frame conv2d ExternKernelOut. Next steps: add codegen-stage realize hooks or build a custom op `torch_vulkan::conv_transpose{1,2,3}d` that wraps the eager path. (~2-3d remaining)
 
 **M6 — New issues discovered 2026-05-15 (conv training analysis):**
 
 - [x] **M6.5 Conv2d backward gradient correctness**: **FIXED (2026-05-15):** `g_inp = torch.empty_like(inp)` → `torch.zeros_like(inp)` in `fx_passes/eager/conv.py:L133`. The CAS `vk_atomic_add` reads before write — uninitialized memory corrupts gradient computations. ParameterBlock field ordering verified correct (input/weight/grad_out/grad_input/grad_weight/grad_bias). ✅
 - [x] **M6.6 Depthwise conv backward via aten.convolution_backward**: **FIXED (2026-05-15):** Per-group `_slang_tile_conv2d_bwd` decomposition in `fx_passes/eager/conv.py:_conv2d_backward`. When groups>1 + Vulkan + f32, splits tensors per-group, calls Slang bwd for each group, concatenates results. Avoids the FunctionalTensor type mismatch in `aten.convolution_backward`. Non-Vulkan/non-f32 still falls through to aten. ✅
+- [ ] **M6.8 Vulkan allocator offset-view handling (NEW 2026-05-15)**: `csrc/ops/dispatch.cpp:get_buffer_info` looks up `tensor.data_ptr()` in `VulkanAllocator`'s pointer→buffer map. For a view with non-zero `storage_offset()`, `data_ptr()` includes the offset and the lookup misses, throwing "Tensor has no backing Vulkan buffer". This blocks depthwise conv compile mode: `tests/test_inductor_regression.py::TestConvGeneralityGaps::test_m6_depthwise_conv_{matches_cpu,backward_matches_cpu}` both fail because Inductor's wrapper emits `reinterpret_tensor(primals_1, (1,1,H,W), (C*H*W,...,1), offset=N*sizeof)` per group. Even `.contiguous()` and `.clone()` fail because they also dispatch through the same buffer lookup. Fix: (1) `get_buffer_info` should look up by `storage().data_ptr()` (without offset), then carry offset into the binding (`vkBindBufferMemory` / push-constants); (2) update all dispatch sites to pass the offset explicitly. Affects every op that takes a tensor argument. (3-4d) Adjacent fix already in this session: `templates/caller/conv.py:_slang_tile_conv2d_bwd` PF.51 guard now checks output (`grad_input`, `grad_weight`, `grad_bias`) tensors — not just `input_t` — so any FakeTensor leak through the per-group decomposition exits cleanly instead of crashing the dispatch. Doesn't unblock depthwise compile but tightens the guard.
 - [x] **M6.7 Combo kernel body rewriter bugs (BN+ReLU+Conv fusion)**: **FIXED (2026-05-15):** Gate added in `scheduling.py:can_fuse_vertical()` — when `conv_epilogue` fusion group would mix template (conv) + reduction (norm) nodes, fusion is rejected. The generic combo kernel body rewriter can only handle pointwise subkernels; template+reduction fusion must use the native conv template epilogue. ✅
 
 Files: `lowerings/conv.py`, `templates/slang_conv2d.py.jinja`,

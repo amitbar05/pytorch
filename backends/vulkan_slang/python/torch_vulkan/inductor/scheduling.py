@@ -584,11 +584,6 @@ class VulkanScheduling(SIMDScheduling):
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             return wrapper.src_to_kernel[src_code]
-        import pathlib
-
-        pathlib.Path("/tmp/all_kernels.log").open("a").write(
-            f"=== define_kernel ===\n{src_code[:300]}\n\n"
-        )
         kernel_name = f"vulkan_kernel_{wrapper.next_kernel_suffix()}"
         wrapper.src_to_kernel[src_code] = kernel_name
 

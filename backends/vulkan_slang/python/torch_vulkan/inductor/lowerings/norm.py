@@ -44,11 +44,18 @@ def _register_layer_norm() -> None:
         if bias is not None:
             out = L.lowerings[aten.add.Tensor](out, bias)
 
-        # native_layer_norm returns (output, mean, rstd) with mean/rstd = batch shape
-        batch_shape = list(x.get_size()[: ndim - norm_ndim]) or [1]
-        mean_out = L.lowerings[aten.view.default](mean_kd, batch_shape)
-        rstd_out = L.lowerings[aten.view.default](rstd_kd, batch_shape)
-        return [out, mean_out, rstd_out]
+        # ``aten.native_layer_norm`` returns ``(output, mean, rstd)`` where
+        # mean/rstd keep the reduction axes with size 1 (not collapsed). For
+        # input [N, *, normalized_shape] with normalized_shape having
+        # ``norm_ndim`` axes, mean/rstd shape is [N, *, 1, 1, ...] —
+        # ``batch_shape`` for the leading dims plus ``[1] * norm_ndim``.
+        # Eager `at::native_layer_norm` returns shape [..., 1] (verified on
+        # 2.11.0+cu130). var_mean(keepdim=True) already produces this shape;
+        # passing it through directly preserves rank for downstream
+        # ``require_stride_order`` checks (Inductor's
+        # ``stride_ordered_for_memory_format`` asserts rank match against
+        # the FX node's ``meta['val'].stride()``).
+        return [out, mean_kd, rstd_kd]
 
 
 def _register_group_norm() -> None:

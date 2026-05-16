@@ -258,11 +258,22 @@ def _slang_tile_conv2d_bwd(
     # PF.51 guard: during AOT Autograd tracing, inputs are FakeTensors with
     # meta-device storage.  Skip the actual dispatch — the caller already
     # allocated output tensors with correct shapes.
-    try:
-        if input_t.untyped_storage().device.type == "meta":
-            return  # tracing mode, outputs already allocated
-    except Exception:
-        # FakeTensors raise on untyped_storage() — treat as tracing mode.
+    #
+    # Why each tensor is checked: when AOT Autograd traces a depthwise
+    # backward, ``input_t`` (saved from forward) can stay real while
+    # ``grad_input``/``grad_weight`` get re-materialized as FakeTensors via
+    # ``torch.zeros_like`` under FakeTensorMode. Checking just ``input_t``
+    # missed that path.
+    def _is_meta(t):
+        if t is None:
+            return False
+        try:
+            return t.untyped_storage().device.type == "meta"
+        except Exception:
+            # FakeTensors raise on untyped_storage() — treat as tracing.
+            return True
+
+    if any(_is_meta(t) for t in (input_t, weight_t, grad_out, grad_input, grad_weight, bias, grad_bias)):
         return
 
     from ...runtime import compile_and_dispatch

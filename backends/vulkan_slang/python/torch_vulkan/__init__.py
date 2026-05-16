@@ -240,14 +240,28 @@ def _register_optional_tensor_workarounds():
         except Exception:
             return False
 
+    # PERF: Short-circuit re-registration of the eager-patch custom ops.
+    # The patched F.conv2d / F.conv1d / F.sdpa / F.max_pool2d shims below
+    # call ``_ensure_patch_custom_ops()`` on every invocation; without
+    # this guard, each call re-runs ``torch.library.custom_op(...)`` and
+    # creates a fresh ``OpOverload`` object, changing the obj_id Dynamo
+    # guards on (``___check_obj_id(torch.ops.torch_vulkan.X)``). That
+    # invalidates the compiled cache and triggers a Dynamo recompile per
+    # training step (~31 ms / 41 % of SmallCNN training step time in the
+    # cprofile session 2026-05-16).
+    _patch_custom_ops_done = [False]
+
     def _ensure_patch_custom_ops():
         # PF.30.a/.b/.c — register the conv2d/conv1d/sdpa/max_pool2d
         # custom_op shims used by the Vulkan paths below. Lazy because the
         # inductor sub-package's auto-register call wires these up at
         # backend-register time, but eager-only users never import it.
+        if _patch_custom_ops_done[0]:
+            return
         from torch_vulkan.inductor.fx_passes import register_eager_patch_custom_ops
 
         register_eager_patch_custom_ops()
+        _patch_custom_ops_done[0] = True
 
     def _is_fake(t):
         # Dynamo / AOT can fake-run the patched fn to derive output meta;

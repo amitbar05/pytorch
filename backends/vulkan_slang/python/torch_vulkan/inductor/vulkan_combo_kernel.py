@@ -537,16 +537,29 @@ class VulkanComboKernel:
         all_args.extend(outer for _, _, outer in rw_decls)
 
         # PF.13.b.4-CODG: The Inductor memory planner may alias two buffers
-        # via ``buf1 = div; del div`` before the kernel call.  If any kernel
-        # argument name was freed by a reuse line, substitute the new name
-        # so the emitted call doesn't reference a deleted variable.
+        # via ``buf1 = reinterpret_tensor(div); del div`` before the kernel
+        # call.  If any kernel argument name was freed by a reuse line,
+        # substitute the new name so the emitted call doesn't reference a
+        # deleted variable. Resolve transitively so a chain
+        # ``buf9 → buf10 → buf11`` collapses to the final live name —
+        # a naive one-step substitution leaves the intermediate buf10
+        # in args, which references a deleted variable at runtime
+        # (UnboundLocalError seen in MultiheadAttention forward graphs).
         freed: set = getattr(wrapper, "freed", set())
         reuses: dict = getattr(wrapper, "reuses", {})
         if freed:
             old_to_new: dict[str, str] = {}
             for new_name, old_name in reuses.items():
                 old_to_new[old_name] = new_name
-            all_args = [old_to_new.get(a, a) for a in all_args]
+
+            def _resolve(name: str) -> str:
+                seen: set[str] = set()
+                while name in old_to_new and name in freed and name not in seen:
+                    seen.add(name)
+                    name = old_to_new[name]
+                return name
+
+            all_args = [_resolve(a) for a in all_args]
 
         for v in self.subkernels[0][0].args.sizevars:
             all_args.append(str(v))

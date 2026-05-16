@@ -137,9 +137,20 @@ def _register_view_symint_autograd_pyimpl() -> None:
         _view_symint_autograd_lib = torch.library.Library(
             "aten", "IMPL", "AutogradPrivateUse1"
         )
-        _view_symint_autograd_lib.impl("view", _make_pyimpl("view"))
-        _view_symint_autograd_lib.impl("reshape", _make_pyimpl("reshape"))
-        _view_symint_autograd_lib.impl("_unsafe_view", _make_pyimpl("_unsafe_view"))
+        # Silences the one-shot "Overriding a previously registered kernel"
+        # diagnostic — the override is intentional (replaces the default
+        # LegacyBatchingRegistrations kernel for AutogradPrivateUse1).
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings(
+                "ignore",
+                message="Warning only once for all operators",
+                category=UserWarning,
+            )
+            _view_symint_autograd_lib.impl("view", _make_pyimpl("view"))
+            _view_symint_autograd_lib.impl("reshape", _make_pyimpl("reshape"))
+            _view_symint_autograd_lib.impl("_unsafe_view", _make_pyimpl("_unsafe_view"))
     except Exception as e:  # pragma: no cover
         import logging
 

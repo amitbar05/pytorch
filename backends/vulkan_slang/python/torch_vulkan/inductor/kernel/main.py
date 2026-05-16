@@ -748,13 +748,13 @@ class VulkanKernel(
         max_wg = self._apply_loop_depth_penalty(max_wg, vgpr_class, loop_depth)
 
         # ── Numel-driven sizing ────────────────────────────────────
+        # Pointwise WG-size cap by VGPR pressure class.
+        caps = {"light": 512, "normal": 384, "heavy": 256}
         if all(not is_dynamic(v) for v in self.numels.values()):
             total = 1
             for v in self.numels.values():
                 total *= int(v)
             scale = 4 // dtype_bytes  # 1 for f32, 2 for f16/bf16
-            # Pointwise: prefer larger caps for better occupancy.
-            caps = {"light": 512, "normal": 384, "heavy": 256}
             cap = caps.get(vgpr_class, 256)
             if total > scale * 256 * 1024:
                 wg_size = min(max_wg, cap)
@@ -806,7 +806,8 @@ class VulkanKernel(
                 wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
             return wg_size
 
-        wg_size = min(max_wg, pt_caps.get(vgpr_class, 256))
+        # Dynamic-numel fall-through: use the same VGPR-class caps.
+        wg_size = min(max_wg, caps.get(vgpr_class, 256))
         # M11.5: round WG size up to wave-size multiple.
         if config.round_wg_to_wave() and wg_size % sgs != 0:
             wg_size = self._round_wg_to_wave(wg_size, max_wg, sgs)
