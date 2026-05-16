@@ -84,23 +84,17 @@ struct PC {
 
 [[vk::push_constant]] PC pc;
 
-// N+1.10 — Buffer bindings are wrapped in a single
-// ``ParameterBlock<KernelArgs>``.  Slang assigns one descriptorTableSlot
-// per struct field in declaration order (set 0, binding 0..N-1),
-// matching the descriptorCount=1 layout the runtime expects.  The
-// dispatch caller (``_slang_tile_mm`` / ``_slang_tile_addmm`` /
-// ``_slang_tile_addmm_gelu`` / ``_slang_tile_bmm`` in
-// ``vulkan_template_caller.py``) passes tensors in struct-field order
-// (a, b, [bias,] c).  No `[[vk::binding(N)]]` literals are emitted.
-struct KernelArgs {
-    StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
-    StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
+/*{%*/ set c_binding = 2 if has_bias else 2 /*%}*/
+// M17.1 — Buffer bindings use explicit [[vk::binding(N)]] decorations.
+// ParameterBlock at global scope is assigned to Set 1 by slangc 2026.5+.
+// Per-binding decorations avoid the set mismatch entirely.
+// Binding order: a=0, b=1, [bias=2,] c=/*{{*/ c_binding /*}}2*/.
+[[vk::binding(0)]] StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
+[[vk::binding(1)]] StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
 /*{%*/ if has_bias /*%}*/
-    StructuredBuffer</*{{*/ dtype_bias | default(dtype_c) /*}}float*/> bias;
+[[vk::binding(2)]] StructuredBuffer</*{{*/ dtype_bias | default(dtype_c) /*}}float*/> bias;
 /*{%*/ endif /*%}*/
-    RWStructuredBuffer</*{{*/ dtype_c /*}}float*/> c;
-};
-ParameterBlock<KernelArgs> args;
+[[vk::binding(/*{{*/ c_binding /*}}2*/)]] RWStructuredBuffer</*{{*/ dtype_c /*}}float*/> c;
 /*{%*/ if num_stages > 1 /*%}*/
 // Double-buffered: stage 0 occupies the first half, stage 1 the second half.
 // Flat 1-D layout (rather than `[2][N]`) so helpers can index with a single
@@ -148,7 +142,7 @@ void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
         uint global_k = k_base + local_k;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_m < pc.M && global_k < pc.K) {
-            v = (/*{{*/ dtype_acc /*}}float*/)args.a[batch_a_off + global_m * pc.stride_a_m + global_k * pc.stride_a_k];
+            v = (/*{{*/ dtype_acc /*}}float*/)a[batch_a_off + global_m * pc.stride_a_m + global_k * pc.stride_a_k];
         }
         tile_a[off_a + i] = v;
     }
@@ -161,7 +155,7 @@ void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
         uint global_n = col_base + local_n;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_k < pc.K && global_n < pc.N) {
-            v = (/*{{*/ dtype_acc /*}}float*/)args.b[batch_b_off + global_k * pc.stride_b_k + global_n * pc.stride_b_n];
+            v = (/*{{*/ dtype_acc /*}}float*/)b[batch_b_off + global_k * pc.stride_b_k + global_n * pc.stride_b_n];
         }
         tile_b[off_b + j] = v;
     }
@@ -214,8 +208,13 @@ void mma_tile(uint stage, uint k_base, uint3 lid, inout /*{{*/ dtype_acc /*}}flo
     }
 }
 
+/*{%*/ set wg_n_literal = tile_n // n_per_thread /*%}*/
+/*{%*/ set wg_m_literal = tile_m // m_per_thread /*%}*/
 [shader("compute")]
-[numthreads(WG_N, WG_M, 1)]
+// M17.1: Use Jinja-computed literals instead of spec-constant-derived
+// WG_N/WG_M to avoid slangc 2026.5+ E39999. Different tile configs
+// already produce different SPIR-V modules, so no dedup is lost.
+[numthreads(/*{{*/ wg_n_literal /*}}64*/, /*{{*/ wg_m_literal /*}}64*/, 1)]
 void computeMain<Epilogue : IDifferentiable>(
                  uint3 gtid : SV_DispatchThreadID,
                  uint3 lid : SV_GroupThreadID,
@@ -301,10 +300,10 @@ void computeMain<Epilogue : IDifferentiable>(
             v *= pc.alpha;
 /*{%*/ endif /*%}*/
 /*{%*/ if has_bias /*%}*/
-            v += (/*{{*/ dtype_acc /*}}float*/)args.bias[col * pc.stride_bias_n];
+            v += (/*{{*/ dtype_acc /*}}float*/)bias[col * pc.stride_bias_n];
 /*{%*/ endif /*%}*/
 /*{%*/ if has_beta /*%}*/
-            v += pc.beta * (/*{{*/ dtype_acc /*}}float*/)args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
+            v += pc.beta * (/*{{*/ dtype_acc /*}}float*/)c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
 /*{%*/ endif /*%}*/
 /*{%*/ if epilogue /*%}*/
             v = (/*{{*/ dtype_acc /*}}float*/)Epilogue::apply((float)v);
@@ -315,7 +314,7 @@ void computeMain<Epilogue : IDifferentiable>(
 /*{%*/ if has_clamp /*%}*/
             v = clamp(v, (/*{{*/ dtype_acc /*}}float*/)pc.clamp_min, (/*{{*/ dtype_acc /*}}float*/)pc.clamp_max);
 /*{%*/ endif /*%}*/
-            args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = (/*{{*/ dtype_c /*}}float*/)v;
+            c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = (/*{{*/ dtype_c /*}}float*/)v;
         }
     }
 }

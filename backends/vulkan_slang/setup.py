@@ -3,10 +3,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Ensure the installed PyTorch (in the venv) is used instead of any source-tree
+# copy that may be on sys.path (e.g. from the parent pytorch repo).
+# Without this, setup.py picks up the source tree's torch/ which may require
+# C-extension symbols not present in the installed version.
+_venv_site = os.path.join(
+    os.path.dirname(__file__),
+    ".venv",
+    "lib",
+    f"python{sys.version_info.major}.{sys.version_info.minor}",
+    "site-packages",
+)
+if os.path.isdir(_venv_site) and _venv_site not in sys.path:
+    sys.path.insert(0, _venv_site)
+
+# Remove the root pytorch source tree from sys.path so `import torch` always
+# resolves to the venv-installed copy.
+_root_pytorch = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root_pytorch in sys.path:
+    sys.path.remove(_root_pytorch)
+
 # Enable parallel compilation
 os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 
@@ -18,9 +38,7 @@ def get_sources():
     for d in src_dirs:
         dir_path = root / d
         if dir_path.exists():
-            sources.extend(
-                str(p.relative_to(root)) for p in dir_path.glob("*.cpp")
-            )
+            sources.extend(str(p.relative_to(root)) for p in dir_path.glob("*.cpp"))
     sources.append("csrc/init.cpp")
     return sources
 
