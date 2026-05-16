@@ -105,9 +105,19 @@ from .utils import (
 )
 
 
+def _unwrap_tensor_subclasses_no_symints(
+    args: list[Any],
+) -> list[Any]:
+    return runtime_unwrap_tensor_subclasses(args, append_symints=False)  # type: ignore[arg-type]
+
+
 zip = strict_zip
 
 aot_graphs_log = getArtifactLogger(__name__, "aot_graphs")
+
+
+def _unwrap_no_symints(args: list[Any]) -> list[Any]:
+    return runtime_unwrap_tensor_subclasses(args, append_symints=False)
 
 
 def _describe_arg_for_logging(arg: object) -> str:
@@ -1006,7 +1016,7 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
         *,
         runtime_metadata: ViewAndMutationMeta,
     ) -> Callable[..., Any]:
-        if self.maybe_subclass_meta is None:
+        if self.maybe_subclass_meta is None and not runtime_metadata.act_input_indices:
             return compiled_fn
 
         from .subclass_codegen import codegen_subclass_wrapper
@@ -1017,6 +1027,7 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
             out_metas=runtime_metadata.subclass_fw_graph_out_meta,
             num_fw_outs_saved_for_bw=self.num_fw_outs_saved_for_bw,
             frozen_inp_indices=self._get_frozen_inp_indices(),
+            act_input_indices=runtime_metadata.act_input_indices,
         )
         inner_fn._boxed_call = True  # type: ignore[attr-defined]
         return inner_fn
@@ -1328,11 +1339,23 @@ class AOTDedupeWrapper(CompilerWrapper):
         if not self.needs_post_compile:
             return compiled_fn
 
-        @wraps(compiled_fn)
-        def wrapped_compiled_fn(args: list[Any]) -> Any:
-            deduped_args = self.remove_dupe_args(args)
-            args.clear()
-            return compiled_fn(deduped_args)
+        keep_indices = [i for i, keep in enumerate(self.keep_arg_mask) if keep]
+        idx_list = ", ".join(f"args[{i}]" for i in keep_indices)
+        source = (
+            f"def inner_fn(args):\n"
+            f"    deduped_args = [{idx_list}]\n"
+            f"    args.clear()\n"
+            f"    return compiled_fn(deduped_args)\n"
+        )
+        from .subclass_codegen import _compile_and_exec_source
+
+        wrapped_compiled_fn: Callable[..., Any] = _compile_and_exec_source(  # type: ignore[assignment]
+            source,
+            {"compiled_fn": compiled_fn},
+            "inner_fn",
+            "dedup_wrapper",
+            wrapped_fn=compiled_fn,
+        )
 
         wrapped_compiled_fn._boxed_call = True  # type: ignore[attr-defined]
 
@@ -1897,6 +1920,7 @@ def merge_view_inputs(
                 raise AssertionError(
                     "every argument in the inner calling convention should be accounted for"
                 )
+        # pyrefly: ignore [bad-return]
         return (
             args_to_functionalization,
             args_to_functionalization_descs,
@@ -1947,7 +1971,8 @@ def _backward_prologue_functional(
     ctx_opaque_objects: Sequence[Any],
     metadata: ViewAndMutationMeta,
     maybe_subclass_metadata: SubclassMeta | None,
-    *flat_args: Any,
+    flat_args: Sequence[Any],
+    codegen_unwrap_fn: Callable[..., Any] | None = None,
 ) -> list[Any]:
     # Calling convention: we expect a grad_out passed to the backward:
     # - for every output of the fw that does *not* alias an input or graph intermediate
@@ -1991,6 +2016,12 @@ def _backward_prologue_functional(
         ],
         flat_args[num_mutated_runtime_inps + metadata.num_outputs :],
     )
+    # Release grad refs from the caller's list (boxed calling convention).
+    # Slicing already copied refs into sub-lists above, so clearing the
+    # original list only drops redundant refs. The isinstance guard skips
+    # this when flat_args is a tuple (non-boxed path from compiled_autograd).
+    if isinstance(flat_args, list):
+        flat_args.clear()
     # input_info contains info on *every* input,
     # But in the backward(), we are only given grad outputs for every mutated input
     # We then need to filter out the grad outputs that correspond to metadata-only mutations or don't require grad
@@ -2128,23 +2159,15 @@ def _backward_prologue_functional(
             )
         )
 
-        unwrapped_tangents = runtime_unwrap_tensor_subclasses(
-            all_args[:tangents_start_idx],  # type: ignore[arg-type]
-            # SymInts that are inputs to the backward graph are
-            # already included in the "all_args" list.
-            # Any symints coming from tensor subclasses should always
-            # come from primals, and so they will show up as extra
-            # arguments to the forward graph, and they will be saved
-            # as activation in the backward graph.
-            append_symints=False,
+        if codegen_unwrap_fn is not None:
+            unwrap = codegen_unwrap_fn
+        else:
+            unwrap = _unwrap_no_symints
+        all_args = (
+            unwrap(all_args[:tangents_start_idx])
+            + flat_processed_tangents
+            + unwrap(all_args[tangents_end_idx:])
         )
-
-        unwrapped_primals = runtime_unwrap_tensor_subclasses(
-            all_args[tangents_end_idx:],  # type: ignore[arg-type]
-            append_symints=False,
-        )
-
-        all_args = unwrapped_tangents + flat_processed_tangents + unwrapped_primals
     else:
         stack_traces = metadata.tangent_source_stack_traces or ()
 
@@ -2779,15 +2802,13 @@ class _AOTDispatchAutogradFunctionFactory:
         aot_config = self.spec.aot_config
         fw_metadata = self.spec.fw_metadata
 
+        _codegen_bw_unwrap_fn = None
         _codegen_bw_wrap_fn = None
-        if (
-            maybe_subclass_meta is not None
-            and maybe_subclass_meta.grad_input_metas is not None
-        ):
-            from .subclass_codegen import codegen_backward_subclass_wrap
+        if maybe_subclass_meta is not None:
+            from .subclass_codegen import codegen_backward_subclass_fns
 
-            _codegen_bw_wrap_fn = codegen_backward_subclass_wrap(
-                maybe_subclass_meta.grad_input_metas,
+            _codegen_bw_unwrap_fn, _codegen_bw_wrap_fn = codegen_backward_subclass_fns(
+                grad_input_metas=maybe_subclass_meta.grad_input_metas,
             )
 
         class CompiledFunction(torch.autograd.Function):
@@ -2799,6 +2820,8 @@ class _AOTDispatchAutogradFunctionFactory:
             _aot_id = aot_config.aot_id
             _lazy_backward_info = lazy_backward_info
             _bw_epilogue_wrap_fn = _codegen_bw_wrap_fn
+            _bw_prologue_unwrap_fn = _codegen_bw_unwrap_fn
+            boxed_grads_call = True
 
             @staticmethod
             def _compiled_autograd_key(ctx: Any) -> tuple[Any, ...]:
@@ -2837,13 +2860,32 @@ class _AOTDispatchAutogradFunctionFactory:
 
             @staticmethod
             def backward(ctx: Any, *flat_args: Any) -> tuple[Any, ...]:
+                # With boxed_grads_call, grads arrive as a single mutable
+                # list (not *args) so backward can free them individually
+                # to reduce peak memory.
+                if CompiledFunction.boxed_grads_call:
+                    if len(flat_args) != 1 or not isinstance(flat_args[0], list):
+                        raise AssertionError(
+                            "boxed_grads_call is set but backward received "
+                            f"{len(flat_args)} args instead of a single mutable "
+                            "list. When boxed_grads_call=True, grads must be "
+                            "passed as a single list argument [grad0, grad1, ...] "
+                            "to allow freeing individual grads mid-backward."
+                        )
+                    grad_args = flat_args[0]
+                else:
+                    # Non-boxed path: used by subclasses of CompiledFunction
+                    # that override boxed_grads_call to False.
+                    grad_args = list(flat_args)
+                del flat_args
                 all_args = _backward_prologue_functional(
                     saved_state.load_tensors(ctx),
                     ctx.symints,
                     ctx.opaque_objects,
                     CompiledFunction.metadata,
                     CompiledFunction.maybe_subclass_metadata,
-                    *flat_args,
+                    grad_args,
+                    codegen_unwrap_fn=CompiledFunction._bw_prologue_unwrap_fn,
                 )
                 rng_state.add_backward_args(ctx, all_args)
 
@@ -3148,36 +3190,38 @@ class DebugAssertWrapper(CompilerWrapper):
         *,
         runtime_metadata: ViewAndMutationMeta,
     ) -> Callable[..., Any]:
-        @wraps(compiled_fn)
-        def debug_compiled_function(args: list[Any]) -> Any:
-            # TODO: T253242027 Check aliasing relationships
-            # TODO: Check strides for metadata mutation
-            # (NB: ideally, this logic is factored out of this function and
-            # you move these debug checks there)
+        lines = ["def inner_fn(args):"]
+        globals_dict: dict[str, object] = {"compiled_fn": compiled_fn}
+        for i, can_require_grad in enumerate(self.flat_requires_grad):
+            if can_require_grad is None:
+                lines.append(
+                    f"    if isinstance(args[{i}], Tensor):"
+                    f" raise AssertionError("
+                    f"'expected non-Tensor for arg {i}, got Tensor')"
+                )
+            elif not can_require_grad:
+                msg_name = f"_msg_{i}"
+                globals_dict[msg_name] = format_guard_bug_msg(
+                    aot_config,
+                    f"{describe_input(i, aot_config)} would not require grad",
+                )
+                lines.append(
+                    f"    if args[{i}].requires_grad: raise AssertionError({msg_name})"
+                )
+        lines.append("    return compiled_fn(args)")
 
-            # Check requires grad.  Bad case is when we compiled with
-            # requires_grad = False, but input requires_grad = True
-            # (vice versa is OK; we compute a gradient and then throw
-            # it away when it hits the input.)
-            for i, a in enumerate(args):
-                can_require_grad = self.flat_requires_grad[i]
-                if can_require_grad is None:
-                    if isinstance(a, Tensor):
-                        raise AssertionError(
-                            f"expected non-Tensor for arg {i}, got Tensor"
-                        )
-                elif not can_require_grad:
-                    if a.requires_grad:
-                        raise AssertionError(
-                            format_guard_bug_msg(
-                                aot_config,
-                                f"{describe_input(i, aot_config)} would not require grad",
-                            )
-                        )
+        source = "\n".join(lines)
+        globals_dict["Tensor"] = Tensor
 
-            return compiled_fn(args)
+        from .subclass_codegen import _compile_and_exec_source
 
-        return debug_compiled_function
+        return _compile_and_exec_source(
+            source,
+            globals_dict,
+            "inner_fn",
+            "debug_assert_wrapper",
+            wrapped_fn=compiled_fn,
+        )
 
 
 def pre_compile(

@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import re
 import sys
 import tempfile
 import unittest
@@ -479,10 +480,14 @@ class ComboKernelTests(TestCase):
                 for event in trace_json["traceEvents"]
                 if "triton_poi_fused_0" in event["name"]
             ]
-            if torch._inductor.config.combo_kernel_per_subkernel_blocks:
-                self.assertEqual([3795, 1, 1], triton_events[0]["args"]["grid"])
-            else:
-                self.assertEqual([791, 4096, 1], triton_events[0]["args"]["grid"])
+            # ROCTracer does not report grid metadata for Triton kernels
+            # launched via hipModuleLaunchKernel, so grid may be absent.
+            grid = triton_events[0].get("args", {}).get("grid")
+            if grid is not None:
+                if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+                    self.assertEqual([3795, 1, 1], grid)
+                else:
+                    self.assertEqual([791, 4096, 1], grid)
 
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
@@ -522,7 +527,10 @@ class ComboKernelTests(TestCase):
                     for e in trace_json["traceEvents"]
                     if "triton_poi_fused" in e["name"]
                 ]
-                return triton_events[0]["args"]["grid"], out
+                # ROCTracer does not report grid metadata for Triton kernels
+                # launched via hipModuleLaunchKernel, so grid may be absent.
+                grid = triton_events[0].get("args", {}).get("grid")
+                return grid, out
 
         x1 = torch.randn(1024, 512, device=GPU_TYPE)
         y1 = torch.randn(2048, 256, device=GPU_TYPE)
@@ -534,13 +542,14 @@ class ComboKernelTests(TestCase):
         grid2, out2 = get_grid(x2, y2)
         eager_out2 = fn(x2, y2)
 
-        self.assertNotEqual(grid1[0], grid2[0])
         self.assertEqual(out1, eager_out1)
         self.assertEqual(out2, eager_out2)
 
-        if torch._inductor.config.combo_kernel_per_subkernel_blocks:
-            self.assertEqual(grid1[1], 1)
-            self.assertEqual(grid2[1], 1)
+        if grid1 is not None and grid2 is not None:
+            self.assertNotEqual(grid1[0], grid2[0])
+            if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+                self.assertEqual(grid1[1], 1)
+                self.assertEqual(grid2[1], 1)
 
     @requires_gpu_and_triton
     @parametrize("pointwise_only,expected_kernel_count", [(False, 2), (True, 3)])
@@ -569,6 +578,42 @@ class ComboKernelTests(TestCase):
             out_compiled, _ = run_and_get_code(fn_c, *inps)
             self.assertEqual(out_eager, out_compiled)
             # With pointwise_only=True, we expect more kernels because reductions are not combined with pointwise ops
+            self.assertEqual(
+                torch._inductor.metrics.generated_kernel_count, expected_kernel_count
+            )
+
+    @requires_gpu_and_triton
+    @parametrize(
+        "max_num_nodes,expected_kernel_count",
+        [(8, 1), (3, 2), (2, 3)],
+    )
+    def test_combo_kernel_max_num_nodes(self, max_num_nodes, expected_kernel_count):
+        def fn(a, b, c, d, e, f):
+            return (
+                a * 2.0,
+                b + 1.0,
+                c.sin(),
+                d.cos(),
+                e.exp(),
+                f.neg(),
+            )
+
+        inps = [
+            torch.rand(1024, device=GPU_TYPE),
+            torch.rand(1024, device=GPU_TYPE),
+            torch.rand(1024, device=GPU_TYPE),
+            torch.rand(1024, device=GPU_TYPE),
+            torch.rand(1024, device=GPU_TYPE),
+            torch.rand(1024, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+
+        torch._inductor.metrics.reset()
+        with torch._inductor.config.patch("combo_kernel_max_num_nodes", max_num_nodes):
+            fn_c = torch.compile(fn)
+            out_compiled, _ = run_and_get_code(fn_c, *inps)
+            self.assertEqual(out_eager, out_compiled)
             self.assertEqual(
                 torch._inductor.metrics.generated_kernel_count, expected_kernel_count
             )
@@ -617,11 +662,14 @@ class ComboKernelTests(TestCase):
                 for event in trace_json["traceEvents"]
                 if "triton_poi_fused_0" in event["name"]
             ]
-
-            if torch._inductor.config.combo_kernel_per_subkernel_blocks:
-                self.assertEqual([83660, 1, 1], triton_events[0]["args"]["grid"])
-            else:
-                self.assertEqual([4, 45260, 2], triton_events[0]["args"]["grid"])
+            # ROCTracer does not report grid metadata for Triton kernels
+            # launched via hipModuleLaunchKernel, so grid may be absent.
+            grid = triton_events[0].get("args", {}).get("grid")
+            if grid is not None:
+                if torch._inductor.config.combo_kernel_per_subkernel_blocks:
+                    self.assertEqual([83660, 1, 1], grid)
+                else:
+                    self.assertEqual([4, 45260, 2], grid)
 
         self.assertEqual(out_eager, out_compiled)
 
@@ -1241,11 +1289,11 @@ class ComboKernelTestsMaxAutotune(TestCase):
         logger = logging.getLogger("torch._inductor.runtime.triton_heuristics")
         with self.assertLogs(logger, level=logging.DEBUG) as cm:
             out_compiled, code = run_and_get_code(fn_c, *inps)
-        best_config_logs = [msg for msg in cm.output if "Best config" in msg]
+        chained_logs = [msg for msg in cm.output if "Combo sequential autotune" in msg]
         self.assertGreater(
-            len(best_config_logs),
+            len(chained_logs),
             0,
-            "autotune_to_one_config was not invoked — no 'Best config' log found",
+            "_combo_sequential_autotune was not invoked",
         )
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
@@ -1266,14 +1314,156 @@ class ComboKernelTestsMaxAutotune(TestCase):
         logger = logging.getLogger("torch._inductor.runtime.triton_heuristics")
         with self.assertLogs(logger, level=logging.DEBUG) as cm:
             out_compiled, code = run_and_get_code(fn_c, *inps)
-        best_config_logs = [msg for msg in cm.output if "Best config" in msg]
+        chained_logs = [msg for msg in cm.output if "Combo sequential autotune" in msg]
         self.assertGreater(
-            len(best_config_logs),
+            len(chained_logs),
             0,
-            "autotune_to_one_config was not invoked — no 'Best config' log found",
+            "_combo_sequential_autotune was not invoked",
         )
         self.assertEqual(out_eager, out_compiled)
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_gpu_and_triton
+    def test_combo_autotune_many_subkernels(self):
+        def fn(a, b, c, d, e, f):
+            return (
+                a * 2.0,
+                b + 1.0,
+                c.sin(),
+                d.cos(),
+                e.exp(),
+                f.neg(),
+            )
+
+        inps = [
+            torch.rand(8, 8192, device=GPU_TYPE),
+            torch.rand(128, 64, device=GPU_TYPE),
+            torch.rand(16, 4096, device=GPU_TYPE),
+            torch.rand(512, 16, device=GPU_TYPE),
+            torch.rand(32, 2048, device=GPU_TYPE),
+            torch.rand(256, 32, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+        fn_c = torch.compile(fn)
+
+        logger = logging.getLogger("torch._inductor.runtime.triton_heuristics")
+        with self.assertLogs(logger, level=logging.DEBUG) as cm:
+            out_compiled, code = run_and_get_code(fn_c, *inps)
+
+        chained_logs = [msg for msg in cm.output if "Combo sequential autotune" in msg]
+        self.assertGreater(len(chained_logs), 0)
+        self.assertEqual(out_eager, out_compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_gpu_and_triton
+    def test_combo_kernel_per_subkernel_reduction_hint(self):
+        def fn(x, y):
+            return x.sum(dim=-1), y.sum(dim=0)
+
+        inps = [
+            torch.rand(128, 256, device=GPU_TYPE),
+            torch.rand(128, 256, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+        out, code = run_and_get_code(torch.compile(fn), *inps)
+        self.assertEqual(out_eager, out)
+        # Verify per-subkernel reduction hints in generated code
+        found_hints = {}
+        for c in code:
+            for key in ["reduction_hint_0", "reduction_hint_1"]:
+                m = re.search(rf"'{key}':\s*'(\w+)'", c)
+                if m:
+                    found_hints[key] = m.group(1)
+
+        self.assertIn(
+            "reduction_hint_0", found_hints, "Missing per-subkernel reduction_hint_0"
+        )
+        self.assertIn(
+            "reduction_hint_1", found_hints, "Missing per-subkernel reduction_hint_1"
+        )
+        self.assertEqual(found_hints["reduction_hint_0"], "INNER")
+        self.assertEqual(found_hints["reduction_hint_1"], "OUTER")
+
+    @requires_gpu_and_triton
+    @torch._inductor.config.patch("combo_kernel_autotune_grouping", True)
+    def test_combo_autotune_grouping(self):
+        def fn(a, b, c, d):
+            return a.cos(), b.sin(), c.exp(), d.neg()
+
+        # a,b: numel=262144 → bs=1024, c,d: numel=32 → bs=256
+        # Different bs → different configs → separate groups
+        inps = [
+            torch.rand(4, 65536, device=GPU_TYPE),
+            torch.rand(4, 65536, device=GPU_TYPE),
+            torch.rand(4, 8, device=GPU_TYPE),
+            torch.rand(4, 8, device=GPU_TYPE),
+        ]
+
+        out_eager = fn(*inps)
+        fn_c = torch.compile(fn)
+
+        logger = logging.getLogger("torch._inductor.runtime.triton_heuristics")
+        with self.assertLogs(logger, level=logging.DEBUG) as cm:
+            out_compiled, code = run_and_get_code(fn_c, *inps)
+
+        # Parse "Phase 1 group N SK[...]" lines to check grouping
+        group_lines = [
+            msg for msg in cm.output if "Phase 1 group" in msg and "SK[" in msg
+        ]
+        group_indices = {
+            int(re.search(r"group (\d+)", line).group(1))
+            for line in group_lines
+            if re.search(r"group (\d+)", line)
+        }
+        # 2 groups (not 4) — identical configs are grouped together
+        self.assertEqual(
+            len(group_indices),
+            2,
+            f"Expected 2 groups, got {len(group_indices)}: {group_lines}",
+        )
+        self.assertEqual(out_eager, out_compiled)
+        self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
+
+    @requires_gpu_and_triton
+    @torch._inductor.config.patch("combo_kernel_autotune_grouping", True)
+    def test_combo_autotune_grouping_uses_tiling_signature(self):
+        import triton
+
+        inductor_meta = {
+            "combo_grid_meta": {
+                "num_kernels": 2,
+                "heuristic_0": "pointwise",
+                "heuristic_1": "pointwise",
+                "size_hints_0": {"x": 256, "y": 256},
+                "size_hints_1": {"x": 256, "y": 256},
+                "tile_hint_0": "TileHint.SQUARE",
+                "tile_hint_1": "TileHint.SQUARE",
+                "tiling_scores_0": {"x": 8, "y": 1},
+                "tiling_scores_1": {"x": 1, "y": 8},
+            }
+        }
+
+        def pointwise_configs(*args, **kwargs):
+            return [
+                triton.Config({"XBLOCK": 64, "YBLOCK": 32}, num_warps=4, num_stages=1),
+                triton.Config({"XBLOCK": 128, "YBLOCK": 32}, num_warps=4, num_stages=1),
+            ]
+
+        with unittest.mock.patch(
+            "torch._inductor.runtime.triton_heuristics.pointwise",
+            side_effect=pointwise_configs,
+        ):
+            torch._inductor.runtime.triton_heuristics._handle_combo_kernel_per_subkernel_blocks(
+                {"x": 256, "y": 256},
+                inductor_meta,
+                triton_meta={},
+            )
+
+        groups = inductor_meta["combo_tuning_groups"]
+        self.assertEqual(len(groups), 2)
+        self.assertEqual([[0], [1]], [g["member_indices"] for g in groups])
 
 
 if __name__ == "__main__":

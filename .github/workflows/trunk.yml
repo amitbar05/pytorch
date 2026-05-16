@@ -81,7 +81,7 @@ jobs:
     secrets: inherit
 
   linux-jammy-cuda12_8-py3_10-gcc11-build:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda12.8-py3.10-gcc11 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test ') }}
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda12.8-py3.10-gcc11 ') }}
     name: linux-jammy-cuda12.8-py3.10-gcc11
     uses: ./.github/workflows/_linux-build.yml
     needs:
@@ -102,7 +102,6 @@ jobs:
           { config: "distributed", shard: 1, num_shards: 3, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g4dn.12xlarge.nvidia.gpu" },
           { config: "distributed", shard: 2, num_shards: 3, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g4dn.12xlarge.nvidia.gpu" },
           { config: "distributed", shard: 3, num_shards: 3, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g4dn.12xlarge.nvidia.gpu" },
-          { config: "pr_time_benchmarks", shard: 1, num_shards: 1, runner: "linux.g4dn.metal.nvidia.gpu" },
           { config: "libtorch_agnostic_targetting", shard: 1, num_shards: 1, runner: "linux.g4dn.metal.nvidia.gpu" },
         ]}
     secrets: inherit
@@ -113,7 +112,7 @@ jobs:
   # See P2188981399 for the full CI workflow analysis.
 
   linux-jammy-cuda13_0-py3_10-gcc11-build:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda13.0-py3.10-gcc11 ') }}
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-cuda13.0-py3.10-gcc11 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
     name: linux-jammy-cuda13.0-py3.10-gcc11
     uses: ./.github/workflows/_linux-build.yml
     needs:
@@ -249,16 +248,17 @@ jobs:
       disable-monitor: false
     secrets: inherit
 
-  win-vs2022-cuda12_8-py3-build:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' win-vs2022-cuda12.8-py3 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test ') }}
-    name: win-vs2022-cuda12.8-py3
+
+  win-vs2022-cuda13_0-py3-build:
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' win-vs2022-cuda13.0-py3 ') || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
+    name: win-vs2022-cuda13.0-py3
     uses: ./.github/workflows/_win-build.yml
     needs:
       - get-label-type
       - job-filter
     with:
-      build-environment: win-vs2022-cuda12.8-py3
-      cuda-version: "12.8"
+      build-environment: win-vs2022-cuda13.0-py3
+      cuda-version: "13.0"
       runner: "${{ needs.get-label-type.outputs.label-type }}windows.4xlarge.nonephemeral"
     secrets: inherit
 
@@ -314,22 +314,23 @@ jobs:
       cuda-arch-list: '8.0'
     secrets: inherit
 
-  # Test cross-compiled models with Windows libs extracted from wheel
-  cross-compile-linux-test:
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test ') }}
-    name: cross-compile-linux-test
+
+  # Test cross-compiled models with Windows libs extracted from wheel (CUDA 13.0)
+  cross-compile-linux-test-cuda13:
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' cross-compile-linux-test-cuda13 ') }}
+    name: cross-compile-linux-test-cuda13
     uses: ./.github/workflows/_linux-test.yml
     needs:
-      - linux-jammy-cuda12_8-py3_10-gcc11-build
+      - linux-jammy-cuda13_0-py3_10-gcc11-build
       - get-label-type
-      - win-vs2022-cuda12_8-py3-build
+      - win-vs2022-cuda13_0-py3-build
       - job-filter
     with:
-      build-environment: ${{ needs.linux-jammy-cuda12_8-py3_10-gcc11-build.outputs.build-environment }}
-      docker-image: ${{ needs.linux-jammy-cuda12_8-py3_10-gcc11-build.outputs.docker-image }}
+      build-environment: ${{ needs.linux-jammy-cuda13_0-py3_10-gcc11-build.outputs.build-environment }}
+      docker-image: ${{ needs.linux-jammy-cuda13_0-py3_10-gcc11-build.outputs.docker-image }}
       test-matrix: |
         { include: [
-          { config: "aoti_cross_compile_for_windows", shard: 1, num_shards: 1, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g6.4xlarge.experimental.nvidia.gpu", win_torch_wheel_artifact: "win-vs2022-cuda12.8-py3" },
+          { config: "aoti_cross_compile_for_windows", shard: 1, num_shards: 1, runner: "${{ needs.get-label-type.outputs.label-type }}linux.g6.4xlarge.experimental.nvidia.gpu", win_torch_wheel_artifact: "win-vs2022-cuda13.0-py3" },
         ]}
       tests-to-include: ${{ github.event.inputs.tests-to-include || '' }}
     secrets: inherit
@@ -409,5 +410,35 @@ jobs:
       runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
       runner: linux.r7i.2xlarge
       build-environment: linux-jammy-py3.10-gcc11-full-debug-build-only
-      docker-image-name: ci-image:pytorch-linux-jammy-py3.10-gcc11
+      docker-image-name: ci-image:pytorch-linux-jammy-py3.10-clang18
+    secrets: inherit
+
+  linux-jammy-aarch64-py3_10-gcc13-build:
+    name: linux-jammy-aarch64-py3.10
+    uses: ./.github/workflows/_linux-build.yml
+    needs: get-label-type
+    with:
+      runner_prefix: ${{ needs.get-label-type.outputs.label-type }}
+      build-environment: linux-jammy-aarch64-py3.10
+      docker-image-name: ci-image:pytorch-linux-jammy-aarch64-py3.10-gcc13
+      runner: linux.arm64.m7g.4xlarge
+      # Periodic AArch64 tests for SVE256 coverage
+      test-matrix: |
+        { include: [
+          { config: "default", shard: 1, num_shards: 5, runner: "${{ needs.get-label-type.outputs.label-type }}linux.arm64.m7g.4xlarge" },
+          { config: "default", shard: 2, num_shards: 5, runner: "${{ needs.get-label-type.outputs.label-type }}linux.arm64.m7g.4xlarge" },
+          { config: "default", shard: 3, num_shards: 5, runner: "${{ needs.get-label-type.outputs.label-type }}linux.arm64.m7g.4xlarge" },
+          { config: "default", shard: 4, num_shards: 5, runner: "${{ needs.get-label-type.outputs.label-type }}linux.arm64.m7g.4xlarge" },
+          { config: "default", shard: 5, num_shards: 5, runner: "${{ needs.get-label-type.outputs.label-type }}linux.arm64.m7g.4xlarge" },
+        ]}
+    secrets: inherit
+
+  linux-jammy-aarch64-py3_10-gcc13-test:
+    name: linux-jammy-aarch64-py3.10
+    uses: ./.github/workflows/_linux-test.yml
+    needs: linux-jammy-aarch64-py3_10-gcc13-build
+    with:
+      build-environment: ${{ needs.linux-jammy-aarch64-py3_10-gcc13-build.outputs.build-environment }}
+      docker-image: ${{ needs.linux-jammy-aarch64-py3_10-gcc13-build.outputs.docker-image }}
+      test-matrix: ${{ needs.linux-jammy-aarch64-py3_10-gcc13-build.outputs.test-matrix }}
     secrets: inherit

@@ -95,7 +95,7 @@ class FusionScore:
 
 class InductorChoices:
     """
-    This class contains a collection of default heuristics that effect performance of our generated
+    This class contains a collection of default heuristics that affect performance of our generated
     code.  We try to not put correctness requirements in this file.
 
     You can override the choices made here by doing:
@@ -104,6 +104,9 @@ class InductorChoices:
                 ...
 
             torch._inductor.virtualized.V.set_choices_handler(MyHeuristics())
+
+    Subclasses used with inductor_choices_class must implement uuid() for
+    cache key computation.
     """
 
     def get_config_heuristics(
@@ -655,11 +658,10 @@ class InductorChoices:
         - Fusions closer together in original graph order
         """
 
-        memory_score, buffer_overlap_score, is_mix_order_reduction = typing.cast(
-            tuple[int, int, bool],
+        memory_score, buffer_overlap_score, is_mix_order_reduction = (
             scheduler.score_fusion_memory(
                 node1, node2, return_is_mix_order_reduction=True
-            ),
+            )
         )
         proximity_score = -max(
             abs(node1.min_order - node2.max_order),
