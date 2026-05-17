@@ -22,7 +22,7 @@ from torch._inductor.virtualized import V
 
 from .pointwise_load_mixin import PointwiseLoadMixin
 from .pointwise_vec4_mixin import PointwiseVec4Mixin
-from .symbolic import is_dynamic
+from .symbolic import is_dynamic, is_dynamic_stride
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import StoreMode
@@ -611,7 +611,7 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
             _, (numel, rnumel) = sn.group
             if rnumel != 1:
                 return False  # has reduction
-            if is_dynamic(numel):
+            if is_dynamic_stride(numel):
                 return False
             n = int(numel)
             total_numel += n

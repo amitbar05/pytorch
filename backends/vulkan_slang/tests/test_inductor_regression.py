@@ -38609,3 +38609,247 @@ class TestM175DispatchOverhead:
             f"cycles, got hits={s['hits']}: {s}"
         )
         assert s["lifo_hits"] > 0, f"lifo_hits should be >0: {s}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# M16.3 — Track 4 finish: model_ops.cpp deleted
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestM16ModelOpsDeleted:
+    """M16.3 — Verify model_ops.cpp is gone and legacy_eager.cpp exists."""
+
+    _BUG_ROOT_COMPONENT = "build"
+
+    def test_model_ops_cpp_does_not_exist(self):
+        """model_ops.cpp must not exist — anti-goal #2 closure."""
+        import torch_vulkan
+        pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        repo_root = os.path.dirname(os.path.dirname(pkg_dir))
+        model_ops = os.path.join(repo_root, "csrc", "ops", "model_ops.cpp")
+        assert not os.path.exists(model_ops), (
+            "M16.3 VIOLATION: " + model_ops + " exists. "
+            "model_ops.cpp was deleted as part of Track 4 finish. "
+            "New eager ops belong in csrc/ops/legacy_eager.cpp."
+        )
+
+    def test_legacy_eager_cpp_exists(self):
+        """legacy_eager.cpp must exist as the replacement for model_ops.cpp."""
+        import torch_vulkan
+        pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        repo_root = os.path.dirname(os.path.dirname(pkg_dir))
+        legacy = os.path.join(repo_root, "csrc", "ops", "legacy_eager.cpp")
+        assert os.path.exists(legacy), (
+            "M16.3 VIOLATION: " + legacy + " is missing. "
+            "legacy_eager.cpp is the required replacement for the deleted model_ops.cpp."
+        )
+
+    def test_legacy_eager_functions_present(self):
+        """legacy_eager.cpp must contain the 5 preserved functions."""
+        import torch_vulkan
+        pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        repo_root = os.path.dirname(os.path.dirname(pkg_dir))
+        legacy_path = os.path.join(repo_root, "csrc", "ops", "legacy_eager.cpp")
+        with open(legacy_path, "r") as f:
+            content = f.read()
+        required = [
+            "vulkan_triu",
+            "vulkan_contiguous",
+            "vulkan_to_copy",
+            "vulkan_as_strided",
+            "vulkan_resize_",
+        ]
+        for fn in required:
+            assert fn in content, (
+                "M16.3 VIOLATION: " + fn + " not found in legacy_eager.cpp"
+            )
+
+    def test_setup_py_has_model_ops_gate(self):
+        """setup.py must contain the _validate_no_model_ops build gate."""
+        import torch_vulkan
+        pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        repo_root = os.path.dirname(os.path.dirname(pkg_dir))
+        setup_py = os.path.join(repo_root, "setup.py")
+        with open(setup_py, "r") as f:
+            content = f.read()
+        assert "_validate_no_model_ops" in content, (
+            "M16.4 VIOLATION: setup.py missing _validate_no_model_ops build gate"
+        )
+        assert "model_ops.cpp" in content, (
+            "M16.4 VIOLATION: setup.py validation must reference model_ops.cpp"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OP.22 — Dynamic-shape reduction backward codegen
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestOP22DynamicReductionBackward:
+    """OP.22 — Dynamic-shape reduction backward via sizevar push constants.
+
+    Verifies that reduction backward kernels (sum, mean, var, prod)
+    with dynamic batch dimensions route stride expressions through
+    push constants rather than ``static const uint``.
+    """
+
+    _BUG_ROOT_COMPONENT = "codegen"
+
+    def test_op22_is_dynamic_stride_is_called(self):
+        """``is_dynamic_stride()`` is wired into pointwise_load_mixin
+        and indexing codegen — verifies the function is imported and
+        referenced (closes the 'never called' audit gap)."""
+        import importlib
+        import inspect
+
+        from torch_vulkan.inductor.kernel import pointwise_load_mixin
+        from torch_vulkan.inductor.kernel import indexing
+
+        # Re-import to get fresh module state.
+        importlib.reload(pointwise_load_mixin)
+        importlib.reload(indexing)
+
+        # Verify is_dynamic_stride is referenced in pointwise_load_mixin source.
+        src_plm = inspect.getsource(pointwise_load_mixin)
+        assert "is_dynamic_stride(" in src_plm, (
+            "OP.22: is_dynamic_stride not called in pointwise_load_mixin.py"
+        )
+
+        # Verify is_dynamic_stride is referenced in indexing source.
+        src_idx = inspect.getsource(indexing)
+        assert "is_dynamic_stride(" in src_idx, (
+            "OP.22: is_dynamic_stride not called in indexing.py"
+        )
+
+    def test_op22_symbolic_module_exports_is_dynamic_stride(self):
+        """``is_dynamic_stride`` is exported from ``kernel/symbolic.py``
+        and importable by codegen modules."""
+        from torch_vulkan.inductor.kernel.symbolic import is_dynamic_stride
+
+        import sympy
+
+        # Static stride: sympy.Integer → False
+        assert not is_dynamic_stride(sympy.Integer(128)), (
+            "OP.22: static stride 128 should not be dynamic"
+        )
+        # Dynamic stride: sympy.Symbol → True
+        B = sympy.Symbol("B", integer=True, positive=True)
+        assert is_dynamic_stride(B * 128), (
+            "OP.22: dynamic stride B*128 should be detected as dynamic"
+        )
+        # Mixed: B * 128 is dynamic → True
+        assert is_dynamic_stride(B * 128 + 64), (
+            "OP.22: dynamic stride B*128+64 should be dynamic"
+        )
+
+    def test_op22_dynamic_sum_backward_compiles(self):
+        """``sum(x, dim=0).backward()`` with dynamic batch compiles
+        without ``DynamicShapeNotImplemented``."""
+        import os
+
+        if not os.environ.get("SLANGC"):
+            import pytest
+
+            pytest.skip("SLANGC env var not set")
+
+        os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"] = "1"
+        try:
+            torch.manual_seed(0)
+
+            @torch.compile(backend="inductor", dynamic=True)
+            def fn(x):
+                return torch.sum(x, dim=0)
+
+            # Warmup: compile with one batch size.
+            x = torch.randn(4, 128, device="vulkan:0", requires_grad=True)
+            y = fn(x)
+            y.sum().backward()
+        finally:
+            del os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"]
+
+    def test_op22_dynamic_sum_backward_correct(self):
+        """``sum(x, dim=0).backward()`` gradients match CPU across
+        batch sizes {1, 4, 16, 64}."""
+        import os
+
+        if not os.environ.get("SLANGC"):
+            import pytest
+
+            pytest.skip("SLANGC env var not set")
+
+        os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"] = "1"
+        try:
+            torch.manual_seed(0)
+
+            @torch.compile(backend="inductor", dynamic=True)
+            def fn(x):
+                return torch.sum(x, dim=0)
+
+            # Warmup
+            x = torch.randn(4, 128, device="vulkan:0", requires_grad=True)
+            y = fn(x)
+            y.sum().backward()
+
+            for B in [1, 4, 16, 64]:
+                x_cpu = torch.randn(B, 128, requires_grad=True)
+                x_vk = x_cpu.detach().to("vulkan:0").requires_grad_(True)
+
+                out_vk = fn(x_vk)
+                out_vk.sum().backward()
+
+                out_cpu = torch.sum(x_cpu, dim=0)
+                out_cpu.sum().backward()
+
+                torch.testing.assert_close(
+                    out_vk.cpu(), out_cpu,
+                    rtol=1e-3, atol=1e-3,
+                    msg="OP.22: sum fwd batch=" + str(B) + " diverged",
+                )
+                torch.testing.assert_close(
+                    x_vk.grad.cpu(), x_cpu.grad,
+                    rtol=1e-3, atol=1e-3,
+                    msg="OP.22: sum bwd batch=" + str(B) + " diverged",
+                )
+        finally:
+            del os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"]
+
+    def test_op22_dynamic_mean_backward_correct(self):
+        """``mean(x, dim=0).backward()`` gradients match CPU across
+        batch sizes {1, 4, 16, 64}."""
+        import os
+
+        if not os.environ.get("SLANGC"):
+            import pytest
+
+            pytest.skip("SLANGC env var not set")
+
+        os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"] = "1"
+        try:
+            torch.manual_seed(0)
+
+            @torch.compile(backend="inductor", dynamic=True)
+            def fn(x):
+                return torch.mean(x, dim=0)
+
+            # Warmup
+            x = torch.randn(4, 128, device="vulkan:0", requires_grad=True)
+            y = fn(x)
+            y.sum().backward()
+
+            for B in [1, 4, 16, 64]:
+                x_cpu = torch.randn(B, 128, requires_grad=True)
+                x_vk = x_cpu.detach().to("vulkan:0").requires_grad_(True)
+
+                out_vk = fn(x_vk)
+                out_vk.sum().backward()
+
+                out_cpu = torch.mean(x_cpu, dim=0)
+                out_cpu.sum().backward()
+
+                torch.testing.assert_close(
+                    x_vk.grad.cpu(), x_cpu.grad,
+                    rtol=1e-3, atol=1e-3,
+                    msg="OP.22: mean bwd batch=" + str(B) + " diverged",
+                )
+        finally:
+            del os.environ["TORCH_VULKAN_DYNAMIC_SHAPES"]

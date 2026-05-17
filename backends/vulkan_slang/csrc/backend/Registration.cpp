@@ -610,45 +610,6 @@ static at::Tensor vulkan_eye_m_adapter(
     return ops::vulkan_eye_m(n.expect_int(), m.expect_int(), dtype_opt, layout_opt, device_opt, pin_memory_opt);
 }
 
-// triu/tril: SymInt diagonal in 2.10
-static at::Tensor vulkan_triu_adapter(const at::Tensor& self, c10::SymInt diagonal) {
-    return ops::vulkan_triu(self, diagonal.expect_int());
-}
-static at::Tensor vulkan_tril_adapter(const at::Tensor& self, c10::SymInt diagonal) {
-    return ops::vulkan_tril(self, diagonal.expect_int());
-}
-
-// repeat: SymInt repeats in 2.10
-static at::Tensor vulkan_repeat_adapter(const at::Tensor& self, c10::SymIntArrayRef repeats) {
-    return ops::vulkan_repeat(self, symint_to_int(repeats));
-}
-
-// repeat_interleave: SymInt repeats in 2.10
-static at::Tensor vulkan_repeat_interleave_self_int_adapter(
-    const at::Tensor& self, c10::SymInt repeats,
-    std::optional<int64_t> dim, std::optional<c10::SymInt> output_size) {
-    std::optional<int64_t> os;
-    if (output_size.has_value()) os = output_size->expect_int();
-    return ops::vulkan_repeat_interleave_self_int(self, repeats.expect_int(), dim, os);
-}
-
-// constant_pad_nd: SymInt pad in 2.10
-static at::Tensor vulkan_constant_pad_nd_adapter(
-    const at::Tensor& self, c10::SymIntArrayRef pad, const at::Scalar& value) {
-    return ops::vulkan_constant_pad_nd(self, symint_to_int(pad), value);
-}
-
-// narrow: SymInt start/length in 2.10
-static at::Tensor vulkan_narrow_adapter(const at::Tensor& self, int64_t dim,
-    c10::SymInt start, c10::SymInt length) {
-    return ops::vulkan_narrow(self, dim, start.expect_int(), length.expect_int());
-}
-
-// _unsafe_view: SymInt size in 2.10
-static at::Tensor vulkan_unsafe_view_adapter(const at::Tensor& self, c10::SymIntArrayRef size) {
-    return ops::vulkan_unsafe_view(self, symint_to_int(size));
-}
-
 // _to_copy: SymInt-aware in 2.10
 static at::Tensor vulkan_to_copy_adapter(const at::Tensor& self,
     std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
@@ -670,12 +631,6 @@ static at::Tensor vulkan_as_strided_adapter(const at::Tensor& self,
 static const at::Tensor& vulkan_resize_adapter(const at::Tensor& self,
     c10::SymIntArrayRef size, std::optional<at::MemoryFormat> memory_format) {
     return ops::vulkan_resize_(self, symint_to_int(size), memory_format);
-}
-
-// roll: SymInt in 2.10
-static at::Tensor vulkan_roll_adapter(const at::Tensor& self,
-    c10::SymIntArrayRef shifts, at::IntArrayRef dims) {
-    return ops::vulkan_roll(self, symint_to_int(shifts), dims);
 }
 
 // topk: SymInt k in 2.10
@@ -911,7 +866,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("t", ops::vulkan_t);
     m.impl("expand", vulkan_expand_adapter);
     m.impl("cat", ops::vulkan_cat);
-    m.impl("narrow", vulkan_narrow_adapter);
+    // NOTE: narrow decomposes to slice — no PrivateUse1 registration needed.
     m.impl("select.int", vulkan_select_adapter);
     m.impl("slice.Tensor", vulkan_slice_adapter);
     m.impl("split.Tensor", vulkan_split_adapter);
@@ -956,8 +911,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("nll_loss_backward", vulkan_nll_loss_backward_adapter);
     // NOTE: cross_entropy_loss NOT registered — let PyTorch decompose via
     // CompositeImplicitAutograd into log_softmax + nll_loss for proper autograd backward
-    m.impl("mse_loss", ops::vulkan_mse_loss);
-    m.impl("mse_loss_backward", ops::vulkan_mse_loss_backward);
     m.impl("binary_cross_entropy", ops::vulkan_binary_cross_entropy);
     m.impl("binary_cross_entropy_backward", ops::vulkan_binary_cross_entropy_backward);
     m.impl("binary_cross_entropy_with_logits", ops::vulkan_binary_cross_entropy_with_logits);
@@ -1022,24 +975,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("_foreach_lerp_.Scalar", ops::vulkan_foreach_lerp_);
     m.impl("_foreach_maximum.List", ops::vulkan_foreach_maximum);
 
-    // AMP ops
-    m.impl("_amp_foreach_non_finite_check_and_unscale_",
-           ops::vulkan_amp_non_finite_check_and_unscale_);
-    m.impl("_amp_update_scale_", ops::vulkan_amp_update_scale_);
-
     // Additional unary ops
-    m.impl("reciprocal", ops::vulkan_reciprocal);
-    m.impl("sin", ops::vulkan_sin);
-    m.impl("cos", ops::vulkan_cos);
     m.impl("tan", ops::vulkan_tan);
     m.impl("atan", ops::vulkan_atan);
     m.impl("log2", ops::vulkan_log2);
     m.impl("log10", ops::vulkan_log10);
     m.impl("log1p", ops::vulkan_log1p);
-    m.impl("logical_not", ops::vulkan_logical_not);
-    m.impl("bitwise_not", ops::vulkan_bitwise_not);
-    m.impl("bitwise_and.Tensor_out", ops::vulkan_bitwise_and_out);
-    m.impl("random_.from", ops::vulkan_random_from);
 
     // Check ops
     m.impl("isnan", ops::vulkan_isnan);
@@ -1048,19 +989,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Additional binary ops
     m.impl("atan2", ops::vulkan_atan2);
 
-    // Phase 3: Model coverage ops
-    m.impl("triu", vulkan_triu_adapter);
-    m.impl("tril", vulkan_tril_adapter);
-    m.impl("constant_pad_nd", vulkan_constant_pad_nd_adapter);
-    m.impl("index.Tensor", ops::vulkan_index_tensor);
-    m.impl("repeat", vulkan_repeat_adapter);
-    m.impl("repeat_interleave.self_int", vulkan_repeat_interleave_self_int_adapter);
-    m.impl("stack", ops::vulkan_stack);
-    m.impl("erf", ops::vulkan_erf);
-    m.impl("erf_", ops::vulkan_erf_);
-    m.impl("flip", ops::vulkan_flip);
-    m.impl("roll", vulkan_roll_adapter);
-    m.impl("_unsafe_view", vulkan_unsafe_view_adapter);
+    // Legacy eager-only ops (M16: model_ops.cpp → legacy_eager.cpp)
+    m.impl("_to_copy", vulkan_to_copy_adapter);
     m.impl("as_strided", vulkan_as_strided_adapter);
     m.impl("resize_", vulkan_resize_adapter);
 

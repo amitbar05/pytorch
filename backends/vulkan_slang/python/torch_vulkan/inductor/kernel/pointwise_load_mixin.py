@@ -8,6 +8,8 @@ import torch
 from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.virtualized import V
 
+from .symbolic import is_dynamic_stride
+
 # dtype → (emit_fn, header_tag) dispatch table used by PointwiseLoadMixin.load().
 # ``emit_fn(var, idx_str)`` returns a Slang expression that loads one
 # element from ``var`` at index ``idx_str`` into a float register.
@@ -119,7 +121,7 @@ class PointwiseLoadMixin:
             if self.inside_reduction and red:
                 rnumel, _ = self._compute_red_numel()
                 if (
-                    isinstance(rnumel, sympy.Integer)
+                    not is_dynamic_stride(rnumel)
                     and int(rnumel) > 0
                     and int(rnumel) <= self.simd_group_size
                     and int(rnumel) % 2 == 0
@@ -135,7 +137,7 @@ class PointwiseLoadMixin:
 
             innermost = non_red[-1]
             if (
-                not isinstance(innermost.numel, sympy.Integer)
+                is_dynamic_stride(innermost.numel)
                 or int(innermost.numel) % 2 != 0
             ):
                 self._packed16 = False
@@ -148,7 +150,7 @@ class PointwiseLoadMixin:
             if (
                 not self.inside_reduction
                 and len(non_red_trees) == 1
-                and isinstance(non_red_trees[0].numel, sympy.Integer)
+                and not is_dynamic_stride(non_red_trees[0].numel)
                 and int(non_red_trees[0].numel) % (self.max_threadgroup_size * 4) == 0
             ):
                 self._packed16_vw_active = True

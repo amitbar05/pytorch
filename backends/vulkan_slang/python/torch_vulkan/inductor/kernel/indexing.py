@@ -8,7 +8,7 @@ from __future__ import annotations
 import sympy
 from torch._inductor.codegen.simd import IterationRangesEntry
 
-from .symbolic import is_dynamic
+from .symbolic import is_dynamic, is_dynamic_stride
 
 
 class IndexingMixin:
@@ -127,7 +127,7 @@ class IndexingMixin:
             return None
         red_vars = [v for v in self.range_trees if v.is_reduction]
         if len(red_vars) == 2:
-            if any(is_dynamic(v.numel) for v in red_vars):
+            if any(is_dynamic_stride(v.numel) for v in red_vars):
                 return None
             sizes = [int(v.numel) for v in red_vars]
             product = sizes[0] * sizes[1]
@@ -138,7 +138,7 @@ class IndexingMixin:
             entries = self._slang_entries_sorted(red_vars[0])
             if len(entries) != 2:
                 return None
-            if any(is_dynamic(e.length) for e in entries):
+            if any(is_dynamic_stride(e.length) for e in entries):
                 return None
             sizes = [int(e.length) for e in entries]
             product = sizes[0] * sizes[1]
@@ -160,7 +160,7 @@ class IndexingMixin:
             return None
         red_vars = [v for v in self.range_trees if v.is_reduction]
         if len(red_vars) == 2:
-            if any(is_dynamic(v.numel) for v in red_vars):
+            if any(is_dynamic_stride(v.numel) for v in red_vars):
                 return None
             outer = int(red_vars[0].numel)
             inner = int(red_vars[1].numel)
@@ -168,7 +168,7 @@ class IndexingMixin:
             entries = self._slang_entries_sorted(red_vars[0])
             if len(entries) != 2:
                 return None
-            if any(is_dynamic(e.length) for e in entries):
+            if any(is_dynamic_stride(e.length) for e in entries):
                 return None
             outer = int(entries[0].length)
             inner = int(entries[1].length)

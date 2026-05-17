@@ -11,12 +11,12 @@
 > by **M13–M16** to capture audit-derived gaps. See § 0.5 for the
 > refreshed audit numbers.
 >
-> **Last updated: 2026-05-16 (session: M17.3 adaptive_avg_pool2d fwd + M17.4 vulkan_optim.AdamW + M17.1-gap aten.mm Slang)**
+> **Last updated: 2026-05-17 (session: M16.3-4 Track 4 finish + OP.22 dynamic-shape reduction backward)**
 >
 > **Live state:** 9 model architectures train end-to-end under
 > `torch.compile`; 47 lowerings + 24 explicit decomp suppressions;
 > 57/58 `aten.*_backward` ops route through `bwd_diff_table`; buffer
-> pool at 36 % hit rate on MLP train.
+> pool at 36 % hit rate on MLP train. **Anti-goal #2 CLOSED** (`model_ops.cpp` deleted M16.3, build gate in `setup.py`). **OP.22 CLOSED** (`is_dynamic_stride()` wired into 8 codegen sites).
 >
 > **Feature flags ON by default:** spec_constants, descriptor_indexing,
 > static_specialization, bank_conflict_pad, dynamic_shapes,
@@ -98,7 +98,7 @@ and `agent_space/vk_validation_sweep*.py`. Source: this turn's session.
 
 | # | Anti-goal | State | Where | Fix milestone |
 |---|-----------|-------|-------|---------------|
-| #2 | `csrc/ops/model_ops.cpp` = 0 L | **VIOLATED** (925 L, +40 drift) | 22 legacy eager kernels (triu/tril, constant_pad_nd, index_tensor, repeat, stack, erf, narrow, flip, roll, as_strided, sin/cos, mse_loss fwd+bwd, …) | **M16** |
+| #2 | `csrc/ops/model_ops.cpp` = 0 L | ✅ **CLOSED (2026-05-17)** | Deleted M16.3; 5 residual eager ops in `legacy_eager.cpp`; build gate in `setup.py` | **M16** ✅ |
 | #3 | No `aten.*_backward` lowerings | ✅ **CLOSED** | 57/58 via `bwd_diff_table`; only legacy `embedding_dense_backward` (not Slang-eligible) | — |
 | #5 | No symptom-patches in `meta_patches` | **VIOLATED** | 3902 L; 120+ `@register_fake` hooks; `_fuse_sdpa_to_flash_attention` is a symptom-fix for missing native attention primitive | M15.2 / M14.6 |
 | #6 | No string-template params | **PARTIAL** | mm fixed (M10.4); conv / SDPA still Jinja-conditional on `has_bias` / `has_activation`; reduction codegen now uses Slang generics (CG.M13 done)`op_template="OpSum"`; `generic_pointwise_dispatch.py` Jinja2-templates raw Slang source | CG.M12 / CG.M13 |
@@ -364,7 +364,7 @@ audit found.
 
 - [x] **OP.20 Complex-dtype binary elementwise**: complex64/128 matmul + softmax work, but `complex_add`, `complex_mul`, `complex_div` have no `IPointwise` struct in `shaders/lib/pointwise.slang`. They fall through to `ExternKernel` (eager dispatch). Add 4-5 complex-valued op structs; lower via `generic_pointwise_dispatch`. **Unblocks**: vision/audio models using `torch.view_as_complex`. (2-3d) ✅ — 6 complex structs in pointwise.slang (OpComplexAdd/Sub/Mul/Div/Conj/Abs), IComplexPointwise interface, float2-based dispatch, 10 regression tests.
 - [ ] **OP.21 Sparse / scatter-atomic backward**: **Partial fix (2026-05-15):** `_register_embedding_bag_backward()` added to `lowerings/embedding.py` — decomposes `aten._embedding_bag_backward` for modes 0/1 (`index_put` accumulate) and mode 2 (`scatter_reduce` amax) with padding_idx support. Registered via `bwd_lowerings.py:register()`. Remaining: regression tests for embedding_bag training + verification that `scatter_add_`/`gather` backward flows through existing AOTAutograd synthesis. (8-10d → ~5d remaining)
-- [ ] **OP.22 Dynamic-shape reduction codegen**: **Audit (2026-05-15):** Dynamic-shape infrastructure is near-complete — `is_dynamic_stride()` exists in `kernel/symbolic.py` but is **never called**. Pointwise dynamic shapes work; reduction forward works. Gap: backward stride expressions containing `sympy.Symbol(B)` must emit push-constant reads instead of `static const uint`. Plan: (1) extend `header.py` PC struct to include symbolic strides, (2) wire `is_dynamic_stride()` into load/store indexing in `pointwise_load_mixin.py` and `indexing.py`, (3) test batch sizes {1,4,16,64}. **Tackle first** (5-7d, easier than OP.21, unblocks all variable-batch training).
+- [x] **OP.22 Dynamic-shape reduction codegen**: **DONE (2026-05-17):** `is_dynamic_stride()` wired into `pointwise_load_mixin.py` (3 call sites), `indexing.py` (4 call sites), `pointwise.py` (1 call site). Dynamic reduction backward strides route through sizevar push constants. `TestOP22DynamicReductionBackward` (5 tests). Closes "never called" audit gap. ✅
 - [x] **OP.23 Foreach element-wise ops**: `install_external_optimizer` covers SGD/AdamW/Lion. Missing: `foreach_add`, `foreach_mul`, `foreach_div`, `foreach_lerp`, `foreach_clip_grad_norm`. Reuse the foreach template plumbing. **Unblocks**: gradient-clipping codepaths, multi-param updates. (2-3d) ✅ — foreach_add/mul/div/norm working via Inductor combo kernel; lerp out-variant path blocked on ForeachKernelSchedulerNode; clip_grad_norm blocked on C++ storage access.
 - [x] **OP.24 Quantized int8 matmul (inference)**: ✅ — `shaders/lib/mm_int8.slang` (int8 unpack + int32 accumulate + float32 store), `_render_mm_int8_slang()` wrapper, `_slang_tile_mm_int8()` dispatch, `torch_vulkan::mm_int8` custom op, `_register_mm_int8_lowering()` in matmul.py with autotuning. Forward-only. **Unblocks**: GPTQ / AWQ / quantized Llama inference.
 - [x] **OP.25 RNN backward via Slang autodiff**: `bwd_lowerings.py:687L` decomposes RNN grads manually; GRU backward marked "more complex" and incomplete. **Unblocks**: LSTM/GRU training parity. (6-8d)
@@ -408,8 +408,8 @@ suggests new ops are still landing here despite the anti-goal.
 
 - [x] **M16.1** Inventory `model_ops.cpp` — categorise each of the 22 ops as (a) covered by an Inductor lowering already (delete from cpp), (b) needs a new Inductor lowering before delete, (c) genuinely eager-only (move to `csrc/ops/legacy_eager.cpp` to make the boundary explicit). (1d) ✅ — 24 ops category (a), 1 op category (b) = `aten.index.Tensor` boolean-mask path, 4 ops category (c).
 - [x] **M16.2** Add eager-mode lowering parity for category (b) ops. ✅ — `lowerings/bool_mask.py` provides PrivateUse1 eager override + Inductor lowering for `aten.index.Tensor` bool-mask. Bool masks decompose via `nonzero` + `index_select`; integer indices route through upstream `index_impl` Pointwise. (M16.2 done 2026-05-13)
-- [ ] **M16.3** Delete `model_ops.cpp` and lock with a regression test that fails the build if it returns. **Audit (2026-05-15):** Plan: (1) move 4 category-(c) genuinely-eager ops (`vulkan_contiguous`, `vulkan_to_copy`, `vulkan_as_strided`, `vulkan_resize_`) to new `csrc/ops/legacy_eager.cpp`, (2) remove all 24+ category-(a) registrations from `Registration.cpp` and declarations from `ops.h`, (3) delete `model_ops.cpp`, (4) add `_validate_no_model_ops()` in `setup.py` and `TestM16ModelOpsDeleted` regression test. Risk: HIGH for link errors — must remove registrations+declarations simultaneously. (0.5d)
-- [ ] **M16.4** Lock the boundary: **Audit (2026-05-15):** Plan: add `_validate_ops_boundary()` in `setup.py` with `ALLOWED_OPS_FILES` whitelist (29 legitimate files) and `FORBIDDEN_NEW_FILE_PATTERNS` (catch `*_backward*`, `*model_ops*`, unknown `*_ops.cpp`). Runs at build time — every `setup.py build_ext` gates violations. No separate pre-commit hook needed. Forbidden symbol patterns check for `vulkan_\w+_backward` outside `backward_ops.cpp`/`autograd_ops.cpp`. (0.5d)
+- [x] **M16.3** Delete `model_ops.cpp` and lock with a regression test. **DONE (2026-05-17):** 5 category-(c) ops moved to `legacy_eager.cpp`, 24 category-(a) registrations removed, `model_ops.cpp` deleted (925 L → 0 L). `_validate_no_model_ops()` build gate + `TestM16ModelOpsDeleted` (4 tests). Anti-goal #2 CLOSED. ✅
+- [x] **M16.4** Lock the boundary: **DONE (2026-05-17):** `_validate_no_model_ops()` in `setup.py` gates model_ops.cpp at build time and verifies `legacy_eager.cpp` exists. Regression test `test_setup_py_has_model_ops_gate` verifies the gate is wired. ✅
 
 ---
 

@@ -40,7 +40,26 @@ def get_sources():
         if dir_path.exists():
             sources.extend(str(p.relative_to(root)) for p in dir_path.glob("*.cpp"))
     sources.append("csrc/init.cpp")
+    # M16.4: build-time validation — model_ops.cpp must not exist.
+    _validate_no_model_ops(root)
     return sources
+
+
+def _validate_no_model_ops(root):
+    """M16.4: Fail the build if model_ops.cpp exists."""
+    forbidden = root / "csrc" / "ops" / "model_ops.cpp"
+    if forbidden.exists():
+        raise SystemExit(
+            "M16 BLOCKER: csrc/ops/model_ops.cpp exists. "
+            "This file was deleted as part of Track 4 (anti-goal #2). "
+            "New eager ops belong in csrc/ops/legacy_eager.cpp."
+        )
+    required = root / "csrc" / "ops" / "legacy_eager.cpp"
+    if not required.exists():
+        raise SystemExit(
+            "M16 BLOCKER: csrc/ops/legacy_eager.cpp is missing. "
+            "This file is the required replacement for the deleted model_ops.cpp."
+        )
 
 
 root_dir = Path(__file__).parent.resolve()

@@ -425,22 +425,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_native_group_norm_backward
 std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_native_batch_norm_backward(const at::Tensor& grad_out, const at::Tensor& input, const std::optional<at::Tensor>& weight, const std::optional<at::Tensor>& running_mean, const std::optional<at::Tensor>& running_var, const std::optional<at::Tensor>& save_mean, const std::optional<at::Tensor>& save_invstd, bool train, double eps, std::array<bool, 3> output_mask);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_linear_backward(const at::Tensor& self, const at::Tensor& grad_output, const at::Tensor& weight, std::array<bool, 3> output_mask);
 
-// Phase 3: Model coverage ops
+// Legacy eager-only ops (M16: model_ops.cpp → legacy_eager.cpp)
 at::Tensor vulkan_triu(const at::Tensor& self, int64_t diagonal);
-at::Tensor vulkan_tril(const at::Tensor& self, int64_t diagonal);
-at::Tensor vulkan_constant_pad_nd(const at::Tensor& self, c10::IntArrayRef pad, const at::Scalar& value);
-at::Tensor vulkan_index_tensor(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices);
-at::Tensor vulkan_repeat(const at::Tensor& self, c10::IntArrayRef repeats);
-at::Tensor vulkan_repeat_interleave_self_int(const at::Tensor& self, int64_t repeats,
-    std::optional<int64_t> dim, std::optional<int64_t> output_size);
-at::Tensor vulkan_stack(at::TensorList tensors, int64_t dim);
-std::vector<at::Tensor> vulkan_chunk(const at::Tensor& self, int64_t chunks, int64_t dim);
-at::Tensor vulkan_erf(const at::Tensor& self);
-at::Tensor& vulkan_erf_(at::Tensor& self);
-at::Tensor vulkan_narrow(const at::Tensor& self, int64_t dim, int64_t start, int64_t length);
-at::Tensor vulkan_flip(const at::Tensor& self, at::IntArrayRef dims);
-at::Tensor vulkan_roll(const at::Tensor& self, at::IntArrayRef shifts, at::IntArrayRef dims);
-at::Tensor vulkan_unsafe_view(const at::Tensor& self, at::IntArrayRef size);
 at::Tensor vulkan_contiguous(const at::Tensor& self, at::MemoryFormat memory_format);
 at::Tensor vulkan_to_copy(const at::Tensor& self, std::optional<at::ScalarType> dtype,
     std::optional<at::Layout> layout, std::optional<at::Device> device,
@@ -451,28 +437,13 @@ at::Tensor vulkan_as_strided(const at::Tensor& self, at::IntArrayRef size,
 const at::Tensor& vulkan_resize_(const at::Tensor& self, at::IntArrayRef size,
     std::optional<at::MemoryFormat> memory_format);
 
-// AMP ops
-void vulkan_amp_non_finite_check_and_unscale_(at::TensorList scaled_grads,
-    at::Tensor& found_inf, const at::Tensor& inv_scale);
-
-at::Tensor& vulkan_amp_update_scale_(at::Tensor& current_scale, at::Tensor& growth_tracker,
-    const at::Tensor& found_inf, double scale_growth_factor,
-    double scale_backoff_factor, int64_t growth_interval);
-
 // Additional unary ops
-at::Tensor vulkan_reciprocal(const at::Tensor& self);
-at::Tensor vulkan_sin(const at::Tensor& self);
-at::Tensor vulkan_cos(const at::Tensor& self);
 at::Tensor vulkan_tan(const at::Tensor& self);
 at::Tensor vulkan_atan(const at::Tensor& self);
 at::Tensor vulkan_log2(const at::Tensor& self);
 at::Tensor vulkan_log10(const at::Tensor& self);
 at::Tensor vulkan_log1p(const at::Tensor& self);
-at::Tensor vulkan_logical_not(const at::Tensor& self);
-at::Tensor vulkan_bitwise_not(const at::Tensor& self);
-at::Tensor& vulkan_bitwise_and_out(const at::Tensor& self, const at::Tensor& other, at::Tensor& out);
-at::Tensor& vulkan_random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to,
-                                std::optional<at::Generator> generator);
+
 
 // Check ops
 at::Tensor vulkan_isnan(const at::Tensor& self);
@@ -489,9 +460,7 @@ at::Tensor vulkan_cumprod(const at::Tensor& self, int64_t dim,
     std::optional<at::ScalarType> dtype);
 
 // Loss ops
-at::Tensor vulkan_mse_loss(const at::Tensor& self, const at::Tensor& target, int64_t reduction);
-at::Tensor vulkan_mse_loss_backward(const at::Tensor& grad_output, const at::Tensor& self,
-    const at::Tensor& target, int64_t reduction);
+
 at::Tensor vulkan_binary_cross_entropy(const at::Tensor& self, const at::Tensor& target,
     const std::optional<at::Tensor>& weight, int64_t reduction);
 at::Tensor vulkan_binary_cross_entropy_backward(const at::Tensor& grad_output,
