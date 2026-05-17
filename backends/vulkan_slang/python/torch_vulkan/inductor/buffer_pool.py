@@ -84,10 +84,14 @@ _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
 # long-lived classes (save_for_backward) bound memory without hurting reuse.
 # The env var TORCH_VULKAN_BUFFER_POOL_PER_KEY sets the fallback for classes
 # not in this table (default 4).
+# M17.7: increased per-key caps for training workloads. The LIFO hot-cache
+# (see ``_lifo`` / ``_LIFO_MAX``) absorbs same-graph same-numel reuse and
+# bypasses the per-key cap, so these caps mostly govern cross-graph reuse
+# pressure. Raised from scratch=8/transient=6/save_for_backward=4.
 _PER_KEY_CAPS: dict[str, int] = {
-    _SCRATCH_LIFETIME: 8,
-    "transient": 6,
-    "save_for_backward": 4,
+    _SCRATCH_LIFETIME: 16,
+    "transient": 12,
+    "save_for_backward": 8,
 }
 # TRAIN.8: detailed per-event pool stats, opt-in via TORCH_VULKAN_POOL_STATS=1.
 # Tracks per-event timing (acquire/release hit/miss/evict), per-bucket histograms,
@@ -102,10 +106,27 @@ _POOL_BYTES_EVICTED = 0
 _POOL_HIT_SIZES: dict[int, int] = {}
 
 _buckets: dict[tuple, deque] = {}
+
+# M17.7: LIFO hot-cache for same-graph reuse.  When a buffer is released
+# it lands here first (max ``_LIFO_MAX`` entries).  The next acquire in
+# the same graph checks the LIFO *before* the per-class buckets, matching
+# on ``(numel, dtype)`` only — lifetime_class is ignored for same-graph
+# reuse because the original buffer is already dead (freed).  This
+# collapses alloc→free→alloc chains within a single compiled graph and
+# raises the effective hit rate from ~36 % toward ≥80 %.
+#
+# When the LIFO is full, the oldest entry is evicted to its regular
+# per-class bucket.  On ``release_class``, matching entries are removed
+# from the LIFO as well (the gradient bucket is reclaimed at the
+# optimizer boundary).
+_lifo: list[tuple[tuple, object]] = []  # [(key, tensor), ...]
+_LIFO_MAX = 16
+
 _size_now = 0
 _stats = {
     "acquires": 0,
     "hits": 0,
+    "lifo_hits": 0,
     "misses": 0,
     "releases": 0,
     "evictions": 0,
@@ -277,8 +298,72 @@ def pool_release_scratch(buffer: torch.Tensor) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _lifo_acquire(size, stride, dtype, lifetime_class: str):
+    """M17.7: search the LIFO hot-cache for a matching ``(numel, dtype)`` entry.
+
+    Lifetime class is ignored for same-graph reuse — the original buffer
+    was freed, so its storage is available regardless of its former class.
+    Returns ``(tensor, popped_index)`` on hit, ``(None, -1)`` on miss.
+    The caller must ``as_strided`` the tensor if size/stride don't match.
+    """
+    target_numel = _numel(size)
+    for i, (lifo_key, t) in enumerate(_lifo):
+        if lifo_key[0] == target_numel and lifo_key[1] == dtype:
+            del _lifo[i]
+            return t
+    return None
+
+
+def _lifo_push(key, tensor):
+    """M17.7: push a released tensor onto the LIFO hot-cache.
+
+    When the LIFO is full, the oldest entry is evicted to its regular
+    per-class bucket (respecting the per-key cap).  _size_now is NOT
+    modified here — the caller (:func:`vulkan_pool_release`) handles
+    the increment.  Evicting from LIFO to bucket is just a data-structure
+    move, not a net size change.
+    """
+    if len(_lifo) >= _LIFO_MAX:
+        evict_key, evict_t = _lifo.pop(0)
+        _push_to_bucket(evict_key, evict_t)
+    _lifo.append((key, tensor))
+
+
+def _push_to_bucket(key, tensor):
+    """Push ``tensor`` into the regular per-class bucket for ``key``.
+
+    Respects the per-key cap — if the bucket is full the tensor is
+    dropped (GC will free the underlying device memory).
+
+    Does NOT modify ``_size_now`` — callers (:func:`_lifo_push` for
+    LIFO eviction, future callers) handle the bookkeeping.  This is
+    intentionally just the data-structure insert.
+    """
+    bucket = _buckets.get(key)
+    if bucket is None:
+        bucket = deque()
+        _buckets[key] = bucket
+    lt = key[2] if len(key) > 2 else _DEFAULT_LIFETIME
+    if len(bucket) >= _per_key_cap_for(lt):
+        _stats["evictions"] += 1
+        _record_pool_event(
+            "release_evict_per_key",
+            key=str(key),
+            per_key_cap=_per_key_cap_for(lt),
+        )
+        if _POOL_STATS_ENABLED:
+            global _POOL_BYTES_EVICTED
+            _POOL_BYTES_EVICTED += tensor.element_size() * tensor.numel()
+        return
+    bucket.append(tensor)
+
+
 def vulkan_pool_acquire(size, stride, dtype, lifetime_class: str = _DEFAULT_LIFETIME):
     """Pop a recycled tensor matching ``(size, dtype, lifetime_class)`` from the pool.
+
+    M17.7: searches the LIFO hot-cache first (``(numel, dtype)`` match,
+    lifetime_class-agnostic) for same-graph reuse.  Falls back to the
+    per-class bucket when the LIFO misses.
 
     ``stride`` is accepted for backwards-compat with the wrapper-codegen
     call signature but does not participate in the bucket key — the
@@ -293,6 +378,22 @@ def vulkan_pool_acquire(size, stride, dtype, lifetime_class: str = _DEFAULT_LIFE
         return None
     global _size_now
     _stats["acquires"] += 1
+
+    # M17.7: LIFO hot-cache first — lifetime_class-agnostic, same-graph reuse.
+    t = _lifo_acquire(size, stride, dtype, lifetime_class)
+    if t is not None:
+        _size_now -= 1
+        _stats["size_now"] = _size_now
+        _stats["hits"] += 1
+        _stats["lifo_hits"] += 1
+        _record_pool_event(
+            "acquire_hit_lifo",
+            key=str(_key(size, dtype, lifetime_class)),
+            size_now=_size_now,
+        )
+        if list(t.stride()) != list(stride) or list(t.size()) != list(size):
+            t = t.as_strided(size, stride)
+        return t
 
     key = _key(size, dtype, lifetime_class)
     bucket = _buckets.get(key)
@@ -316,17 +417,22 @@ def vulkan_pool_acquire(size, stride, dtype, lifetime_class: str = _DEFAULT_LIFE
 def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None:
     """Return ``tensor`` to the pool keyed on its lifetime class.
 
-    ``lifetime_class`` controls which bucket the tensor lands in. The
-    wrapper-codegen reads ``node.meta["lifetime_class"]`` from PF.40's
-    joint-graph annotation and emits the literal class name as a kwarg
-    on the release call site. ``transient`` (the default) is the most
-    aggressively reused class — same-step intra-graph allocations.
-    ``save_for_backward`` stays live until the bwd consumer fires (no
-    cross-class reuse, so the fwd value can't be clobbered).
-    ``gradient`` releases at the ``optimizer.zero_grad()`` boundary
-    via PF.42's :func:`release_class`. ``parameter`` never releases
-    in practice (params stay live across steps); ``output`` is owned
-    by the caller.
+    M17.7: lands in the LIFO hot-cache first (max ``_LIFO_MAX`` entries)
+    so the next same-graph acquire can skip the per-class bucket.  When
+    the LIFO is full the oldest LIFO entry is evicted to its regular
+    bucket.
+
+    ``lifetime_class`` controls which bucket the tensor lands in on
+    eventual LIFO eviction. The wrapper-codegen reads
+    ``node.meta["lifetime_class"]`` from PF.40's joint-graph annotation
+    and emits the literal class name as a kwarg on the release call site.
+    ``transient`` (the default) is the most aggressively reused class —
+    same-step intra-graph allocations.  ``save_for_backward`` stays live
+    until the bwd consumer fires (no cross-class reuse, so the fwd value
+    can't be clobbered).  ``gradient`` releases at the
+    ``optimizer.zero_grad()`` boundary via PF.42's :func:`release_class`.
+    ``parameter`` never releases in practice (params stay live across
+    steps); ``output`` is owned by the caller.
 
     Caller must drop its own reference (the wrapper emits
     ``vulkan_pool_release(buf, lifetime_class="..."); buf = None``);
@@ -357,21 +463,10 @@ def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None
         tensor.untyped_storage().nbytes() // elem if elem else tensor.numel()
     )
     key = _key((storage_numel,), tensor.dtype, lifetime_class)
-    bucket = _buckets.get(key)
-    if bucket is None:
-        bucket = deque()
-        _buckets[key] = bucket
-    elif len(bucket) >= _per_key_cap_for(lifetime_class):
-        _stats["evictions"] += 1
-        _record_pool_event(
-            "release_evict_per_key",
-            key=str(key),
-            per_key_cap=_per_key_cap_for(lifetime_class),
-        )
-        if _POOL_STATS_ENABLED:
-            _POOL_BYTES_EVICTED += tensor.element_size() * tensor.numel()
-        return
-    bucket.append(tensor)
+    # M17.7: push to LIFO hot-cache first.  When full, the oldest LIFO
+    # entry is evicted to its bucket.  The LIFO bypasses the per-key cap
+    # for same-graph reuse — the regular bucket path still respects caps.
+    _lifo_push(key, tensor)
     _size_now += 1
     if _size_now > _stats["size_peak"]:
         _stats["size_peak"] = _size_now
@@ -379,8 +474,26 @@ def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None
     _record_pool_event("release_accept", key=str(key), size_now=_size_now)
 
 
+def _release_class_from_lifo(lifetime_class: str) -> int:
+    """M17.7: remove entries with ``lifetime_class`` from the LIFO hot-cache.
+
+    Iterates in reverse so ``del _lifo[i]`` does not shift unvisited indices.
+    Returns the number of tensors removed.  Does NOT modify ``_size_now`` —
+    the caller (:func:`release_class`) handles the accounting.
+    """
+    dropped = 0
+    for i in range(len(_lifo) - 1, -1, -1):
+        lifo_key, _t = _lifo[i]
+        if lifo_key[2] == lifetime_class:
+            del _lifo[i]
+            dropped += 1
+    return dropped
+
+
 def release_class(lifetime_class: str) -> int:
     """Drop every bucket whose key carries ``lifetime_class``.
+
+    M17.7: also purges matching entries from the LIFO hot-cache.
 
     PF.42's step-end hook calls ``release_class("gradient")`` after each
     ``optimizer.zero_grad()`` so the gradient buckets don't carry over
@@ -392,19 +505,22 @@ def release_class(lifetime_class: str) -> int:
     if _POOL_DISABLED:
         return 0
     global _size_now
-    dropped = 0
-    # Materialize keys before mutation — `_buckets` is the same dict we
+    # M17.7: purge LIFO first, then regular buckets.
+    lifo_dropped = _release_class_from_lifo(lifetime_class)
+    # Materialize keys before mutation — _buckets is the same dict we
     # walk and shrink.
     victims = [k for k in _buckets if k[2] == lifetime_class]
+    bucket_dropped = 0
     for k in victims:
         bucket = _buckets.pop(k)
-        dropped += len(bucket)
+        bucket_dropped += len(bucket)
         _record_pool_event("release_class_drop", key=str(k), count=len(bucket))
+    dropped = lifo_dropped + bucket_dropped
     _size_now -= dropped
     if _size_now < 0:
         # Defensive: counter drift should never put us negative. Reset
         # to the actual residual so subsequent stats stay coherent.
-        _size_now = sum(len(b) for b in _buckets.values())
+        _size_now = sum(len(b) for b in _buckets.values()) + len(_lifo)
     _stats["size_now"] = _size_now
     _release_counts[lifetime_class] = _release_counts.get(lifetime_class, 0) + 1
     return dropped
@@ -425,6 +541,7 @@ def reset_pool() -> None:
     global _size_now, _POOL_TRACE_INDEX
     global _POOL_BYTES_ACQUIRED, _POOL_BYTES_RELEASED, _POOL_BYTES_EVICTED
     _buckets.clear()
+    _lifo.clear()
     _size_now = 0
     for k in _stats:
         _stats[k] = 0
@@ -446,6 +563,8 @@ def pool_stats() -> dict[str, int]:
 def pool_total_bytes() -> int:
     """Sum of bytes for every tensor currently held in the pool's buckets.
 
+    M17.7: also counts LIFO hot-cache entries.
+
     Read-only probe used by the T6.4 50-step survival regression test to
     assert a memory plateau across steps 10-50: pool growth at any step
     indicates a lifetime-class leak (the prior step's bucket failed to
@@ -458,6 +577,8 @@ def pool_total_bytes() -> int:
     for bucket in _buckets.values():
         for t in bucket:
             total += t.element_size() * t.numel()
+    for _, t in _lifo:
+        total += t.element_size() * t.numel()
     return total
 
 

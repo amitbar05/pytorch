@@ -80,6 +80,10 @@ def _register_mm_lowering() -> None:
     # only the unwrap path for BaseView (non-ReinterpretView) nodes
     # on Vulkan devices is changed; everything else delegates to the
     # standard ExternKernel code path.
+    #
+    # M17.1: For fp32 Vulkan tensors, ``codegen`` emits a direct call to
+    # ``_slang_tile_mm`` instead of ``aten.mm.out``, routing through the
+    # Slang tiled matmul and avoiding eager C++ ``vulkan_mm`` sub-dispatches.
     class _VulkanMMOut(ir.ExternKernelOut):
         @classmethod
         def unwrap_storage_for_input(cls, x):
@@ -109,6 +113,59 @@ def _register_mm_lowering() -> None:
                 return x
             assert isinstance(x, (ir.Buffer, ir.ReinterpretView)), type(x)
             return x
+
+        def __init__(
+            self,
+            layout,
+            inputs,
+            *,
+            python_kernel_name=None,
+            op_overload=None,
+            tile_m=None,
+            tile_n=None,
+            tile_k=None,
+            num_stages=None,
+            m_per_thread=None,
+            n_per_thread=None,
+        ):
+            super().__init__(
+                layout=layout,
+                inputs=inputs,
+                python_kernel_name=python_kernel_name,
+                op_overload=op_overload,
+            )
+            self._tile_m = tile_m
+            self._tile_n = tile_n
+            self._tile_k = tile_k
+            self._num_stages = num_stages
+            self._m_per_thread = m_per_thread
+            self._n_per_thread = n_per_thread
+
+        def codegen(self, wrapper):
+            """Emit a call to ``_slang_tile_mm`` for the Slang tile path,
+            or delegate to standard ``ExternKernelOut.codegen`` for the
+            ``aten.mm.out`` fallback path.
+            """
+            if self._tile_m is not None:
+                # M17.1: Slang tiled matmul path.
+                wrapper.add_import_once(
+                    "from torch_vulkan.inductor.vulkan_template_caller "
+                    "import _slang_tile_mm"
+                )
+                input_names = [inp.codegen_reference() for inp in self.inputs]
+                out_name = self.codegen_reference()
+                self.codegen_comment(wrapper)
+                wrapper.writeline(
+                    f"_slang_tile_mm("
+                    f"{self._tile_m}, {self._tile_n}, {self._tile_k}, "
+                    f"{self._num_stages}, "
+                    f"{input_names[0]}, {input_names[1]}, {out_name}, "
+                    f"m_per_thread={self._m_per_thread}, "
+                    f"n_per_thread={self._n_per_thread})"
+                )
+                self.codegen_size_asserts(wrapper)
+            else:
+                super().codegen(wrapper)
 
     @register_lowering(aten.mm, type_promotion_kind=None)
     def _vulkan_mm(tensor1, tensor2, *, layout=None):
@@ -156,6 +213,27 @@ def _register_mm_lowering() -> None:
             stride=[N, 1],
         )
 
+        # M17.1: For fp32 Vulkan tensors, route through Slang tiled matmul
+        # instead of eager C++ vulkan_mm.  The (8,8,8) 1-output-per-thread
+        # tile is the most universal config — it fits a single wave on both
+        # wave32 and wave64 hardware.
+        if t1_dtype == torch.float32:
+            kernel = _VulkanMMOut(
+                layout=out_layout,
+                inputs=[tensor1, tensor2],
+                python_kernel_name="torch_vulkan.inductor.templates.caller.gemm.dispatch._slang_tile_mm",
+                op_overload=None,
+                tile_m=8,
+                tile_n=8,
+                tile_k=8,
+                num_stages=1,
+                m_per_thread=1,
+                n_per_thread=1,
+            )
+            return ir.TensorBox.create(kernel)
+
+        # Non-fp32 Vulkan tensors (e.g. fp16): fall through to aten.mm.out
+        # path which dispatches to eager C++ vulkan_mm.
         kernel = _VulkanMMOut(
             layout=out_layout,
             inputs=[tensor1, tensor2],

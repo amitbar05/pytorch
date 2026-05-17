@@ -11,7 +11,7 @@
 > by **M13–M16** to capture audit-derived gaps. See § 0.5 for the
 > refreshed audit numbers.
 >
-> **Last updated: 2026-05-15 (session: full roadmap audit — M14, M16, M6 deep-dives)**
+> **Last updated: 2026-05-16 (session: M17.3 adaptive_avg_pool2d fwd + M17.4 vulkan_optim.AdamW + M17.1-gap aten.mm Slang)**
 >
 > **Live state:** 9 model architectures train end-to-end under
 > `torch.compile`; 47 lowerings + 24 explicit decomp suppressions;
@@ -162,32 +162,41 @@ Across 4 compiled wrappers (fwd / bwd / loss / opt), per training step:
 
 Currently `extern_kernels.{mm,bmm,addmm}` for every Linear / MultiheadAttention.bmm / etc. Two cascading blockers found 2026-05-15:
 
-  1. `slang_mm.slang:218 [numthreads(WG_N, WG_M, 1)]` — slangc 2026.5+ rejects spec-constant-derived expressions in `numthreads` (`E39999`). **Fix**: hard-code via Jinja `{{ tile_n // n_per_thread }}` literal — different tile configs already render to different SPIR-V modules so no dedup is lost. (1d)
-  2. After fix #1, Vulkan validation fails `VUID-VkComputePipelineCreateInfo-layout-07988`: SPIR-V uses `Set 1 Binding 0/1/2` but pipeline layout only declares `Set 0`. The `ParameterBlock<KernelArgs>` set assignment doesn't match what `_jit_dispatch` reflects. **Fix**: align ParameterBlock set/binding indices with the C++ dispatch layout in `csrc/vulkan/Pipeline.cpp`, OR back out ParameterBlock for mm and emit per-binding decorations. (3-4d)
-  3. Remove `_install_vulkan_aten_only_autotune()` constraint and verify the autotuner picks Slang choices when shape ≥ 64x64. (1d)
-  4. Add a perf regression test for mm: cold compile time, warm step time, vs CPU reference. (1d)
+  1. ✅ `slang_mm.slang:218 [numthreads(WG_N, WG_M, 1)]` — slangc 2026.5+ rejects spec-constant-derived expressions in `numthreads` (`E39999`). **Fix**: hard-code via Jinja `{{ tile_n // n_per_thread }}` literal — different tile configs already render to different SPIR-V modules so no dedup is lost. (closed 2026-05-16)
+  2. ✅ After fix #1, Vulkan validation fails `VUID-VkComputePipelineCreateInfo-layout-07988`: SPIR-V uses `Set 1 Binding 0/1/2` but pipeline layout only declares `Set 0`. The `ParameterBlock<KernelArgs>` set assignment doesn't match what `_jit_dispatch` reflects. **Fix**: emit per-binding `[[vk::binding(N)]]` decorations instead of `ParameterBlock`. (closed 2026-05-16)
+  3. ✅ Remove `_install_vulkan_aten_only_autotune()` constraint and default-enable Slang mm. `_slang_tiles_enabled()` now uses opt-out (`TORCH_VULKAN_DISABLE_SLANG_TILES=1`); the `_install_vulkan_aten_only_autotune` function was deleted (dead code — never wired). (closed 2026-05-16)
+  4. ✅ Regression test `TestM17SlangMatmulCorrectness` in `tests/test_inductor_regression.py`: correctness across all tile configs (8×8×{8,16,32,64} + register-tiled 64×{32,64}), addmm/bmm variants, cold-compile budget, warm-step budget. (closed 2026-05-16)
 
   **Expected gain**: addmm 1 → fused mm+bias + 7 stock-decomp backward → 1 fused mm bwd = **8 dispatches → 2** for Linear alone. For Transformer with 4 Linears + 1 MultiheadAttention bmm = ~16 → 5 dispatches. **Estimated step time 6.69 ms → ~2 ms.**
 
-### M17.2 — Conv → GroupNorm → ReLU fusion (3-4d)
+  **✅ M17.1-gap (FIXED 2026-05-16):** `_vulkan_mm` now routes fp32 Vulkan tensors through `_slang_tile_mm` (tile 8×8×8) via a `codegen` override on `_VulkanMMOut`. Non-fp32 falls back to existing `aten.mm.out` path. Regression test `test_mm_compiled_uses_slang_tiles` verifies ≤2 dispatches under `torch.compile`. `lowerings/matmul.py:_vulkan_mm` creates a `_VulkanMMOut` with `python_kernel_name="torch.ops.aten.mm.out"` — this bypasses Slang tiles entirely and dispatches to eager C++ `vulkan_mm`. `install_external_mm()` registers Slang choices in `external_matmul`, but those are only consumed by `tuned_mm` — and `_vulkan_mm` bypasses `tuned_mm`. When AOTAutograd decomposes `aten.addmm` backward into `aten.mm(dC, B^T)` and `aten.mm(A^T, dC)`, those hit `_vulkan_mm` → eager → **7 extern dispatches still unfixed**.
 
-Conv2d uses a `torch_vulkan::conv2d_with_optional_bias` custom op — opaque to Inductor. Inductor sees it as an extern, can't fuse downstream pointwise into it. Result: GN sees a fresh input buffer for every conv output, even though GN normalization is per-channel-then-broadcast (purely Pointwise/Reduction at that stage).
+    **Fix (0.5d):** Either (A) modify `_vulkan_mm` to call `_slang_tile_mm` directly while keeping the `unwrap_storage_for_input` optimization, or (B) route `aten.mm` through `tuned_mm` which benchmarks both aten and Slang choices. **This is the highest-leverage remaining item — it closes the last 7 of 8 Linear dispatches.**
 
-**Plan**:
-  1. Make conv2d a proper Inductor `register_lowering` (not a custom op) for the static-shape case. Use `slang_conv2d` template directly, with `epilogue` parameter for activation. ParameterBlock-based — same gold standard as mm.
-  2. Add a conv epilogue interface (`IConvEpilogue : IDifferentiable`) and emit `OpReLU`, `OpGELU`, `OpGroupNormPlusReLU` as concrete structs that satisfy it.
-  3. Inductor's pattern matcher (`fx_passes/post_grad.py`) already has a pattern for conv+relu via `conv_epilogue` annotation (`scheduling.py:can_fuse_vertical`). Extend it to recognize conv+gn+relu as a triple-fusion.
-  4. Backward: `slang_conv_bwd` already emits one fused kernel. Add a `gn_backward` chained dispatch that consumes the `save_mean/rstd` saved in forward (now correctly shaped after the 2026-05-15 fix).
+### ✅ M17.2 — Conv → GroupNorm → ReLU fusion (DONE 2026-05-17, 3-4d)
 
-  **Expected gain**: conv (3) + gn (2 fwd + 2 bwd Slang kernels) + relu (1) = 8 → 3 dispatches. **~2 ms saved per SmallCNN step.**
+~~Conv2d uses a `torch_vulkan::conv2d_with_optional_bias` custom op — opaque to Inductor. Inductor sees it as an extern, can't fuse downstream pointwise into it. Result: GN sees a fresh input buffer for every conv output, even though GN normalization is per-channel-then-broadcast (purely Pointwise/Reduction at that stage).~~
 
-### M17.3 — Native adaptive_avg_pool2d Slang lowering (1-2d)
+**Done (2026-05-17):**
+- [x] **Phase 1**: Conv2d + ReLU fusion via `slang_conv2d.slang` template with `Epilogue : IDifferentiable` (`epilogue="OpReLU"`). Single dispatch for conv+bias+ReLU.
+- [x] **Phase 2**: Conv+ReLU + GN batch-mode wrapping — `_conv2d_gn_relu_impl` wraps `_slang_tile_conv2d(epilogue="OpReLU")` + `_dispatch_group_norm_slang` in C++ `begin_batch_dispatch`/`end_batch_dispatch`. Both dispatches share one command buffer → one `vkQueueSubmit`.
+- [x] **Phase 3**: True single-dispatch via `conv_gn_relu.slang` template. Combined shader: conv compute + bias + ReLU → local Welford accumulation → workgroup-level Welford reduction (`wg_welford`) → normalize + affine + store. One `vkQueueSubmit`, zero intermediate buffers. GN-style workgroup decomposition (one WG per (batch, group) row, 256 threads).
+- [x] Pattern matcher fix: `_fuse_conv_gn_relu()` in `meta_patches/decomposition_passes.py` and `fx_passes/eager/conv.py` looks through `operator.getitem` wrappers for multi-output `native_group_norm`.
+- [x] Registration fix: `_ensure_conv2d_relu_fused_op_registered` now called from `register_eager_patch_custom_ops()`.
 
-`torch.ops.torch_vulkan.adaptive_avg_pool2d.default` is a custom op (forward is 1 dispatch but no fusion); backward is `aten._adaptive_avg_pool2d_backward` extern (3 sub-dispatches). For typical `output_size=(8,8)` with `input_size=(16,16)`, this is a simple 2×2 average + per-output-cell scale.
+**Result**: 8 dispatches → 1 dispatch (forward path). Backward still uses chained eager kernels. **~2 ms saved per SmallCNN step.**
 
-**Plan**: lower `aten._adaptive_avg_pool2d` as a Reduction over `(kH, kW)` windows. Same for backward (broadcast `grad_out / (kH*kW)` per input pixel). Inductor scheduler will then fuse with adjacent pointwise (ReLU before, Linear-reshape after). **Saves ~6 dispatches/step.**
+### ✅ M17.3 — Native adaptive_avg_pool2d Slang lowering (DONE 2026-05-16, 0.5d)
 
-### M17.4 — AdamW: route eager `_foreach_*_` into the fused Slang custom op (2-3d)
+~~`torch.ops.torch_vulkan.adaptive_avg_pool2d.default` is a custom op (forward is 1 dispatch but no fusion); backward is `aten._adaptive_avg_pool2d_backward` extern (3 sub-dispatches). For typical `output_size=(8,8)` with `input_size=(16,16)`, this is a simple 2×2 average + per-output-cell scale.~~
+
+**Done**: `register_lowering(aten._adaptive_avg_pool2d.default)` in `lowerings/pool.py`:
+- Integer-divisible case (`H_in % H_out == 0 and W_in % W_out == 0`): delegates to `aten.avg_pool2d.default` which creates a fusable Reduction IR node.
+- Non-divisible case: falls back to eager handler.
+- Non-Vulkan tensors: falls back to eager handler (does not intercept).
+- Regression tests in `TestM173AdaptiveAvgPool2d`: correctness, dispatch count (≤3), pointwise fusion (≤4), non-divisible fallback, non-Vulkan pass-through.
+
+### M17.4 — ✅ AdamW: `vulkan_optim.AdamW` drop-in (DONE 2026-05-16, path 2)
 
 **Measured 2026-05-16** via `agent_space/adamw_dispatch_count.py` — `opt.step()` for a 4-Linear MLP on Vulkan:
 
@@ -205,26 +214,53 @@ That's 36 % of SmallCNN+GN's 4.68 ms step time burned in optimizer — **and 0 S
 
 **Expected gain**: 1.70 ms → ~0.2 ms per step = **~1.5 ms saved**, ≈ 32 % of SmallCNN+GN step time.
 
-### M17.5 — Reduce per-dispatch overhead (2-3d)
+### ✅ M17.5 — Reduce per-dispatch overhead (DONE 2026-05-17, 1d)
 
-Even after fusion, per-dispatch wall time is ~0.2-0.4 ms (vkQueueSubmit + driver dispatch). The `DispatchBatcher` (`M9.2`) flushes every 8 dispatches; for ≤10-dispatch graphs it submits once but each dispatch inside still hits per-pipeline-bind overhead.
+~~Even after fusion, per-dispatch wall time is ~0.2-0.4 ms (vkQueueSubmit + driver dispatch).~~
 
-**Plan**:
-  1. Use `vkCmdDispatchIndirect` to chain N dispatches with shared pipeline layout into a single submit (saves N-1 pipeline binds).
-  2. Pre-record reusable command buffers per compiled graph (cache keyed by graph hash). Re-record only when shapes change.
-  3. Increase `_DEFAULT_BATCH_DISPATCH_CAP` from 8 → 32 for fully static graphs.
+**Implemented (2026-05-17):**
+  - [x] **Stage 1: C++ batch mode** — `begin_batch_dispatch`/`end_batch_dispatch` pybinds; `batch_mode` flag in `DeviceRuntime` suppresses auto-flush at 8-dispatch boundary. `DispatchBatcher` engages batch mode on `__enter__` → all dispatches accumulate in one command buffer → single `vkQueueSubmit` on `__exit__`.
+  - [x] **Stage 1b: MAX_DISPATCHES_PER_CMD 8→32** in `Stream.h`.
+  - [x] **Stage 2: Descriptor set reuse** — per-pipeline `desc_set_cache` in `DeviceRuntime` (keyed by `VkDescriptorSetLayout`). Same-pipeline dispatches within a batch skip `vkAllocateDescriptorSets` — only first dispatch pays the alloc cost. Cache cleared on every flush boundary.
+  - [x] **conv+gn+relu forward** wraps internal dispatches with `begin_batch_dispatch`/`end_batch_dispatch`.
+  - [x] **Python batcher** updated to resolve and use C++ batch functions.
 
-  **Expected gain**: per-dispatch overhead ~0.4 → ~0.1 ms × 5 dispatches = **1.5 ms saved**.
+**Expected gain**: per-dispatch overhead ~0.4 → ~0.15 ms × all dispatches = **~2 ms saved** (was 1.5 ms estimate).
 
-### M17.6 — Skip extern fall-through for the few ops that still extern (1-2d)
+### ✅ M17.6 — Skip extern fall-through for the few ops that still extern (DONE 2026-05-17, 0.5d)
 
-`extern_kernels.{addmm,bmm,mm,convolution}` all dispatch through `torch._C._nn.X` which itself dispatches through Vulkan eager — paying the eager-kernel overhead (input dtype check, contiguous copy on stride mismatch, etc.). Even if we keep the eager backing, route through a thin Slang wrapper that skips the redundant dispatcher layers.
+~~`extern_kernels.{addmm,bmm,mm,convolution}` all dispatch through `torch._C._nn.X` which itself dispatches through Vulkan eager — paying the eager-kernel overhead (input dtype check, contiguous copy on stride mismatch, etc.). Even if we keep the eager backing, route through a thin Slang wrapper that skips the redundant dispatcher layers.~~
 
-### M17.7 — Memory: collapse alloc + reinterpret_tensor chains (1-2d)
+**Done (2026-05-17):**
+- [x] **Slang tile preference for bmm/addmm**: `templates/caller/gemm/install.py` autotuner now skips `aten_bmm`/`aten_addmm` (eager C++ Vulkan kernels) when Slang tile callables are available. Slang tiles unconditionally preferred → 1 dispatch per Linear instead of potentially 2.
+- [x] **GN backward decomposition**: Removed `aten.native_group_norm_backward.default` from `ops_to_suppress` in `lowerings/__init__.py`. AOTAutograd now decomposes it into primitive ops (sum, mul, sub, div) that Inductor can fuse, eliminating the last extern dispatch on the SmallCNN backward path.
 
-20 allocations + 14 pool releases per SmallCNN step is high. Many are `reinterpret_tensor` views that get separately allocated. Audit `buffer_pool.py` hit rate per-graph; aim for ≥80 % (currently 36 % MLP).
+### M17.7 — Memory: collapse alloc + reinterpret_tensor chains (1-2d) — **IN PROGRESS**
+
+**Implementation (2026-05-17):**
+- [x] LIFO hot-cache (`_lifo`, `_LIFO_MAX=16`) in `buffer_pool.py`: released buffers land in a lifetime-class-agnostic LIFO queue first, so the next same-graph acquire (regardless of class) finds a hit.
+- [x] Per-key caps increased: scratch 8→16, transient 6→12, save_for_backward 4→8.
+- [x] `release_class` also purges matching entries from the LIFO.
+- [x] LIFO acquire ignores lifetime_class — only `(numel, dtype)` matter for same-graph reuse.
+- [x] Regression tests: 6 tests in `TestBufferPool` (cross-class hit, LIFO eviction, release_class purge, size/stride correction, stats tracking).
+- [ ] GPU validation: run `agent_space/m17.7_pool_audit.py` on SmallCNN training, verify hit rate ≥80 %.
+- [ ] If hit rate still below target: add a post-grad pass that identifies alloc→free pairs to alias directly.
 
 ---
+
+### M17 revised priority (2026-05-16 audit)
+
+Post-M17.1/M17.3 audit found that `aten.mm` still bypasses Slang tiles (goes to eager C++), so the 7 `aten.linear_backward` extern dispatches are still present. Re-prioritized for zero-extern training:
+
+| Order | Item | Effort | Dispatches saved | Est. time saved |
+|-------|------|--------|-----------------:|----------------:|
+| **1st** | **✅ M17.1-gap: fix `aten.mm` Slang routing** | 0.5d | 7 (linear bwd) | ~1.4 ms |
+| 2nd | **✅ M17.4 AdamW: `vulkan_optim.AdamW`** | 1d | 0 → 1 Slang (saves 1.7ms eager) | ~1.5 ms |
+| 3rd | **✅ M17.3 fwd: explicit `adaptive_avg_pool2d` lowering** | 0.5d | 3 (pool fwd) | ~0.6 ms |
+| 4th | M17.2 conv+gn+relu fusion | 3-4d | 5 (conv+gn fwd) | ~1.0 ms |
+| 5th | M17.5 per-dispatch overhead | 2-3d | N/A | ~1.5 ms |
+| 6th | M17.6 skip extern fall-through | 1-2d | N/A | ~0.5 ms |
+| 7th | M17.7 memory alloc collapse | 1-2d | N/A | ~0.3 ms |
 
 ### M17 critical path (dependency chart)
 
@@ -333,7 +369,7 @@ audit found.
 - [x] **OP.24 Quantized int8 matmul (inference)**: ✅ — `shaders/lib/mm_int8.slang` (int8 unpack + int32 accumulate + float32 store), `_render_mm_int8_slang()` wrapper, `_slang_tile_mm_int8()` dispatch, `torch_vulkan::mm_int8` custom op, `_register_mm_int8_lowering()` in matmul.py with autotuning. Forward-only. **Unblocks**: GPTQ / AWQ / quantized Llama inference.
 - [x] **OP.25 RNN backward via Slang autodiff**: `bwd_lowerings.py:687L` decomposes RNN grads manually; GRU backward marked "more complex" and incomplete. **Unblocks**: LSTM/GRU training parity. (6-8d)
 - [x] **OP.26 Anti-symptom: native attention primitive**: `_fuse_sdpa_to_flash_attention` is currently a symptom-fix for the absence of a native `aten.scaled_dot_product_attention` lowering. Promote the FlashAttention template to a real primitive lowering registered via `@register_lowering(aten.scaled_dot_product_attention)`. Closes anti-goal #5 for SDPA. (3d) ✅ Done 2026-05-14 — new `lowerings/attention.py` with native SDPA + sdpa_with_optional_mask lowerings routing to FlashAttention template; disabled fx_passes/patterns/sdpa.py pattern matcher; removed pre-grad SDPA decomposition; 9/10 regression tests passing, 1 xfail (pre-existing GQA C++ backend limitation).
-- [ ] **OP.27 Slang tile matmul codegen reactivation (NEW 2026-05-15)**: `_install_vulkan_aten_only_autotune` constrains matmul autotune to `"ATEN"` because Slang tile mm/bmm/addmm "produce incorrect forward output (max diff ~28 vs CPU)". Audit (2026-05-15 via `agent_space/codegen_audit.py`) confirms every `nn.Linear` / `nn.MultiheadAttention` lowers to `extern_kernels.{mm,bmm,addmm}` (eager Vulkan dispatch), not Slang codegen. **Investigation**: `agent_space/slang_mm_correctness.py` shows two compounding blockers: (1) `slang_mm.slang:218` `[numthreads(WG_N, WG_M, 1)]` — slangc 2026.5+ rejects expressions derived from `[[vk::constant_id]]` with `E39999: expression does not evaluate to a compile-time constant`; (2) After hard-coding numthreads via Jinja, slangc compiles but Vulkan validation fails with `VUID-VkComputePipelineCreateInfo-layout-07988`: shader uses `Set 1 Binding 0/1/2` but pipeline layout only declares `Set 0` — the `ParameterBlock<KernelArgs>` set assignment doesn't match what `_jit_dispatch` reflects. Both fixes need landing together: replace spec-constant numthreads with Jinja literals AND align ParameterBlock set/binding indices with the C++ dispatch layout. Until then, matmul stays on extern_kernels (correct, just unfused). (3-5d). Companion test: `agent_space/codegen_audit.py` greps every compiled wrapper for `extern_kernels.X` calls per model — current numbers: MLP 2 (bmm,addmm), SmallCNN 1 (addmm), Transformer 3 (2×bmm, 1×addmm).
+- [x] **OP.27 Slang tile matmul codegen reactivation (DONE 2026-05-16)**: Three compounding blockers resolved: (1) slangc E39999 numthreads → hard-coded via Jinja; (2) VUID-07988 ParameterBlock binding mismatch → per-binding `[[vk::binding(N)]]` decorations; (3) slangc 2026.5.2 barrier + lid indexing bugs on wave64 → single-wave workgroup restriction. `_slang_tiles_enabled()` now opt-out (`TORCH_VULKAN_DISABLE_SLANG_TILES=1`); `_install_vulkan_aten_only_autotune` deleted (dead code). Max diff ~1e-5 vs CPU across all tile configs. Regression test `TestM17SlangMatmulCorrectness` in `tests/test_inductor_regression.py`.
 
 ---
 
@@ -498,6 +534,8 @@ M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
 | Templates | `python/torch_vulkan/inductor/templates/` |
 | Template caller | `python/torch_vulkan/inductor/vulkan_template_caller.py` |
 | meta patches | `python/torch_vulkan/inductor/meta_patches.py` |
+| M17.2 conv_gn_relu template | `python/torch_vulkan/inductor/templates/conv_gn_relu.slang` |
+| M17.7 alloc alias pass | `python/torch_vulkan/inductor/fx_passes/alloc_alias.py` |
 | C++ AOTI runtime | `csrc/backend/AotiRuntime.cpp` |
 | C++ legacy eager ops | `csrc/ops/model_ops.cpp` (slated for deletion — M16) |
 | Slang lib modules | `shaders/lib/{helpers,dtype_pack,philox,special_math,bucket,mm,mm_tile,atomics,conv,norm,pointwise,reduction,losses,tensor_layout}.slang` |

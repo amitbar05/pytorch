@@ -10,6 +10,12 @@
 //
 // Supported: groups==1, f32 only.
 //
+// M17.2: Optional epilogue via ``<Epilogue : IDifferentiable>``.
+// When ``has_epilogue`` is set, ``Epilogue::apply(sum)`` is called before
+// writing the output.  Common epilogues: OpReLU, OpGELU, OpSiLU, OpIdentity.
+// The concrete epilogue type is resolved at SPIR-V compile time via the
+// ``entry`` parameter (e.g. ``entry="computeMain<OpReLU>"``).
+//
 // CG.M15: Tile sizes are specialization constants (``[[vk::constant_id]]``).
 // They determine numthreads at SPIR-V compile time.  Actual loop bounds use
 // push-constant values (``pc.tile_w``, ``pc.tile_h``, ``pc.tile_c``) so the
@@ -80,6 +86,9 @@ struct PC {
 // dispatch caller (``_slang_tile_conv2d`` in ``vulkan_template_caller.py``)
 // passes tensors in struct-field order (input, weight, [bias,] out).
 // No `[[vk::binding(N)]]` literals are emitted.
+
+import pointwise;
+
 struct KernelArgs {
     StructuredBuffer<float> input;
     StructuredBuffer<float> weight;
@@ -92,7 +101,7 @@ ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
 [numthreads(THREADS_W, THREADS_H, 1)]
-void computeMain(
+void computeMain<Epilogue : IDifferentiable>(
     uint3 gtid : SV_DispatchThreadID,
     uint3 gid : SV_GroupID,
     uint3 lid : SV_GroupThreadID)
@@ -176,6 +185,9 @@ void computeMain(
                          + ow * pc.stride_out_w;
 /*{%*/ if has_bias /*%}*/
             sum += args.bias[co * pc.stride_bias];
+/*{%*/ endif /*%}*/
+/*{%*/ if epilogue /*%}*/
+            sum = Epilogue::apply(sum);
 /*{%*/ endif /*%}*/
             args.out[out_idx] = sum;
         }

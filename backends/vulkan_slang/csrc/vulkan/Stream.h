@@ -25,7 +25,7 @@ public:
     // ── Deferred execution (command buffer batching) ──────────────
     // Maximum dispatches per deferred command buffer before auto-submit.
     // Balances submission amortization against descriptor pool pressure.
-    static constexpr uint32_t MAX_DISPATCHES_PER_CMD = 8;
+    static constexpr uint32_t MAX_DISPATCHES_PER_CMD = 32;
 
     // Get the active command buffer for recording dispatches.
     // Automatically begins a new command buffer if none is active.

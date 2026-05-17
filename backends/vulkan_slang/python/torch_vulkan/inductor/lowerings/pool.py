@@ -1,7 +1,12 @@
 """M17.3 — Adaptive average pooling lowering for Vulkan Inductor.
 
-Replaces the upstream ``make_fallback`` for ``aten._adaptive_avg_pool2d_backward``
-with a decomposition into broadcast + scale that fuses with adjacent pointwise ops.
+Forward: For the integer-divisible case, delegates to ``aten.avg_pool2d``
+which creates a Reduction IR node that the scheduler fuses with adjacent
+pointwise ops. Non-divisible / non-Vulkan cases fall back to the eager handler.
+
+Backward: Replaces the upstream ``make_fallback`` for
+``aten._adaptive_avg_pool2d_backward`` with a decomposition into broadcast
++ scale that fuses with adjacent pointwise ops.
 """
 
 from __future__ import annotations
@@ -10,6 +15,49 @@ import torch
 from torch._inductor.lowering import register_lowering
 
 aten = torch.ops.aten
+
+
+@register_lowering(aten._adaptive_avg_pool2d.default)
+def _adaptive_avg_pool2d_vulkan(x, output_size):
+    """Lower the forward pass for adaptive_avg_pool2d.
+
+    For the integer-divisible case (``H_in % H_out == 0 and W_in % W_out == 0``),
+    the op is equivalent to a standard ``avg_pool2d`` with
+    ``kernel_size = (H_in//H_out, W_in//W_out)``.  Delegating to
+    ``aten.avg_pool2d.default`` produces a Reduction IR node that the
+    scheduler can fuse with adjacent pointwise ops.
+
+    Non-divisible and non-Vulkan cases fall back to the eager handler.
+    """
+    from torch._inductor.ir import TensorBox
+    from torch._inductor.virtualized import V
+
+    assert isinstance(x, TensorBox)
+    x.realize_hint()
+
+    # Only intercept Vulkan tensors.
+    try:
+        if x.get_device().type != "vulkan":
+            return _fallback_fwd(x, output_size)
+    except Exception:
+        return _fallback_fwd(x, output_size)
+
+    *batch, h_in, w_in = x.get_size()
+    h_out, w_out = output_size
+
+    h_in_int = V.graph.sizevars.guard_int(h_in)
+    w_in_int = V.graph.sizevars.guard_int(w_in)
+
+    if h_in_int % h_out == 0 and w_in_int % w_out == 0:
+        kH = h_in_int // h_out
+        kW = w_in_int // w_out
+        # Route to avg_pool2d which creates a fusable Reduction IR node.
+        from torch._inductor.lowering import lowerings as _lowerings
+
+        return _lowerings[aten.avg_pool2d.default](x, [kH, kW])
+
+    # Non-divisible case: fall through to eager handler.
+    return _fallback_fwd(x, output_size)
 
 
 @register_lowering(aten._adaptive_avg_pool2d_backward)
@@ -62,6 +110,13 @@ def _adaptive_avg_pool2d_backward_vulkan(grad_out, x, output_size):
         return result
 
     return _fallback(grad_out, x, output_size)
+
+
+def _fallback_fwd(x, output_size):
+    """Route to the eager handler for the forward pass."""
+    from torch._inductor.lowering import fallback_handler
+
+    return fallback_handler(aten._adaptive_avg_pool2d.default)(x, output_size)
 
 
 def _fallback(grad_out, x, output_size):

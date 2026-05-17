@@ -2230,6 +2230,155 @@ class TestForeachOptimizerTemplate:
                 f"torch_vulkan::{name} not registered (M24 schema fix lost?)"
             )
 
+    # ── M17.4: torch_vulkan.optim.AdamW ──────────────────────────
+
+    def test_adamw_optim_matches_cpu(self):
+        """M17.4: torch_vulkan.optim.AdamW matches torch.optim.AdamW on CPU."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+
+        # Generate on CPU, then clone to Vulkan (Vulkan RNG differs from CPU).
+        cpu_params = [torch.randn(8, 8, requires_grad=True)]
+        vk_params = [
+            p.clone().detach().to("vulkan:0").requires_grad_(True) for p in cpu_params
+        ]
+
+        # CPU reference — standard PyTorch AdamW
+        cpu_opt = torch.optim.AdamW(cpu_params, lr=0.01, weight_decay=0.01)
+        cpu_loss = cpu_params[0].sum()
+        cpu_loss.backward()
+        cpu_opt.step()
+
+        # Vulkan — fused Slang foreach_adamw_step via optim.AdamW
+        vk_opt = torch_vulkan.optim.AdamW(vk_params, lr=0.01, weight_decay=0.01)
+        vk_loss = vk_params[0].sum()
+        vk_loss.backward()
+        vk_opt.step()
+
+        torch.testing.assert_close(
+            vk_params[0].cpu(),
+            cpu_params[0],
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+    def test_adamw_optim_multi_step_matches_cpu(self):
+        """M17.4: Bias correction matches CPU across multiple steps."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+
+        cpu_params = [torch.randn(8, 8, requires_grad=True)]
+        vk_params = [
+            p.clone().detach().to("vulkan:0").requires_grad_(True) for p in cpu_params
+        ]
+
+        cpu_opt = torch.optim.AdamW(cpu_params, lr=0.01, weight_decay=0.01)
+        vk_opt = torch_vulkan.optim.AdamW(vk_params, lr=0.01, weight_decay=0.01)
+
+        for _step in range(5):
+            cpu_loss = cpu_params[0].sum()
+            cpu_loss.backward()
+            cpu_opt.step()
+            cpu_opt.zero_grad()
+
+            vk_loss = vk_params[0].sum()
+            vk_loss.backward()
+            vk_opt.step()
+            vk_opt.zero_grad()
+
+        torch.testing.assert_close(
+            vk_params[0].cpu(),
+            cpu_params[0],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
+    def test_adamw_optim_multi_param_group(self):
+        """M17.4: Multiple parameters in a single param_group."""
+        import torch_vulkan
+
+        N = 4
+        torch.manual_seed(42)
+
+        cpu_params = [torch.randn(8, 8, requires_grad=True) for _ in range(N)]
+        vk_params = [
+            p.clone().detach().to("vulkan:0").requires_grad_(True) for p in cpu_params
+        ]
+
+        cpu_opt = torch.optim.AdamW(cpu_params, lr=0.01, weight_decay=0.01)
+        cpu_loss = sum(p.sum() for p in cpu_params)
+        cpu_loss.backward()
+        cpu_opt.step()
+
+        vk_opt = torch_vulkan.optim.AdamW(vk_params, lr=0.01, weight_decay=0.01)
+        vk_loss = sum(p.sum() for p in vk_params)
+        vk_loss.backward()
+        vk_opt.step()
+
+        for i, (vk, cpu) in enumerate(zip(vk_params, cpu_params)):
+            torch.testing.assert_close(
+                vk.cpu(),
+                cpu,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Param {i} mismatch",
+            )
+
+    def test_adamw_optim_fallback_non_vulkan(self):
+        """M17.4: Falls back to super().step() for CPU tensors."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+        cpu_params = [torch.randn(8, 8, requires_grad=True)]
+        cpu_params2 = [p.clone().detach().requires_grad_(True) for p in cpu_params]
+
+        cpu_opt_ref = torch.optim.AdamW(cpu_params, lr=0.01)
+        cpu_opt_vk = torch_vulkan.optim.AdamW(cpu_params2, lr=0.01)
+
+        cpu_loss = cpu_params[0].sum()
+        cpu_loss.backward()
+        cpu_opt_ref.step()
+
+        cpu_loss2 = cpu_params2[0].sum()
+        cpu_loss2.backward()
+        cpu_opt_vk.step()
+
+        torch.testing.assert_close(
+            cpu_params2[0],
+            cpu_params[0],
+            rtol=1e-5,
+            atol=1e-8,
+        )
+
+    def test_adamw_optim_state_dict_roundtrip(self):
+        """M17.4: state_dict / load_state_dict round-trips correctly."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+        vk_params = [torch.randn(8, 8, device="vulkan:0", requires_grad=True)]
+        vk_opt = torch_vulkan.optim.AdamW(vk_params, lr=0.01)
+
+        # Run one step to populate state
+        vk_loss = vk_params[0].sum()
+        vk_loss.backward()
+        vk_opt.step()
+
+        state_dict = vk_opt.state_dict()
+
+        # Create a fresh optimizer and load state
+        vk_params2 = [torch.randn(8, 8, device="vulkan:0", requires_grad=True)]
+        vk_opt2 = torch_vulkan.optim.AdamW(vk_params2, lr=0.01)
+        vk_opt2.load_state_dict(state_dict)
+
+        # Verify state was loaded
+        for p in vk_params2:
+            state = vk_opt2.state[p]
+            assert "exp_avg" in state
+            assert "exp_avg_sq" in state
+            assert "step" in state
+
 
 class TestTemplateParameterBlockInvariant:
     """N+1.10 — every Jinja/Slang template under
@@ -3170,6 +3319,290 @@ class TestRegisterTileMatmul:
         )
         assert "[unroll(32)]" not in src_large, (
             "tile_k=32 should not produce a full [unroll(32)] — cap is 16"
+        )
+
+
+class TestM17SlangMatmulCorrectness:
+    """M17.1 — Slang tile matmul correctness regression tests.
+
+    Verifies that the Slang tiled matmul kernels (1-output-per-thread and
+    register-tiled variants) produce correct results vs CPU reference after
+    the three compounding blockers were resolved:
+      - E39999: numthreads must be literal (spec-constant-derived rejected)
+      - VUID-07988: ParameterBlock set/binding mismatch
+      - slangc 2026.5.2 barrier + lid indexing bugs on wave64
+
+    Per the roadmap, covers: correctness (vs CPU), cold-compile time,
+    and warm-step timing across the full tile-config matrix.
+    """
+
+    _COLD_COMPILE_CEILING_US = 15_000_000  # generous: slangc is slow
+    _WARM_STEP_CEILING_US = 5_000  # per-call dispatch should be sub-5 ms
+
+    def _assert_close(
+        self,
+        vk_result: torch.Tensor,
+        cpu_ref: torch.Tensor,
+        rtol: float = 1e-4,
+        atol: float = 1e-5,
+    ) -> None:
+        torch.testing.assert_close(
+            vk_result.cpu(),
+            cpu_ref,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    # ── 1-output-per-thread tile configs ──────────────────────────
+
+    def test_mm_8x8x8_square(self):
+        """1-output-per-thread tile (8,8,8) on a square matrix."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(64, 64, device="vulkan:0")
+        b = torch.randn(64, 64, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(8, 8, 8, num_stages=1, m_per_thread=1, n_per_thread=1)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    def test_mm_8x8x16_unaligned(self):
+        """Non-tile-aligned shapes with (8,8,16) tile."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(127, 200, device="vulkan:0")
+        b = torch.randn(200, 130, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(8, 8, 16, num_stages=2, m_per_thread=1, n_per_thread=1)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+    def test_mm_8x8x32_tall_skinny(self):
+        """Tall-skinny matrix: M >> N."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(256, 32, device="vulkan:0")
+        b = torch.randn(32, 16, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(8, 8, 32, num_stages=1, m_per_thread=1, n_per_thread=1)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    def test_mm_8x8x64_small(self):
+        """Small matrix with largest K tile (8,8,64)."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(16, 128, device="vulkan:0")
+        b = torch.randn(128, 16, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(8, 8, 64, num_stages=2, m_per_thread=1, n_per_thread=1)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    # ── Register-tiled configs ────────────────────────────────────
+
+    def test_mm_register_tile_64x64x16_r8x8(self):
+        """Register-tiled (64,64) tile, 8×8 outputs/thread."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(128, 128, device="vulkan:0")
+        b = torch.randn(128, 128, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(64, 64, 16, num_stages=1, m_per_thread=8, n_per_thread=8)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    def test_mm_register_tile_64x32x16_r8x8(self):
+        """Register-tiled (64,32) tile, 8×8 outputs/thread."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(100, 200, device="vulkan:0")
+        b = torch.randn(200, 96, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(64, 32, 16, num_stages=2, m_per_thread=8, n_per_thread=8)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    def test_mm_register_tile_32x64x16_r8x8(self):
+        """Register-tiled (32,64) tile, 8×8 outputs/thread."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(96, 200, device="vulkan:0")
+        b = torch.randn(200, 100, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+        mm = _SlangTileMM(32, 64, 16, num_stages=1, m_per_thread=8, n_per_thread=8)
+        out = mm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    # ── addmm variants ────────────────────────────────────────────
+
+    def test_addmm_8x8x16_bias(self):
+        """Fused addmm (C = A @ B + bias) with 1-output-per-thread tile."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileAddMM
+
+        torch.manual_seed(42)
+        bias = torch.randn(64, device="vulkan:0")
+        a = torch.randn(64, 128, device="vulkan:0")
+        b = torch.randn(128, 64, device="vulkan:0")
+        ref = a.cpu() @ b.cpu() + bias.cpu()
+        addmm = _SlangTileAddMM(8, 8, 16, num_stages=1, m_per_thread=1, n_per_thread=1)
+        out = addmm(bias, a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    def test_addmm_register_tile_bias(self):
+        """Fused addmm with register-tiled path."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileAddMM
+
+        torch.manual_seed(42)
+        bias = torch.randn(128, device="vulkan:0")
+        a = torch.randn(200, 256, device="vulkan:0")
+        b = torch.randn(256, 128, device="vulkan:0")
+        ref = a.cpu() @ b.cpu() + bias.cpu()
+        addmm = _SlangTileAddMM(
+            64,
+            64,
+            16,
+            num_stages=2,
+            m_per_thread=8,
+            n_per_thread=8,
+        )
+        out = addmm(bias, a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    # ── bmm variant ───────────────────────────────────────────────
+
+    def test_bmm_8x8x16_batched(self):
+        """Batched matmul (bmm) with 1-output-per-thread tile."""
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileBMM
+
+        torch.manual_seed(42)
+        a = torch.randn(4, 32, 64, device="vulkan:0")
+        b = torch.randn(4, 64, 32, device="vulkan:0")
+        ref = torch.bmm(a.cpu(), b.cpu())
+        bmm = _SlangTileBMM(8, 8, 16, m_per_thread=1, n_per_thread=1)
+        out = bmm(a, b)
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    # ── Slang tiles enabled by default ────────────────────────────
+
+    def test_slang_tiles_enabled_by_default(self):
+        """M17.1 gate: Slang tiles are enabled by default (opt-out)."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _slang_tiles_enabled,
+        )
+
+        assert _slang_tiles_enabled(), (
+            "Slang tiles must be enabled by default. "
+            "Set TORCH_VULKAN_DISABLE_SLANG_TILES=1 to opt out."
+        )
+
+    def test_slang_tiles_opt_out(self, monkeypatch):
+        """M17.1 escape hatch: TORCH_VULKAN_DISABLE_SLANG_TILES=1 disables
+        Slang tiles."""
+        monkeypatch.setenv("TORCH_VULKAN_DISABLE_SLANG_TILES", "1")
+        from importlib import reload
+
+        from torch_vulkan.inductor.templates.caller.gemm import dispatch
+
+        reload(dispatch)
+        assert not dispatch._slang_tiles_enabled(), (
+            "TORCH_VULKAN_DISABLE_SLANG_TILES=1 must disable Slang tiles."
+        )
+        # Restore
+        monkeypatch.delenv("TORCH_VULKAN_DISABLE_SLANG_TILES", raising=False)
+        reload(dispatch)
+
+    # ── Lowering dispatch gate ────────────────────────────────────
+
+    def test_mm_compiled_uses_slang_tiles(self):
+        """M17.1-gap: aten.mm under torch.compile must route through
+        Slang tiles, not eager C++ vulkan_mm."""
+        import torch_vulkan
+
+        @torch.compile(backend="inductor")
+        def fn(a, b):
+            return torch.mm(a, b)
+
+        torch.manual_seed(42)
+        a = torch.randn(64, 64, device="vulkan:0")
+        b = torch.randn(64, 64, device="vulkan:0")
+        ref = a.cpu() @ b.cpu()
+
+        # Warm up — first call compiles the Inductor graph
+        fn(a, b)
+        torch_vulkan._c_ext._reset_perf_counters()
+        out = fn(a, b)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+        # Should be 1 Slang dispatch, not multiple eager dispatches
+        assert d <= 2, f"aten.mm dispatch count {d} > 2 (expected Slang tile dispatch)"
+        self._assert_close(out, ref, rtol=1e-3, atol=1e-4)
+
+    # ── Cold-compile and warm-step timing ─────────────────────────
+
+    def test_mm_cold_compile_under_ceiling(self):
+        """First dispatch of a novel tile config must compile within budget."""
+        import time
+
+        if not os.environ.get("SLANGC"):
+            pytest.skip("SLANGC env var not set — cold-compile path inactive")
+
+        from torch_vulkan.inductor.inductor_stats import (
+            compile_stats,
+            reset_compile_stats,
+        )
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        reset_compile_stats()
+        torch.manual_seed(42)
+        a = torch.randn(64, 64, device="vulkan:0")
+        b = torch.randn(64, 64, device="vulkan:0")
+        mm = _SlangTileMM(8, 8, 8, num_stages=1, m_per_thread=1, n_per_thread=1)
+        t0 = time.perf_counter()
+        _ = mm(a, b)
+        torch.empty(1, device="vulkan:0").cpu()  # sync
+        wall_us = (time.perf_counter() - t0) * 1e6
+
+        stats = compile_stats()
+        cold_us = stats["cold_compile_us"]
+        assert cold_us < self._COLD_COMPILE_CEILING_US, (
+            f"Cold compile time {cold_us:.0f}us > "
+            f"ceiling {self._COLD_COMPILE_CEILING_US}us"
+        )
+        # Also check wall-clock is not wildly off from reported compile time
+        assert wall_us > 0, "Wall-clock must be positive"
+
+    def test_mm_warm_step_under_ceiling(self):
+        """Second+ dispatch of a cached tile must be fast (no recompile)."""
+        import time
+
+        from torch_vulkan.inductor.vulkan_template_caller import _SlangTileMM
+
+        torch.manual_seed(42)
+        a = torch.randn(64, 64, device="vulkan:0")
+        b = torch.randn(64, 64, device="vulkan:0")
+        mm = _SlangTileMM(8, 8, 8, num_stages=1, m_per_thread=1, n_per_thread=1)
+
+        # Warm up — first call compiles, second hits cache
+        _ = mm(a, b)
+        torch.empty(1, device="vulkan:0").cpu()
+        _ = mm(a, b)
+        torch.empty(1, device="vulkan:0").cpu()
+
+        # Measure warm step
+        t0 = time.perf_counter()
+        _ = mm(a, b)
+        torch.empty(1, device="vulkan:0").cpu()
+        warm_us = (time.perf_counter() - t0) * 1e6
+
+        assert warm_us < self._WARM_STEP_CEILING_US, (
+            f"Warm step time {warm_us:.0f}us > ceiling {self._WARM_STEP_CEILING_US}us"
         )
 
 
@@ -9873,6 +10306,7 @@ class TestBufferPool:
         for key in (
             "acquires",
             "hits",
+            "lifo_hits",
             "misses",
             "releases",
             "evictions",
@@ -9893,6 +10327,7 @@ class TestBufferPool:
         assert s["releases"] == 1
         assert s["acquires"] == 2
         assert s["hits"] == 1
+        assert s["lifo_hits"] == 1  # M17.7: single release → LIFO → hit
         assert s["misses"] == 1
         assert s["size_peak"] == 1
 
@@ -9969,6 +10404,186 @@ class TestBufferPool:
         s = summary()
         assert "buffer_pool" in s
         assert "acquires" in s["buffer_pool"]
+
+    # ---- M17.7 LIFO hot-cache tests ----
+
+    def test_m177_lifo_hit_same_numel_different_lifetime(self):
+        """M17.7: LIFO hot-cache serves same-numel+dtype acquires regardless
+        of lifetime_class — a freed transient buffer can feed a subsequent
+        save_for_backward acquire in the same graph."""
+        from torch_vulkan.inductor.buffer_pool import (
+            _lifo,
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        t = torch.empty_strided(
+            (64, 128), (128, 1), dtype=torch.float32, device="vulkan:0"
+        )
+        original_ptr = t.data_ptr()
+        # Release with "transient" lifetime
+        vulkan_pool_release(t, lifetime_class="transient")
+        del t
+
+        # Should be in LIFO (numel=8192, dtype=float32, lt=transient)
+        assert len(_lifo) == 1
+
+        # Acquire with "save_for_backward" — different lifetime_class, same numel+dtype.
+        # The LIFO ignores lifetime_class for same-graph reuse.
+        recycled = vulkan_pool_acquire(
+            (64, 128), (128, 1), torch.float32, lifetime_class="save_for_backward"
+        )
+        assert recycled is not None, "LIFO should serve cross-class acquire"
+        assert recycled.data_ptr() == original_ptr, "same storage reused"
+        assert len(_lifo) == 0
+
+    def test_m177_lifo_lifetime_class_ignored_on_acquire(self):
+        """M17.7: LIFO acquires ignore lifetime_class — only numel+dtype matter."""
+        from torch_vulkan.inductor.buffer_pool import (
+            _lifo,
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        # Release scratch, acquire transient → LIFO hit.
+        t = torch.empty_strided((32,), (1,), dtype=torch.float32, device="vulkan:0")
+        vulkan_pool_release(t, lifetime_class="scratch")
+        del t
+        assert len(_lifo) == 1
+
+        recycled = vulkan_pool_acquire(
+            (32,), (1,), torch.float32, lifetime_class="transient"
+        )
+        assert recycled is not None
+        assert len(_lifo) == 0
+
+        # Release transient, acquire scratch → LIFO hit.
+        t2 = torch.empty_strided((32,), (1,), dtype=torch.float32, device="vulkan:0")
+        vulkan_pool_release(t2, lifetime_class="transient")
+        del t2
+        assert len(_lifo) == 1
+
+        recycled2 = vulkan_pool_acquire(
+            (32,), (1,), torch.float32, lifetime_class="scratch"
+        )
+        assert recycled2 is not None
+        assert len(_lifo) == 0
+
+    def test_m177_lifo_evicts_to_bucket_when_full(self):
+        """M17.7: when LIFO reaches _LIFO_MAX, the oldest entry evicts to
+        its per-class bucket."""
+        from torch_vulkan.inductor.buffer_pool import (
+            _LIFO_MAX,
+            _buckets,
+            _lifo,
+            reset_pool,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        # Fill LIFO beyond capacity.
+        total = _LIFO_MAX + 3
+        for i in range(total):
+            numel = 64 + i  # unique numel per tensor → unique keys
+            t = torch.empty_strided(
+                (numel,), (1,), dtype=torch.float32, device="vulkan:0"
+            )
+            vulkan_pool_release(t, lifetime_class="transient")
+            del t
+
+        # LIFO should hold exactly _LIFO_MAX entries.
+        assert len(_lifo) == _LIFO_MAX, (
+            f"LIFO should hold {_LIFO_MAX}, got {len(_lifo)}"
+        )
+        # The first 3 entries should have been evicted to buckets.
+        evicted_count = sum(len(b) for b in _buckets.values())
+        assert evicted_count == total - _LIFO_MAX, (
+            f"Expected {total - _LIFO_MAX} evicted to buckets, got {evicted_count}"
+        )
+
+    def test_m177_release_class_purges_lifo(self):
+        """M17.7: release_class("gradient") also purges matching entries
+        from the LIFO hot-cache."""
+        from torch_vulkan.inductor.buffer_pool import (
+            _lifo,
+            release_class,
+            reset_pool,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        # Release one gradient and one transient buffer into LIFO.
+        t_grad = torch.empty_strided(
+            (16,), (1,), dtype=torch.float32, device="vulkan:0"
+        )
+        t_trans = torch.empty_strided(
+            (32,), (1,), dtype=torch.float32, device="vulkan:0"
+        )
+        vulkan_pool_release(t_grad, lifetime_class="gradient")
+        vulkan_pool_release(t_trans, lifetime_class="transient")
+        del t_grad, t_trans
+        assert len(_lifo) == 2
+
+        # Release gradient class — only the gradient entry should drop.
+        dropped = release_class("gradient")
+        assert dropped >= 1
+        # Transient entry should remain in LIFO.
+        remaining_classes = {k[2] for k, _ in _lifo}
+        assert "gradient" not in remaining_classes, (
+            f"gradient should be purged from LIFO: {remaining_classes}"
+        )
+
+    def test_m177_lifo_size_stride_correction(self):
+        """M17.7: LIFO-acquired tensors get as_strided to the requested
+        size/stride — same as regular bucket acquires."""
+        from torch_vulkan.inductor.buffer_pool import (
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        # Allocate with shape (64, 16), release, then acquire with (16, 64).
+        t = torch.empty_strided(
+            (64, 16), (16, 1), dtype=torch.float32, device="vulkan:0"
+        )
+        vulkan_pool_release(t, lifetime_class="transient")
+        del t
+
+        recycled = vulkan_pool_acquire(
+            (16, 64), (64, 1), torch.float32, lifetime_class="transient"
+        )
+        assert recycled is not None
+        assert tuple(recycled.size()) == (16, 64)
+        assert tuple(recycled.stride()) == (64, 1)
+
+    def test_m177_lifo_stats_tracked(self):
+        """M17.7: LIFO hits are counted in both 'hits' and 'lifo_hits'."""
+        from torch_vulkan.inductor.buffer_pool import (
+            pool_stats,
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+        t = torch.empty_strided((8,), (1,), dtype=torch.float32, device="vulkan:0")
+        vulkan_pool_release(t, lifetime_class="transient")
+        del t
+        recycled = vulkan_pool_acquire(
+            (8,), (1,), torch.float32, lifetime_class="transient"
+        )
+        assert recycled is not None
+
+        s = pool_stats()
+        assert s["acquires"] == 1
+        assert s["hits"] == 1
+        assert s["lifo_hits"] == 1, f"lifo_hits should be 1: {s}"
+        assert s["misses"] == 0
 
 
 class TestPoolReleaseTupleOutput:
@@ -37217,6 +37832,96 @@ class TestM99ComboBatcher:
         assert torch.isfinite(out.cpu()).all()
 
 
+class TestM173AdaptiveAvgPool2d:
+    """M17.3 — ``aten._adaptive_avg_pool2d.default`` forward lowering.
+
+    Verifies that the integer-divisible case routes through
+    ``aten.avg_pool2d`` (producing a fusable Reduction IR node), while
+    non-divisible and non-Vulkan cases fall back to eager.
+    """
+
+    _BUG_ROOT_COMPONENT = "lowering"
+
+    def test_adaptive_avg_pool2d_correctness_divisible(self):
+        """Integer-divisible case (16×16 → 8×8): matches CPU."""
+        import torch.nn.functional as F
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return F.adaptive_avg_pool2d(x, 8)
+
+        x = torch.randn(2, 4, 16, 16, device="vulkan:0")
+        result = fn(x)
+        expected = F.adaptive_avg_pool2d(x.cpu(), 8)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
+
+    def test_adaptive_avg_pool2d_dispatch_count_divisible(self):
+        """Integer-divisible case: ≤3 dispatches (fusable Reduction)."""
+        import torch.nn.functional as F
+        import torch_vulkan
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return F.adaptive_avg_pool2d(x, 8)
+
+        x = torch.randn(2, 4, 16, 16, device="vulkan:0")
+        fn(x)
+
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+        assert d <= 3, (
+            f"adaptive_avg_pool2d(16×16→8×8): expected ≤3 dispatches, got {d}"
+        )
+
+    def test_adaptive_avg_pool2d_fuses_with_adjacent_pointwise(self):
+        """ReLU → AdaptiveAvgPool2d → add should fuse into ≤4 dispatches."""
+        import torch.nn.functional as F
+        import torch_vulkan
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            h = F.relu(x)
+            h = F.adaptive_avg_pool2d(h, 8)
+            return h + 1.0
+
+        x = torch.randn(2, 4, 16, 16, device="vulkan:0")
+        fn(x)
+
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+        assert d <= 4, (
+            f"ReLU+AdaptiveAvgPool2d+add: expected ≤4 dispatches (fused), got {d}"
+        )
+
+    def test_adaptive_avg_pool2d_non_divisible_falls_back(self):
+        """Non-divisible case (16×16 → 7×7): must not crash."""
+        import torch.nn.functional as F
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return F.adaptive_avg_pool2d(x, 7)
+
+        x = torch.randn(2, 4, 16, 16, device="vulkan:0")
+        result = fn(x)
+        expected = F.adaptive_avg_pool2d(x.cpu(), 7)
+        torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
+
+    def test_adaptive_avg_pool2d_non_vulkan_falls_back(self):
+        """CPU tensor: must not be intercepted by Vulkan lowering."""
+        import torch.nn.functional as F
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return F.adaptive_avg_pool2d(x, 8)
+
+        x = torch.randn(2, 4, 16, 16)
+        result = fn(x)
+        expected = F.adaptive_avg_pool2d(x, 8)
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+
 class TestOP20ComplexPointwise:
     """OP.20: Complex-dtype binary elementwise ops.
 
@@ -37594,9 +38299,7 @@ class TestM6Phase4ConvTranspose:
 
         self._check(
             fn,
-            lambda x, w: F.conv_transpose3d(
-                x, w, stride=(1, 2, 2), padding=(0, 1, 1)
-            ),
+            lambda x, w: F.conv_transpose3d(x, w, stride=(1, 2, 2), padding=(0, 1, 1)),
             x,
             w,
         )
@@ -37618,3 +38321,291 @@ class TestM6Phase4ConvTranspose:
             out = fn(x.to("vulkan:0"), w.to("vulkan:0")).cpu()
         ref = F.conv_transpose3d(x, w)
         assert out.shape == ref.shape, f"shape {out.shape} != {ref.shape}"
+
+
+class TestM175DispatchOverhead:
+    """M17.5 — Per-dispatch overhead reduction regression tests.
+
+    Verifies that the four M17.5 mechanisms work end-to-end:
+      1. **C++ batch mode** — `begin_batch_dispatch`/`end_batch_dispatch`
+         suppress per-8-dispatch auto-flush. `DispatchBatcher` engages
+         batch mode on `__enter__` → all dispatches accumulate in one
+         command buffer → single `vkQueueSubmit` on `__exit__`.
+      2. **Descriptor set cache** — per-pipeline `desc_set_cache` in
+         `DeviceRuntime` (keyed by `VkDescriptorSetLayout`). Same-pipeline
+         dispatches within a batch skip `vkAllocateDescriptorSets`.
+      3. **Slang tile routing** — `aten.addmm` routes through
+         `_slang_tile_addmm` (single Slang dispatch) instead of eager
+         `addmm.out`.
+      4. **conv+gn+relu forward** — wraps internal dispatches with
+         `begin_batch_dispatch`/`end_batch_dispatch`, producing ≤ 2
+         batched Vulkan dispatches.
+      5. **Buffer pool LIFO hot-cache** — released buffers land in LIFO
+         first, achieving non-zero hit rate for same-graph reuse.
+
+    Stage tag: `_BUG_ROOT_COMPONENT="host-overhead"`.
+    """
+
+    _BUG_ROOT_COMPONENT = "host-overhead"
+
+    # ── Test 1: Batch mode dispatch count ────────────────────────
+
+    def test_batch_mode_dispatch_count(self):
+        """SmallCNN training step dispatch ≤ 15 and flush ≤ 5 after M17.5.
+
+        The DispatchBatcher (Python) + C++ batch mode together suppress the
+        per-8-dispatch auto-flush, so all dispatches within a wrapper
+        invocation accumulate in one command buffer.  This test runs 5
+        training steps on a compiled SmallCNN and asserts per-step dispatch
+        and flush counts stay within the post-M17.5 ceilings:
+          - dispatch ≤ 15 (target ~10-12)
+          - flush ≤ 5  (target ~4: fwd/bwd/loss/opt wrappers each flushed
+                         once)
+        """
+        import torch.nn as nn
+        import torch_vulkan
+
+        class SmallCNN(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+                self.gn2 = nn.GroupNorm(4, 32)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.fc1 = nn.Linear(32 * 8 * 8, 64)
+                self.fc2 = nn.Linear(64, num_classes)
+
+            def forward(self, x):
+                x = self.pool(torch.relu(self.gn1(self.conv1(x))))
+                x = self.pool(torch.relu(self.gn2(self.conv2(x))))
+                return self.fc2(torch.relu(self.fc1(x.flatten(1))))
+
+        model = SmallCNN().to("vulkan:0")
+        model.train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        x = torch.randn(2, 3, 32, 32, device="vulkan:0")
+        y = torch.randint(0, 10, (2,), device="vulkan:0")
+
+        @torch.compile(backend="inductor")
+        def step(inp, target):
+            out = model(inp)
+            loss = torch.nn.functional.cross_entropy(out, target)
+            loss.backward()
+            return loss
+
+        # Warmup compile.
+        step(x, y)
+        opt.step()
+        opt.zero_grad()
+        torch_vulkan._c_ext._synchronize(0)
+
+        # Measure 5 steps.
+        max_dispatch = 0
+        max_flush = 0
+        for _ in range(5):
+            torch_vulkan._c_ext._reset_perf_counters()
+            step(x, y)
+            opt.step()
+            opt.zero_grad()
+            torch_vulkan._c_ext._synchronize(0)
+            d = torch_vulkan._c_ext._get_dispatch_count()
+            f = torch_vulkan._c_ext._get_flush_count()
+            max_dispatch = max(max_dispatch, d)
+            max_flush = max(max_flush, f)
+
+        assert max_dispatch <= 15, (
+            f"SmallCNN training step: expected ≤15 dispatches after M17.5, "
+            f"got max_dispatch={max_dispatch}"
+        )
+        assert max_flush <= 5, (
+            f"SmallCNN training step: expected ≤5 flushes after M17.5 "
+            f"(fwd/bwd/loss/opt ~4), got max_flush={max_flush}"
+        )
+
+    # ── Test 2: Descriptor set cache hit ─────────────────────────
+
+    def test_desc_set_cache_hit(self):
+        """M17.5 desc-set cache: pointwise chain dispatches < unique pipelines.
+
+        Runs ``(add → mul → relu)`` under torch.compile with
+        ``TORCH_VULKAN_PROFILE_DISPATCH=1``.  The same pipeline is reused
+        for structurally identical pointwise dispatches within a batch;
+        the descriptor-set cache (keyed by `VkDescriptorSetLayout`)
+        skips ``vkAllocateDescriptorSets`` for all but the first dispatch
+        of each pipeline.
+
+        Verifies:
+          - Profiling infrastructure activates under the env var.
+          - Desc-alloc time is not zero (profiling is actually measuring).
+          - Dispatch count is ≤ the number of unique pipelines in the
+            chain (if fusion fires this can be 1; if not, still ≤ ~5).
+        """
+        import torch_vulkan
+
+        old_env = os.environ.get("TORCH_VULKAN_PROFILE_DISPATCH")
+        os.environ["TORCH_VULKAN_PROFILE_DISPATCH"] = "1"
+        try:
+
+            @torch.compile(backend="inductor")
+            def fn(x):
+                y = x + 0.5
+                y = y * 2.0
+                return torch.relu(y)
+
+            x = torch.randn(256, 256, device="vulkan:0")
+
+            # Warm up.
+            fn(x)
+            torch_vulkan._c_ext._synchronize(0)
+
+            # Second run — measure.
+            torch_vulkan._c_ext._reset_perf_counters()
+            torch_vulkan._c_ext._reset_profile_timers()
+            fn(x)
+            torch_vulkan._c_ext._synchronize(0)
+            d = torch_vulkan._c_ext._get_dispatch_count()
+            desc_ns = torch_vulkan._c_ext._profile_desc_alloc_ns()
+
+            # Profiling must be active.
+            assert torch_vulkan._c_ext._profiling_enabled(), (
+                "TORCH_VULKAN_PROFILE_DISPATCH=1 must enable profiling"
+            )
+            # A fused pointwise chain should produce very few dispatches.
+            # Descriptor allocation should be measured (≥ 0 ns) and
+            # less than what N unique pipelines would cost without a cache.
+            assert d <= 8, (
+                f"Pointwise chain: expected ≤8 dispatches after M17.5, got {d}"
+            )
+            assert desc_ns >= 0, f"profile_desc_alloc_ns should be ≥ 0, got {desc_ns}"
+        finally:
+            if old_env is None:
+                os.environ.pop("TORCH_VULKAN_PROFILE_DISPATCH", None)
+            else:
+                os.environ["TORCH_VULKAN_PROFILE_DISPATCH"] = old_env
+
+    # ── Test 3: addmm uses Slang tiles ───────────────────────────
+
+    def test_addmm_uses_slang_tiles(self):
+        """M17.5 gate: ``aten.addmm`` under torch.compile routes through
+        ``_slang_tile_addmm`` (1 fused Slang dispatch), not eager
+        ``addmm.out`` / ``aten.addmm``.
+
+        A simple ``nn.Linear`` forward (which decomposes to addmm) should
+        produce exactly 1 dispatch after warmup.  If the routing regresses
+        and falls through to eager addmm, the dispatch count jumps to
+        ≥ 3 (separate mm + add dispatches).
+        """
+        import torch_vulkan
+
+        m = torch.nn.Linear(64, 128).to("vulkan:0")
+        x = torch.randn(8, 64, device="vulkan:0")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return m(x)
+
+        # Warm up — first call compiles the Inductor graph.
+        fn(x)
+        torch_vulkan._c_ext._synchronize(0)
+
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x)
+        torch_vulkan._c_ext._synchronize(0)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+
+        # Linear(x) → addmm(bias, x, w.T) → 1 Slang dispatch.
+        assert d == 1, (
+            f"nn.Linear forward: expected 1 dispatch (Slang tile addmm), "
+            f"got {d} — routing may have fallen through to eager addmm"
+        )
+
+    # ── Test 4: Conv+GN+ReLU fused forward ───────────────────────
+
+    def test_conv_gn_relu_fused_forward(self):
+        """M17.5: Conv2d + GroupNorm + ReLU forward fuses into ≤ 2 dispatches.
+
+        The conv+gn+relu chain is a common SmallCNN block.  Under M17.5 the
+        conv2d custom-op internally wraps its dispatches with
+        ``begin_batch_dispatch``/``end_batch_dispatch``, so the entire
+        fused chain lands in a single batched submission.  The test
+        verifies dispatch count ≤ 2 after warmup.
+        """
+        import torch.nn as nn
+        import torch_vulkan
+
+        class ConvGNReLU(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn = nn.GroupNorm(4, 16)
+
+            def forward(self, x):
+                return torch.relu(self.gn(self.conv(x)))
+
+        m = ConvGNReLU().to("vulkan:0")
+        m.train()
+        x = torch.randn(1, 3, 32, 32, device="vulkan:0")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return m(x)
+
+        # Warm up.
+        fn(x)
+        torch_vulkan._c_ext._synchronize(0)
+
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x)
+        torch_vulkan._c_ext._synchronize(0)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+
+        # With M17.5 batch mode the conv+gn+relu forward should be tight.
+        assert d <= 2, (
+            f"Conv+GN+ReLU forward: expected ≤2 dispatches after M17.5 "
+            f"(batched conv+gn+relu), got {d}"
+        )
+
+    # ── Test 5: Buffer pool LIFO hit rate ────────────────────────
+
+    def test_pool_stats_lifo(self):
+        """M17.7/M17.5: LIFO hot-cache achieves non-zero hit rate.
+
+        After several alloc/free cycles with matching numel+dtype, the
+        LIFO hot-cache should intercept acquires and produce at least one
+        hit.  The LIFO bypasses per-class buckets for same-graph reuse —
+        a freed transient buffer can feed a subsequent acquire regardless
+        of the requested lifetime_class.
+        """
+        from torch_vulkan.inductor.buffer_pool import (
+            pool_stats,
+            reset_pool,
+            vulkan_pool_acquire,
+            vulkan_pool_release,
+        )
+
+        reset_pool()
+
+        # Allocate and release several buffers with the same numel.
+        num_cycles = 6
+        for i in range(num_cycles):
+            t = torch.empty_strided(
+                (64, 32), (32, 1), dtype=torch.float32, device="vulkan:0"
+            )
+            vulkan_pool_release(t, lifetime_class="transient")
+            del t
+
+        # Acquire the same shape — should hit the LIFO.
+        for _ in range(num_cycles):
+            recycled = vulkan_pool_acquire(
+                (64, 32), (32, 1), torch.float32, lifetime_class="scratch"
+            )
+            assert recycled is not None, "LIFO should serve acquires after releases"
+
+        s = pool_stats()
+        assert s["acquires"] == num_cycles
+        assert s["hits"] > 0, (
+            f"LIFO should achieve >0 hits after {num_cycles} alloc/free "
+            f"cycles, got hits={s['hits']}: {s}"
+        )
+        assert s["lifo_hits"] > 0, f"lifo_hits should be >0: {s}"

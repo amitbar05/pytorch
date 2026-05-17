@@ -143,7 +143,11 @@ def install_external_bmm() -> None:
         choices = []
 
         if use_aten_gemm_kernels():
-            choices.append(aten_bmm.bind(kernel_inputs.nodes(), layout_))
+            # M17.5: Only include aten_bmm as fallback when Slang tiles
+            # are not available. For Vulkan fp32, Slang tiles are
+            # preferred (single dispatch vs eager C++).
+            if not bmm_tile_fns:
+                choices.append(aten_bmm.bind(kernel_inputs.nodes(), layout_))
 
         if out_dtype is None:
             for fn in bmm_tile_fns:
@@ -248,7 +252,11 @@ def install_external_addmm() -> None:
         choices = []
 
         if use_aten_gemm_kernels():
-            choices.append(aten_addmm.bind(kernel_inputs.nodes(), layout_))
+            # M17.5: Only include aten_addmm as fallback when Slang tiles
+            # are not available. For Vulkan fp32, Slang tiles are
+            # preferred (single fused dispatch vs 2 eager C++ dispatches).
+            if not addmm_tile_fns:
+                choices.append(aten_addmm.bind(kernel_inputs.nodes(), layout_))
 
         for fn in addmm_tile_fns:
             choices.append(ExternKernelChoice(fn).bind(kernel_inputs.nodes(), layout_))
@@ -377,7 +385,7 @@ def prewarm_matmul_templates(*, sync: bool = False) -> int:
     """Submit the standard mm/addmm/bmm × {f32, f16} × {1, 2 stages} tile
     configs to the slangc thread pool so the first user dispatch hits a
     populated SPIR-V cache. No-op when slangc is not available or when
-    Slang tiles are disabled (``TORCH_VULKAN_ENABLE_SLANG_TILES != 1``).
+    Slang tiles are disabled (``TORCH_VULKAN_DISABLE_SLANG_TILES=1``).
 
     N+1.6: When ``TORCH_VULKAN_ASYNC_COMPILE=1`` (the default), uses
     ``_compile_slang_batch_parallel`` with ``ThreadPoolExecutor`` to compile
@@ -444,10 +452,10 @@ _int8_installed = False
 # manageable (int32 groupshared = 4× the bytes of float16/float32 for same
 # element count). Register-tiling is used to amortize the unpack overhead.
 _INT8_TILE_CONFIGS: list[tuple[int, int, int, int, int]] = [
-    (32, 32, 16, 4, 4),   # 256 threads, 16 outputs/thread
-    (16, 64, 16, 2, 4),   # 128 threads, 8 outputs/thread
-    (64, 16, 16, 4, 2),   # 128 threads, 8 outputs/thread
-    (16, 16, 16, 2, 2),   # 64 threads, 4 outputs/thread
+    (32, 32, 16, 4, 4),  # 256 threads, 16 outputs/thread
+    (16, 64, 16, 2, 4),  # 128 threads, 8 outputs/thread
+    (64, 16, 16, 4, 2),  # 128 threads, 8 outputs/thread
+    (16, 16, 16, 2, 2),  # 64 threads, 4 outputs/thread
 ]
 
 
@@ -459,8 +467,8 @@ def install_external_mm_int8() -> None:
     ``tuned_mm`` lowering can benchmark our Slang tiled-int8 templates
     alongside the CPU fallback path.
 
-    Only active when ``TORCH_VULKAN_ENABLE_SLANG_TILES=1`` (same gate as
-    other Slang tile matmul variants).
+    Only active when Slang tiles are enabled (``TORCH_VULKAN_DISABLE_SLANG_TILES``
+    is not set to ``1`` — same gate as other Slang tile matmul variants).
 
     Safe to call multiple times — only installs once.
     """
@@ -487,11 +495,7 @@ def _collect_int8_matmul_prewarm_specs() -> list[tuple[str, str]]:
     """
     specs: list[tuple[str, str]] = []
     for tm, tn, tk, mpt, npt in _INT8_TILE_CONFIGS:
-        cache_key = (
-            f"slang_mm_int8_{tm}_{tn}_{tk}_r{mpt}x{npt}_n111"
-        )
-        src = _render_mm_int8_slang(
-            tm, tn, tk, m_per_thread=mpt, n_per_thread=npt
-        )
+        cache_key = f"slang_mm_int8_{tm}_{tn}_{tk}_r{mpt}x{npt}_n111"
+        src = _render_mm_int8_slang(tm, tn, tk, m_per_thread=mpt, n_per_thread=npt)
         specs.append((cache_key, src))
     return specs

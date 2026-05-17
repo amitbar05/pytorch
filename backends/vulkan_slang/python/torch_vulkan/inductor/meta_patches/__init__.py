@@ -34,6 +34,7 @@ from .autograd_registrations import (
 # ── Decomposition / pre-grad passes ─────────────────────────────────────────
 from .decomposition_passes import (
     _patch_decompositions,
+    _patch_pre_grad_passes_for_conv_gn_relu_fusion,
     _patch_pre_grad_passes_for_optimizer_foreach,
     _patch_pre_grad_passes_for_relu_rewrite,
 )
@@ -514,5 +515,9 @@ def apply() -> None:
     # catches in-place ``add_/mul_/addcdiv_/addcmul_`` sequences BEFORE
     # AOTAutograd functionalization decomposes them into triplets/doublets.
     _patch_pre_grad_passes_for_optimizer_foreach()
+
+    # M17.2 Phase 2: fuse conv → group_norm → relu on the pre-grad graph
+    # BEFORE AOTAutograd decomposition (native_group_norm is still intact).
+    _patch_pre_grad_passes_for_conv_gn_relu_fusion()
 
     _patched = True

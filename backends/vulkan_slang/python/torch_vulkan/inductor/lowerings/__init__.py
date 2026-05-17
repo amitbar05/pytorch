@@ -52,7 +52,13 @@ def _suppress_upstream_decomps() -> None:
     aten = torch.ops.aten
     ops_to_suppress = [
         aten.native_layer_norm_backward.default,
-        aten.native_group_norm_backward.default,
+        # PT.21: native_group_norm_backward is intentionally NOT suppressed.
+        # Removing it from the suppress list lets AOTAutograd / Inductor
+        # decompose it into primitive ops (sum, mul, div, sub, rsqrt, etc.)
+        # which all have existing Vulkan Slang lowerings.  The decomposition
+        # turns 1 extern dispatch into several fused Slang dispatches — better
+        # perf and eliminates the last remaining extern on the SmallCNN
+        # critical path.
         aten.native_batch_norm_backward.default,
         aten.native_batch_norm.default,
         # DR.1+: Suppress native_group_norm and native_layer_norm decompositions
@@ -303,6 +309,7 @@ def register() -> None:
     _register_conv_and_pool_lowerings()
     # M17.3: adaptive_avg_pool2d backward lowering
     from . import pool  # noqa: F811
+
     _register_bmm_lowering()
     _register_mm_lowering()
     _register_mm_int8_op()

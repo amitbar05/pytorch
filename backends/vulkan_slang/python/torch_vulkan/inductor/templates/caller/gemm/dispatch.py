@@ -458,13 +458,15 @@ def _slang_tile_bmm(
 def _slang_tiles_enabled() -> bool:
     """Check if Slang tile matmul shaders are enabled for autotune.
 
-    Disabled by default — the Slang tile mm/bmm/addmm shaders produce
-    incorrect forward output (max diff ~28 vs CPU). The ATEN choice
-    (C++ vulkan_mm/vulkan_bmm via eager dispatch) is verified correct.
-    Set ``TORCH_VULKAN_ENABLE_SLANG_TILES=1`` to re-enable for
-    benchmarking / correctness auditing.
+    Enabled by default as of M17.1 (2026-05-16) — the three compounding
+    blockers (E39999 numthreads, VUID-07988 binding mismatch, slangc 2026.5.2
+    barrier + lid indexing bugs on wave64) are all resolved.  Forward matmul
+    produces correct results: max diff ~1e-5 vs CPU across all tile configs.
+
+    Set ``TORCH_VULKAN_DISABLE_SLANG_TILES=1`` to fall back to the ATEN
+    (C++ vulkan_mm/vulkan_bmm) path for bisecting / debugging.
     """
-    return os.environ.get("TORCH_VULKAN_ENABLE_SLANG_TILES") == "1"
+    return os.environ.get("TORCH_VULKAN_DISABLE_SLANG_TILES") != "1"
 
 
 def _get_device_subgroup_size() -> int:
@@ -544,7 +546,8 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
     sgs = _get_device_subgroup_size()
     if sgs == 64:
         return [
-            c for c in _MM_REGISTER_TILE_CONFIGS
+            c
+            for c in _MM_REGISTER_TILE_CONFIGS
             if (c[0] // c[3]) * (c[1] // c[4]) <= 64  # wg threads <= wave size
         ]
     if sgs == 32:

@@ -471,6 +471,15 @@ PYBIND11_MODULE(_C, m) {
         torch_vulkan_aoti_model_free(handle);
     }, py::arg("handle"));
 
+    // M17.5: Batch dispatch mode — suppresses auto-flush until end_batch_dispatch()
+    m.def("begin_batch_dispatch", []() {
+        ops::begin_batch_dispatch();
+    }, "Begin batched dispatch mode — suppresses auto-flush until end_batch_dispatch()");
+
+    m.def("end_batch_dispatch", []() {
+        ops::end_batch_dispatch();
+    }, "End batched dispatch mode — flushes remaining dispatches");
+
     // Flush pending GPU work (for benchmarking / synchronization)
     m.def("_flush", []() { ops::flush_stream(); });
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from . import (
     addmm_gelu,
+    conv_epilogue,
     conv_im2col,
     matmul_epilogue,
     mm_add,
@@ -23,6 +24,7 @@ from . import (
 
 __all__ = [
     "addmm_gelu",
+    "conv_epilogue",
     "swiglu",
     "scaled_bmm",
     "mm_add",

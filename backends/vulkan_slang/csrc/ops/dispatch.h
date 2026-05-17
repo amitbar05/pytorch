@@ -24,6 +24,18 @@ struct DeviceRuntime {
     // Tracks VkBuffers written by dispatches in the current deferred command buffer.
     // Used for smart barrier insertion: barrier only emitted when a read depends on a prior write.
     std::unordered_set<VkBuffer> dirty_buffers;
+
+    // M17.5: batch mode suppresses auto-flush until end_batch_dispatch().
+    // When true, dispatch_shader/dispatch_shader_indexed will NOT auto-flush
+    // even when MAX_DISPATCHES_PER_CMD is exceeded.
+    bool batch_mode = false;
+
+    // M17.5: Per-batch descriptor set cache.
+    // Key = VkDescriptorSetLayout pointer from the pipeline.
+    // Value = pre-allocated descriptor set that can be reused by
+    //   subsequent dispatches with the same pipeline in the same batch.
+    // Cleared on flush (end_batch or auto-flush boundary).
+    std::unordered_map<VkDescriptorSetLayout, VkDescriptorSet> desc_set_cache;
 };
 
 DeviceRuntime& get_runtime(uint32_t device_index = UINT32_MAX);
@@ -133,6 +145,13 @@ uint64_t get_barrier_count();
 uint64_t get_barrier_skip_count();
 void reset_perf_counters();
 void inc_war_flush_count();
+
+// ── M17.5: Batch dispatch mode ─────────────────────────────────
+// Begin batched dispatch mode — suppresses auto-flush until end_batch_dispatch().
+void begin_batch_dispatch();
+
+// End batched dispatch mode — flushes remaining dispatches and resets descriptor pool.
+void end_batch_dispatch();
 
 // ── Per-dispatch timing breakdown (nanoseconds, cumulative) ────
 // Only populated when TORCH_VULKAN_PROFILE_DISPATCH=1 is set.

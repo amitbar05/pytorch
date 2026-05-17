@@ -8,8 +8,10 @@ registry and re-exports all public symbols for backward compatibility.
 from .conv import (
     _render_conv2d_slang,
     _render_conv_bwd_slang,
+    _render_conv_gn_relu_slang,
     _slang_tile_conv2d,
     _slang_tile_conv2d_bwd,
+    _slang_tile_conv2d_gn_relu,
 )
 from .fft import (
     _dispatch_fft,

@@ -88,6 +88,28 @@ void reset_perf_counters() {
 }
 void inc_war_flush_count() { g_war_flush_count++; }
 
+// ── M17.5: Batch dispatch mode ─────────────────────────────────
+
+void begin_batch_dispatch() {
+    auto& ctx = vulkan::Context::instance();
+    auto& rt = get_runtime(ctx.current_device());
+    rt.batch_mode = true;
+}
+
+void end_batch_dispatch() {
+    auto& ctx = vulkan::Context::instance();
+    auto& rt = get_runtime(ctx.current_device());
+    if (!rt.batch_mode) return;
+    rt.batch_mode = false;
+    // Flush any remaining dispatches + reset descriptor pool
+    if (rt.stream && rt.stream->pending_dispatches() > 0) {
+        rt.stream->flush_async();
+        rt.desc_pool->reset();
+        rt.dirty_buffers.clear();
+        rt.desc_set_cache.clear();  // M17.5: clear on batch end
+    }
+}
+
 // Fast path cache for single-device case (avoids mutex + map lookup per dispatch)
 static thread_local DeviceRuntime* g_cached_runtime = nullptr;
 static thread_local uint32_t g_cached_device_index = UINT32_MAX;
@@ -186,16 +208,23 @@ void dispatch_shader(
 
     // M9.2 batched submission: submit async every 8 dispatches so the
     // GPU can overlap compute with CPU recording the next batch.
-    if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
+    if (!rt.batch_mode && rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
         rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
+        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
-    // Allocate descriptor set and bind buffers
-    VkDescriptorSet desc_set = rt.desc_pool->allocate(
-        pipeline->descriptor_set_layout());
+    // M17.5: Reuse cached descriptor set for same pipeline in batch.
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    auto cache_it = rt.desc_set_cache.find(pipeline->descriptor_set_layout());
+    if (cache_it != rt.desc_set_cache.end()) {
+        desc_set = cache_it->second;
+    } else {
+        desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
+        rt.desc_set_cache[pipeline->descriptor_set_layout()] = desc_set;
+    }
 
     if (g_profile_enabled) { t3 = _now_ns(); g_profile_desc_alloc_ns += (t3 - t2); }
 
@@ -326,15 +355,23 @@ void dispatch_shader_indexed(
 
     auto& rt = get_runtime(device_idx);
 
-    if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
+    if (!rt.batch_mode && rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
         rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
+        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
-    VkDescriptorSet desc_set =
-        rt.desc_pool->allocate(pipeline->descriptor_set_layout());
+    // M17.5: Reuse cached descriptor set for same pipeline in batch.
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    auto cache_it = rt.desc_set_cache.find(pipeline->descriptor_set_layout());
+    if (cache_it != rt.desc_set_cache.end()) {
+        desc_set = cache_it->second;
+    } else {
+        desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
+        rt.desc_set_cache[pipeline->descriptor_set_layout()] = desc_set;
+    }
 
     static const uint32_t MAX_BINDINGS =
         ctx.descriptor_indexing_enabled() ? 256 : 32;
@@ -409,6 +446,7 @@ void flush_stream() {
             rt.desc_pool->reset();
         }
         rt.dirty_buffers.clear();
+        rt.desc_set_cache.clear();  // M17.5: clear on pool reset (flush)
     }
     // Drain quarantined buffers back into the reuse pool now that
     // the command buffer they were referenced by has completed.
@@ -477,6 +515,7 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
         rt.stream->flush_async();
         rt.desc_pool->reset();
         rt.dirty_buffers.clear();
+        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
     auto& cmd = rt.stream->deferred_cmd();

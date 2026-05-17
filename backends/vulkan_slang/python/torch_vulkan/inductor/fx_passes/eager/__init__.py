@@ -13,6 +13,8 @@ from .addmm import (
 )
 from .conv import (
     _ensure_conv1d_with_optional_bias_op_registered,
+    _ensure_conv2d_gn_relu_fused_op_registered,
+    _ensure_conv2d_relu_fused_op_registered,
     _ensure_conv2d_with_optional_bias_op_registered,
 )
 from .optimizer import (
@@ -48,6 +50,10 @@ def register_eager_patch_custom_ops() -> None:
     _ensure_sdpa_with_optional_mask_op_registered()
     _ensure_max_pool2d_op_registered()
     _ensure_adaptive_avg_pool2d_op_registered()
+    # M17.2 Phase 1: conv+ReLU fused custom op
+    _ensure_conv2d_relu_fused_op_registered()
+    # M17.2 Phase 2: conv+GN+ReLU triple-fusion custom op
+    _ensure_conv2d_gn_relu_fused_op_registered()
     # T4.8 foreach optimizer custom ops — registered lazily by
     # install_external_optimizer() in vulkan_template_caller. They live in
     # this module (below) because eager_patches is the canonical home for
@@ -58,6 +64,8 @@ __all__ = [
     "_ensure_addmm_gelu_op_registered",
     "_ensure_adaptive_avg_pool2d_op_registered",
     "_ensure_conv1d_with_optional_bias_op_registered",
+    "_ensure_conv2d_gn_relu_fused_op_registered",
+    "_ensure_conv2d_relu_fused_op_registered",
     "_ensure_conv2d_with_optional_bias_op_registered",
     "_ensure_flash_attention_op_registered",
     "_ensure_foreach_adamw_step_op_registered",

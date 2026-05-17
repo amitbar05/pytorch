@@ -1038,3 +1038,7 @@ class AdamW:
 
     def add_param_group(self, param_group):
         self.param_groups.append(param_group)
+
+
+# Import optim submodule for torch_vulkan.optim.AdamW (M17.4).
+from . import optim  # noqa: E402, F401 (deliberate late import after class defs)

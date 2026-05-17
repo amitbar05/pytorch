@@ -22,6 +22,19 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.virtualized import V
 
+# M17.7 — defer heavy import to first use; the pass is only called once
+# per compile from generate().
+_alloc_alias_fn = None
+
+
+def _get_alloc_alias_fn():
+    global _alloc_alias_fn
+    if _alloc_alias_fn is None:
+        from torch_vulkan.inductor.fx_passes.alloc_alias import alias_alloc_free_pairs
+
+        _alloc_alias_fn = alias_alloc_free_pairs
+    return _alloc_alias_fn
+
 
 def _install_vulkan_skip_alignment_clone() -> None:
     """OP.5 fix — exclude Vulkan tensors from Inductor's alignment check.
@@ -356,6 +369,28 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
                 f"_stashed_outputs[:] = [{', '.join(stash_entries)}]"
             )
         super().generate_return(output_refs)
+
+    # M17.7 — override generate() to post-process the assembled wrapper
+    # source and elide redundant empty_strided_vulkan calls via aliasing.
+    def generate(self, is_inference):
+        result_vlm, kernel_decls_vlm = super().generate(is_inference)
+        try:
+            alias_fn = _get_alloc_alias_fn()
+            new_value = alias_fn(result_vlm.value)
+        except Exception:
+            # Never let a cosmetic optimization break compilation.
+            # Fall through with the un-modified source.
+            return result_vlm, kernel_decls_vlm
+        # Construct a new ValueWithLineMap preserving the original
+        # line_map — the line numbers will be slightly off for elided
+        # lines but the rest of the mapping stays valid.
+        from torch._inductor.utils import ValueWithLineMap
+
+        new_result = ValueWithLineMap(
+            value=new_value,
+            line_map=result_vlm.line_map,
+        )
+        return new_result, kernel_decls_vlm
 
     def codegen_input_size_asserts(self) -> None:
         # P5.11.a.1: under default-ON, skip collecting per-input asserts

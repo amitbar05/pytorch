@@ -461,3 +461,234 @@ def _patch_pre_grad_passes_for_relu_rewrite() -> None:
 
     _cfx.run_pre_grad_passes = _patched
     _cfx._vulkan_relu_rewrite_patched = True
+
+
+def _patch_pre_grad_passes_for_conv_gn_relu_fusion() -> None:
+    """M17.2 Phase 2 pre-grad pass: fuse conv → group_norm → relu into
+    ``torch_vulkan::conv2d_gn_relu_fused``.
+
+    Runs BEFORE AOTAutograd decomposition so ``aten.native_group_norm``
+    is still a single node in the graph.  Matches:
+
+        conv2d_with_optional_bias(x, w, b, ...)
+          → native_group_norm(y, gn_w, gn_b, ...)
+            → relu(z)
+
+    and replaces the chain with a single fused custom-op call.
+    """
+    import torch
+    import torch._inductor.compile_fx as _cfx
+
+    if getattr(_cfx, "_vulkan_conv_gn_relu_fusion_patched", False):
+        return
+
+    _orig = _cfx.run_pre_grad_passes
+
+    def _detect_vulkan(example_inputs_, model_) -> bool:
+        """Return True if this compilation involves Vulkan tensors."""
+        inputs = example_inputs_ or ()
+        for t in inputs:
+            if not isinstance(t, torch.Tensor):
+                continue
+            try:
+                if t.device.type in ("vulkan", "privateuseone"):
+                    return True
+            except Exception:
+                pass
+            try:
+                fd = getattr(t, "fake_device", None)
+                if fd is not None and fd.type in ("vulkan", "privateuseone"):
+                    return True
+            except Exception:
+                pass
+        if isinstance(model_, torch.fx.GraphModule):
+            try:
+                for node in model_.graph.nodes:
+                    if node.op != "placeholder":
+                        continue
+                    val = node.meta.get("val") if hasattr(node, "meta") else None
+                    if val is None:
+                        continue
+                    for v in val if isinstance(val, (list, tuple)) else [val]:
+                        if not isinstance(v, torch.Tensor):
+                            continue
+                        try:
+                            if v.device.type in ("vulkan", "privateuseone"):
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            fd = getattr(v, "fake_device", None)
+                            if fd is not None and fd.type in (
+                                "vulkan",
+                                "privateuseone",
+                            ):
+                                return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return False
+
+    def _patched(model_, example_inputs_):
+        if _detect_vulkan(example_inputs_, model_) and isinstance(
+            model_, torch.fx.GraphModule
+        ):
+            try:
+                _fuse_conv_gn_relu(model_)
+            except Exception as e:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Vulkan pre-grad conv→GN→ReLU fusion failed: %s", e
+                )
+        return _orig(model_, example_inputs_)
+
+    _cfx.run_pre_grad_passes = _patched
+    _cfx._vulkan_conv_gn_relu_fusion_patched = True
+
+
+def _fuse_conv_gn_relu(gm: "torch.fx.GraphModule") -> None:
+    """Scan the FX graph for conv → group_norm → relu chains and replace
+    with ``torch_vulkan::conv2d_gn_relu_fused``.
+    """
+    import operator
+
+    import torch
+
+    aten = torch.ops.aten
+
+    # Conv targets we recognize (pre-decomposition, pre-AOTAutograd).
+    _CONV_TARGETS = set()
+    try:
+        _CONV_TARGETS.add(torch.ops.torch_vulkan.conv2d_with_optional_bias.default)
+    except AttributeError:
+        pass
+    try:
+        _CONV_TARGETS.add(aten.convolution.default)
+    except AttributeError:
+        pass
+
+    # Walk the graph looking for relu nodes whose input is a native_group_norm
+    # whose input is a conv.
+    graph = gm.graph
+    changed = True
+    while changed:
+        changed = False
+        for node in list(graph.nodes):
+            if node.op != "call_function":
+                continue
+
+            # Match: relu
+            if node.target != aten.relu.default:
+                continue
+            relu_node = node
+
+            # M17.2 Phase 2: Match native_group_norm (returns tuple).
+            # Dynamo wraps multi-output ops with operator.getitem(gn_call, 0),
+            # so look through getitem to find the real native_group_norm call.
+            gn_node = None
+            for arg in relu_node.args:
+                if isinstance(arg, torch.fx.Node) and arg.op == "call_function":
+                    if arg.target == aten.native_group_norm.default:
+                        gn_node = arg
+                        break
+                    # Look through operator.getitem(gn_call, idx) wrapper
+                    if (
+                        arg.target == operator.getitem
+                        and len(arg.args) >= 1
+                        and isinstance(arg.args[0], torch.fx.Node)
+                        and arg.args[0].op == "call_function"
+                        and arg.args[0].target == aten.native_group_norm.default
+                    ):
+                        gn_node = arg.args[0]
+                        break
+            if gn_node is None:
+                continue
+
+            # Extract GN args: input, num_groups, weight, bias, eps
+            gn_args = gn_node.args
+            if len(gn_args) < 5:
+                continue
+            gn_input = gn_args[0]
+            num_groups = gn_args[1]
+            gn_weight = gn_args[2]
+            gn_bias = gn_args[3]
+            eps = gn_args[4] if len(gn_args) > 4 else 1e-5
+
+            if not isinstance(gn_input, torch.fx.Node):
+                continue
+            if gn_input.op != "call_function":
+                continue
+
+            # Match: conv (conv2d_with_optional_bias or aten.convolution)
+            conv_node = gn_input
+            if conv_node.target not in _CONV_TARGETS:
+                continue
+
+            # Extract conv args
+            conv_args = conv_node.args
+            if conv_node.target == aten.convolution.default:
+                # aten.convolution(input, weight, bias, stride, padding, dilation, transposed, output_padding, groups)
+                if len(conv_args) < 9:
+                    continue
+                conv_input = conv_args[0]
+                conv_weight = conv_args[1]
+                conv_bias = conv_args[2]
+                conv_stride = conv_args[3]
+                conv_padding = conv_args[4]
+                conv_dilation = conv_args[5]
+                conv_groups = conv_args[8]
+            else:
+                # torch_vulkan::conv2d_with_optional_bias(input, weight, bias, stride, padding, dilation, groups)
+                if len(conv_args) < 7:
+                    continue
+                conv_input = conv_args[0]
+                conv_weight = conv_args[1]
+                conv_bias = conv_args[2]
+                conv_stride = conv_args[3]
+                conv_padding = conv_args[4]
+                conv_dilation = conv_args[5]
+                conv_groups = conv_args[6]
+
+            # Build the fused op call
+            try:
+                fused_op = torch.ops.torch_vulkan.conv2d_gn_relu_fused.default
+            except AttributeError:
+                continue
+
+            # Ensure list types for stride/padding/dilation
+            if not isinstance(conv_stride, (list, tuple)):
+                conv_stride = [conv_stride, conv_stride]
+            if not isinstance(conv_padding, (list, tuple)):
+                conv_padding = [conv_padding, conv_padding]
+            if not isinstance(conv_dilation, (list, tuple)):
+                conv_dilation = [conv_dilation, conv_dilation]
+
+            with graph.inserting_before(relu_node):
+                fused = graph.call_function(
+                    fused_op,
+                    args=(
+                        conv_input,
+                        conv_weight,
+                        conv_bias,
+                        list(conv_stride),
+                        list(conv_padding),
+                        list(conv_dilation),
+                        int(conv_groups),
+                        gn_weight,
+                        gn_bias,
+                        int(num_groups) if num_groups is not None else 1,
+                        float(eps) if eps is not None else 1e-5,
+                    ),
+                )
+                fused.meta = dict(relu_node.meta)
+
+            relu_node.replace_all_uses_with(fused)
+            graph.erase_node(relu_node)
+            graph.erase_node(gn_node)
+            graph.erase_node(conv_node)
+            graph.lint()
+            gm.recompile()
+            changed = True
+            break  # restart scan after graph mutation

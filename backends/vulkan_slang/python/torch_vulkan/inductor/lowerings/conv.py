@@ -189,13 +189,16 @@ def _register_conv_and_pool_lowerings() -> None:
     class _VulkanConv2dExternKernel(ir.ExternKernelOut):
         """ExternKernelOut that dispatches conv2d via the slang_conv2d template.
 
-        Holds conv2d parameters (stride, padding, dilation) as instance
-        attributes so the codegen path can call ``_slang_tile_conv2d``.
+        Holds conv2d parameters (stride, padding, dilation, epilogue) as
+        instance attributes so the codegen path can call ``_slang_tile_conv2d``.
 
         The output buffer is pre-allocated by the wrapper's
         ``codegen_allocation`` path (routed through ``empty_strided_vulkan``).
         The ``codegen`` override emits a direct call to ``_slang_tile_conv2d``
         which writes into the pre-allocated output.
+
+        M17.2: Optional ``epilogue`` param (e.g. ``"OpReLU"``) for
+        fused conv+activation in a single dispatch.
         """
 
         def __init__(
@@ -205,6 +208,7 @@ def _register_conv_and_pool_lowerings() -> None:
             stride_arg,
             padding_arg,
             dilation_arg,
+            epilogue=None,
         ):
             super().__init__(
                 layout=layout,
@@ -215,6 +219,7 @@ def _register_conv_and_pool_lowerings() -> None:
             self.stride_arg = stride_arg
             self.padding_arg = padding_arg
             self.dilation_arg = dilation_arg
+            self.epilogue = epilogue
 
         def codegen(self, wrapper):
             """Emit a call to ``_slang_tile_conv2d`` in the generated wrapper.
@@ -223,6 +228,9 @@ def _register_conv_and_pool_lowerings() -> None:
             go through ``ExternKernelOutLine``) because our function
             signature differs from the standard ``kernel(out=...)``
             convention — we pass the output as a positional arg.
+
+            M17.2: When ``self.epilogue`` is set, the ``epilogue`` kwarg
+            is emitted, routing through the fused conv+activation path.
             """
             wrapper.add_import_once(
                 "from torch_vulkan.inductor.vulkan_template_caller "
@@ -240,6 +248,8 @@ def _register_conv_and_pool_lowerings() -> None:
             pH, pW = self.padding_arg
             dH, dW = self.dilation_arg
 
+            epilogue_kwarg = f', epilogue="{self.epilogue}"' if self.epilogue else ""
+
             self.codegen_comment(wrapper)
             wrapper.writeline(
                 f"_slang_tile_conv2d("
@@ -247,7 +257,8 @@ def _register_conv_and_pool_lowerings() -> None:
                 f"stride=({sH}, {sW}), "
                 f"padding=({pH}, {pW}), "
                 f"dilation=({dH}, {dW}), "
-                f"bias={bias_t})"
+                f"bias={bias_t}"
+                f"{epilogue_kwarg})"
             )
             self.codegen_size_asserts(wrapper)
 

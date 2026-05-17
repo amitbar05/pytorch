@@ -202,35 +202,10 @@ def _install_vulkan_scheduler_exemption() -> None:
         _log.warning("Failed to patch Scheduler.create_backend: %s", e)
 
 
-def _install_vulkan_aten_only_autotune() -> None:
-    """PF.30.h.4 — constrain matmul autotune to ATEN only on Vulkan.
-
-    The Slang tile mm/bmm/addmm kernels produce incorrect forward
-    output (max diff ~28 vs CPU); the autotuner picks broken tiles and
-    silently corrupts gradients. The ATEN choice dispatches to our
-    C++ ``vulkan_mm``/``vulkan_bmm``/``vulkan_addmm`` (verified correct
-    in eager).
-
-    Re-enable Slang tiles per-op by setting
-    ``TORCH_VULKAN_ENABLE_SLANG_TILES=1`` for benchmarking.
-    """
-    import logging
-
-    _log = logging.getLogger(__name__)
-    try:
-        import os as _os
-
-        if _os.environ.get("TORCH_VULKAN_ENABLE_SLANG_TILES") != "1":
-            from torch._inductor import config as _ic
-
-            if hasattr(_ic, "max_autotune_gemm_backends"):
-                _ic.max_autotune_gemm_backends = "ATEN"
-                _log.info(
-                    "Set max_autotune_gemm_backends='ATEN' (Slang tiles disabled "
-                    "until tile-mm correctness audited)"
-                )
-    except Exception as e:
-        _log.warning("Failed to constrain matmul autotune to ATEN: %s", e)
+# M17.1: _install_vulkan_aten_only_autotune removed (2026-05-16).
+# Slang tile mm/bmm/addmm correctness is now verified (max diff ~1e-5 vs CPU).
+# The gate was already dead code (never called from _legacy_register).
+# Use TORCH_VULKAN_DISABLE_SLANG_TILES=1 to disable Slang tiles if needed.
 
 
 def _install_vulkan_cpu_timer_benchmark() -> None:

@@ -29,23 +29,42 @@ class DispatchBatcher:
     (still beneficial: eliminates Python bytecode overhead between dispatches).
     """
 
-    # Cached lookup of the batch FFI entry point (lazy, once per process).
-    _batch_ffi = None
-    _batch_ffi_probed: bool = False
+    # Cached lookup of C++ batch-mode functions (lazy, once per process).
+    _begin_batch = None
+    _end_batch = None
+    _batch_probed: bool = False
 
     def __init__(self):
         self._pending: list[tuple] = []  # (kernel_callable, args_tuple)
         self._active: bool = False
+        self._batch_active: bool = False  # C++ batch mode engaged
 
     def __enter__(self):
         self._active = True
         self._pending.clear()
+        # M17.5: Engage C++ batch mode to suppress per-8-dispatch auto-flush.
+        # When batch mode is active, all dispatches accumulate in a single
+        # command buffer and are submitted together on __exit__.
+        self._ensure_batch_resolved()
+        if self._begin_batch is not None:
+            try:
+                self._begin_batch()
+                self._batch_active = True
+            except Exception:
+                self._batch_active = False
         return self
 
     def __exit__(self, *args):
         self._active = False
         if self._pending:
             self._flush()
+        # M17.5: Disengage C++ batch mode — flush remaining dispatches.
+        if self._batch_active and self._end_batch is not None:
+            try:
+                self._end_batch()
+            except Exception:
+                pass
+            self._batch_active = False
         return False  # propagate exceptions
 
     def add(self, kernel_handle, *dispatch_args):
@@ -64,42 +83,36 @@ class DispatchBatcher:
     def _flush(self):
         """Submit all pending dispatches.
 
-        Tries the C++ ``_jit_dispatch_batch`` fast path first (single
-        ``vkQueueSubmit`` for all kernels).  Falls back to sequential
-        individual dispatches when the C++ FFI is unavailable.
+        When C++ batch mode is active (M17.5), the ``begin_batch_dispatch``
+        call has suppressed per-8-dispatch auto-flush, so all dispatches
+        accumulate in a single command buffer.  We replay them sequentially
+        here, then ``end_batch_dispatch`` (called in ``__exit__``) flushes
+        with a single ``vkQueueSubmit``.
+
+        Falls back to sequential individual dispatches with per-8-dispatch
+        auto-flush when the C++ batch functions are unavailable.
         """
         if not self._pending:
             return
 
-        # Try the C++ batch FFI path.
-        batch_fn = self._resolve_batch_ffi()
-        if batch_fn is not None:
-            try:
-                handles = [h for h, _ in self._pending]
-                arg_lists = [list(a) for _, a in self._pending]
-                batch_fn(handles, arg_lists)
-                self._pending.clear()
-                return
-            except Exception:
-                # Fall through to sequential path on any C++ error.
-                pass
-
-        # Sequential fallback: call each kernel in a tight loop.
-        # Still beneficial vs. full Python wrapper overhead per dispatch.
+        # Sequential replay: each kernel_handle calls through to
+        # dispatch_shader() which, with batch_mode=true, skips auto-flush.
+        # All dispatches accumulate in one command buffer.
         for kernel_handle, dispatch_args in self._pending:
             kernel_handle(*dispatch_args)
         self._pending.clear()
 
     @classmethod
-    def _resolve_batch_ffi(cls):
-        """Lazily resolve the ``_jit_dispatch_batch`` C++ FFI entry."""
-        if cls._batch_ffi_probed:
-            return cls._batch_ffi
-        cls._batch_ffi_probed = True
+    def _ensure_batch_resolved(cls):
+        """Lazily resolve the C++ batch-mode entry points."""
+        if cls._batch_probed:
+            return
+        cls._batch_probed = True
         try:
             from torch_vulkan import _C as _c
 
-            cls._batch_ffi = getattr(_c, "_jit_dispatch_batch", None)
+            cls._begin_batch = getattr(_c, "begin_batch_dispatch", None)
+            cls._end_batch = getattr(_c, "end_batch_dispatch", None)
         except Exception:
-            cls._batch_ffi = None
-        return cls._batch_ffi
+            cls._begin_batch = None
+            cls._end_batch = None
