@@ -174,12 +174,18 @@ class ReductionMixin(ReductionLoadMixin):
             self.headers.add(_wave_fn)
             return result
 
+        # M20.6: wave size flows through the VK_SUBGROUP_SIZE spec const
+        # (declared in lib/helpers.slang at constant_id=100, default 64).
+        # The rendered Slang reads ``VK_SUBGROUP_SIZE`` instead of a
+        # baked ``{simd}u`` literal, so future wave32 dispatch on
+        # NAVI21+ silicon overrides the spec const at pipeline create
+        # time without any codegen surgery.
         if partitioned is not None and self.multistage_reduction_entry:
             ty, tx, loop_y, loop_x = partitioned
             guarded_val = str(val)
             result = self.cse.generate(
                 self.stores,
-                f"wg_reduce_wave_2d<{op_tmpl}>({guarded_val}, lid.x, lid.y, {tx}, {ty}, {simd}u)",
+                f"wg_reduce_wave_2d<{op_tmpl}>({guarded_val}, lid.x, lid.y, {tx}, {ty}, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[dtype],
             )
             self.headers.add("wgreduce2d")
@@ -189,7 +195,7 @@ class ReductionMixin(ReductionLoadMixin):
             guarded_val = str(val)
             result = self.cse.generate(
                 self.stores,
-                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, {linear_tid}, {n_waves}u, {simd}u)",
+                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, {linear_tid}, {n_waves}u, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[dtype],
             )
             self.headers.add("wgreduce")
@@ -201,7 +207,7 @@ class ReductionMixin(ReductionLoadMixin):
             )
             result = self.cse.generate(
                 self.stores,
-                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, lid.x, {n_waves}u, {simd}u)",
+                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, lid.x, {n_waves}u, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[dtype],
             )
             self.headers.add("wgreduce")
@@ -267,7 +273,7 @@ class ReductionMixin(ReductionLoadMixin):
         tup_name = f"tmp_wf_{next(self.acc_var_ids)}"
         self.stores.writeline(
             f"WelfordResult<float> {tup_name} = "
-            f"wg_welford({input_triple}, lid.x, {red_size});"
+            f"wg_welford({input_triple}, lid.x, {red_size}, VK_SUBGROUP_SIZE);"
         )
         comp_dtype = DTYPE_TO_COMPUTATION_DTYPE[dtype]
         mean_v = V.kernel.create_cse_var(
@@ -288,7 +294,7 @@ class ReductionMixin(ReductionLoadMixin):
         red_size = min(red_numel, self.max_threadgroup_size)
         return self.cse.generate(
             self.stores,
-            f"vk_wg_reduce_any({value} ? 1.0f : 0.0f, lid.x, {red_size}) != 0.0f",
+            f"vk_wg_reduce_any({value} ? 1.0f : 0.0f, lid.x, {red_size}, VK_SUBGROUP_SIZE) != 0.0f",
             dtype=torch.bool,
         )
 
@@ -303,13 +309,13 @@ class ReductionMixin(ReductionLoadMixin):
             self.headers.add("wgreduce2d_xor")
             result = self.cse.generate(
                 self.stores,
-                f"vk_wg_reduce_xor_2d({value}, {tx}, lid.y * {tx} + lid.x, {tx * ty})",
+                f"vk_wg_reduce_xor_2d({value}, {tx}, lid.y * {tx} + lid.x, {tx * ty}, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[src_dtype],
             )
         else:
             result = self.cse.generate(
                 self.stores,
-                f"vk_wg_reduce_xor({value}, lid.x, {red_size})",
+                f"vk_wg_reduce_xor({value}, lid.x, {red_size}, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[src_dtype],
             )
         return result
@@ -347,7 +353,7 @@ class ReductionMixin(ReductionLoadMixin):
 
         result = self.cse.generate(
             self.stores,
-            f"vk_wg_reduce_arg{suffix}({guarded_val}, lid.x, {red_size})",
+            f"vk_wg_reduce_arg{suffix}({guarded_val}, lid.x, {red_size}, VK_SUBGROUP_SIZE)",
             dtype=dtype,
         )
         result_val = V.kernel.create_cse_var(
@@ -403,10 +409,12 @@ class ReductionMixin(ReductionLoadMixin):
             dtype: Output dtype for CSE registration.
         """
         self.headers.add("wg_scan_exclusive")
+        # M20.6: wave-size literal replaced with VK_SUBGROUP_SIZE spec const
+        # (lib/helpers.slang, constant_id=100, default 64).
         result = self.cse.generate(
             self.compute,
             f"wg_scan_exclusive<{scan_op}>"
-            f"({value}, lid.x & ({self.simd_group_size}u - 1u), {self.simd_group_size}u)",
+            f"({value}, lid.x & (VK_SUBGROUP_SIZE - 1u), VK_SUBGROUP_SIZE)",
             dtype=dtype,
         )
         return result
@@ -428,10 +436,10 @@ class ReductionMixin(ReductionLoadMixin):
             dtype: Output dtype for CSE registration.
         """
         self.headers.add("wg_scan_inclusive")
+        # M20.6: wave-size literal replaced with VK_SUBGROUP_SIZE spec const.
         result = self.cse.generate(
             self.compute,
-            f"wg_scan_inclusive<{scan_op}>"
-            f"({value}, lid.x, {size}u, {self.simd_group_size}u)",
+            f"wg_scan_inclusive<{scan_op}>({value}, lid.x, {size}u, VK_SUBGROUP_SIZE)",
             dtype=dtype,
         )
         return result
@@ -464,7 +472,8 @@ class ReductionMixin(ReductionLoadMixin):
         result = self.cse.generate(
             self.compute,
             f"wg_scan_inclusive<{struct_name}>"
-            f"({guarded_val}, lid.x, {red_size}u, {self.simd_group_size}u)",
+            # M20.6: wave-size literal replaced with VK_SUBGROUP_SIZE spec const.
+            f"({guarded_val}, lid.x, {red_size}u, VK_SUBGROUP_SIZE)",
             dtype=dtypes[0],
         )
         return (result,)

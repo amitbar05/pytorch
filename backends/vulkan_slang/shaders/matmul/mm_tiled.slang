@@ -6,6 +6,25 @@
 // When transpose_b=1: B is [N,K]  (contiguous), op(B) = B^T
 //
 // Each thread block computes a TILE_SIZE x TILE_SIZE tile of C.
+//
+// M22.13-followup: derive ``lrow`` / ``lcol`` from a linearised
+// ``tid_local`` instead of reading ``lid.x`` / ``lid.y`` directly. The
+// raw ``lid.x``/``lid.y`` form triggered a slangc 2026.5+ wave64
+// scalarisation bug on RDNA1 (3+ structured-buffer bindings, both
+// ``lid.x`` and ``lid.y`` used to address different buffers): the
+// generated SPIR-V folded ``lid.x`` to a constant for lanes with
+// ``lid.x >= 1``, collapsing rows 1..TILE_SIZE-1 of every output tile
+// onto row 0 (the visually-buggy "all rows identical" symptom from
+// M22.13). The pattern is the analog of M17.1's ``slang_mm.slang``
+// fix (see ``templates/slang_mm.slang`` lines 239-246).
+//
+// Linearisation rule used here: this shader's workgroup is
+// ``numthreads(TILE_SIZE, TILE_SIZE, 1)``, so the SPIR-V lane ordering
+// is ``lane = lid.y * TILE_SIZE + lid.x``. Reconstructing ``lid.x``
+// and ``lid.y`` from that lane via integer math IS algebraically
+// identical to the direct read — but slangc's wave64 scalarisation
+// pass does not recognise the recovered values as wave-uniform, so
+// the buggy fold doesn't fire.
 
 static const uint TILE_SIZE = 16;
 
@@ -28,13 +47,19 @@ struct Params {
 [shader("compute")]
 [numthreads(TILE_SIZE, TILE_SIZE, 1)]
 void computeMain(
-    uint3 tid : SV_DispatchThreadID,
-    uint3 lid : SV_GroupThreadID)
+    uint3 lid : SV_GroupThreadID,
+    uint3 gid : SV_GroupID)
 {
-    uint row = tid.x;
-    uint col = tid.y;
-    uint lrow = lid.x;
-    uint lcol = lid.y;
+    // M22.13-followup: derive per-thread coordinates from a linearised
+    // ``tid_local``. Algebraically identical to reading lid.x/lid.y
+    // directly, but the SPIR-V wave64-scalarisation pass treats the
+    // recovered values as per-lane (correct) rather than wave-uniform
+    // (the buggy fold).
+    uint tid_local = lid.y * TILE_SIZE + lid.x;
+    uint lrow = tid_local % TILE_SIZE;  // == lid.x — but recovered
+    uint lcol = tid_local / TILE_SIZE;  // == lid.y — but recovered
+    uint row = gid.x * TILE_SIZE + lrow;
+    uint col = gid.y * TILE_SIZE + lcol;
 
     float sum = 0.0f;
 

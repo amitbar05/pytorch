@@ -232,6 +232,7 @@ def register() -> None:
     from .loss import _register_loss_lowerings
     from .matmul import (
         _register_bmm_lowering,
+        _register_linear_backward_decomposition,
         _register_matmul_backward,
         _register_matmul_lowering,
         _register_mm_int8_lowering,
@@ -247,6 +248,13 @@ def register() -> None:
     make_fallback(torch.ops.torch_vulkan.foreach_sgd_momentum_step)
     make_fallback(torch.ops.torch_vulkan.foreach_adamw_step)
     make_fallback(torch.ops.torch_vulkan.foreach_lion_step)
+
+    # M17.8.d.2 / M22.14 — opaque conv2d_backward custom op. Emits
+    # extern_kernels.conv2d_backward(...) which runs the C++
+    # vulkan_convolution_backward_overrideable adapter at runtime.
+    # Registered by fx_passes/eager/conv.py::_ensure_conv2d_backward_op_registered.
+    if hasattr(torch.ops.torch_vulkan, "conv2d_backward"):
+        make_fallback(torch.ops.torch_vulkan.conv2d_backward.default)
 
     # TRAIN.7: autocast boundary ops — identity dtype casts that must not
     # break fusion.  aten._autocast_to_reduced_precision (fp32→fp16/bf16)
@@ -316,6 +324,15 @@ def register() -> None:
     _register_mm_int8_lowering()
     _register_matmul_lowering()
     _register_matmul_backward()
+    # M19.1: install pure-aten decomp for ``aten.linear_backward.default``.
+    # Replaces the 8-dispatch C++ eager path with mm + sum primitives that
+    # Inductor can schedule + fuse. Enabled by M22.13 — the underlying
+    # mm tile transpose-a path is now corrected in
+    # ``csrc/ops/matmul_ops.cpp::vulkan_addmm_out`` (detects
+    # ``is_t_transposed(mat2)`` and routes to ``vulkan_linear`` which has
+    # the validated ``is_t_transposed`` fast-path). See M19.1 docstring
+    # in lowerings/matmul.py for the dispatch ratchet discussion.
+    _register_linear_backward_decomposition()
     # OP.26: native SDPA lowering — routes aten.scaled_dot_product_attention
     # directly to the FlashAttention template, eliminating the symptom-fix
     # pattern matcher in fx_passes/patterns/sdpa.py (anti-goal #5).

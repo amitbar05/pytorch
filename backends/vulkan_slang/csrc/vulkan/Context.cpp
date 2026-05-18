@@ -18,11 +18,41 @@ namespace vulkan {
 // ── Debug callback ───────────────────────────────────────────────
 VkBool32 VKAPI_CALL Context::debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT /*type*/,
+    VkDebugUtilsMessageTypeFlagsEXT type,
     const VkDebugUtilsMessengerCallbackDataEXT* data,
     void* /*user_data*/) {
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        std::cerr << "[Vulkan Validation] " << data->pMessage << std::endl;
+    // Map severity bit to a short tag so the M21.3 sweep parser can
+    // categorize hints. BestPractices hints arrive at INFO severity, so we
+    // accept everything from INFO and above when TORCH_VULKAN_DEBUG_UTILS=1
+    // is set; otherwise only WARNING+ to keep production logs quiet.
+    const char* sev_tag = "UNKNOWN";
+    switch (severity) {
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT: sev_tag = "VERBOSE"; break;
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT:    sev_tag = "INFO";    break;
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT: sev_tag = "WARNING"; break;
+        case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:   sev_tag = "ERROR";   break;
+        default: break;
+    }
+    // Type bits are flags — concatenate the active ones.
+    std::string type_tag;
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT)     type_tag += "GENERAL|";
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)  type_tag += "VALIDATION|";
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) type_tag += "PERFORMANCE|";
+    if (!type_tag.empty()) type_tag.pop_back();  // drop trailing '|'
+
+    // When TORCH_VULKAN_DEBUG_UTILS is set, surface every message
+    // (including INFO-level best-practices hints) so the M21.3 sweep
+    // can collect them. Otherwise keep the WARNING+ floor for production.
+    static const bool debug_utils_full =
+        []() {
+            const char* e = getenv("TORCH_VULKAN_DEBUG_UTILS");
+            return e && strcmp(e, "0") != 0;
+        }();
+    if (debug_utils_full ||
+        severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        std::cerr << "[Vulkan VUID] " << sev_tag << " " << type_tag << " "
+                  << (data && data->pMessage ? data->pMessage : "")
+                  << std::endl;
     }
     return VK_FALSE;
 }
@@ -151,12 +181,22 @@ void Context::init_instance() {
     }
 
     // Set up debug messenger
+    // TORCH_VULKAN_DEBUG_UTILS=1 opts into the full M21.3 sweep mode:
+    // INFO-level severity is enabled so BestPractices hints (which the
+    // Khronos layer emits at INFO) reach userspace stderr. Production
+    // and ordinary tests get the WARNING+ floor.
+    const char* du_env = getenv("TORCH_VULKAN_DEBUG_UTILS");
+    bool debug_utils_full = du_env && strcmp(du_env, "0") != 0;
     if (has_validation && has_debug_utils) {
         VkDebugUtilsMessengerCreateInfoEXT dbg_info{};
         dbg_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
         dbg_info.messageSeverity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        if (debug_utils_full) {
+            dbg_info.messageSeverity |=
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+        }
         dbg_info.messageType =
             VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
             VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
@@ -203,16 +243,28 @@ void Context::init_device(uint32_t index) {
     vkGetPhysicalDeviceFeatures(dev.physical, &features);
     dev.caps.float64 = features.shaderFloat64;
     dev.caps.int64 = features.shaderInt64;
+    // M18.4-followup-C: shaderInt16 lives on the base VkPhysicalDeviceFeatures
+    // (not the Vulkan 1.2 aggregate). Required for declaring 16-bit
+    // arithmetic / 16-bit element-typed structured buffers.
+    dev.caps.int16 = features.shaderInt16;
 
-    // Check for float16 / int8 support (chain through Vulkan 1.2
-    // features then descriptor indexing features for a single query).
+    // Check for float16 / int8 / 8-bit / 16-bit storage support. The Vulkan
+    // 1.2 aggregated features struct already covers 8-bit storage and the
+    // 1.1 aggregate covers 16-bit storage. Chain both through pNext so a
+    // single ``vkGetPhysicalDeviceFeatures2`` populates all of them.
     VkPhysicalDeviceDescriptorIndexingFeatures desc_idx_features{};
     desc_idx_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
 
+    // M18.4-followup-C: Vulkan 1.1 features expose
+    // ``storageBuffer16BitAccess`` + ``uniformAndStorageBuffer16BitAccess``.
+    VkPhysicalDeviceVulkan11Features vk11_features{};
+    vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    vk11_features.pNext = &desc_idx_features;
+
     VkPhysicalDeviceVulkan12Features vk12_features{};
     vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    vk12_features.pNext = &desc_idx_features;
+    vk12_features.pNext = &vk11_features;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -220,6 +272,15 @@ void Context::init_device(uint32_t index) {
     vkGetPhysicalDeviceFeatures2(dev.physical, &features2);
     dev.caps.float16 = vk12_features.shaderFloat16;
     dev.caps.int8 = vk12_features.shaderInt8;
+    // M18.4-followup-C: stash 8/16-bit storage caps for the device-create
+    // step below. We enable them only when the device reports support
+    // (defensive — Lavapipe / older drivers may lack one or both).
+    dev.caps.storage_buffer_8bit = vk12_features.storageBuffer8BitAccess;
+    dev.caps.uniform_and_storage_buffer_8bit =
+        vk12_features.uniformAndStorageBuffer8BitAccess;
+    dev.caps.storage_buffer_16bit = vk11_features.storageBuffer16BitAccess;
+    dev.caps.uniform_and_storage_buffer_16bit =
+        vk11_features.uniformAndStorageBuffer16BitAccess;
 
     // ── Descriptor indexing support ─────────────────────────
     // Gate: env var TORCH_VULKAN_DESCRIPTOR_INDEXING (default 1 on
@@ -285,15 +346,36 @@ void Context::init_device(uint32_t index) {
     queue_ci.queueCount = 1;
     queue_ci.pQueuePriorities = &queue_priority;
 
-    // Enable Vulkan 1.2 features + descriptor indexing we need.
+    // Enable Vulkan 1.2 + 1.1 aggregated features + descriptor indexing.
     // Spec (VUID-VkDeviceCreateInfo-pNext-02830): when VkPhysicalDeviceVulkan12Features
     // is in the pNext chain, the legacy per-feature structs (including
-    // VkPhysicalDeviceDescriptorIndexingFeatures) must NOT also be present —
-    // the 1.2 features struct already aggregates those bits.
+    // VkPhysicalDeviceDescriptorIndexingFeatures and the standalone
+    // 8-bit / 16-bit storage feature structs) must NOT also be present —
+    // the 1.x aggregated structs already cover those bits.
+    //
+    // M18.4-followup-C: also enable the 8/16-bit storage bits from the
+    // 1.1+1.2 aggregates, plus ``shaderInt16`` on the base
+    // VkPhysicalDeviceFeatures struct. With these flipped on, the
+    // generated SPIR-V is allowed to declare ``RWStructuredBuffer<T>``
+    // with ``T ∈ {int8_t, uint8_t, int16_t, uint16_t}`` which matches
+    // PyTorch's native 1B/2B allocation for narrow-int dtypes and
+    // closes the M17.8.d.3 tail-corruption bug class for the full set.
+    VkPhysicalDeviceVulkan11Features enabled_vk11{};
+    enabled_vk11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    enabled_vk11.storageBuffer16BitAccess =
+        dev.caps.storage_buffer_16bit ? VK_TRUE : VK_FALSE;
+    enabled_vk11.uniformAndStorageBuffer16BitAccess =
+        dev.caps.uniform_and_storage_buffer_16bit ? VK_TRUE : VK_FALSE;
+
     VkPhysicalDeviceVulkan12Features enabled_vk12{};
     enabled_vk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    enabled_vk12.pNext = &enabled_vk11;
     enabled_vk12.shaderFloat16 = dev.caps.float16;
     enabled_vk12.shaderInt8 = dev.caps.int8;
+    enabled_vk12.storageBuffer8BitAccess =
+        dev.caps.storage_buffer_8bit ? VK_TRUE : VK_FALSE;
+    enabled_vk12.uniformAndStorageBuffer8BitAccess =
+        dev.caps.uniform_and_storage_buffer_8bit ? VK_TRUE : VK_FALSE;
     enabled_vk12.timelineSemaphore = VK_TRUE;
     enabled_vk12.bufferDeviceAddress = VK_FALSE;
     enabled_vk12.descriptorIndexing =
@@ -306,6 +388,8 @@ void Context::init_device(uint32_t index) {
     // shaderInt64 is required by SPIR-V kernels emitted by Inductor that use
     // 64-bit integer arithmetic for indexing (cat/view, gather, scatter).
     enabled_features.shaderInt64 = dev.caps.int64;
+    // M18.4-followup-C: shaderInt16 unlocks 16-bit arithmetic in shaders.
+    enabled_features.shaderInt16 = dev.caps.int16 ? VK_TRUE : VK_FALSE;
 
     VkDeviceCreateInfo device_ci{};
     device_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -396,8 +480,32 @@ std::string Context::device_name(uint32_t index) const {
     return capabilities(index).device_name;
 }
 
+// M-cpp-new-5-followup-test: process-global runtime override.
+// -1 = use the capability (default); 0 = force off; 1 = force on.
+// Atomic so tests can flip it concurrently with dispatch threads
+// reading it.
+static std::atomic<int> g_desc_indexing_override{-1};
+
 bool Context::descriptor_indexing_enabled(uint32_t index) const {
+    // M-cpp-new-5-followup-test: consult the override BEFORE the
+    // capability flag. The atomic load is uncontended in the common
+    // case (override stays at -1 in production) and adds ~1 ns to
+    // the hot path.
+    const int override_val = g_desc_indexing_override.load(
+        std::memory_order_relaxed);
+    if (override_val == 0) return false;
+    if (override_val == 1) return true;
+    // override_val == -1 (or any other sentinel): fall through to
+    // the underlying capability flag.
     return capabilities(index).descriptor_indexing;
+}
+
+void Context::set_descriptor_indexing_override(int value) {
+    g_desc_indexing_override.store(value, std::memory_order_relaxed);
+}
+
+int Context::get_descriptor_indexing_override() {
+    return g_desc_indexing_override.load(std::memory_order_relaxed);
 }
 
 } // namespace vulkan

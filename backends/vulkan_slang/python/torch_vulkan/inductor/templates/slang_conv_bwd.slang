@@ -15,6 +15,22 @@
 // Mesa ACO on RDNA1 cannot lower `buffer_atomic_add_f32` and crashes at
 // shader assembly; the CAS path is portable and the canonical fallback
 // established by `lib/atomics.slang`.
+//
+// M20.3: Tile sizes are specialization constants (``[[vk::constant_id]]``).
+// One SPIR-V module per (dtype, has_bias) configuration is reused across
+// every (TILE_W, TILE_H, TILE_C, THREADS_W, THREADS_H) tuple — the caller
+// passes the tuple via Vulkan spec-constant overrides at pipeline-create
+// time. The Jinja default after ``/*}}*/`` keeps the raw .slang file
+// passing ``slangc --syntax-check`` standalone.
+//
+// Constant ID assignment (file-local 40-44; avoids 10-12 used by
+// flash_attention, 20-24 by slang_mm, 30-34 by slang_conv2d fwd, and
+// 13-15 by flash_attention_bwd):
+//   40 — TILE_W      (default 8)
+//   41 — TILE_H      (default 8)
+//   42 — TILE_C      (default 8)
+//   43 — THREADS_W   (default 16)
+//   44 — THREADS_H   (default 16)
 import atomics;
 
 /*{%*/ set tile_w = tile_w | default(8) /*%}*/
@@ -22,6 +38,14 @@ import atomics;
 /*{%*/ set tile_c = tile_c | default(8) /*%}*/
 /*{%*/ set threads_w = threads_w | default(16) /*%}*/
 /*{%*/ set threads_h = threads_h | default(16) /*%}*/
+
+// M20.3: Specialization constants — overridden at dispatch time so the
+// same SPIR-V module serves all autotuned tile configs.
+[[vk::constant_id(40)]] const uint TILE_W = /*{{*/ tile_w /*}}8*/;
+[[vk::constant_id(41)]] const uint TILE_H = /*{{*/ tile_h /*}}8*/;
+[[vk::constant_id(42)]] const uint TILE_C = /*{{*/ tile_c /*}}8*/;
+[[vk::constant_id(43)]] const uint THREADS_W = /*{{*/ threads_w /*}}16*/;
+[[vk::constant_id(44)]] const uint THREADS_H = /*{{*/ threads_h /*}}16*/;
 
 // ── Push-constant struct (fits in 128B Vulkan limit) ──────────────────
 // grad_input strides = input strides (same NCHW shape).
@@ -80,7 +104,8 @@ struct KernelArgs {
     RWStructuredBuffer<uint> grad_bias;
 /*{%*/ endif /*%}*/
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // ── CG.M6: Differentiable scalar inner — inlined for standalone compilation ──
 // Uses [BackwardDerivative] to avoid autodiff coverage warnings.
@@ -103,8 +128,10 @@ void conv_inner_madd_bwd(
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
+// M20.3: numthreads now references the spec-constant THREADS_W/THREADS_H so
+// the same SPIR-V module handles any (THREADS_W, THREADS_H) combo.
 [shader("compute")]
-[numthreads(/*{{*/ threads_w /*}}16*/, /*{{*/ threads_h /*}}16*/, 1)]
+[numthreads(THREADS_W, THREADS_H, 1)]
 void computeMain(
     uint3 gtid : SV_DispatchThreadID,
     uint3 gid : SV_GroupID,
@@ -115,23 +142,40 @@ void computeMain(
     uint tile_h_idx = gid.y;
     uint batch_co_tile = gid.z;
 
-    uint tile_c_count = (pc.C_out + /*{{*/ tile_c /*}}8*/u - 1u) / /*{{*/ tile_c /*}}8*/u;
+    // M20.3: TILE_C / TILE_W / TILE_H are spec constants (vk::constant_id
+    // 40-42). Same SPIR-V module serves all autotune tile choices.
+    uint tile_c_count = (pc.C_out + TILE_C - 1u) / TILE_C;
     uint n = batch_co_tile / tile_c_count;
     uint co_tile = batch_co_tile % tile_c_count;
 
     if (n >= pc.N || co_tile >= tile_c_count) return;
 
-    uint co_start = co_tile * /*{{*/ tile_c /*}}8*/u;
-    uint co_end = min(co_start + /*{{*/ tile_c /*}}8*/u, pc.C_out);
+    uint co_start = co_tile * TILE_C;
+    uint co_end = min(co_start + TILE_C, pc.C_out);
 
-    uint ow_start = tile_w_idx * /*{{*/ tile_w /*}}8*/u;
-    uint oh_start = tile_h_idx * /*{{*/ tile_h /*}}8*/u;
-    uint ow_end = min(ow_start + /*{{*/ tile_w /*}}8*/u, pc.oW);
-    uint oh_end = min(oh_start + /*{{*/ tile_h /*}}8*/u, pc.oH);
+    uint ow_start = tile_w_idx * TILE_W;
+    uint oh_start = tile_h_idx * TILE_H;
+    uint ow_end = min(ow_start + TILE_W, pc.oW);
+    uint oh_end = min(oh_start + TILE_H, pc.oH);
 
     // ── Per-thread output position ───────────────────────────────────
-    uint local_ow = lid.x;
-    uint local_oh = lid.y;
+    // M-slang-new-4: derive local_ow / local_oh from a linearised
+    // ``tid_local`` instead of reading ``lid.x`` / ``lid.y`` directly.
+    // Same slangc 2026.5+ wave64 scalarisation bug as M22.13 / M22.13-
+    // extras: 5+ StructuredBuffer bindings (args.input, args.weight,
+    // args.grad_out, args.grad_input, args.grad_weight, optional
+    // args.grad_bias) with both ``lid.x`` and ``lid.y`` reads addressing
+    // different buffers triggers the row-collapse fold on RDNA1 wave64.
+    //
+    // Linearisation rule: workgroup is ``numthreads(THREADS_W,
+    // THREADS_H, 1)``, so SPIR-V lane ordering is
+    // ``lane = lid.y * THREADS_W + lid.x``. Reconstructing via modular
+    // arithmetic is algebraically identical to direct ``lid`` reads but
+    // sidesteps the slangc fold. See ``mm_tiled.slang`` /
+    // ``slang_conv2d.slang`` for the precedent.
+    uint tid_local = lid.y * THREADS_W + lid.x;
+    uint local_ow = tid_local % THREADS_W;  // == lid.x — but recovered
+    uint local_oh = tid_local / THREADS_W;  // == lid.y — but recovered
 
     uint ow = ow_start + local_ow;
     uint oh = oh_start + local_oh;
@@ -142,9 +186,11 @@ void computeMain(
     uint dx_batch_base = n * pc.stride_in_n  /*dx same as input*/;
 
     // ── Per-thread dB accumulator (local to this workgroup tile) ─────
-    float db_local[/*{{*/ tile_c /*}}8*/];
+    // M20.3: array dimension uses spec-constant TILE_C. SPIR-V supports
+    // spec-constant-sized arrays for local (non-groupshared) declarations.
+    float db_local[TILE_C];
     [unroll]
-    for (uint ci = 0; ci < /*{{*/ tile_c /*}}8*/; ci++) {
+    for (uint ci = 0; ci < TILE_C; ci++) {
         db_local[ci] = 0.0f;
     }
 
@@ -216,7 +262,7 @@ void computeMain(
     // ── Atomic accumulate dB contributions ────────────────────────────
 /*{%*/ if has_bias /*%}*/
     [unroll]
-    for (uint ci = 0; ci < /*{{*/ tile_c /*}}8*/; ci++) {
+    for (uint ci = 0; ci < TILE_C; ci++) {
         uint co = co_start + ci;
         if (co >= co_end) break;
         if (db_local[ci] != 0.0f) {

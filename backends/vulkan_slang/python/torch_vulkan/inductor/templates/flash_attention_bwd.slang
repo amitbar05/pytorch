@@ -26,12 +26,41 @@
 //   head_dim      — D ∈ {32, 64, 128, 256}
 //   BK            — K/V tile size along S axis (default 64)
 //   BQ            — Q tile size along N axis (default 32)
+//
+// M20.3: BQ, BK, HEAD_DIM are specialization constants
+// (``[[vk::constant_id]]``). They determine groupshared array sizes and
+// numthreads at SPIR-V compile time. One SPIR-V module per (dtype,
+// is_causal, head_layout) serves every (BQ, BK, HEAD_DIM) tuple — the
+// caller passes the tuple via Vulkan spec-constant overrides.
+//
+// Constant ID assignment (file-local 13-15; sequential after the
+// forward template's 10-12 so dispatching forward+backward in the same
+// pipeline-cache run doesn't collide):
+//   13 — BQ        (default 32)
+//   14 — BK        (default 64)
+//   15 — HEAD_DIM  (default 64)
+//
+// We don't use the forward's 10-12 because backward maintains its own
+// pipeline cache key; reusing the same IDs would force a forced
+// override at every backward dispatch and lose the cleanliness of the
+// per-template ID space.
 
 // dK/dV use CAS-based vk_atomic_add (Mesa ACO on RDNA1 cannot lower
 // `buffer_atomic_add_f32`; the lib's CAS path is portable).
 import atomics;
 
 /*{%*/ set wg_size = head_dim if head_dim <= 256 else 256 /*%}*/
+
+// M20.3: Specialization constants for tile shape + workgroup dimensions.
+// HEAD_DIM doubles as the workgroup x-dim — ``numthreads`` references it
+// directly because Slang's compile-time-constant analysis only recognises
+// spec consts in attribute arguments when the spec-const symbol is used
+// without an intermediate ``static const`` alias (verified standalone:
+// ``numthreads(X, 1, 1)`` works for ``[[vk::constant_id(N)]] const uint X``
+// but ``static const uint Y = X; numthreads(Y, 1, 1)`` does not).
+[[vk::constant_id(13)]] const uint BQ = /*{{*/ BQ /*}}32*/;
+[[vk::constant_id(14)]] const uint BK = /*{{*/ BK /*}}64*/;
+[[vk::constant_id(15)]] const uint HEAD_DIM = /*{{*/ head_dim /*}}64*/;
 
 struct BwdPC {
     uint B;           // batch size
@@ -60,13 +89,15 @@ struct KernelArgs {
     RWStructuredBuffer<uint> dK;
     RWStructuredBuffer<uint> dV;
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // Shared memory for Q, K, V, dO tiles.
-groupshared float Q_smem[/*{{*/ BQ /*}}32*/ * /*{{*/ head_dim /*}}64*/];
-groupshared float K_smem[/*{{*/ BK /*}}64*/ * /*{{*/ head_dim /*}}64*/];
-groupshared float V_smem[/*{{*/ BK /*}}64*/ * /*{{*/ head_dim /*}}64*/];
-groupshared float dO_smem[/*{{*/ BQ /*}}32*/ * /*{{*/ head_dim /*}}64*/];
+// M20.3: groupshared array dimensions use spec-constant BQ, BK, HEAD_DIM.
+groupshared float Q_smem[BQ * HEAD_DIM];
+groupshared float K_smem[BK * HEAD_DIM];
+groupshared float V_smem[BK * HEAD_DIM];
+groupshared float dO_smem[BQ * HEAD_DIM];
 
 // ── CG.M7: Differentiable scalar inner functions (inlined) ──────────────
 // These are copies of loss.slang::sdpa_score / sdpa_output / softmax_elem
@@ -108,22 +139,22 @@ uint _kv_offset(uint b, uint kv_h, uint pos, uint d) {
 // ── Entry point — one workgroup per (b, h, q_tile) ───────────────────────
 
 [shader("compute")]
-[numthreads(/*{{*/ wg_size /*}}256*/, 1, 1)]
+[numthreads(HEAD_DIM, 1, 1)]
 void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     uint tid = lid.x;
 
     // Decode global id: matches forward grid encoding.
     uint b = gid.x;
-    uint N_q_tiles = (pc.N + /*{{*/ BQ /*}}32*/ - 1u) / /*{{*/ BQ /*}}32*/;
+    uint N_q_tiles = (pc.N + BQ - 1u) / BQ;
     uint h = gid.y / N_q_tiles;
-    uint q_start = (gid.y % N_q_tiles) * /*{{*/ BQ /*}}32*/;
+    uint q_start = (gid.y % N_q_tiles) * BQ;
     uint kv_h = (h * pc.KV_H) / pc.H;  // GQA head mapping
 
     if (b >= pc.B || h >= pc.H) return;
 
     // ── Load Q and dO into shared memory ──────────────────────────────
     [unroll]
-    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         uint q_pos = q_start + qi;
         float qv = 0.0f;
         float dov = 0.0f;
@@ -131,73 +162,73 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
             qv = args.q[_q_offset(b, h, q_pos, tid)];
             dov = args.dO[_q_offset(b, h, q_pos, tid)];
         }
-        Q_smem[qi * /*{{*/ head_dim /*}}64*/ + tid] = qv;
-        dO_smem[qi * /*{{*/ head_dim /*}}64*/ + tid] = dov;
+        Q_smem[qi * HEAD_DIM + tid] = qv;
+        dO_smem[qi * HEAD_DIM + tid] = dov;
     }
     GroupMemoryBarrierWithGroupSync();
 
     // ── Per-thread dQ accumulator (registers, one per qi × d) ─────────
     // dQ has same shape as Q: [BQ, D].  Each thread accumulates one d-slot
     // and writes it at the end — same pattern as O in the forward.
-    float dQ_acc[/*{{*/ BQ /*}}32*/];
+    float dQ_acc[BQ];
     [unroll]
-    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         dQ_acc[qi] = 0.0f;
     }
 
     // ── Iterate over K/V tiles ────────────────────────────────────────
-    uint kv_tiles = (pc.S + /*{{*/ BK /*}}64*/ - 1u) / /*{{*/ BK /*}}64*/;
+    uint kv_tiles = (pc.S + BK - 1u) / BK;
     for (uint kvt = 0; kvt < kv_tiles; kvt++) {
-        uint kv_start = kvt * /*{{*/ BK /*}}64*/;
+        uint kv_start = kvt * BK;
 
         // ── Load K tile into shared memory ──────────────────────────
         [unroll]
-        for (uint ki_load = 0; ki_load < /*{{*/ BK /*}}64*/; ki_load++) {
+        for (uint ki_load = 0; ki_load < BK; ki_load++) {
             uint k_pos = kv_start + ki_load;
             float kv_val = 0.0f;
             if (k_pos < pc.S && tid < pc.D) {
                 kv_val = args.k[_kv_offset(b, kv_h, k_pos, tid)];
             }
-            K_smem[ki_load * /*{{*/ head_dim /*}}64*/ + tid] = kv_val;
+            K_smem[ki_load * HEAD_DIM + tid] = kv_val;
         }
 
         // ── Load V tile into shared memory ──────────────────────────
         [unroll]
-        for (uint ki_load = 0; ki_load < /*{{*/ BK /*}}64*/; ki_load++) {
+        for (uint ki_load = 0; ki_load < BK; ki_load++) {
             uint k_pos = kv_start + ki_load;
             float vv = 0.0f;
             if (k_pos < pc.S && tid < pc.D) {
                 vv = args.v[_kv_offset(b, kv_h, k_pos, tid)];
             }
-            V_smem[ki_load * /*{{*/ head_dim /*}}64*/ + tid] = vv;
+            V_smem[ki_load * HEAD_DIM + tid] = vv;
         }
         GroupMemoryBarrierWithGroupSync();
 
         // ── Phase 1: Recompute softmax P and accumulate dV ─────────
         // Online softmax state for each qi in this Q tile.
-        float m[/*{{*/ BQ /*}}32*/];
-        float l[/*{{*/ BQ /*}}32*/];
+        float m[BQ];
+        float l[BQ];
         // Accumulated dV per ki for this thread's d-slot.
-        float dV_local[/*{{*/ BK /*}}64*/];
+        float dV_local[BK];
         [unroll]
-        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             m[qi] = -1e38f;
             l[qi] = 0.0f;
         }
         [unroll]
-        for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+        for (uint ki = 0; ki < BK; ki++) {
             dV_local[ki] = 0.0f;
         }
 
         // Recompute scores and softmax (same as forward).
         // Also accumulate dV contributions using the recomputed P.
         [unroll]
-        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             uint q_pos = q_start + qi;
             if (q_pos >= pc.N) break;
 
             [unroll]
-            for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+            for (uint ki = 0; ki < BK; ki++) {
                 uint k_pos = kv_start + ki;
                 if (k_pos >= pc.S) break;
 
@@ -208,8 +239,8 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
                 // consistent softmax state on every lane).
                 float score = 0.0f;
                 for (uint d = 0; d < pc.D; d++) {
-                    score += Q_smem[qi * /*{{*/ head_dim /*}}64*/ + d]
-                           * K_smem[ki * /*{{*/ head_dim /*}}64*/ + d];
+                    score += Q_smem[qi * HEAD_DIM + d]
+                           * K_smem[ki * HEAD_DIM + d];
                 }
                 score *= pc.scale;
 
@@ -226,7 +257,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
                 // dV_contrib[ki, d] += p_val * dO_smem[qi, d]
                 // (per d-slot; only this thread's tid dimension)
                 if (tid < pc.D) {
-                    float do_val = dO_smem[qi * /*{{*/ head_dim /*}}64*/ + tid];
+                    float do_val = dO_smem[qi * HEAD_DIM + tid];
                     dV_local[ki] += p_val * do_val;
                 }
             }
@@ -273,13 +304,13 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         //   7. Accumulate dQ += dS * K  (register)
         //   8. Atomic-add dK += dS^T * Q  (atomic)
 
-        float P_cache[/*{{*/ BQ /*}}32*/][/*{{*/ BK /*}}64*/];
-        float dP_cache[/*{{*/ BQ /*}}32*/][/*{{*/ BK /*}}64*/];
-        float dS_cache[/*{{*/ BQ /*}}32*/][/*{{*/ BK /*}}64*/];
+        float P_cache[BQ][BK];
+        float dP_cache[BQ][BK];
+        float dS_cache[BQ][BK];
         [unroll]
-        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             [unroll]
-            for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+            for (uint ki = 0; ki < BK; ki++) {
                 P_cache[qi][ki] = 0.0f;
                 dP_cache[qi][ki] = 0.0f;
                 dS_cache[qi][ki] = 0.0f;
@@ -287,7 +318,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         }
 
         [unroll]
-        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             uint q_pos = q_start + qi;
             if (q_pos >= pc.N) break;
 
@@ -298,7 +329,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
             float row_dot = 0.0f;
 
             [unroll]
-            for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+            for (uint ki = 0; ki < BK; ki++) {
                 uint k_pos = kv_start + ki;
                 if (k_pos >= pc.S) break;
                 if (pc.is_causal != 0u && k_pos > q_pos) continue;
@@ -306,8 +337,8 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
                 // Recompute score S = Q @ K^T * scale.
                 float score = 0.0f;
                 for (uint d = 0; d < pc.D; d++) {
-                    score += Q_smem[qi * /*{{*/ head_dim /*}}64*/ + d]
-                           * K_smem[ki * /*{{*/ head_dim /*}}64*/ + d];
+                    score += Q_smem[qi * HEAD_DIM + d]
+                           * K_smem[ki * HEAD_DIM + d];
                 }
                 score *= pc.scale;
 
@@ -317,8 +348,8 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
                 // dP = dO @ V^T: dP[qi,ki] = sum_d(dO[qi,d] * V[ki,d])
                 float dp_val = 0.0f;
                 for (uint d = 0; d < pc.D; d++) {
-                    dp_val += dO_smem[qi * /*{{*/ head_dim /*}}64*/ + d]
-                            * V_smem[ki * /*{{*/ head_dim /*}}64*/ + d];
+                    dp_val += dO_smem[qi * HEAD_DIM + d]
+                            * V_smem[ki * HEAD_DIM + d];
                 }
 
                 P_cache[qi][ki] = p_val;
@@ -328,7 +359,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
 
             // Softmax backward: dS = P * (dP - row_dot)
             [unroll]
-            for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+            for (uint ki = 0; ki < BK; ki++) {
                 uint k_pos = kv_start + ki;
                 if (k_pos >= pc.S) break;
                 if (pc.is_causal != 0u && k_pos > q_pos) continue;
@@ -346,7 +377,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         // dV[ki,d] += sum_qi(P[qi,ki] * dO[qi,d])   (atomic)
 
         [unroll]
-        for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             uint q_pos = q_start + qi;
             if (q_pos >= pc.N) break;
 
@@ -354,12 +385,12 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
             if (tid < pc.D) {
                 float dq_val = 0.0f;
                 [unroll]
-                for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+                for (uint ki = 0; ki < BK; ki++) {
                     uint k_pos = kv_start + ki;
                     if (k_pos >= pc.S) break;
                     if (pc.is_causal != 0u && k_pos > q_pos) continue;
                     dq_val += dS_cache[qi][ki]
-                            * K_smem[ki * /*{{*/ head_dim /*}}64*/ + tid];
+                            * K_smem[ki * HEAD_DIM + tid];
                 }
                 dQ_acc[qi] += dq_val * pc.scale;  // chain-rule scale factor
             }
@@ -367,7 +398,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
 
         // dK and dV: atomic-add (multiple Q tiles contribute).
         [unroll]
-        for (uint ki = 0; ki < /*{{*/ BK /*}}64*/; ki++) {
+        for (uint ki = 0; ki < BK; ki++) {
             uint k_pos = kv_start + ki;
             if (k_pos >= pc.S) break;
             if (tid >= pc.D) continue;
@@ -375,12 +406,12 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
             // dV[ki,d] += sum_qi(P[qi,ki] * dO[qi,d])
             float dv_val = 0.0f;
             [unroll]
-            for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+            for (uint qi = 0; qi < BQ; qi++) {
                 uint q_pos = q_start + qi;
                 if (q_pos >= pc.N) break;
                 if (pc.is_causal != 0u && k_pos > q_pos) continue;
                 dv_val += P_cache[qi][ki]
-                        * dO_smem[qi * /*{{*/ head_dim /*}}64*/ + tid];
+                        * dO_smem[qi * HEAD_DIM + tid];
             }
             if (dv_val != 0.0f) {
                 uint dv_idx = _kv_offset(b, kv_h, k_pos, tid);
@@ -390,12 +421,12 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
             // dK[ki,d] += sum_qi(dS[qi,ki] * Q[qi,d]) * scale
             float dk_val = 0.0f;
             [unroll]
-            for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+            for (uint qi = 0; qi < BQ; qi++) {
                 uint q_pos = q_start + qi;
                 if (q_pos >= pc.N) break;
                 if (pc.is_causal != 0u && k_pos > q_pos) continue;
                 dk_val += dS_cache[qi][ki]
-                        * Q_smem[qi * /*{{*/ head_dim /*}}64*/ + tid];
+                        * Q_smem[qi * HEAD_DIM + tid];
             }
             if (dk_val != 0.0f) {
                 uint dk_idx = _kv_offset(b, kv_h, k_pos, tid);
@@ -407,7 +438,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
 
     // ── Write dQ output ────────────────────────────────────────────────
     [unroll]
-    for (uint qi = 0; qi < /*{{*/ BQ /*}}32*/; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         uint q_pos = q_start + qi;
         if (q_pos >= pc.N) break;
         if (tid < pc.D) {

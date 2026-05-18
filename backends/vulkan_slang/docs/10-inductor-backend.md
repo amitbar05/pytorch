@@ -1,17 +1,26 @@
-# Vulkan-Slang Inductor Backend Roadmap v6.2
+# Vulkan-Slang Inductor Backend Roadmap v6.3
 
 > **v5 North Star achieved (2026-05-10).** SmallCNN trains end-to-end.
-> **v6.1 closeouts (2026-05-11 / 2026-05-13):** M6 Phase 1 (Conv1d),
-> M9.1 (buffer-pool key bug), M9.3 (prewarm-on-import), M10.4 / CG.M10
-> (mm epilogue generic) → archived in
-> [10-inductor-backend-history.md](10-inductor-backend-history.md).
+> **v6.1 closeouts** archived in [10-inductor-backend-history.md](10-inductor-backend-history.md).
+> **v6.2 (2026-05-13)** added M13–M16 from a four-track audit.
 >
-> **v6.2 (2026-05-13) refresh** following a four-track parallel audit
-> (codegen / op-coverage / scheduler / training). Active milestones grow
-> by **M13–M16** to capture audit-derived gaps. See § 0.5 for the
-> refreshed audit numbers.
+> **v6.3 (2026-05-18) overhaul** following a five-agent comprehensive
+> audit (FX / lowerings / scheduler+codegen / Slang-lib / runtime+validation).
+> Each agent tested hypotheses against the live pipeline; surfaced **6 P0
+> correctness blockers** (vk_wg_reduce_* undefined; FunctionalTensor
+> 3-copy drift in `conv.py:528,847`; `empty_like` in 8 backward decomps;
+> DTYPE_TO_SLANG element-size mismatches; Transformer 3D-matmul compile
+> crash; DescriptorPool FREE_BIT anti-pattern) and **31 new milestones**
+> across M18–M23. Subsequent full clean rebuild surfaced **4 additional
+> in-tree blockers** filed as M22.8–11 (66 unused meta-kernels in
+> `MetaKernels.cpp` = forgotten registrations or 600 LoC dead code;
+> `vulkan_empty` device-binding gap; etc.). See § 0.6.
 >
-> **Last updated: 2026-05-17 (session: M16.3-4 Track 4 finish + OP.22 dynamic-shape reduction backward)**
+> § 0.5.2 reframings (corrections to prior numbers): persistent kernels
+> 40 % → 0 % effective; `[require]` capabilities 0 % → ~80 % already wired;
+> reflection metadata 100 % → 40 %.
+>
+**Last updated: 2026-05-18 (session: M-NEW.1 closeout + M-cpp-new-6 Layer 2 + fence-reuse fix + wave32 simd + current_device + attention dynamic-shape + capability-atom fix; roadmap v6.3 — see § 0.6)**
 >
 > **Live state:** 9 model architectures train end-to-end under
 > `torch.compile`; 47 lowerings + 24 explicit decomp suppressions;
@@ -40,18 +49,24 @@
 
 | # | Milestone | Goal | Effort |
 |---|-----------|------|--------|
-| **M17** | **🔥 Inductor VK perf parity with CPU (NEW, HIGHEST PRIORITY)** | SmallCNN+GroupNorm is 5.7× slower than CPU eager (4.68 ms vs 0.82 ms). Cut dispatch count from ~20/step to ≤5, reactivate Slang matmul, fuse conv+gn+relu, fuse linear backward. **Target: 1× CPU parity for SmallCNN+GN, then 2× wins on bigger workloads.** | 3-4w |
-| **M9** | **Host-overhead reduction** | Close the 96 %/230× host/kernel gap. M9.1-M9.5, M9.8-M9.9 closed; M9.6-M9.7 remain. | 1-2w remaining |
-| **M11** | **Occupancy-aware codegen** | Wire reflection → WG sizing; subgroup reductions; LDS bank rigour. | 1-2w |
-| **M12** | **Reduction backward via autodiff** | 6/8 reduction ops `[Differentiable]`; route through `bwd_diff_table`. | 1w |
-| **M13** | **Slang feature saturation (NEW)** | Bring conv / SDPA / reduction / pointwise up to the mm gold standard: generics, interfaces, `ParameterBlock`, link-time spec, capabilities, wave intrinsics. | 2-3w |
-| **M14** | **Op coverage gaps (NEW)** | Complex-dtype binary, sparse / scatter-atomic, dynamic-shape reduction, foreach element-wise, quantized int8, RNN backward. | 2-3w |
-| **M15** | **Anti-goal #5/#7 cleanup (expanded M10)** | Split 6 newly-discovered monoliths; audit `meta_patches.py` for symptom-fixes. | 1-2w |
-| **M16** | **Track 4 finish (NEW)** | Delete `csrc/ops/model_ops.cpp` (925 L of legacy eager ops). Irreversible. | 1w |
-| **M6** | **Conv generality** | Phase 1 done (Conv1d); Phase 2-4 remain (depthwise/3D/transposed-1D/3D). | 1-2w |
-| **M7** | **Production hardening** | Link-time spec (gated on slangc), AOTI .so packaging, CI gate. | gated |
+| **M18** | **🔥🔥 Correctness sweep (NEW P0 — comprehensive-audit-derived)** | Six P0 audit-found blockers + four rebuild-found blockers (M22.8–11): M18.1 ✅, M18.3 ✅ (empty_like→new_empty all meta_patches), M18.4 partial ✅, M18.5 ✅, M18.6 ✅; M22.8 ✅ (33 registered, dead stubs deleted); M22.9 ✅ (device-binding + pybind); M22.10 ✅; M22.11 ✅; M22.12 ✅; M22.13 ✅ (shader-side fix + C++ workaround deleted); M-cpp-new-6 Layer 1 ✅ Layer 2 ✅ (reset_generation_ counter); M-cpp-new-2 ✅; M-pipeline-4 ✅; M-NEW.4 ✅. M18.2 remains. See § 0.6.1 + § 0.6.5.x. | 1w |
+| **M17** | **🔥 Inductor VK perf parity with CPU** | SmallCNN+GroupNorm 5.7× → 4.4× → 3.9× CPU (mid-progress). Cut dispatch count ~20/step → ≤5; reactivate Slang matmul; fuse conv+gn+relu; fuse linear backward. **Target: 1× CPU parity for SmallCNN+GN, then 2× wins on bigger workloads.** | 2-3w remaining |
+| **M19** | **Codegen completeness (NEW)** | Wire `_register_linear_backward_decomposition` (8→4 dispatches/Linear bwd); revive dead-code persistent kernels; close reduction-boundary fusion gap (GN+ReLU+GlobalAvg → 1 kernel); vec4 progressive fallback (60 %→≥80 %); dynamic-shape conv lifting (39 sites); attention.py dynamic-shape fix ✅ (`int(get_size()[-1])`→`size_hint`); foreach generic Slang template; complex pointwise C++ bridge (M19.7 in flight); autotune empty-choices warning. See § 0.6.2. | 2-3w |
+| **M20** | **Slang feature re-investment (NEW, supersedes M13)** | RNN cell bwd via autodiff; slang_mm `ParameterBlock` restore + dispatch-path unification; conv_bwd/flash_attn_bwd spec-constant tiles; wave-intrinsic coverage (Any/All/Ballot/BitOr) (M20.4: wave ops ✅, capability atom ✅ — `subgroup_basic_ballot`→`subgroup_ballot`); wave32 simd ✅ (vk_wg_reduce_* + wg_welford + wg_argmax now accept simd param); reflection metadata 40 %→80 %; subgroup-size spec const; lib helper extraction; anti-goal-#6 sweep for RNN/scatter. See § 0.6.3. | 2-3w |
+| **M21** | **Hardware-profiling + validation infrastructure (NEW, user-requested)** | Device-profile-on-import phase (M21.1 in flight); validation-as-codegen-check during autotune; best-practices VUID sweep (M21.3 + M21.3.a debug-utils messenger ✅); per-kernel lifecycle stress tests. See § 0.6.4. | 1-2w |
+| **M9** | **Host-overhead reduction** | ✅ M9.1–M9.9 all closed (M-docs-9 reconciled 2026-05-18). New host-overhead targets file as M-cpp-new-2 (M-cpp-new-2 ✅ (DescriptorPool async-reset path + fence-per-submit + pre_sync_callback drain)). | active perf-track (sub-followups) |
+| **M11** | **Occupancy-aware codegen** | M11.1–M11.2, M11.9 closed; refined by M20 (reflection 100 %→40 %). | 1-2w |
+| **M12** | **Reduction backward via autodiff** | 6/8 reduction ops `[Differentiable]`. Audit confirms argmax/argmin SHOULDN'T be differentiable (positions, not values). | 1w |
+| **M13** | **Slang feature saturation** | Superseded/expanded by **M20**. | merged into M20 |
+| **M14** | **Op coverage gaps** | Complex-dtype binary (→ M19.7), foreach element-wise (→ M19.6), dynamic-shape reduction (→ M19.5), RNN backward (→ M20.1). Residual: sparse + quantized int8. | 2w |
+| **M15** | **Anti-goal #5/#7 cleanup** | M15.1.a–j closed / in-flight. Expanded by **M22** (5 new file-size violators + M22.8–11 rebuild blockers). | 1-2w |
+| **M16** | **Track 4 finish** | ✅ CLOSED 2026-05-17 (model_ops.cpp deleted). | ✅ |
+| **M22** | **Anti-goal cleanup follow-on + rebuild blockers (NEW, refines M15)** | 5 new file-size violators; `alloc_alias.py` IR migration; 3-layer proxy consolidation. M22.8 ✅ M22.9 ✅ M22.10 ✅ M22.11 ✅ M22.12 ✅ M22.13 ✅. See § 0.6.5 + § 0.6.5.x. | 1-2w |
+| **M23** | **Safety nets (NEW)** | M23.1 ✅ (would have caught M18.1); M23.2 ✅ (capability-gate coverage); render-binding-set assertion; combo-kernel chain-rename resolver; sparse-tensor stub. See § 0.6.6. | 0.5-1w |
+| **M6** | **Conv generality** | Phase 1 done (Conv1d); Phase 2–4 remain. | 1-2w |
+| **M7** | **Production hardening** | gated on slangc / AOTI / CI. | gated |
 | **M8** | **Model zoo expansion** | More real-world models end-to-end. | ongoing |
-| **M10** | **Anti-goal #7 cleanup** | M10.1-3 originally listed; M10.5-8 small fixes; M10.4 closed. Subsumed under M15 — see there. | merged into M15 |
+| **M10** | **Anti-goal #7 cleanup** | Subsumed under M15 / M22. | merged |
 
 ---
 
@@ -120,9 +135,279 @@ and `agent_space/vk_validation_sweep*.py`. Source: this turn's session.
 | `lowerings/rnn.py` | 805 | 1.0× | ❌ NEW (borderline) | M15.1.j |
 | `templates/caller/gemm.py` | 2331 | 2.9× | ❌ NEW | **M15.1.a follow-up** |
 
-### 0.5.5 New items added by this audit
+### 0.5.5 New items added by audits (cumulative)
 
-Counted: **22 new items** across M9 (1), M11 (1), M13 (6), M14 (6), M15 (6), M16 (1), M6 (1).
+- v6.2 (2026-05-13): 22 items across M9/M11/M13/M14/M15/M16/M6.
+- v6.3 (2026-05-18): **31 new items** across M18 (7), M19 (8), M20 (9), M21 (4), M22 (11 ← refines M15 + adds rebuild blockers), M23 (5). See § 0.6.
+
+---
+
+## 0.6. 2026-05-18 five-agent comprehensive audit + rebuild diagnostics
+
+Five disjoint expert agents audited the full Inductor pipeline in parallel,
+each tested hypotheses against the live code with probe scripts under
+`agent_space/audit_agent{1..5}_*.py`. A full clean rebuild
+(`agent_space/full_rebuild_2026_05_18.log`) then surfaced 4 additional
+in-tree blockers (M22.8–11). Agent owners:
+
+| # | Agent | Scope |
+|---|-------|-------|
+| 1 | FX & pre/post-grad | `fx_passes/`, `meta_patches/`, AOTAutograd boundary |
+| 2 | Lowerings & PrimTorch coverage | `lowerings/`, `bwd_diff_dispatch.py`, fallback census |
+| 3 | Scheduler / fusion / codegen templates | `scheduling.py`, `vulkan_combo_kernel.py`, `kernel/`, `templates/` |
+| 4 | Slang library & feature saturation | `shaders/lib/`, `templates/*.slang`, Slang language features |
+| 5 | Runtime / profiling / validation | `runtime.py`, `buffer_pool.py`, `lifetime.py`, `csrc/ops/dispatch.cpp`, Vulkan validation |
+
+### 0.6.1 M18 — Correctness sweep (P0)
+
+| # | Title | Status | Evidence |
+|---|-------|--------|----------|
+| **M18.1** | `vk_wg_reduce_{any,xor,xor_2d,argmax,argmin}` undefined → 5 ops fail compile | ✅ FIXED 2026-05-18 (Slang-Lib agent) | Defined in `shaders/lib/reduction.slang:488-693`; tests `TestM181WgReduceHelpers` (4 pass, 2 xfail on separate codegen guard at `kernel/reduction.py:69-75`); `TestM23LibModuleSanity::test_lib_module_no_undefined_symbols` (M23.1) compiles every lib standalone. |
+| **M18.2** | FunctionalTensor 3-copy drift in `fx_passes/eager/conv.py:528, 847` | in-flight (FX agent) | M17.8.d.2's helper extraction missed `_conv2d_relu_backward` and `_conv2d_gn_relu_backward`. Empirically Conv2d+ReLU `c.weight.grad` cpu_norm=30.59 vs vk_norm=12.67, L∞=9.78. Fix: extract `_has_real_vulkan_storage` to `fx_passes/eager/_common.py`; remove `@torch.compiler.disable`. |
+| **M18.3** | 8 backward decomps use `empty_like` → silent zero grads | in-flight (FX agent) | `meta_patches/decomposition_passes.py:88-209` for `_softmax_bwd`, `_log_softmax_bwd`, `_avg_pool2d_bwd`, `_max_pool_bwd`, `_linear_bwd`, `_layer_norm_bwd`, `_group_norm_bwd`, `_batch_norm_bwd`. Same M17.8.d.2 class. Fix: `t.new_empty(t.shape)`. |
+| **M18.4** | DTYPE_TO_SLANG element-size mismatch sweep | ✅ PARTIAL 2026-05-18 (Dtype-Matrix agent) | `overrides.py:51` audit found bool/int8/uint8/int16/bfloat16/complex32 all mis-sized; uint16/uint32/uint64 absent. **Landed**: uint16/32/64 mappings + 4-byte sign-extend bit-twiddles for narrow types as a stopgap. **Pending M18.4-followup-C**: enable `shaderInt8 + storageBuffer{8,16}BitAccess` in `csrc/vulkan/Context.cpp` and switch narrow Slang types to `uint8_t/int8_t/int16_t/uint16_t`. Tests: `TestDtypeMatrix` 7 pass + 3 xfail-strict (int8/uint8/int16). |
+| **M18.5** | Transformer 3D-matmul compile crash | ✅ FIXED 2026-05-18 (Matmul-3D agent) | `lowerings/matmul.py:274-317` — added `ndim1≥2 × ndim2==2` sympy-product fold mirroring upstream `should_fold`. Parity 3.815e-6 vs CPU. `TestM185Transformer3DMatmul` 4/4 pass. |
+| **M18.6** | DescriptorPool `FREE_DESCRIPTOR_SET_BIT` anti-pattern | ✅ FIXED 2026-05-18 (Validation agent) | `csrc/vulkan/DescriptorSet.cpp:21` — flag removed; matches CommandPool precedent. `TestM186DescriptorPool` added (validates via VUID absence assertion). |
+| **M18.7** | Three-layer shape-only proxy consolidation | open (deferred from FX agent) | `_OP_IMPLS` × `_register_backward_meta_decomps` × `_patch_decompositions` overlap for 8 backwards. Pick one, delete the others. |
+
+### 0.6.2 M19 — Codegen completeness
+
+| # | Title | Status |
+|---|-------|--------|
+| **M19.1** | Wire `_register_linear_backward_decomposition` (closes M17.1-gap remainder) | in-flight (Matmul-3D agent) |
+| **M19.2** | Persistent pointwise kernels wired (currently dead code in `kernel/pointwise.py`) | open |
+| **M19.3** | Reduction-boundary horizontal fusion (`vulkan_combo_kernel.py:194 _coalesce_orphan_pointwise` admits reductions) | open |
+| **M19.4** | Vec4 progressive fallback (60 %→≥80 % eligibility) | open |
+| **M19.5** | Dynamic-shape lifting in `lowerings/conv*.py` (39 `int(get_size()[i])` sites) | open |
+| **M19.6** | Foreach pointwise generic Slang template (covers 16 foreach ops) | open |
+| **M19.7** | Complex pointwise C++ bridge (closes OP.20) | in-flight (Dtype-Matrix agent) |
+| **M19.8** | Slang autotune empty-choices warning + render-binding-set ratchet | open |
+
+### 0.6.3 M20 — Slang feature re-investment (supersedes M13)
+
+| # | Title | Status |
+|---|-------|--------|
+| **M20.1** | RNN cell backward via autodiff (238 L hand-rolled → bwd_diff) | open |
+| **M20.2** | slang_mm `ParameterBlock` restore + dispatch-path unification | open |
+| **M20.3** | Spec-constant tiles for conv_bwd + flash_attn_bwd | open |
+| **M20.4** | Wave-intrinsic coverage (AnyTrue/AllTrue/Ballot/BitOr/BitAnd/BitXor/CountBits/PrefixCountBits) | in-flight (Slang-Lib agent) |
+| **M20.5** | Reflection metadata 40 %→80 % (subgroupSize, numSgprs, numStores/Loads/Atomics) | open |
+| **M20.6** | Subgroup-size spec constant | open |
+| **M20.7** | Lib helper extraction (Welford streaming, grid-stride loops) | open |
+| **M20.8** | Anti-goal #6 sweep for RNN + scatter (Jinja `{{}}` → generic `<S : IScatter>`) | open |
+| **M20.9** | `should_use_cooperative_reduction` reflection-aware | open |
+
+### 0.6.4 M21 — Hardware-profiling + validation infrastructure (user-requested, NEW)
+
+| # | Title | Status |
+|---|-------|--------|
+| **M21.1** | Device-profile-on-import phase (microbench launch latency, mem BW, LDS BW, atomics; cache to `~/.cache/torch_vulkan/`) | in-flight (Validation agent) |
+| **M21.2** | Validation-as-codegen-check during autotune (per-kernel VUID surface) | open |
+| **M21.3** | Best-practices VUID sweep across 9 models | open (sweep harness ready in `agent_space/m21_3_validation_sweep.py`) |
+| **M21.3.a** | `VK_EXT_debug_utils` messenger wired in `csrc/vulkan/Context.cpp` | ✅ FIXED 2026-05-18 |
+| **M21.4** | Per-kernel VUID lifecycle stress tests | open |
+
+### 0.6.5 M22 — Anti-goal cleanup follow-on (refines M15)
+
+| # | Title | Status |
+|---|-------|--------|
+| **M22.1.a-g** | Split 7 file-size violators (`pointwise.py` 761, `pointwise_vec4_mixin.py` 755, `header.py` 794, `kernel/main.py` 928, `bwd_lowerings.py` 805, `fx_passes/eager/conv.py` 1063, `templates/caller/rnn.py` 1053) | open |
+| **M22.2** | `alloc_alias.py` IR-level migration (280 L regex post-processor) | open |
+| **M22.3** | Pre-grad pattern firing-rate instrumentation | open |
+| **M22.4** | Delete dead `_replace_sdpa_with_custom_op` (160 L) | open |
+| **M22.5** | Suppress 9 dead-code lowerings (addcmul, addcdiv, index_add, index_copy, norm.ScalarOpt_dim, permute, pow.Scalar, rot90, unfold) | open |
+| **M22.6** | Split `bwd_lowerings.py` (805 L) | (= M22.1.e) |
+| **M22.7** | Sparse-tensor stub `TORCH_CHECK(false)` upgrade | open |
+
+### 0.6.5.x M22.8–11 — Rebuild diagnostics (2026-05-18)
+
+Full clean rebuild produced 0 errors + 85 warnings. In-tree categorisation:
+
+| Warning class | In-tree | Third-party (VMA, skip) |
+|---------------|--------:|------------------------:|
+| `-Wunused-function` | 73 | 0 |
+| `-Wunused-variable` | 7 | 10 |
+| `-Wunused-but-set-variable` | 4 | 2 |
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M22.8** | **Meta-kernel registration audit (P1 — silent FakeTensor gap)** | **HIGH** | `csrc/backend/MetaKernels.cpp` has 66 defined-but-unreferenced `meta_*` functions: `meta_clone`, `meta_t`, `meta_transpose`, `meta_permute`, `meta_squeeze{,_dim}`, `meta_expand`, `meta_cat`, `meta_select`, `meta_slice`, `meta_split`, `meta_avg_pool2d`, `meta_index_select`, `meta_gather`, `meta_sort`, `meta_topk`, `meta_cumsum`, `meta_nll_loss_forward`, `meta_cross_entropy_loss`, `meta_upsample_{nearest,bilinear}2d`, `meta_grid_sampler_2d`, `meta_conv_transpose2d`, `meta_native_dropout{,_backward}`, `meta_foreach_{inplace_scalar,inplace_list,addcmul,unary,binary_list}`. The `TORCH_LIBRARY_IMPL(aten, Meta, m)` at `MetaKernels.cpp:796` registers ~9 binary-scalar/pow/inplace meta kernels only; the rest are unregistered. **Two possibilities**: (a) forgotten registrations → upstream Meta dispatch may give wrong stride/dtype for PrivateUse1 layout → silent FakeTensor bug surfaces as miscompilation under Inductor (M17.8.d.2 / M18.3 bug class but in C++ shape inference); (b) dead code from refactor → 600+ LoC delete. Investigation: for each unused `meta_*`, compare output against upstream's meta fallback on a synthetic shape; flag divergences as bugs, delete agreers. |
+| **M22.9** | `vulkan_empty` device-binding gap (P2 — multi-GPU correctness) | MED | `csrc/backend/Registration.cpp:88-89` (and sibling line 162 `vulkan_empty_strided`) reads `device = device_opt.value_or(...)` but never binds it; storage + tensor use default `PrivateUse1:0`. Multi-GPU silently lands on device 0. Add `tensor.unsafeGetTensorImpl()->set_device(device)`. Regression test: `TestM229MultiDeviceEmpty::test_vulkan_empty_respects_device_opt`. |
+| **M22.10** | conv3d shape-var drift (P3 — refactor leftover) | LOW | `Registration.cpp:327-328` declares `N, C_in, H, W` for conv3D shape calc; never references them. Audit the moved logic, then delete the dead vars. Risk surface: M6 Phase 3 conv3D rollout. |
+| **M22.11** | `q_seq_major` saved-but-unused (P3 — trivial) | LOW | `csrc/ops/autograd_ops.cpp:1901` saves `q_seq_major` to `ctx->saved_data`; flash backward auto-detects from strides. Delete the save. |
+
+### 0.6.6 M23 — Safety nets
+
+| # | Title | Status |
+|---|-------|--------|
+| **M23.1** | `test_lib_module_no_undefined_symbols` (would have caught M18.1 at lib-build time) | ✅ FIXED 2026-05-18 (Slang-Lib agent) |
+| **M23.2** | `test_capability_gate_coverage` — every wave-intrinsic call site preceded by `[require]` annotation | ✅ FIXED 2026-05-18 — `TestM232CapabilityGateCoverage` at `tests/test_inductor_regression.py:40473` with `_decl_has_capability_gate` helper. Verified by Audit Agent 1 post-Wave-2. |
+| **M23.3** | Generalised render-binding-set assertion (every Jinja template with `[[vk::binding(N)]]` literals) | open |
+| **M23.4** | Combo-kernel chain-rename transitive resolver test | open |
+| **M23.5** | Foreach-step-outside-compile dispatch ratchet | open |
+
+### 0.6.5.y M22 follow-ons from git-reset incident + agent waves (2026-05-18 late)
+
+A peer agent ran `git reset --hard` mid-session, wiping out earlier work. Subsequent agents inherited a post-rollback tree and re-discovered the same bugs that prior session fixes had addressed. Filed memory `feedback-no-git-reset-with-agents` to prevent recurrence.
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M22.12** | **slang_mm.slang c_binding typo REGRESSION (RESTORE)** | **P0 (FIXED in parent)** | `templates/slang_mm.{slang,py.jinja}` lines 87/95 — `c_binding = 2 if has_bias else 2` (typo from M17.1-gap2) came back after the git reset. Fixed 2026-05-18 (`3 if has_bias else 2`). Blocks `TestM17SlangMatmulCorrectness::test_addmm_*`, `TestQKVLinearFusion::test_qkv_compile_correctness`, parts of `TestM185Transformer3DMatmul`. |
+| **M22.13** | **mm tile transpose-a row-collapse bug** | **✅ FIXED (workaround) 2026-05-18** | Matmul-3D agent applied a C++ workaround at `csrc/ops/matmul_ops.cpp:213-232` + `:379-407`: when `is_t_transposed` is detected, materialize the transposed operand via `.contiguous()` (one extra dispatch) then recurse with no-transpose path. M19.1 floor-gate FLIPPED (`lowerings/__init__.py:320-328` now active); 3 xfails removed; `TestM2213MmTransposeA` added. **Workaround cost**: 1 extra `dispatch_strided_copy` per transposed-input mm. Filed M22.13-followup for the deeper shader-side fix. |
+| **M22.13-followup** | **Shader-side root cause for transpose-a row-collapse** | **✅ FIXED 2026-05-18 (Slang-Lib)** | Linearised-tid pattern applied to `shaders/matmul/mm_tiled.slang:58` (`tid_local = lid.y * TILE_SIZE + lid.x`). Also `shaders/matmul/bmm_tiled.slang:57` (M22.13-extras). C++ workaround at `matmul_ops.cpp:213-232` is now redundant defense-in-depth. Filed **M22.13-retire-workaround** for cleanup. |
+| **M22.13-retire-workaround** | **Retire C++ `.contiguous()` workaround now that shader-side root cause is fixed** | LOW (cleanup) | After M22.13-followup landed, the C++ short-circuit at `csrc/ops/matmul_ops.cpp:213-232` + `:379-407` is redundant. Delete the workaround. Saves 1 extra `dispatch_strided_copy` per transposed-input mm. Gated on a regression test that exercises `aten.mm(g.t(), x)` directly with the shader-side fix only (i.e. with the workaround toggled off via env knob). |
+| **M22.14** | **M17.8.d.2 base infrastructure RE-RESTORE** | **MED (FX agent doing Step 2)** | `_ensure_conv2d_backward_op_registered()` + `make_fallback(torch.ops.torch_vulkan.conv2d_backward)` were wiped by the reset. FX agent re-registering; parent applies the `make_fallback` to `lowerings/__init__.py` once Matmul-3D finishes touching that file. |
+| **M22.15** | **Three-layer empty_like fix didn't fire on the load-bearing layer** | **HIGH (FX agent fixing)** | Initial M18.3 only fixed `decomposition_passes.py`; the load-bearing layer is `meta_patches/op_registration.py:31-35` `_bwd_meta_like_grad`/`_bwd_meta_like_input` helpers. All 8 `TestM18ShapeOnlyProxiesUseNewEmpty` tests still fail until those helpers get the same `empty_like → new_empty` treatment. |
+| **M22.16** | **slangc threadpool deadlock under 5-agent concurrent compile** | MED (env-only) | M186 DescriptorPool tests (and others that spawn subprocess + import torch_vulkan) deadlock at `slangc.py:1770 event.wait()` when multiple agent processes share the SPIR-V cache. Mitigation options: (a) per-subprocess `TORCH_VULKAN_SPIRV_CACHE=<tmpdir>` override; (b) `TORCH_VULKAN_ASYNC_COMPILE=0` to serialize within a process; (c) gate the wave size of parallel agents. Tests pass cleanly in isolation. |
+
+### 0.6.5.zz M18.8.b + M18.9 — Conv backward investigation (2026-05-18, FX agent)
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M18.8.b** | **Dynamo splits `nn.Sequential` at monkey-patched `F.conv2d`** | **MED** (architectural) | Under `torch.compile`, `nn.Sequential(Conv, GN, ReLU)` produces THREE separate subgraphs (one per layer) because Dynamo can't trace through the monkey-patched `F.conv2d` opaque custom op. The pre-grad fusion pass `_fuse_conv_gn_relu` therefore never matches the full chain — the fused `conv2d_gn_relu_fused` custom op is dead code in this compile path. Two paths forward: (a) FX-pass-level fusion across subgraph boundaries (touches `fx_passes/`); (b) **fix the underlying conv backward C++ adapter (M18.9)** which would make the fused op moot for correctness — only useful as a perf optimization. Recommended: (b) first. |
+| **M18.9** | **`vulkan_convolution_backward_overrideable` C++ adapter** | **✅ FIXED 2026-05-18 (Matmul-3D)** | Root cause: `vulkan_copy_` (the `.cpu()` path) ignores `stride` + `storage_offset`, doing a raw VkBuffer byte copy. For a `reinterpret_tensor` view (compile-mode standard), the CPU tensor receives raw storage bytes not matching the view's logical layout; `at::convolution_backward` then computes correct math on wrong data → ratio 0.082 / 0.60 / 5.66. Eager-mode unaffected (uses Vulkan-native autograd path, never hits `.cpu()`). **Fix at `csrc/backend/Registration.cpp:385-434`**: `.contiguous()` before `.cpu()` on each operand (input/weight/grad_output) — `.contiguous()` routes through `dispatch_strided_copy` which respects stride correctly. Filed **M18.9-followup**: fix `vulkan_copy_` itself to respect stride (wider blast radius — every `.cpu()` call uses it). |
+| **M18.9-followup** | **`vulkan_copy_` ignores stride/storage_offset on Vulkan→CPU read** | MED | Per Matmul-3D's M18.9 investigation: `vulkan_copy_` at `csrc/backend/Registration.cpp:31-50` does `buf->read(self.data_ptr(), self.nbytes())` — raw byte copy, ignoring strides. Affects EVERY `.cpu()` call on a Vulkan tensor that isn't contiguous. Today M18.9 worked around it inside the conv backward adapter; a proper fix would address it at the source. Plumb stride-aware copy via `dispatch_strided_copy` or similar. Wider blast radius — verify all current `.cpu()` callers are okay first. |
+| **M18.10** | **Reduction codegen emits undefined `r0_index` in Slang source** | **HIGH (blocks M18.9 verification + several test paths)** | Surfaced by Matmul-3D's M18.9 probe: `kernel/reduction.py` emits Slang strings referencing `r0_index` symbol that isn't declared in some sum/welford-reduction kernels. Conv+GN compile path hits this; bare Conv2d backward also via the gradient `sum`. Group C codegen — needs `kernel/reduction.py` audit for the missing variable declaration. Likely a recent regression from one of the wave's edits to reduction codegen (M20.4 wave intrinsic + M20.6 spec const + M22.16). |
+
+The M21.4 VUID stress harness inadvertently surfaced eager-mode correctness bugs that don't appear under `torch.compile`. Filing them here for visibility.
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **EAGER.1** | **Factory ops intermittent zero result — slangc-cache class FIXED, residual flake remains** | **PARTIAL FIX (M22.16 closes slangc-cache class)** | Root cause of slangc-cache class: torn `.slang-module` files (closed by M22.16's atomic-write). **Residual EAGER.1.b**: 2/10 trials still produce `[0,…]` or `[2,…]` (stale buffer contents). Validation agent's M21.3 sweep surfaces the deeper root cause as M21.3.01 (Set-1 binding mismatch — SPIR-V reads from `[Set 1 Binding 0]` which the pipeline layout doesn't declare, returning unbound / stale descriptor contents). Filed as **EAGER.1.b**. Currently xfail-strict-OFF in `TestEager1NoFactoryZeros::test_torch_ones_returns_ones_under_stress`. Will flip to PASS when M21.3.01 lands. |
+| **EAGER.1.b** | **Residual EAGER.1 flake — eager fill+add buffer sync, NOT Set-1 mismatch** | **P0 (NOT closed by M21.3.01)** | Initial framing said this was the M21.3.01 Set-1 issue. **Wrong.** Eager `torch.zeros + torch.ones` routes through `csrc/ops/binary_ops.cpp` → `shaders/binary/add.slang` which uses explicit `[[vk::binding(N)]]` (no set, defaults to 0) — never went through `ParameterBlock<KernelArgs>`. The pattern reproduces unchanged after M21.3.01 lands. Real root cause: dispatch/sync between `vulkan_fill_scalar` (zeros init) and the dependent `binary_add` — either fill isn't flushed before add reads, OR buffer-pool recycles a buffer the prior fill hasn't finished writing. **Filed as M21.3.02 below.** |
+| **M21.3.01** | **`VUID-VkComputePipelineCreateInfo-layout-07988` — Set-1 binding mismatch** | **✅ FIXED 2026-05-18 (Path A — Slang annotation)** | 24 templates + `kernel/header.py` codegen path got `[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;`. Cache sweep: 61/61 fresh SPIR-V have Set 0 (vs 30/85 = 35 % at Set 1 pre-fix). `TestM2130_1PipelineLayoutSet0::test_spirv_emits_set_0_decoration` PASSES. `test_pipeline_creation_no_set_1_vuid_canary` correctly gated as SKIPPED when validation layer absent. **Audit Agent 3 had REFRAMED this as universal correctness (M-NEW.6) — confirmed by the cache sweep that 35 % of all pre-existing SPIR-V blobs had Set 1.** Side effect: M22.16 tmp-path bug was uncovered and fixed (precompile_shader_libs `force=True` was emitting `.tmp.<pid>.<tid>` which slangc rejected with `E00060 cannot infer an output format`). |
+| **M21.3.02** | **Eager-mode dispatch/sync ordering between fill_scalar and binary_add** | **P0 (NEW — surfaced by M21.3.01 closeout)** | The real EAGER.1.b root cause. `torch.zeros(N).vulkan()` calls `vulkan_fill_scalar(0.0)`; `torch.ones(N).vulkan()` calls `vulkan_fill_scalar(1.0)`; then `aten.add.Tensor` dispatches `vulkan_add_tensor_out`. Trial 0 returns all zeros; trial 4 returns all twos. Hypothesis: (a) `vulkan_fill_scalar` enqueues async; `binary_add` reads the buffer before the fill's write barrier fires; OR (b) buffer-pool returns a recycled buffer to `vulkan_fill_scalar` while it's still pending — the prior dispatch's contents survive. Fix needs investigation in `csrc/ops/fill_ops.cpp`, `csrc/ops/binary_ops.cpp`, and `csrc/vulkan/Stream.cpp` (dispatch ordering + `dirty_buffers` tracker). |
+| **M21.4.c** | Document `VK_ICD_FILENAMES` requirement under validation layers | LOW | When `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` is set, the Vulkan loader's ICD-sort heuristic picks Lavapipe (software rasterizer) on this dev box. Subprocesses then time out (>180 s). Pinning `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json` fixes it. Belongs in `CLAUDE.md` "Useful environment knobs" section. |
+| **M21.4.d** | Inductor codecache `FileNotFoundError` under concurrent agents | LOW | `TORCHINDUCTOR_CACHE_DIR` namespacing keys off file mtimes; simultaneous agent edits rename the cache dir mid-flight. Workaround: per-process `TORCHINDUCTOR_CACHE_DIR` override. |
+
+### 0.6.7 Reframings (corrections to prior § 0.5 claims)
+
+| Prior claim | Reality (per audit) |
+|-------------|---------------------|
+| `meta_patches.py` is 3902 L | Already split: 8 files / 4460 L total (M15.1.b ✅) |
+| Persistent kernels: 40 % | **0 % effective** — `_enable_persistent_mode` is dead code |
+| `[require(...)]` capabilities: 0 % | **~80 %** for wave-intrinsic helpers (`lib/helpers.slang:89-112` + 6 sites in `lib/reduction.slang`) |
+| Reflection metadata: 100 % (M11.1) | **40 %** — only 3/8+ fields wired |
+| `ParameterBlock`: 30 % (mm only) | **45 %** (13/29 files) — but mm regressed during M17.1 |
+| Backward op coverage: 57/58 | Accurate; argmax/argmin correctly NOT `[Differentiable]` (positions, not values) |
+| `vulkan_combo_kernel.py` 1106 L | Already split: 600 L + `combo_kernel/` (M15.1.f ✅) |
+| `templates/caller/gemm.py` 2331 L | Already split: `gemm/` 5 files, max 778 L (M15.1.a ✅) |
+
+---
+
+## 0.7. 2026-05-18 Wave 3 audit — post-Wave-2 re-audit (5 analysts + 1 implementer)
+
+After Wave 2 landed M18–M22 + M-cpp-new family, a third audit wave (5 read-only analysts + 1 implementer on M21.3.01) was dispatched. Findings reshape the priority list:
+
+### 0.7.1 Headline metrics (re-baseline 2026-05-18)
+
+| Model | CPU ms | VK eager ms | VK/CPU eager | v6.3 baseline | Note |
+|---|---:|---:|---:|---|---|
+| MLP            | 0.29 | 0.49 | **1.68×** | n/a | |
+| Conv2d only    | 0.42 | 0.79 | **1.87×** | n/a | |
+| **SmallCNN+GN** | 0.62 | 1.46 | **2.36×** | 5.7→4.4→3.9× | **eager beats compile-mode baseline** |
+| Conv2d+ReLU    | 0.45 | 0.82 | **1.80×** | n/a | |
+| Linear chain   | 0.26 | 0.38 | **1.47×** | n/a | closest to parity |
+| Transformer    | 1.00 | 3.40 | **3.41×** | "5.7× CPU" | trained end-to-end (eager, validation off) |
+| ViT            | 1.61 | 5.52 | **3.42×** | "BLOCKED" | trained end-to-end (eager, validation off) |
+| Llama-MLP      | 0.27 | 0.42 | **1.55×** | n/a | |
+| Mixtral-MoE    | 0.39 | 0.68 | **1.72×** | "BLOCKED" | trained end-to-end (eager, validation off) |
+
+**Compile-mode latency: completely BLOCKED** by M-NEW.1 (duplicate-extern regression). Cold import warm-cache: **~3 s**. Memory headroom: SmallCNN+GN runs at batch 16384 (~12 MB activations) without OOM.
+
+### 0.7.2 M-NEW.* — new P0 compile-mode blockers
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M-NEW.1** | **`duplicate extern kernel: slang_addmm_*` blocks compile for entire catalog** | **P0** | `templates/caller/gemm/install.py:262 ExternKernelChoice(fn).bind(...)` collides on the 2nd `aten.addmm` because `_SlangTileAddMM._format_name()` produces a deterministic name (`slang_addmm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}`) that upstream `ExternKernelChoice.__init__` asserts unique. Any graph with ≥2 Linear / addmm calls hits this — MLP, SmallCNN, every Transformer-family model. **Fix**: use `ExternKernelChoice._registry` lookup-before-create (already supported upstream), OR hoist construction to install-time, OR add per-call disambiguator. Likely regressed after OP.27 closeout (2026-05-16). |
+| **M-NEW.2** | **Conv2d compile-mode hard segfault** | **P0 (downstream of M-NEW.1)** | After M-NEW.1's LoweringException unwinds, autotune's registry pollution causes use-after-free in Inductor IR cleanup → process death exit 139. Retest after M-NEW.1 fix. |
+| **M-NEW.3** | **29 % of slang_mm autotune choices rejected by M27 validator** | MED | `_pick_register_tile_configs()` in `templates/caller/gemm/install.py` emits 4×8×1 / 8×4×1 thread blocks (numthreads product = 32) — not a multiple of wave size 64 on RDNA1. The Slang validator correctly rejects, but the generator should not emit them. **Fix**: gate `reg_tiles` on `tile_m * tile_n / (m_per_thread * n_per_thread) >= simd_group_size`. |
+| **M-NEW.3.b** | ✅ **CLOSED 2026-05-18**: int8 `_INT8_TILE_CONFIGS` wave-alignment + M17.1 single-wave filter. `templates/caller/gemm/install.py`: added `_int8_config_wg_threads` + `_filter_int8_configs_wave_aligned` (drops sub-wave + multi-wave-on-wave64 per M17.1 barrier bug); wired into `install_external_mm_int8` + prewarm path. Source table was already wave-aligned (8/8 on wave32, 2/4 surviving on wave64 due to M17.1 cap). 4 new tests + 4 M-NEW.3 regression tests all PASS. Filed M-NEW.3.c (perf-investigation of 50 % int8 config-loss on RDNA1 wave64; tracks alongside M17.1). |
+| **M-NEW.4** | ✅ **CLOSED 2026-05-18**: see § 0.7.3 + M-pipeline-4 row above. |
+| **M22.9-followup** | ✅ **CLOSED 2026-05-18**: Allocator widening for per-call device. **Option A (additive)** — added `Allocator::allocate(size_t, c10::DeviceIndex)` overload in `csrc/backend/Allocator.{cpp,h}`; `vulkan_empty` + `vulkan_empty_strided` in `Registration.cpp` now pre-allocate via `allocator->allocate(nbytes, device.index())` and pass the `DataPtr` into the byte-size `c10::Storage` constructor. Per-device VMA allocator selection via `Context::allocator(device_idx)`. **Surprises**: test rig has 2 Vulkan devices (RADV + Lavapipe/iGPU); buffer pool still global. **Sub-followups**: M22.9-followup-per-device-pool (pool migration to per-device map), M22.9-followup-device1-init (post-rebuild device-1 init capture). 5 tests (4 PASS static + 1 SKIP pending introspection pybind). |
+| **M22.9-followup-introspection-pybind** | ✅ **CLOSED 2026-05-18**: `_storage_device_index(tensor) -> int` pybind in `csrc/init.cpp`. Reads `DataPtr.device().index()` (storage-side, structurally distinct from impl-key `tensor.device.index`). 2 new runtime tests: (a) end-to-end multi-device storage-routing check (allocates on vulkan:0 + vulkan:1, asserts storage indices differ); (b) storage-vs-impl-key invariant on single-device path. 4 PASS + 2 SKIP pre-rebuild — SKIPs flip post-rebuild. |
+| **M-cpp-new-5-followup-test** | ✅ **CLOSED 2026-05-18**: descriptor_indexing runtime override pybind. **`csrc/vulkan/Context.{cpp,h}`** added module-level `std::atomic<int> g_desc_indexing_override{-1}`; **`descriptor_indexing_enabled(index)`** now consults the override before the capability flag (single read-point — covers all ~10 hot-path branches in dispatch/DescriptorSet/Pipeline). **`csrc/init.cpp`** registered `_set/_get_descriptor_indexing_override` pybinds. Verified the fallback `else` branch exists at `dispatch.cpp:295-317` (M-cpp-new-5's explicit add). 5 tests (1 PASS static + 4 SKIP pre-rebuild). Mid-process override is safe (relaxed-atomic, per-call read). |
+| **M-NEW.5** | Cold-import contention 6+ min under concurrent agent load | LOW | When the parent + 5+ agents all import `torch_vulkan` simultaneously with cold slangc cache, total wall time hits 6+ min. Warm-cache import is ~3 s (acceptable). Mitigation: a single-process slangc daemon OR aggressive cache pre-warming OR per-process cache isolation (already partly addressed by M22.16 atomic-write). |
+| **M-NEW.6** | **REFRAME M21.3.01 — universal correctness, not 5/9 models** | **P0 (correctness)** | M21.3 sweep originally framed the Set-1 binding mismatch as a 5/9-model issue. Audit Agent 3 confirms: every Slang dispatch on every model emits `OpDecorate ... DescriptorSet 1` references. RADV silently tolerates by returning unbound/stale descriptor contents (EAGER.1.b symptom). Other drivers (NV / Intel / Apple via MoltenVK) WILL fail. The "fix" — Set 0 binding annotation OR C++ layout widening — must be applied. **Implementer landed Path A on `slang_mm.slang` 2026-05-18** (line 123: `[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;`). Verify other templates received the same fix. |
+
+### 0.7.3 M-pipeline-* — pipeline contract findings (Agent 4)
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M-pipeline-1** | **🔥 Conv lowering UNREACHABLE under main — lazy `_ensure_patch_custom_ops`** | **P0 (THE REAL M18.8.b ROOT CAUSE)** | `register_eager_patch_custom_ops()` runs lazily inside `_patched_conv2d` during Dynamo trace. Three consequences: (1) Dynamo graph-breaks → SmallCNN traces as **3 subgraphs instead of 1** (this is the M18.8.b symptom); (2) the lazy call **re-registers** the custom op with a new `OpOverload` identity; (3) `lowerings[old_overload]` lookups fail → Inductor emits `Creating implicit fallback for: torch_vulkan.conv2d_with_optional_bias.default` → **ALL M19.5 dynamic-shape lift / M20.3 spec consts / future fusion work is dead code for conv on compile path**. Fix: move `register_eager_patch_custom_ops()` to backend register-time (idempotent, before any Dynamo trace). |
+| **M-pipeline-2** | Centralize OpOverload-identity-safe lowering lookup | MED | Extract `_get_conv2d_lowering_by_name()` from `lowerings/conv_transpose.py` to a shared `lowerings/_overload_safe.py`. Force all custom-op lowerings through it. Prevents future M-pipeline-1-class regressions. |
+| **M-pipeline-3** | `VulkanKernel._compute_config_key` is incomplete | MED | Today's key hashes shape + reduction flags + packed16 + simd_size + loop_depth proxy — but NOT buffer dtypes, push-constant layout, or descriptor_counts. Cache hits across structurally-similar kernels with different SPIR-V are silently mis-routed. |
+| **M-pipeline-4** | Pipeline cache key contract not enforced | MED | `csrc/vulkan/Pipeline.cpp` PipelineCache trusts the Python-side key. If two distinct SPIR-V blobs share a key, the first compile wins forever. Add DCHECK in debug builds that cached SPIR-V hash matches the new one. |
+| **M-pipeline-5** | `MAX_BINDINGS` captured at first dispatch | LOW | `csrc/ops/dispatch.cpp` `static const uint32_t MAX_BINDINGS = ...` evaluates once. If extension state ever flips, mis-sized arrays follow. Replace with per-call read. |
+| **M-pipeline-6** | `_VulkanCustomPass.uuid()` hashes only `__init__.py` | MED | Pattern-only edits (e.g. `patterns/builtin_patterns.py`) leave the uuid unchanged → Inductor codecache serves stale FX-pass results. Hash the whole `fx_passes/` subtree. |
+| **M-pipeline-7** | Combo kernel reflection-cache pollution | LOW | All combo kernels hash to `'combo'` constant key (`define_kernel:632`) → reflection metrics cross-contaminate. Compute a content hash of the combined subkernel list. |
+| **M-pipeline-8** | **Anti-goal #3 violation: conv backward routes through `aten.convolution_backward` extern** | OPEN QUESTION | Confirmed in AOT trace: backward graph 0 contains the extern. Anti-goal #3 forbids new `aten.*_backward` lowerings, but the existing extern fallback is in place. Decision needed: **ratify extern OR migrate to `bwd_diff`**. |
+| **M-pipeline-1** | ✅ **CLOSED 2026-05-18**: Lazy `_ensure_patch_custom_ops` was splitting Dynamo graphs. **`fx_passes/eager/conv.py`**: `_ensure_conv2d_with_optional_bias_op_registered` made idempotent (early-return on existing); fixed latent N/C/HxW shape bug in `_conv2d_gn_relu_backward` (was referencing conv input, now references conv output). **`fx_passes/eager/__init__.py`**: added module-level `_REGISTER_DONE` short-circuit. **Pre-fix: 4 subgraphs + 2 graph_breaks + 2 resume frames; post-fix: 1 subgraph + 0 breaks**. Closes **M18.8.b** root cause (audit reframe was correct). 4/4 PASS. |
+| **M-pipeline-1-followup** | ✅ **CLOSED 2026-05-18**: push-constant `int()` wrapping in `templates/caller/conv.py` + **bonus catch**: pre-existing format string mismatch `"32IfI"` → `"31IfII"` (32 leading uints declared vs 31 in slang struct, AND `I` format rejected the float `eps`). 3 pack sites updated (`_slang_tile_conv2d_gn_relu`, `_slang_tile_conv2d`, `_slang_tile_conv2d_bwd`); 31 fields wrapped per site. **xfail-flip: `test_conv_gn_relu_compile_backward_matches_cpu`** decorator removed. New `TestMPipeline1FollowupConvPackInt` (3 tests) — all PASS inline; pytest verification deferred under heavy slangc peer-load. |
+| **M-pipeline-9** | No assertion that `decomposition_passes.py` decomps use `new_empty` not `empty_like` | LOW | The M18.3 fix is documented at line 91-98 but not enforced. Add a meta-test that walks every decomposition body and asserts no `empty_like` survives. |
+| **M-pipeline-4** | ✅ **CLOSED 2026-05-18**: Pipeline cache key SHA collision guard. **`csrc/vulkan/Pipeline.{cpp,h}` + `csrc/init.cpp`**: added `fnv1a64` SPIR-V hash, `CachedPipeline` struct, atomic `collision_count_` counter, `TORCH_WARN` + counter bump on mismatch, `_pipeline_cache_collisions()` pybind. 6 tests (4 PASSED static, 2 SKIPPED pre-rebuild — flip to PASS after C++ rebuild). |
+| **M-cpp-new-2** | ✅ **CLOSED 2026-05-18**: DescriptorPool async-reset path. **`csrc/vulkan/DescriptorSet.{cpp,h}` + `Stream.h` + `csrc/ops/dispatch.cpp`**: added `reset_async(VkFence)` + `drain_pending_resets()` (deferred poll-based drain, no explicit `vkWaitForFences`); 4 hot-path sites in `dispatch.cpp` converted; sync `reset()` retained for `flush_stream` (already did `vkQueueWaitIdle`). Env knob `TORCH_VULKAN_DESCRIPTOR_POOL_ASYNC_RESET={0,1}` regression escape. **Sub-followups**: M-cpp-new-2-followup-validation (post-rebuild VUID stress under VK_LAYER_KHRONOS_validation). 7 tests (6 PASSED, 1 SKIPPED pre-rebuild). |
+| **M-NEW.4 + M-cpp-new-2-followup-pybind** | ✅ **CLOSED 2026-05-18**: Stream + DescriptorPool telemetry pybinds. **`csrc/vulkan/Stream.{cpp,h}` + `csrc/init.cpp`**: added `Stream::submit_count_` atomic + `submit_count()` accessor; 3 new pybinds (`_stream_submit_count`, `_descriptor_pool_async_reset_requests`, `_descriptor_pool_async_resets_drained`). Single `vkQueueSubmit` site verified in `Stream::submit_cmd_buffer` (line 59); Memory.cpp:176 host-staging submit intentionally not counted (out of M9.2 path). New `TestMNew4StreamSubmitAndPoolCounters` (3 PASS static + 3 SKIP pre-rebuild). Filed M-NEW.4-followup-multidevice (per-device counter pybind). |
+
+### 0.7.4 TEST.COV.* — coverage-matrix findings (Agent 2)
+
+| # | Title | Effort |
+|---|-------|--------|
+| **TEST.COV.1** | Cover 9 P1 registered-but-untested lowerings (`_adaptive_avg_pool2d_backward`, `_embedding_bag_backward`, `_embedding_bag_forward_only`, `cross_entropy_loss`, `leaky_relu_backward`, `rot90.default`, `torch_vulkan.foreach_lion_step`, `torch_vulkan.mm_int8`, `aten.lerp.{Scalar_out, Tensor_out}`) | 1 d |
+| **TEST.COV.2** | Dtype matrix sweep on top-20 lowerings × fp16/bf16 | 2 d |
+| **TEST.COV.3** | Activation-bwd direct dispatch tests (hardtanh / hardsigmoid / softplus / mish + 12 trig + 10 exp/log) | 1 d |
+| **TEST.COV.4** | Special-math bwd direct tests (10 ops: erf*, lgamma, digamma, ndtri, i0*, i1*) | 1 d |
+| **TEST.COV.5** | ✅ **CLOSED 2026-05-18**: Overload-tests for `_out` / `.stable` / `.Scalar` variants. 7 tests passed (leaky_relu_backward x2, foreach_lion_step registered, lerp.Scalar/Tensor_out registered, plus 3 meta-tests). 4 deliberate skips: cross_entropy_loss, embedding_bag_forward_only, lerp.Scalar_out eager parity, lerp.Tensor_out eager parity. **Sub-followups filed:** TEST.COV.5.b (pre-grad pass to suppress cross_entropy decomp), TEST.COV.5.c (same for embedding_bag_forward_only decomp suppression). |
+| **TEST.COV.6** | ✅ **CLOSED 2026-05-18**: Promote `test_op21_embedding_bag_bwd.py` / `test_op22_dynamic_reduction_bwd.py` into regression file. **Sub-followup filed:** TEST.COV.6.b (Lion `beta2` ParamConfig bug — see § 0.7.5.y below; D-group fix in flight). |
+| **TEST.COV.7** | ✅ **CLOSED 2026-05-18**: RNN-bwd-fallback reachability audit. **Sub-followup filed:** TEST.COV.7.a (eager-mode `lerp.{Scalar,Tensor}_out` unimplemented; M-EAGER follow-up). |
+| **TEST.COV.8** | ✅ **CLOSED 2026-05-18**: Meta-test for register_lowering coverage. **Two-tier design**: `TestCoverageStructuralInvariant` (strict single-file, EXEMPT=empty), `TestCov8RegisteredLoweringsHaveTests` (loose full-suite, KNOWN_GAPS=empty). AST walker finds **69 unique registered ops** (raw 270 was an over-count — loop-variable expressions account for ~13 raw call sites covered by named decorations elsewhere). **0 silent gaps post-TEST.COV.1-7 closure** — mission's ~60 estimate was pre-wave. 7/7 PASS in 2.93s; walker takes 0.122 s. Filed TEST.COV.10 (AST walker fidelity for loop-variable register sites). |
+
+Coverage totals (Agent 2): ~270 ops across all dispatch paths; ~210 tested (78 %); 9 hard P1 untested.
+
+### 0.7.5 M-docs-* — docs drift (Agent 5)
+
+| # | Title | Effort |
+|---|-------|--------|
+| **M-docs-1** | Refresh root `CLAUDE.md` against v6.3 (currently at v6.2 — missing M17–M23 entirely; affects every session context) | 15 min |
+| **M-docs-2** | Fix backend `CLAUDE.md` key-files table (4 file→dir renames: `runtime.py` → `runtime/`, `meta_patches.py` → `meta_patches/`, `bwd_diff_dispatch.py` → `bwd_diff/`, `vulkan_combo_kernel.py` → `combo_kernel/`) + retire anti-goal #2 (model_ops.cpp deleted) | 10 min |
+| **M-docs-3** | Document ~20 active env knobs missing from backend CLAUDE.md (`TORCH_VULKAN_SLANGC_WORKERS`, `TORCH_VULKAN_DISABLE_SLANG_TILES`, `TORCH_VULKAN_PARAMETER_BLOCK`, etc.) | 20 min |
+| **M-docs-4** | Resolve MAX_JOBS conflict — memory=3, root CLAUDE.md=8, backend CLAUDE.md=4. Pick canonical value. | 5 min |
+| **M-docs-5** | ✅ **CLOSED 2026-05-18**: PyTorch version mismatch resolved. Live venv reports `2.11.0+cpu` (matches user memory); backend CLAUDE.md updated. | done |
+| **M-docs-6** | **Archive `docs/0[1-8].md` + `09-master-plan.md` under `docs/archive/`** (4000+ lines of stale pre-implementation checklists) | 10 min |
+| **M-docs-7** | Refresh `docs/10-lib-api-reference.md` counts (says 9 lib modules; live: 16; `[BackwardDerivative]` 14 → 50) | 15 min |
+| **M-docs-8** | Refresh `docs/primtorch_coverage.md` shader paths (~260 rows, all stale: `unary_abs_fwd.slang` → `shaders/unary/abs.slang`) | 30 min |
+| **M-docs-9** | ✅ **CLOSED 2026-05-18**: § 0 active-milestones M9 row corrected (was "M9.6/M9.7 remain", actual = all closed; new sub-followups tracked as M-cpp-new-2 etc.). | done |
+| **M-docs-10** | Refresh `docs/10-inductor-backend.md` § 13 reference-files table (6 row updates) | 10 min |
+
+### 0.7.5.y TEST.COV sub-followups (2026-05-18 late, surfaced by Wave-4 TEST.COV.5-7 implementer)
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **TEST.COV.5.b** | Pre-grad pass to suppress `cross_entropy_loss` decomposition | LOW (P3) | The lowering is registered but Inductor decomposes `cross_entropy_loss` into log_softmax + nll_loss before reaching the backend. Either add a pre-grad pattern that re-fuses or accept the decomp as canonical. |
+| **TEST.COV.5.c** | Pre-grad pass to suppress `embedding_bag_forward_only` decomp | LOW (P3) | Same shape as TEST.COV.5.b — Inductor decomposes before our lowering fires. |
+| **TEST.COV.6.b** | ✅ **CLOSED 2026-05-18**: Lion optimizer `beta2` ParamConfig fix. `templates/foreach_optimizer.{slang,py.jinja}`: widened struct-field Jinja guard from `algorithm == "adamw"` to `algorithm in ("adamw", "lion")` (1-line change). Python packer was already shipping `beta2` for Lion — only the Slang struct definition was missing. Direct probe: `foreach_lion_step` end-to-end runtime OK, all-finite, params updated by `±lr` (Lion's signed update). 2 new tests in `TestTestCov6bLionStep`; `TestCov6ForeachLionStep` now upgrades from SKIP→PASS. |
+| **TEST.COV.7.a** | Eager-mode `lerp.{Scalar,Tensor}_out` unimplemented | LOW (P3) | Lowerings registered; eager-path pybind not wired. M-EAGER follow-up. |
+
+### 0.7.5.x New eager-path correctness bug — M-cpp-new-6 (2026-05-18 late)
+
+| # | Title | Severity | Detail |
+|---|-------|----------|--------|
+| **M-cpp-new-6** | **Eager `x = x.relu()` chain returns zeros on even iteration count** | **P0 (CORRECTNESS — silent zero)** | Surfaced by M-cpp-new-5 implementer while probing multi-dispatch correctness. `for _ in range(2): x = x.relu()` on Vulkan eager produces all-zero output (CPU is correct). Flip-flop: odd N correct, even N zeros. Pre-existing — NOT caused by M-cpp-new-5 (verified against pre-rebuild .so). Likely a barrier-skipping OR output-aliasing bug in `csrc/ops/activation_ops.cpp::activation_unary` or its `dispatch_shader` barrier handling. Probe: `agent_space/m_cpp_new_5_relu_chain.py`. **Affects any model that calls `.relu()` in a loop in eager mode** — including the test mode `for _ in range(N_warmup): model.forward()` pattern. Workaround: use fresh inputs per iteration. |
+
+### 0.7.6 Reframings from Wave 3
+
+| Prior claim | Reality (Wave 3 audit) |
+|-------------|------------------------|
+| M18.8.b root cause: Dynamo splits at `nn.Sequential` boundary; needs `torch.library.custom_op` or `@torch.compiler.allow_in_graph` workaround | **WRONG.** The real root cause is M-pipeline-1: lazy `_ensure_patch_custom_ops()` causes the split AND breaks OpOverload identity. Fixing M-pipeline-1 should close M18.8.b automatically. |
+| M21.3.01: 5/9 models BLOCKED in compile-mode | **WRONG.** Universal correctness issue affecting every dispatch on every model. 5/9 is just the subset where validation-layer's pipeline-creation check fires first. RADV's silent tolerance makes production work but EAGER.1.b is the symptom. |
+| SmallCNN+GN: 3.9× CPU (compile-mode target 1× CPU) | **SUPERSEDED.** Eager-mode is already at 2.36× CPU — better than the compile-mode target. The perf focus should shift to eager-mode wins + closing M-NEW.1 to get compile-mode benchmarks running again. |
+| Transformer / ViT / Mamba-2 / Llama-block / Qwen3.5 BLOCKED | **PARTIAL.** Compile-mode blocked (M-NEW.1 + M21.3.01). Eager-mode trains end-to-end for all 9 catalog models (validation off). |
+| M22.13 workaround "FIXED (defense-in-depth) pending M22.13-followup" | **CLOSED.** M22.13-followup shipped (mm_tiled.slang + bmm_tiled.slang linearised). The C++ workaround is now redundant; filed **M22.13-retire-workaround** for cleanup. |
+| M23.2 "in-flight" | **CLOSED.** `TestM232CapabilityGateCoverage` is in `tests/test_inductor_regression.py:40473`. |
+
+### 0.7.7 Net-new items added by Wave 3
+
+Counted: **34 new items** across M-NEW (6), M-pipeline (9), TEST.COV (8), M-docs (10) + 1 reframe of M22.13-followup as closed.
 
 ---
 

@@ -250,7 +250,10 @@ def _repeat_backward_fake(grad_output, input_sizes):
 
 
 def _unary_fake(self):
-    return torch.empty_like(self)
+    # M-pipeline-9: `t.new_empty(t.shape)` not `torch.empty_like(t)` —
+    # see M18.3 closure (joint-graph partitioner collapses `empty_like`
+    # to `aten.full(shape, 0)` if it classifies the fake as shape-only).
+    return self.new_empty(self.shape)
 
 
 def _binary_fake(self, other, alpha=1):
@@ -277,7 +280,7 @@ def _binary_no_alpha_fake(self, other):
 
 
 def _binary_scalar_fake(self, other, alpha=1):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _comparison_fake(self, other):
@@ -289,35 +292,35 @@ def _comparison_fake(self, other):
 
 
 def _gelu_fake(self, *, approximate="none"):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _leaky_relu_fake(self, negative_slope=0.01):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _elu_fake(self, alpha=1.0, scale=1.0, input_scale=1.0):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _hardtanh_fake(self, min_val=-1.0, max_val=1.0):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _softplus_fake(self, beta=1.0, threshold=20.0):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _clamp_fake(self, min=None, max=None):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _clamp_min_fake(self, min):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _clamp_max_fake(self, max):
-    return torch.empty_like(self)
+    return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 
 
 def _where_fake(condition, self, other):

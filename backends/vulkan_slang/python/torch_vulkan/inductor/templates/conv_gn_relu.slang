@@ -79,7 +79,8 @@ struct KernelArgs {
     StructuredBuffer<float> gn_bias;    // [C_out]  beta
     RWStructuredBuffer<float> out;      // [N, C_out, oH, oW]
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -164,7 +165,7 @@ void computeMain(
     wf.mean = (local_n > 0.0f) ? local_mean : 0.0f;
     wf.m2   = (local_n > 0.0f) ? local_m2   : 0.0f;
     wf.n    = local_n;
-    WelfordResult<float> stats = wg_welford(wf, tid, 256u);
+    WelfordResult<float> stats = wg_welford(wf, tid, 256u, VK_SUBGROUP_SIZE);
 
     float mean = stats.mean;
     float var  = (stats.n > 0.0f) ? stats.m2 / stats.n : 0.0f;

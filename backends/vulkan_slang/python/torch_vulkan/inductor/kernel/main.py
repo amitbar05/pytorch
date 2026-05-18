@@ -347,6 +347,8 @@ class VulkanKernel(
     def config_key(self) -> str:
         import hashlib
 
+        from torch._inductor.virtualized import V
+
         # Structural loop-depth proxy: number of reduction axes × max
         # reduction depth correlates with loop nesting in emitted code.
         # Two kernels with identical buffer layouts but different
@@ -361,6 +363,73 @@ class VulkanKernel(
             if not self.should_use_cooperative_reduction():
                 _loop_depth_proxy += 1  # persistent loop overhead
 
+        # M-pipeline-3: include the input + output buffer DTYPES in the
+        # cache key. Two kernels with identical shape / reduction
+        # structure but different dtypes (e.g. fp32 vs fp16 vs int64)
+        # emit different SPIR-V with different VGPR pressure — without
+        # hashing dtype here, the reflection-metrics cross-index
+        # (`_reflection_metrics_by_key` in `runtime/slangc.py`) returns
+        # the wrong kernel's reflection data and M11.1's WG sizing
+        # silently picks a suboptimal numthreads.
+        #
+        # `V.graph.get_dtype(outer_name)` is the canonical resolver
+        # (same path `kernel/header.py` uses to emit buffer types).
+        # Fail-soft: if the graph context is unavailable (rare path —
+        # e.g. when computing the key before the graph is bound, or
+        # when called on a mock kernel during unit testing), fall back
+        # to a marker so the key still differentiates kernels from the
+        # cached-but-graphless case.
+        def _resolve_dtype(outer_name) -> str:
+            try:
+                d = V.graph.get_dtype(outer_name)
+                return str(d)
+            except Exception:  # noqa: BLE001 — defensive against ambient-state misses
+                return "?"
+
+        def _outer_names(buf_container):
+            """Iterate outer-name keys from either a dict (production
+            KernelArgs) or a plain list/tuple (test mocks). Stable
+            order: dicts preserve insertion order in Python 3.7+, lists
+            preserve their natural order."""
+            if hasattr(buf_container, "keys"):
+                return list(buf_container.keys())
+            return list(buf_container)
+
+        _input_dtypes = tuple(
+            _resolve_dtype(outer)
+            for outer in _outer_names(self.args.input_buffers)
+        )
+        _output_dtypes = tuple(
+            _resolve_dtype(outer)
+            for outer in _outer_names(self.args.output_buffers)
+        )
+
+        # M-pipeline-3: hash the push-constant layout (sorted set of
+        # sizevar inner names). Two kernels with identical buffer
+        # counts but different dynamic-dim sets (e.g. one with a
+        # dynamic batch dim N, another with a dynamic seq-len S)
+        # produce different PC structs and reflection metrics.
+        # `args.sizevars` is a dict { sympy_expr → inner_name }; we
+        # hash the inner-name set (which corresponds to PC field names
+        # in the emitted struct). Defensive against mocks that omit it.
+        _sizevars = getattr(self.args, "sizevars", None)
+        if _sizevars is None:
+            _pc_layout: tuple = ()
+        elif hasattr(_sizevars, "values"):
+            _pc_layout = tuple(sorted(str(v) for v in _sizevars.values()))
+        else:
+            _pc_layout = tuple(sorted(str(v) for v in _sizevars))
+
+        # M-pipeline-3: hash a proxy for descriptor_counts. The true
+        # `descriptor_counts` comes from post-compile SPIR-V reflection
+        # so it is not available here. Two pre-compile signals together
+        # determine the binding layout: the count of in-place buffers
+        # (which collapse two logical bindings into one descriptor) and
+        # the ParameterBlock flag (which packs all storage buffers into
+        # one `ParameterBlock<>` slot via `[[vk::binding(0)]]`).
+        _inplace_count = len(getattr(self.args, "inplace_buffers", {}) or {})
+        _use_param_block = int(bool(getattr(self, "_use_parameter_block", False)))
+
         parts = [
             str(len(self.args.input_buffers)),
             str(len(self.args.output_buffers)),
@@ -374,9 +443,21 @@ class VulkanKernel(
             # DR.3: loop-depth proxy — distinct buckets for different
             # reduction arity / persistent vs cooperative
             str(_loop_depth_proxy),
+            # M-pipeline-3: dtype + PC layout + descriptor-binding proxy
+            # — these were silent collision sources before. See block
+            # comment above for the bug and rationale.
+            "in_dt:" + ",".join(_input_dtypes),
+            "out_dt:" + ",".join(_output_dtypes),
+            "pc:" + ",".join(_pc_layout),
+            "ip:" + str(_inplace_count),
+            "pb:" + str(_use_param_block),
         ]
         raw = "|".join(parts)
-        return "cfg_" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+        # M-pipeline-3: prefix bumped `cfg_` → `cfg2_` so any cached
+        # entries from the old key format (which omitted dtype / PC /
+        # descriptor-count dimensions) cannot collide with new entries
+        # in process-lifetime caches like `_reflection_metrics_by_key`.
+        return "cfg2_" + hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _get_actual_vgprs(self) -> Optional[int]:
         """Query cached reflection metrics for this kernel's config.

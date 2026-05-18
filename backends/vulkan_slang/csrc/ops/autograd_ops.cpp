@@ -1883,7 +1883,15 @@ public:
         ctx->save_for_backward({Q, K, V, output, lse});
         ctx->saved_data["scale"]        = scale;
         ctx->saved_data["is_causal"]    = is_causal;
-        ctx->saved_data["q_seq_major"]  = q_seq_major;
+        // M22.11: `q_seq_major` is intentionally NOT saved. The backward
+        // (`vulkan_flash_attention_backward`) auto-detects the layout from
+        // Q's strides and returns gQ/gK/gV in the matching layout. Saving
+        // a redundant copy here was a footgun — the saved flag could
+        // drift from the actual layout if a future fwd path mutates Q's
+        // strides after capture, and the consumer would silently use the
+        // wrong value. (void cast keeps the parameter from triggering
+        // -Wunused-parameter without changing the public signature.)
+        (void)q_seq_major;
         return output;
     }
 
@@ -1898,11 +1906,12 @@ public:
         auto lse    = saved[4];
         float sf       = static_cast<float>(ctx->saved_data["scale"].toDouble());
         bool is_causal = ctx->saved_data["is_causal"].toBool();
-        bool q_seq_major = ctx->saved_data["q_seq_major"].toBool();
         auto go = grad_outputs[0];
         // Pass Q/K/V directly — vulkan_flash_attention_backward auto-detects seq-major
         // layout from strides and returns gQ/gK/gV in matching layout (seq-major → transpose view).
         // No need to convert to head-major here; doing so would add 3 GPU copy dispatches.
+        // M22.11: `q_seq_major` is NOT loaded from saved_data — see forward()
+        // for why the strides-driven auto-detect is the source of truth.
         auto [gQ, gK, gV] = vulkan_flash_attention_backward(
             go, Q, K, V, output, lse, sf, is_causal);
         // Return 6 gradients: Q, K, V, scale, is_causal, q_seq_major

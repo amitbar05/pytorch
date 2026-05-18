@@ -97,7 +97,8 @@ struct KernelArgs {
 /*{%*/ endif /*%}*/
     RWStructuredBuffer<float> out;
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
 [numthreads(THREADS_W, THREADS_H, 1)]
@@ -128,8 +129,27 @@ void computeMain<Epilogue : IDifferentiable>(
     uint oh_end = min(oh_start + pc.tile_h, pc.oH);
 
     // ── Per-thread output position ─────────────────────────────────────
-    uint local_ow = lid.x;
-    uint local_oh = lid.y;
+    // M-slang-new-4: derive local_ow / local_oh from a linearised
+    // ``tid_local`` instead of reading ``lid.x`` / ``lid.y`` directly.
+    // The raw form triggers the same slangc 2026.5+ wave64 scalarisation
+    // bug on RDNA1 that affected ``mm_tiled.slang`` pre-M22.13-followup
+    // and ``bmm_tiled.slang`` pre-M22.13-extras: with 3+ StructuredBuffer
+    // bindings (args.input, args.weight, args.out, optional args.bias)
+    // and both ``lid.x`` and ``lid.y`` reads used to address different
+    // buffers, slangc folds ``lid.x`` to a constant for lanes with
+    // ``lid.x >= 1``, collapsing rows of the C-tile.
+    //
+    // Linearisation rule: workgroup is ``numthreads(THREADS_W,
+    // THREADS_H, 1)``, so SPIR-V lane ordering is
+    // ``lane = lid.y * THREADS_W + lid.x``. Reconstructing the per-thread
+    // coords via modular arithmetic is algebraically identical to direct
+    // ``lid`` reads, but slangc's wave64 scalarisation pass treats the
+    // recovered values as per-lane (correct) rather than wave-uniform
+    // (the buggy fold). Same pattern as ``mm_tiled.slang`` and
+    // ``templates/slang_mm.slang``.
+    uint tid_local = lid.y * THREADS_W + lid.x;
+    uint local_ow = tid_local % THREADS_W;  // == lid.x — but recovered
+    uint local_oh = tid_local / THREADS_W;  // == lid.y — but recovered
 
     // CG.M15: Early exit for threads outside the runtime workgroup
     // (spec-constant THREADS_W/THREADS_H may be larger than needed).

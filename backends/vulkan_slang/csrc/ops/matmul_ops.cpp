@@ -210,7 +210,6 @@ at::Tensor& vulkan_mm_out(const at::Tensor& self, const at::Tensor& mat2,
     auto orig_dtype = out.scalar_type();
     int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
 
-    // Transposed-view fast path: recover physical storage, use transpose flags
     bool ta = is_t_transposed(self), tb = is_t_transposed(mat2);
     if (ta || tb) {
         auto self_use = ta ? get_physical_storage(self, true) : self;

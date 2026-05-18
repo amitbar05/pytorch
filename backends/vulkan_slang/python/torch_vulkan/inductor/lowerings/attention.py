@@ -103,7 +103,28 @@ def _register_sdpa_lowering() -> None:
                 enable_gqa,
                 layout=layout,
             )
-        head_dim = int(query.get_size()[-1])
+        # M19.5: head_dim may be a SymInt under dynamic shapes —
+        # use size_hint to resolve it, and fall through to the
+        # stock aten path when the hint can't give us a concrete
+        # value.
+        from torch._inductor.graph import V
+
+        head_dim_sym = query.get_size()[-1]
+        try:
+            head_dim = V.graph.sizevars.size_hint(head_dim_sym)
+        except (TypeError, ValueError):
+            return _fallthrough_aten(
+                _orig_aten,
+                query,
+                key,
+                value,
+                attn_mask,
+                dropout_p,
+                is_causal,
+                scale,
+                enable_gqa,
+                layout=layout,
+            )
         if head_dim not in _SUPPORTED_HEAD_DIMS:
             return _fallthrough_aten(
                 _orig_aten,

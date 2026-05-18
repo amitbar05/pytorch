@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -101,10 +102,14 @@ void end_batch_dispatch() {
     auto& rt = get_runtime(ctx.current_device());
     if (!rt.batch_mode) return;
     rt.batch_mode = false;
-    // Flush any remaining dispatches + reset descriptor pool
+    // Flush any remaining dispatches + reset descriptor pool.
+    // M-cpp-new-2: use ``reset_async(fence)`` so the M9.2 batching win
+    // isn't defeated by a synchronous fence-wait at every batch end.
+    // The actual ``vkResetDescriptorPool`` fires on the next batch's
+    // drain pass once the fence has signaled.
     if (rt.stream && rt.stream->pending_dispatches() > 0) {
         rt.stream->flush_async();
-        rt.desc_pool->reset();
+        rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on batch end
     }
@@ -139,6 +144,19 @@ DeviceRuntime& get_runtime(uint32_t device_index) {
     rt.desc_pool = std::make_unique<vulkan::DescriptorPool>(
         ctx.device(device_index), 4096);
     rt.desc_pool->set_pre_reset_callback(desc_pool_flush_callback);
+
+    // Wire the Stream's pre-sync callback to drain the DescriptorPool's
+    // pending_resets_ queue BEFORE fence destruction.  This fixes the
+    // M-cpp-new-2 use-after-free: synchronize() destroys fences after
+    // vkQueueWaitIdle, but reset_async() had stored those fence handles
+    // in pending_resets_.  By draining first, fences are still valid
+    // when vkGetFenceStatus is called on them.
+    //
+    // The lambda captures by value (not reference) so it is safe even
+    // if rt moves in the unordered_map.  Both unique_ptrs are stable.
+    rt.stream->set_pre_sync_callback([desc_pool = rt.desc_pool.get()]() {
+        desc_pool->drain_pending_resets();
+    });
 
     // Register callbacks so VulkanBuffer::read() auto-flushes only when needed
     if (!g_callback_registered) {
@@ -208,33 +226,71 @@ void dispatch_shader(
 
     // M9.2 batched submission: submit async every 8 dispatches so the
     // GPU can overlap compute with CPU recording the next batch.
+    // M-cpp-new-2: ``reset_async(fence)`` defers the actual
+    // ``vkResetDescriptorPool`` until the just-submitted cmd buffer's
+    // fence signals. The synchronous ``reset()`` here would either
+    // spec-violate (descriptors still in use by the in-flight cmd
+    // buffer) or force a fence-wait that defeats the M9.2 batching.
     if (!rt.batch_mode && rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
         rt.stream->flush_async();
-        rt.desc_pool->reset();
+        rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
-    // M17.5: Reuse cached descriptor set for same pipeline in batch.
-    VkDescriptorSet desc_set = VK_NULL_HANDLE;
-    auto cache_it = rt.desc_set_cache.find(pipeline->descriptor_set_layout());
-    if (cache_it != rt.desc_set_cache.end()) {
-        desc_set = cache_it->second;
-    } else {
-        desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
-        rt.desc_set_cache[pipeline->descriptor_set_layout()] = desc_set;
-    }
+    // M-cpp-new-5: gate the M17.5 descriptor-set cache on descriptor
+    // indexing. The cache lets us reuse a single `VkDescriptorSet` for
+    // the same pipeline across multiple dispatches in a batch — which
+    // means we call `vkUpdateDescriptorSets` (inside `bind_buffers`)
+    // on a set that may already be bound by a previously-recorded but
+    // un-submitted command buffer. Per Vulkan spec § 14.2.1 this is UB
+    // unless the pool was created with
+    // `VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT`, and that flag
+    // is only set when `VK_EXT_descriptor_indexing` is available
+    // (see `DescriptorSet.cpp:27-29`). On platforms / drivers where
+    // the extension is missing M17.5's cache reuse would silently
+    // violate VUID-VkWriteDescriptorSet-dstSet-04611.
+    //
+    // M-cpp-new-6: even with UPDATE_AFTER_BIND, sharing one descriptor
+    // set between two recorded dispatches with DIFFERENT buffers is
+    // wrong — both bind calls reference the same `VkDescriptorSet`
+    // handle, and the second `vkUpdateDescriptorSets` overwrites the
+    // bindings the first dispatch needed. When the cmd buffer executes,
+    // both dispatches see the LATEST descriptor contents, corrupting
+    // any chain like `x.relu().relu()`. The fix below caches by
+    // (layout, buffer-list-hash) instead of (layout) alone, so the
+    // M17.5 fast path still hits for repeated dispatches with the
+    // SAME buffers (the autotune / multi-launch case M17.5 was designed
+    // for) but a chain with different intermediates gets a fresh set
+    // per dispatch.
+    // M-pipeline-5: per-call read of descriptor-indexing state, NOT a
+    // `static const` capture-at-first-use. The latter would freeze the
+    // first-call value for the whole process — fine today (the env knob
+    // is read once at backend init per M-cpp-new-5) but a latent footgun
+    // for future test fixtures or `Context::reset()` paths that toggle
+    // the state at runtime.
+    const bool kUseDescCache =
+        vulkan::Context::instance().descriptor_indexing_enabled();
 
-    if (g_profile_enabled) { t3 = _now_ns(); g_profile_desc_alloc_ns += (t3 - t2); }
-
-    // Stack-allocated arrays to avoid heap allocation per dispatch.
-    // Capacity grows with descriptor indexing enabled (256 vs 32).
-    static const uint32_t MAX_BINDINGS =
-        vulkan::Context::instance().descriptor_indexing_enabled() ? 256 : 32;
-    VkBuffer vk_buffers_arr[MAX_BINDINGS];
-    VkDeviceSize vk_sizes_arr[MAX_BINDINGS];
+    // M-pipeline-5: ``MAX_BINDINGS_CAP`` is the COMPILE-TIME stack-array
+    // size (the larger of the two possible values: 256 for descriptor
+    // indexing, 32 legacy). ``max_bindings`` is the per-call RUNTIME
+    // cap used for the `n <= max_bindings` precondition check elsewhere.
+    // Allocating the upper bound on stack costs at most ~3 KB of stack
+    // (256 × 8 B VkBuffer + 256 × 8 B VkDeviceSize = 4 KB), negligible
+    // vs. PyTorch's default stack budget. The previous `static const`
+    // expression forced GCC into VLA-extension territory; constexpr
+    // makes it a pure C++ stack array.
+    constexpr uint32_t MAX_BINDINGS_CAP = 256;
+    const uint32_t max_bindings = kUseDescCache ? 256u : 32u;
+    VkBuffer vk_buffers_arr[MAX_BINDINGS_CAP];
+    VkDeviceSize vk_sizes_arr[MAX_BINDINGS_CAP];
     uint32_t n = static_cast<uint32_t>(tensors.size());
+    TORCH_CHECK(n <= max_bindings,
+        "dispatch_shader: total buffer count ", n,
+        " exceeds max_bindings ", max_bindings,
+        " (descriptor_indexing=", kUseDescCache, ")");
 
     for (uint32_t i = 0; i < n; ++i) {
         auto info = get_buffer_info(tensors[i]);
@@ -243,6 +299,48 @@ void dispatch_shader(
     }
 
     if (g_profile_enabled) { t4 = _now_ns(); g_profile_buffer_info_ns += (t4 - t3); }
+
+    // FNV-1a 64-bit hash of the bound VkBuffer handles, in order. We
+    // hash only the handles (not the sizes) because the sizes are a
+    // function of the handles plus the binding's layout (which is
+    // already in the cache key). VkBuffer is opaque-pointer-sized.
+    uint64_t buffers_hash = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t v = reinterpret_cast<uint64_t>(vk_buffers_arr[i]);
+        for (int b = 0; b < 8; ++b) {
+            buffers_hash ^= (v >> (b * 8)) & 0xff;
+            buffers_hash *= 0x100000001b3ull;
+        }
+    }
+
+    // M17.5 + M-cpp-new-6: cache lookup keyed on (layout, buffer-list).
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    if (kUseDescCache) {
+        DeviceRuntime::DescSetCacheKey key{
+            pipeline->descriptor_set_layout(), buffers_hash};
+        auto cache_it = rt.desc_set_cache.find(key);
+        if (cache_it != rt.desc_set_cache.end()) {
+            desc_set = cache_it->second;
+        } else {
+            // M-cpp-new-6 Layer 2: snapshot reset generation before
+            // allocate() in case pool exhaustion triggers an internal
+            // reset. If the generation changed, the cache holds stale
+            // VkDescriptorSet handles from the pre-reset pool — clear.
+            uint64_t gen_before = rt.desc_pool->reset_generation();
+            desc_set = rt.desc_pool->allocate(
+                pipeline->descriptor_set_layout());
+            if (rt.desc_pool->reset_generation() != gen_before) {
+                rt.desc_set_cache.clear();
+            }
+            rt.desc_set_cache[key] = desc_set;
+        }
+    } else {
+        // Legacy path: allocate fresh; do not cache. Pool reset on
+        // batch end frees these in bulk via `vkResetDescriptorPool`.
+        desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
+    }
+
+    if (g_profile_enabled) { t3 = _now_ns(); g_profile_desc_alloc_ns += (t3 - t2); }
 
     vulkan::bind_buffers(device, desc_set, vk_buffers_arr, vk_sizes_arr, n);
 
@@ -358,33 +456,61 @@ void dispatch_shader_indexed(
     if (!rt.batch_mode && rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
         rt.stream->flush_async();
-        rt.desc_pool->reset();
+        // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
+        rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
-    // M17.5: Reuse cached descriptor set for same pipeline in batch.
-    VkDescriptorSet desc_set = VK_NULL_HANDLE;
-    auto cache_it = rt.desc_set_cache.find(pipeline->descriptor_set_layout());
-    if (cache_it != rt.desc_set_cache.end()) {
-        desc_set = cache_it->second;
-    } else {
-        desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
-        rt.desc_set_cache[pipeline->descriptor_set_layout()] = desc_set;
-    }
-
-    static const uint32_t MAX_BINDINGS =
-        ctx.descriptor_indexing_enabled() ? 256 : 32;
-    VkBuffer vk_buffers_arr[MAX_BINDINGS];
-    VkDeviceSize vk_sizes_arr[MAX_BINDINGS];
+    // M-cpp-new-5 / M-cpp-new-6 note: unlike `dispatch_shader` we know
+    // descriptor indexing is on (asserted above), so UPDATE_AFTER_BIND
+    // is available; the M-cpp-new-6 bug (same descriptor-set handle bound
+    // by two recorded dispatches with different buffer contents) still
+    // applies here in principle, so we use the same (layout, buffer-list)
+    // cache key as `dispatch_shader`.
+    // M-pipeline-5: per-call read (not `static const` capture-at-first-
+    // use). See `dispatch_shader` above for the rationale. This path is
+    // already gated by `TORCH_CHECK(ctx.descriptor_indexing_enabled())`
+    // above, so `max_bindings` always evaluates to 256 today — but the
+    // `static const` capture would freeze the wrong value if a future
+    // fixture flipped the assert into a soft warning + fallback.
+    constexpr uint32_t MAX_BINDINGS_CAP = 256;
+    const uint32_t max_bindings =
+        ctx.descriptor_indexing_enabled() ? 256u : 32u;
+    VkBuffer vk_buffers_arr[MAX_BINDINGS_CAP];
+    VkDeviceSize vk_sizes_arr[MAX_BINDINGS_CAP];
     const uint32_t n = static_cast<uint32_t>(tensors.size());
-    TORCH_CHECK(n <= MAX_BINDINGS,
-        "dispatch_shader_indexed: total buffer count exceeds MAX_BINDINGS");
+    TORCH_CHECK(n <= max_bindings,
+        "dispatch_shader_indexed: total buffer count ", n,
+        " exceeds max_bindings ", max_bindings);
 
     for (uint32_t i = 0; i < n; ++i) {
         auto info = get_buffer_info(tensors[i]);
         vk_buffers_arr[i] = info.buffer;
         vk_sizes_arr[i] = info.size;
+    }
+
+    uint64_t buffers_hash = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t v = reinterpret_cast<uint64_t>(vk_buffers_arr[i]);
+        for (int b = 0; b < 8; ++b) {
+            buffers_hash ^= (v >> (b * 8)) & 0xff;
+            buffers_hash *= 0x100000001b3ull;
+        }
+    }
+
+    // M17.5: Reuse cached descriptor set keyed on (layout, buffer-list).
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    {
+        DeviceRuntime::DescSetCacheKey key{
+            pipeline->descriptor_set_layout(), buffers_hash};
+        auto cache_it = rt.desc_set_cache.find(key);
+        if (cache_it != rt.desc_set_cache.end()) {
+            desc_set = cache_it->second;
+        } else {
+            desc_set = rt.desc_pool->allocate(pipeline->descriptor_set_layout());
+            rt.desc_set_cache[key] = desc_set;
+        }
     }
 
     vulkan::bind_buffers_indexed(
@@ -513,7 +639,8 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
     if (rt.stream->pending_dispatches() >= vulkan::Stream::MAX_DISPATCHES_PER_CMD) {
         g_capacity_flush_count++;
         rt.stream->flush_async();
-        rt.desc_pool->reset();
+        // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
+        rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
@@ -569,6 +696,24 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
 }
 
 // ── Dtype-aware buffer copy ─────────────────────────────────────
+//
+// M-cpp-new-4: the `copy_buffer_copy_fwd` shader now operates on 32-bit
+// `uint` words (see `shaders/copy/buffer_copy.slang`). The copy length
+// passed to the shader is `numel * elementSize(dtype) / 4`, which is the
+// number of 4-byte words covering the contiguous tensor storage. This
+// preserves all bits for any dtype whose element size is a multiple of
+// 4 — most importantly `int64` and `float64`, which the prior
+// `StructuredBuffer<float>` path silently truncated by half (the high
+// 32 bits of every element were dropped on every `.to('vulkan')` /
+// `.contiguous()` round-trip).
+//
+// Sub-32-bit dtypes (Bool, Byte, Char, Float8_*) cannot use the word-copy
+// shader because their nbytes() is not guaranteed to be 4-aligned for
+// arbitrary numel; they continue to route through `dispatch_copy_buffer_byte`
+// (OP.1.c — `vkCmdCopyBuffer` with byte precision). Half / BFloat16
+// (2 B/elem) packed pairs ride the word-copy path when numel is even and
+// fall through to the byte-copy path otherwise so the trailing 2 bytes
+// don't read past the end of storage.
 void dispatch_copy_buffer(const at::Tensor& src, const at::Tensor& dst) {
     uint32_t numel = static_cast<uint32_t>(dst.numel());
     if (numel == 0) return;
@@ -590,12 +735,30 @@ void dispatch_copy_buffer(const at::Tensor& src, const at::Tensor& dst) {
         return;
     }
 
-    // The copy shader uses StructuredBuffer<float> (4 bytes per element).
-    // For smaller dtypes, adjust the copy count to avoid buffer overruns.
-    uint32_t copy_units = numel;
-    if (dtype == c10::ScalarType::Half || dtype == c10::ScalarType::BFloat16) {
-        copy_units = (numel + 1) / 2;  // 2 bytes/element → 2 elements per float
+    // 2 B/elem dtypes (Half, BFloat16) only fit a whole-word copy when
+    // numel is even. An odd numel leaves a trailing 2-byte tail; rather
+    // than risk reading past storage, defer to the byte-precision copy.
+    const auto elem_size =
+        static_cast<uint32_t>(c10::elementSize(dtype));
+    const uint64_t nbytes =
+        static_cast<uint64_t>(numel) * static_cast<uint64_t>(elem_size);
+    if (nbytes % 4 != 0) {
+        dispatch_copy_buffer_byte(src, dst);
+        return;
     }
+
+    // The shader copies 32-bit `uint` words; one word covers 4 bytes of
+    // storage regardless of dtype. `numel * elem_size / 4` is the exact
+    // word count, so int64 / float64 are copied in full (the M-cpp-new-4
+    // bug was passing `numel` here against a 4-B/elem shader).
+    TORCH_CHECK(elem_size >= 1, "dispatch_copy_buffer: dtype must have positive element size");
+    const uint64_t copy_units_u64 = nbytes / 4ull;
+    TORCH_CHECK(
+        copy_units_u64 <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()),
+        "dispatch_copy_buffer: tensor too large for 32-bit dispatch (",
+        copy_units_u64,
+        " uint words)");
+    const uint32_t copy_units = static_cast<uint32_t>(copy_units_u64);
 
     dispatch_elementwise("copy_buffer_copy_fwd",
                          shaders::copy_buffer_copy_fwd,

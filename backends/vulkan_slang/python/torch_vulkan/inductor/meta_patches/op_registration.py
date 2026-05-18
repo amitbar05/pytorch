@@ -28,11 +28,18 @@ def _register_backward_meta_decomps() -> None:
 
         aten = torch.ops.aten
 
+        # M18.3 (2026-05-18): torch.empty_like(t) → t.new_empty(t.shape).
+        # The proxy tracer (AOTAutograd joint trace) records ``empty_like(t)``
+        # as a shape-only op; the joint partitioner then drops the primal
+        # inputs and Inductor lowers the backward to ``alloc + zero-init``
+        # — literal-zero gradients at runtime. ``new_empty(shape)``
+        # materialises through the source tensor's factory, which the
+        # partitioner treats as storage-bound rather than shape-derived.
         def _bwd_meta_like_grad(grad_output, *_args, **_kwargs):
-            return torch.empty_like(grad_output)
+            return grad_output.new_empty(grad_output.shape)
 
         def _bwd_meta_like_input(grad_output, input, *_args, **_kwargs):
-            return torch.empty_like(input)
+            return input.new_empty(input.shape)
 
         def _layer_norm_bwd_meta(
             grad_out,
@@ -45,22 +52,22 @@ def _register_backward_meta_decomps() -> None:
             output_mask=(True, True, True),
         ):
             gi = (
-                torch.empty_like(input)
+                input.new_empty(input.shape)
                 if output_mask[0]
-                else torch.empty(0, dtype=input.dtype, device=input.device)
+                else input.new_empty((0,))
             )
             norm_size = 1
             for s in normalized_shape:
                 norm_size *= s
             gw = (
-                torch.empty(norm_size, dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((norm_size,))
                 if output_mask[1]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             gb = (
-                torch.empty(norm_size, dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((norm_size,))
                 if output_mask[2]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             return gi, gw, gb
 
@@ -68,19 +75,19 @@ def _register_backward_meta_decomps() -> None:
             grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
         ):
             gi = (
-                torch.empty_like(input)
+                input.new_empty(input.shape)
                 if output_mask[0]
-                else torch.empty(0, dtype=input.dtype, device=input.device)
+                else input.new_empty((0,))
             )
             gw = (
-                torch.empty(int(C), dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((int(C),))
                 if output_mask[1]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             gb = (
-                torch.empty(int(C), dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((int(C),))
                 if output_mask[2]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             return gi, gw, gb
 
@@ -97,40 +104,38 @@ def _register_backward_meta_decomps() -> None:
             output_mask,
         ):
             gi = (
-                torch.empty_like(input)
+                input.new_empty(input.shape)
                 if output_mask[0]
-                else torch.empty(0, dtype=input.dtype, device=input.device)
+                else input.new_empty((0,))
             )
             C = input.shape[1]
             gw = (
-                torch.empty(C, dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((C,))
                 if output_mask[1]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             gb = (
-                torch.empty(C, dtype=grad_out.dtype, device=grad_out.device)
+                grad_out.new_empty((C,))
                 if output_mask[2]
-                else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+                else grad_out.new_empty((0,))
             )
             return gi, gw, gb
 
         def _linear_bwd_meta(input, grad_output, weight, output_mask):
             gi = (
-                torch.empty_like(input)
+                input.new_empty(input.shape)
                 if output_mask[0]
-                else torch.empty(0, dtype=input.dtype, device=input.device)
+                else input.new_empty((0,))
             )
             gw = (
-                torch.empty_like(weight)
+                weight.new_empty(weight.shape)
                 if output_mask[1]
-                else torch.empty(0, dtype=weight.dtype, device=weight.device)
+                else weight.new_empty((0,))
             )
             gb = (
-                torch.empty(
-                    weight.size(0), dtype=grad_output.dtype, device=grad_output.device
-                )
+                grad_output.new_empty((weight.size(0),))
                 if output_mask[2]
-                else torch.empty(0, dtype=grad_output.dtype, device=grad_output.device)
+                else grad_output.new_empty((0,))
             )
             return gi, gw, gb
 

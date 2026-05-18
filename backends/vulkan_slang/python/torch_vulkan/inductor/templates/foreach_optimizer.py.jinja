@@ -40,7 +40,9 @@
 //       per-param-buffer ``switch (param_idx)`` cascades collapse to
 //       direct ``args.params[param_idx].p[idx]`` indexing.
 
-// Per-param config (12 bytes per param, packed for GPU alignment).
+// Per-param config (packed for GPU alignment).
+// Field order MUST match the Python-side ``struct.pack`` sequence in
+// ``templates/caller/optimizer.py`` (around line 173-193).
 struct ParamConfig {
     uint  numel;
     float lr;
@@ -48,8 +50,12 @@ struct ParamConfig {
 {% if algorithm in ("sgd_momentum", "adamw", "lion") %}
     float momentum;   // SGD: momentum factor; AdamW: β₁; Lion: β₁
 {% endif %}
-{% if algorithm == "adamw" %}
+{% if algorithm in ("adamw", "lion") %}
+    // TEST.COV.6.b: β₂ for both AdamW (variance EMA) AND Lion
+    // (momentum EMA).
     float beta2;
+{% endif %}
+{% if algorithm == "adamw" %}
     float eps;
 {% endif %}
 };
@@ -109,7 +115,8 @@ struct KernelArgs {
 {% endif %}
 };
 {% endif %}
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]

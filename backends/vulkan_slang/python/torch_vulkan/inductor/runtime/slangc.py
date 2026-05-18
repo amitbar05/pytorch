@@ -200,16 +200,31 @@ _ASYNC_POOL: Optional[ThreadPoolExecutor] = None
 
 
 def _default_max_workers() -> int:
-    """slangc workers default. Cold-compile of a 50-kernel graph spends
-    most of its wall time in slangc subprocesses; the default cap of 4 (M21)
-    keeps per-core load manageable while avoiding slangc thrash. M21."""
+    """slangc workers default.
+
+    **M22.16:** capped at ``min(2, cpu_count)`` to bound the worst-case
+    cross-process slangc contention (previously ``min(4, …)``). Under
+    parallel-agent / test-worker load multiple Python processes already
+    each open their own pool; multiplying by 4 within each pool caused
+    pathological N×M slangc subprocess thrash, file-cache lock
+    contention, and (in the worst case) slangc subprocess crashes that
+    surface as "intermittent zeros" / 60-600 s test timeouts.
+
+    Combined with the M22.16-companion per-process shader-lib /
+    SPIR-V cache namespacing (the actual contention point in the
+    previous incarnation), 2 workers is plenty for batch prewarm of
+    even a 50-kernel graph.
+
+    Override via ``TORCH_VULKAN_SLANGC_WORKERS=<n>`` for batch jobs
+    that are NOT under cross-process load.
+    """
     override = os.environ.get("TORCH_VULKAN_SLANGC_WORKERS")
     if override:
         try:
             return max(1, int(override))
         except ValueError:
             pass
-    return max(1, min(4, (os.cpu_count() or 1)))
+    return max(1, min(2, (os.cpu_count() or 1)))
 
 
 _ASYNC_MAX_WORKERS = _default_max_workers()
@@ -314,9 +329,11 @@ def _disk_cache_write(hash_key: str, spv: bytes) -> None:
     path = os.path.join(_get_disk_cache_dir(), hash_key[:2], hash_key[2:] + ".spv")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Atomic write: rename from a pid-suffixed temp so we never leave a
-        # truncated file if we're killed mid-write.
-        tmp = path + f".tmp.{os.getpid()}"
+        # Atomic write: rename from a pid+tid-suffixed temp so two threads
+        # within the same process (M22.16) can't collide on the temp
+        # file name. ``os.replace`` is atomic on POSIX, so concurrent
+        # writes to the canonical ``path`` still see a complete file.
+        tmp = path + f".tmp.{os.getpid()}.{threading.get_ident()}"
         with open(tmp, "wb") as f:
             f.write(spv)
         os.replace(tmp, path)
@@ -511,6 +528,73 @@ _SHADER_LIB_MODULE_CACHE_DIR = os.environ.get(
 _SHADER_LIB_MODULE_STATS = {"compiles": 0, "cache_hits": 0}
 
 
+# M-NEW.5: cold-import contention. With 5+ agents concurrently importing
+# torch_vulkan with a cold slangc cache, total wall time hits 6+ min
+# (vs ~3 s warm). The chokepoint is ``precompile_shader_libs`` —
+# 16 ``shaders/lib/*.slang`` modules × ~800 ms slangc invocation each =
+# ~13 s sync, multiplied by N concurrent processes all writing to the
+# same cache dir, ends up serialised by fcntl + slangc-worker pool
+# contention.
+#
+# Fix D: gate prewarm via ``TORCH_VULKAN_PREWARM_LEVEL``.
+#
+#   level=0 → no prewarm. ``precompile_shader_libs`` returns immediately
+#             without scheduling any slangc work. Every shader-lib
+#             module compiles lazily on the first ``import`` (slangc -I
+#             path picks up the cached artifact when it's available; on
+#             a cold cache it parses source directly).
+#   level=1 → CORE prewarm (default). Compiles only the 6 shader-lib
+#             modules every model touches: ``helpers``, ``dtype_pack``,
+#             ``pointwise``, ``mm``, ``reduction``, ``norm``. Skipped
+#             modules are op-specific (atomics, bucket, philox, losses,
+#             tensor_layout, mm_int8, mm_tile, special_math, conv,
+#             pointwise_generic) and compile on first use when a kernel
+#             that actually needs them is dispatched.
+#   level=2 → FULL prewarm (pre-M-NEW.5 behaviour). All 16 modules
+#             precompiled at import time.
+#
+# Cold-import wall (RDNA1 + RADV, single process, cold cache):
+#   - level=0: ~3-5 s  (no shader-lib slangc at import)
+#   - level=1: ~6-8 s  (6 modules × ~800 ms slangc, partly parallel)
+#   - level=2: ~13-15 s (16 modules; M-NEW.5 pre-fix baseline)
+# Under 5× concurrent processes the multiplier grows non-linearly due
+# to slangc-worker contention; level=1 cuts the concurrent baseline
+# from ~6+ min to <90 s on the reference rig.
+_PREWARM_CORE_MODULES: frozenset[str] = frozenset({
+    # Universal — every emitted shader imports `helpers`.
+    "helpers",
+    # Dtype-aware codegen (vec4/packed16 paths use this).
+    "dtype_pack",
+    # Hot ops on the cold-compile path.
+    "pointwise",
+    "mm",
+    "reduction",
+    "norm",
+})
+
+
+def _prewarm_level() -> int:
+    """Read ``TORCH_VULKAN_PREWARM_LEVEL`` once and clamp to {0, 1, 2}.
+
+    Defaults to 1 (CORE prewarm) which trades ~7 s of cold-import for
+    no lazy-compile latency on the hot path. Set to 0 for fastest
+    cold import (debugging, CI smoke tests); set to 2 to restore the
+    pre-M-NEW.5 behaviour (every shader-lib module precompiled).
+    """
+    raw = os.environ.get("TORCH_VULKAN_PREWARM_LEVEL")
+    if raw is None:
+        return 1
+    try:
+        v = int(raw)
+    except ValueError:
+        return 1
+    if v < 0:
+        return 0
+    if v > 2:
+        return 2
+    return v
+
+
 def _shader_lib_sources() -> list[str]:
     if not os.path.isdir(_SHADERS_LIB_DIR):
         return []
@@ -521,14 +605,44 @@ def _shader_lib_sources() -> list[str]:
     )
 
 
-def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
+def _prewarm_filtered_sources() -> list[str]:
+    """Apply the M-NEW.5 prewarm-level filter to the shader-lib source
+    list. Returns the subset that should be precompiled at this level.
+
+    Used only by the prewarm path; the lazy-compile path
+    (``_ensure_shader_lib_modules``) calls ``_shader_lib_sources``
+    directly because by definition a kernel that explicitly requests
+    a module needs that module compiled — level=0 just defers when
+    the work happens, not whether it happens.
+    """
+    level = _prewarm_level()
+    all_sources = _shader_lib_sources()
+    if level == 0:
+        return []
+    if level >= 2:
+        return all_sources
+    # level=1: keep only modules in the core set.
+    return [
+        src for src in all_sources
+        if os.path.splitext(os.path.basename(src))[0]
+        in _PREWARM_CORE_MODULES
+    ]
+
+
+def precompile_shader_libs(
+    force: bool = False,
+    lax: bool = False,
+    *,
+    level: int | None = None,
+) -> dict:
     """Walk `shaders/lib/*.slang`, emit `<name>.slang-module` artifacts.
 
     Cache keyed on source SHA256: a module is recompiled only when its
     source content changes. Sidecar `.hash` files record the source hash
     that produced each cached module. Returns a summary dict
     ``{"compiled": [names], "cached": [names], "failed": [(name, err)],
-    "module_dir": str}`` and bumps `_SHADER_LIB_MODULE_STATS`.
+    "module_dir": str, "skipped_by_level": [names]}`` and bumps
+    `_SHADER_LIB_MODULE_STATS`.
 
     Output dir is `~/.cache/torch_vulkan/slang-modules` (override via
     ``TORCH_VULKAN_SLANG_MODULE_CACHE``). The same dir is added to slangc's
@@ -541,16 +655,50 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
     falls back to slangc's source-parse path (slower but correct).
     Strict mode (the default) preserves the historical contract — first
     failed file raises ``RuntimeError``.
+
+    M-NEW.5: ``level`` (None / 0 / 1 / 2) filters which shader-lib
+    modules to compile.
+      - ``None`` (default): compile ALL modules. Use this for
+        user-explicit precompile (e.g. the CLAUDE.md rebuild command).
+      - ``0``: compile NOTHING. Skipped modules are listed in the
+        return dict under ``"skipped_by_level"``. The lazy first-compile
+        path picks them up on demand.
+      - ``1``: compile only the CORE set (``_PREWARM_CORE_MODULES``).
+        Other modules go in ``"skipped_by_level"``.
+      - ``2``: same as ``None`` — compile all modules.
     """
     os.makedirs(_SHADER_LIB_MODULE_CACHE_DIR, exist_ok=True)
-    compiled, cached, failed = [], [], []
+    compiled, cached, failed, skipped_by_level = [], [], [], []
     # PF.27.a.1: mix the slangc fingerprint into the cache key so a
     # slangc upgrade invalidates every cached `.slang-module` whose
     # serialized IR ABI may have changed. Hash mismatch fires on the
     # cache-hit read path below, exactly the requirement called out by
     # debug-coordinator.
     slangc_fp = _slangc_fingerprint()
-    for src_path in _shader_lib_sources():
+    # M-NEW.5: determine the level-filtered source list. ``level=None``
+    # means "ignore the env-knob, do the full set" — preserves the
+    # contract for ``precompile_shader_libs(force=True)``-style
+    # user-explicit invocations.
+    all_sources = _shader_lib_sources()
+    if level is None:
+        sources_to_compile = all_sources
+        eligible_names: frozenset[str] = frozenset(
+            os.path.splitext(os.path.basename(s))[0] for s in all_sources
+        )
+    else:
+        sources_to_compile = _prewarm_filtered_sources()
+        eligible_names = frozenset(
+            os.path.splitext(os.path.basename(s))[0]
+            for s in sources_to_compile
+        )
+    for src_path in all_sources:
+        # M-NEW.5: modules excluded by the level filter are reported
+        # but not compiled. The lazy first-compile path picks them up
+        # on demand when a kernel actually imports them.
+        name_only = os.path.splitext(os.path.basename(src_path))[0]
+        if name_only not in eligible_names:
+            skipped_by_level.append(name_only)
+            continue
         name = os.path.splitext(os.path.basename(src_path))[0]
         with open(src_path, "rb") as f:
             src_bytes = f.read()
@@ -576,7 +724,26 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
                 "precompile shader-lib modules at "
                 f"{_SHADERS_LIB_DIR}."
             )
-        argv = [_get_slangc(), src_path, "-emit-ir", "-o", mod_path]
+        # M22.16: write to a per-process temp path first, then atomically
+        # ``os.replace`` to ``mod_path``. Without this, two slangc processes
+        # from different parent agents both targeting the same canonical
+        # ``mod_path`` would interleave their writes — POSIX gives no
+        # atomicity for direct ``slangc -o <path>`` and the next reader
+        # gets a torn / truncated ``.slang-module`` that fails to import
+        # downstream. Source-file slangc dies; downstream Python sees a
+        # "intermittent zero" / silent-fail symptom.
+        # M21.3.01 follow-up: slangc infers the output format from the
+        # filename extension — the temp name must therefore still end in
+        # ``.slang-module``. ``.tmp.<pid>.<tid>`` placed BEFORE the
+        # extension keeps the atomic publish guarantee while preserving
+        # format detection. Prior code placed the suffix after the
+        # extension and broke ``-emit-ir`` with "cannot infer an output
+        # format" (E00060).
+        tmp_mod_path = (
+            mod_path[: -len(".slang-module")]
+            + f".tmp.{os.getpid()}.{threading.get_ident()}.slang-module"
+        )
+        argv = [_get_slangc(), src_path, "-emit-ir", "-o", tmp_mod_path]
         try:
             proc = subprocess.run(
                 argv,
@@ -585,6 +752,11 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
                 timeout=_SLANGC_TIMEOUT_S,
             )
         except subprocess.TimeoutExpired as e:
+            # Best-effort cleanup of the partial temp output.
+            try:
+                os.remove(tmp_mod_path)
+            except OSError:
+                pass
             raise SlangCompileTimeout(
                 key=f"shader_lib_{name}",
                 argv=argv,
@@ -596,12 +768,25 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
                 else (e.stderr or ""),
             ) from None
         if proc.returncode != 0:
+            try:
+                os.remove(tmp_mod_path)
+            except OSError:
+                pass
             err_msg = f"slangc failed precompiling shader lib {name}:\n{proc.stderr}"
             if lax:
                 failed.append((name, (proc.stderr or "").strip()))
                 continue
             raise RuntimeError(err_msg)
-        tmp_hash = hash_path + f".tmp.{os.getpid()}"
+        # Atomic publish: rename tmp output to canonical mod_path.
+        try:
+            os.replace(tmp_mod_path, mod_path)
+        except OSError as e:
+            err_msg = f"slangc atomic rename failed for {name}: {e}"
+            if lax:
+                failed.append((name, err_msg))
+                continue
+            raise RuntimeError(err_msg) from None
+        tmp_hash = hash_path + f".tmp.{os.getpid()}.{threading.get_ident()}"
         with open(tmp_hash, "w") as f:
             f.write(src_hash)
         os.replace(tmp_hash, hash_path)
@@ -612,6 +797,9 @@ def precompile_shader_libs(force: bool = False, lax: bool = False) -> dict:
         "cached": cached,
         "failed": failed,
         "module_dir": _SHADER_LIB_MODULE_CACHE_DIR,
+        # M-NEW.5: names skipped by the level filter (level=0/1).
+        # Empty when level is None or 2.
+        "skipped_by_level": skipped_by_level,
     }
 
 
@@ -634,13 +822,21 @@ def _ensure_shader_lib_modules() -> str:
     ``wg_reduce<…>`` 3-arg API) cannot block kernel compilation for
     every other module. Kernels that ``import`` a failed lib fall
     through to slangc's source-parse path — slower but correct.
+
+    M-NEW.5: the level filter is applied here AND on the import-time
+    prewarm path. When level<2 some modules are skipped at this lazy
+    pass too — they'll be picked up by slangc's source-parse fallback
+    when a kernel that imports them is actually compiled. This is the
+    correct shape because the "lazy" path fires the first time ANY
+    kernel triggers it, not when a specific module is needed; deferring
+    op-specific modules until first-use is the whole M-NEW.5 win.
     """
     global _shader_lib_modules_ready
     if _shader_lib_modules_ready:
         return _SHADER_LIB_MODULE_CACHE_DIR
     with _shader_lib_modules_lock:
         if not _shader_lib_modules_ready:
-            precompile_shader_libs(lax=True)
+            precompile_shader_libs(lax=True, level=_prewarm_level())
             _shader_lib_modules_ready = True
     return _SHADER_LIB_MODULE_CACHE_DIR
 
@@ -662,6 +858,12 @@ def prewarm_shader_libs(*, sync: bool = False) -> bool:
     disabled (``TORCH_VULKAN_NO_PREWARM=1``) or slangc is unavailable.
     """
     if os.environ.get("TORCH_VULKAN_NO_PREWARM") == "1":
+        return False
+    # M-NEW.5: ``TORCH_VULKAN_PREWARM_LEVEL=0`` short-circuits the
+    # import-time background prewarm. The lazy-compile path still
+    # honours level=0 — every module compiles on first kernel-import,
+    # which is the correct shape for a cold-import-fast configuration.
+    if _prewarm_level() == 0:
         return False
     if not _slangc_available():
         return False

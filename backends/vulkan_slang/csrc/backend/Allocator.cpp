@@ -48,9 +48,24 @@ void VulkanAllocator::return_to_cache(std::unique_ptr<vulkan::VulkanBuffer> buff
 }
 
 c10::DataPtr VulkanAllocator::allocate(size_t nbytes) {
+    // M22.9-followup: delegate to the explicit-device overload using
+    // the current device from ``vulkan::Context``. This preserves the
+    // pre-M22.9-followup behaviour (allocator follows the thread-local
+    // current device) while routing through the same shared path as
+    // the per-call-device overload.
+    auto& ctx = vulkan::Context::instance();
+    return allocate(
+        nbytes, static_cast<c10::DeviceIndex>(ctx.current_device()));
+}
+
+c10::DataPtr VulkanAllocator::allocate(
+    size_t nbytes, c10::DeviceIndex device_idx) {
     if (nbytes == 0) {
+        // Zero-byte allocations carry the requested device index so
+        // empty tensors keep their multi-GPU device binding.
         return c10::DataPtr(nullptr, nullptr, &deleter,
-                            c10::Device(c10::DeviceType::PrivateUse1, 0));
+                            c10::Device(c10::DeviceType::PrivateUse1,
+                                        device_idx));
     }
 
     auto& ctx = vulkan::Context::instance();
@@ -68,8 +83,13 @@ c10::DataPtr VulkanAllocator::allocate(size_t nbytes) {
     // Buffers in pool_ are guaranteed safe to reuse.
 
     if (!buffer) {
+        // M22.9-followup: pull the device-specific VMA allocator. The
+        // existing ``Context::allocator(uint32_t)`` overload (line ~469
+        // of Context.cpp) already supports per-device selection — we
+        // just need to pass the index instead of taking the default.
         buffer = std::make_unique<vulkan::VulkanBuffer>(
-            ctx.allocator(), alloc_size,
+            ctx.allocator(static_cast<uint32_t>(device_idx)),
+            alloc_size,
             vulkan::BufferType::HostVisible);
     }
 
@@ -81,10 +101,12 @@ c10::DataPtr VulkanAllocator::allocate(size_t nbytes) {
         buffers_[opaque] = std::move(buffer);
     }
 
+    // M22.9-followup: tag the DataPtr with the caller-supplied
+    // device index, NOT ``ctx.current_device()``. The latter would
+    // race when concurrent threads allocate on different devices.
     return c10::DataPtr(
         opaque, opaque, &deleter,
-        c10::Device(c10::DeviceType::PrivateUse1,
-                    static_cast<c10::DeviceIndex>(ctx.current_device())));
+        c10::Device(c10::DeviceType::PrivateUse1, device_idx));
 }
 
 c10::DeleterFnPtr VulkanAllocator::raw_deleter() const {

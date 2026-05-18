@@ -58,7 +58,8 @@ struct KernelArgs {
     RWStructuredBuffer<uint> dK;
     RWStructuredBuffer<uint> dV;
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // Shared memory for Q, K, V, dO tiles.
 groupshared float Q_smem[{{ BQ }} * {{ head_dim }}];

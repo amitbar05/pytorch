@@ -500,6 +500,20 @@ def _legacy_register() -> None:
     except Exception:
         pass
 
+    # M21.1: profile the device on first import (microbench launch latency,
+    # mem BW, LDS BW, atomics). Cached at
+    # ``~/.cache/torch_vulkan/device_profile_<id>.json`` so subsequent imports
+    # pay only a JSON read. Heuristic consumers will pull from this via
+    # ``device_profile.current()`` once M20.5 rewires them. Gated via
+    # ``TORCH_VULKAN_PROFILE_DEVICE={auto,force,off}`` (default ``auto``).
+    try:
+        from . import device_profile as _dp
+
+        _dp.load_or_profile()
+    except Exception:
+        # Profiling is best-effort — never let it block backend registration.
+        pass
+
     _registered = True
 
 

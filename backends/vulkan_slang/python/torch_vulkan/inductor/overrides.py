@@ -31,7 +31,7 @@ class _SlangExpr(str):
         return s
 
 
-def _infer_dtype(value) -> "torch.dtype | None":
+def _infer_dtype(value) -> torch.dtype | None:
     if hasattr(value, "dtype") and value.dtype is not None:
         return value.dtype
     return None
@@ -48,17 +48,74 @@ def _masked_dtype(body, other) -> torch.dtype:
     return _infer_dtype(body) or _infer_dtype(other) or torch.float32
 
 
+# M18.4 — DTYPE_TO_SLANG: Slang element type per PyTorch dtype.
+#
+# CRITICAL ALLOC CONTRACT: the Slang element type's storage width MUST
+# match PyTorch's ``element_size()`` for that dtype, OR the buffer pool
+# must round the allocation up to match. Otherwise
+# ``RWStructuredBuffer<T>`` writes overflow the buffer for any thread
+# index past ``alloc_nbytes / sizeof(T)``. The M17.8.d.3 root cause
+# was ``bool`` mapped to ``"uint"`` (4B/slot) while PyTorch allocates
+# 1B/bool — tail writes overflowed and downstream reads returned the
+# zero-padded heap.
+#
+# History:
+#   * M18.4 (2026-05-17): stopgap — narrow integers (bool, int8, uint8,
+#     int16) declared as 32-bit slots; the pointwise load/store mixins
+#     sign-extend via bit-twiddles. Allocation was still misaligned and
+#     ``TestDtypeMatrix`` xfail-strict'd int8/uint8/int16 tail-corruption.
+#     Two follow-up paths filed: (a) Slang-side native widths gated on
+#     Vulkan device features; (b) Inductor-side 4-byte alloc round-up.
+#   * M18.4-followup-C (2026-05-18): path (a) LANDED for {bool, int8,
+#     uint8, int16, uint16}. Vulkan device features ``shaderInt8`` +
+#     ``shaderInt16`` + ``storageBuffer8BitAccess`` +
+#     ``storageBuffer16BitAccess`` + ``uniformAndStorageBuffer{8,16}BitAccess``
+#     are now enabled in ``csrc/vulkan/Context.cpp`` (gated on device
+#     report — defensively off on Lavapipe / older drivers). The Slang
+#     element types match PyTorch's native 1B/2B alloc, so the
+#     M17.8.d.3 tail-corruption bug class is CLOSED for the integer
+#     half. The matching sign-extend workarounds have been dropped
+#     from ``pointwise_load_mixin.py``.
+#
+# Still open follow-ups:
+#   * ``bfloat16``: bound as 32-bit ``uint`` slot (2B-vs-4B mismatch).
+#     Works today via the ``packed16_bf16`` load path on eligible
+#     fusions; long-term should bind as native ``bfloat16_t``. slangc
+#     2026.7.1 does NOT have a ``bfloat16_t`` type
+#     (``agent_space/m18_4_slang_dtype_probe_bfloat16.slang`` produces
+#     ``E30015``). Tracked as ``M18.4-followup-bfloat16`` — gated on a
+#     slangc upgrade or explicit ``uint16_t`` reinterpret in the
+#     load/store paths.
+#   * ``complex32``: bound as ``float2`` (8B/slot) but PyTorch allocates
+#     4B/elem. Same alloc-mismatch bug class. Rarely exercised; tracked
+#     as ``M18.4-followup-complex32``.
 DTYPE_TO_SLANG: dict[torch.dtype, str] = {
-    torch.bool: "uint",
-    torch.int8: "int",
-    torch.int16: "int",
+    # M18.4-followup-C: narrow integers now bind at their native width.
+    # ``RWStructuredBuffer<{int8_t,uint8_t,int16_t,uint16_t}>`` is legal
+    # SPIR-V once ``shaderInt{8,16}`` + 8/16-bit storage features are
+    # enabled (see ``csrc/vulkan/Context.cpp``). Sign extension is
+    # implicit in the load-side ``(float)(v[i])`` cast — no bit-twiddle
+    # workaround needed.
+    torch.bool: "uint8_t",
+    torch.int8: "int8_t",
+    torch.uint8: "uint8_t",
+    torch.int16: "int16_t",
+    torch.uint16: "uint16_t",
+    # bfloat16 still binds as a 32-bit uint slot — see
+    # ``M18.4-followup-bfloat16`` above. The ``packed16_bf16`` load path
+    # handles the 2B-vs-4B mismatch on eligible fusion shapes.
+    torch.bfloat16: "uint",
+    # 32-bit native types — width matches PyTorch's 4B alloc.
     torch.int32: "int",
-    torch.int64: "int64_t",
-    torch.uint8: "uint",
+    torch.uint32: "uint",
     torch.float: "float",
     torch.half: "float16_t",
-    torch.bfloat16: "uint",
+    # 64-bit native types — width matches PyTorch's 8B alloc.
+    torch.int64: "int64_t",
+    torch.uint64: "uint64_t",
     torch.float64: "double",
+    # Complex (complex32 8B-vs-4B alloc mismatch is a known gap;
+    # rarely exercised, deferred to ``M18.4-followup-complex32``).
     torch.complex32: "float2",
     torch.complex64: "float2",
     torch.complex128: "double2",

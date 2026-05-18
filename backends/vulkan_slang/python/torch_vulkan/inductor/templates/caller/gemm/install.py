@@ -25,6 +25,7 @@ from .classes import (
     _make_tile_mm_int8_fn,
 )
 from .dispatch import (
+    _get_device_subgroup_size,
     _pick_register_tile_configs,
     _pick_tile_configs,
     _slang_tiles_enabled,
@@ -35,6 +36,49 @@ from .render import _render_mm_int8_slang, _render_mm_slang
 _installed = False
 _bmm_installed = False
 _addmm_installed = False
+
+# M-NEW.1: ``ExternKernelChoice.__init__`` asserts ``not hasattr(
+# extern_kernels, name)`` — the upstream API doesn't expose a public
+# lookup method in PyTorch 2.11. Our tile callables have deterministic
+# names (e.g. ``slang_addmm_8_8_8_s1_r1x1``), so the second ``aten.addmm``
+# / ``aten.bmm`` lowered in the same compile would re-enter the
+# constructor and crash with ``AssertionError: duplicate extern
+# kernel: ...``. We cache the constructed singletons here keyed by
+# ``fn.__name__``; the per-compile lowering looks them up first and
+# only constructs once per (template, tile-config) combination.
+#
+# This is the dominant compile-mode blocker per Audit Agent 3
+# (2026-05-18): every model with ≥2 ``Linear`` modules — MLP, ViT,
+# Transformer block, Llama-MLP, Mixtral-MoE — hits it.
+_EXTERN_CHOICE_CACHE: dict = {}
+
+
+def _ensure_extern_choices(tile_fns, extern_kernel_choice_cls) -> None:
+    """Pre-construct + cache ``ExternKernelChoice`` for each tile fn.
+
+    Called at install time from ``install_external_bmm`` /
+    ``install_external_addmm`` so the deterministic ``__name__``s are
+    registered on ``torch._inductor.select_algorithm.extern_kernels``
+    exactly once per process — including the path where a cached
+    Inductor wrapper short-circuits ``_vulkan_tuned_addmm`` on a
+    subsequent compile (the wrapper references
+    ``extern_kernels.slang_addmm_*`` directly without going through
+    our lowering).
+    """
+    # Resolve the upstream ``extern_kernels`` namespace so we can also
+    # short-circuit when the name is already registered there (e.g.
+    # ``install_external_*`` re-entered after a partial init, or when
+    # the same fn name appears across both bmm and addmm tile lists).
+    from torch._inductor.select_algorithm import extern_kernels
+
+    for fn in tile_fns:
+        if fn.__name__ in _EXTERN_CHOICE_CACHE:
+            continue
+        if hasattr(extern_kernels, fn.__name__):
+            # Some other path constructed the choice already (rare).
+            # Skip rather than re-trigger the duplicate assertion.
+            continue
+        _EXTERN_CHOICE_CACHE[fn.__name__] = extern_kernel_choice_cls(fn)
 
 
 def install_external_mm() -> None:
@@ -61,26 +105,33 @@ def install_external_mm() -> None:
         return
 
     from torch._inductor import config as inductor_config
+    from torch._inductor.select_algorithm import ExternKernelChoice
 
     if _slang_tiles_enabled():
+        mm_tile_fns: list = []
         for tm, tn, tk in tiles:
-            inductor_config.external_matmul.append(
-                _make_tile_mm_fn(tm, tn, tk, num_stages=1)
-            )
-            inductor_config.external_matmul.append(
-                _make_tile_mm_fn(tm, tn, tk, num_stages=2)
-            )
+            mm_tile_fns.append(_make_tile_mm_fn(tm, tn, tk, num_stages=1))
+            mm_tile_fns.append(_make_tile_mm_fn(tm, tn, tk, num_stages=2))
         for tm, tn, tk, mpt, npt in reg_tiles:
-            inductor_config.external_matmul.append(
+            mm_tile_fns.append(
                 _make_tile_mm_fn(
                     tm, tn, tk, num_stages=1, m_per_thread=mpt, n_per_thread=npt
                 )
             )
-            inductor_config.external_matmul.append(
+            mm_tile_fns.append(
                 _make_tile_mm_fn(
                     tm, tn, tk, num_stages=2, m_per_thread=mpt, n_per_thread=npt
                 )
             )
+        # M-NEW.1: pre-construct ExternKernelChoices at install time so
+        # the deterministic ``__name__``s are registered on
+        # ``extern_kernels`` exactly once per process.  The upstream
+        # ``lazy_register_extern_choice`` has ``@functools.cache`` which
+        # catches repeat calls within one process, but pre-constructing
+        # here provides defense-in-depth against codecache serialization
+        # creating new callable objects.
+        _ensure_extern_choices(mm_tile_fns, ExternKernelChoice)
+        inductor_config.external_matmul.extend(mm_tile_fns)
 
 
 def install_external_bmm() -> None:
@@ -125,6 +176,13 @@ def install_external_bmm() -> None:
             _make_tile_bmm_fn(tm, tn, tk, m_per_thread=mpt, n_per_thread=npt)
             for tm, tn, tk, mpt, npt in reg_tiles
         ]
+        # M-NEW.1: pre-construct ExternKernelChoices at install time so
+        # the deterministic ``__name__``s are registered on
+        # ``extern_kernels`` exactly once per process — even if a cached
+        # Inductor wrapper short-circuits ``_vulkan_tuned_bmm`` on a
+        # subsequent compile (the wrapper references
+        # ``extern_kernels.slang_bmm_*`` directly).
+        _ensure_extern_choices(bmm_tile_fns, ExternKernelChoice)
 
     @_L.register_lowering(aten.bmm, type_promotion_kind=None)
     def _vulkan_tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
@@ -151,9 +209,17 @@ def install_external_bmm() -> None:
 
         if out_dtype is None:
             for fn in bmm_tile_fns:
-                choices.append(
-                    ExternKernelChoice(fn).bind(kernel_inputs.nodes(), layout_)
-                )
+                # M-NEW.1: choices are constructed once at install time
+                # via ``_ensure_extern_choices``. Re-lookup so subsequent
+                # ``aten.bmm`` lowerings reuse the singleton.
+                choice = _EXTERN_CHOICE_CACHE.get(fn.__name__)
+                if choice is None:
+                    # Defensive: install was skipped (slang tiles
+                    # disabled at install time, then re-enabled?) — fall
+                    # back to constructing here so we don't KeyError.
+                    choice = ExternKernelChoice(fn)
+                    _EXTERN_CHOICE_CACHE[fn.__name__] = choice
+                choices.append(choice.bind(kernel_inputs.nodes(), layout_))
 
         if not choices:
             choices.append(aten_bmm.bind(kernel_inputs.nodes(), layout_))
@@ -224,6 +290,12 @@ def install_external_addmm() -> None:
                 for tm, tn, tk, mpt, npt in reg_tiles
             ]
         )
+        # M-NEW.1: pre-construct ExternKernelChoices at install time so
+        # the deterministic ``__name__``s are registered on
+        # ``extern_kernels`` exactly once per process — even if a cached
+        # Inductor wrapper short-circuits ``_vulkan_tuned_addmm`` on a
+        # subsequent compile.
+        _ensure_extern_choices(addmm_tile_fns, ExternKernelChoice)
 
     @_L.register_lowering(aten.addmm.default, type_promotion_kind=None)
     def _vulkan_tuned_addmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
@@ -259,7 +331,15 @@ def install_external_addmm() -> None:
                 choices.append(aten_addmm.bind(kernel_inputs.nodes(), layout_))
 
         for fn in addmm_tile_fns:
-            choices.append(ExternKernelChoice(fn).bind(kernel_inputs.nodes(), layout_))
+            # M-NEW.1: choices are constructed once at install time via
+            # ``_ensure_extern_choices``. Re-lookup so subsequent
+            # ``aten.addmm`` lowerings reuse the singleton.
+            choice = _EXTERN_CHOICE_CACHE.get(fn.__name__)
+            if choice is None:
+                # Defensive fallback (see bmm site above).
+                choice = ExternKernelChoice(fn)
+                _EXTERN_CHOICE_CACHE[fn.__name__] = choice
+            choices.append(choice.bind(kernel_inputs.nodes(), layout_))
 
         if not choices:
             choices.append(aten_addmm.bind(kernel_inputs.nodes(), layout_))
@@ -451,12 +531,70 @@ _int8_installed = False
 # Conservative tile configs for int8 — smaller tiles to keep LDS footprint
 # manageable (int32 groupshared = 4× the bytes of float16/float32 for same
 # element count). Register-tiling is used to amortize the unpack overhead.
+#
+# M-NEW.3.b: workgroup-thread comment is ``(WG_M*WG_N) threads`` where
+# ``WG_M = TILE_M // M_PER_THREAD`` and ``WG_N = TILE_N // N_PER_THREAD``
+# — same formula as the fp register-tile path (``_pick_register_tile_
+# configs`` in dispatch.py). All entries below produce wave-aligned
+# (multiple of 64) workgroups for RDNA1; the filter in
+# ``install_external_mm_int8`` enforces this invariant for future
+# additions.
 _INT8_TILE_CONFIGS: list[tuple[int, int, int, int, int]] = [
-    (32, 32, 16, 4, 4),  # 256 threads, 16 outputs/thread
-    (16, 64, 16, 2, 4),  # 128 threads, 8 outputs/thread
-    (64, 16, 16, 4, 2),  # 128 threads, 8 outputs/thread
-    (16, 16, 16, 2, 2),  # 64 threads, 4 outputs/thread
+    (32, 32, 16, 4, 4),  # WG=8*8=64 threads, 16 outputs/thread
+    (16, 64, 16, 2, 4),  # WG=8*16=128 threads, 8 outputs/thread
+    (64, 16, 16, 4, 2),  # WG=16*8=128 threads, 8 outputs/thread
+    (16, 16, 16, 2, 2),  # WG=8*8=64 threads, 4 outputs/thread
 ]
+
+
+def _int8_config_wg_threads(c: tuple[int, int, int, int, int]) -> int:
+    """Compute the workgroup thread count for an int8 tile config.
+
+    The int8 mm wrapper (``render._render_mm_int8_slang``) emits
+    ``[numthreads(wg_n, wg_m, 1)]`` where::
+
+        wg_m = tile_m // m_per_thread
+        wg_n = tile_n // n_per_thread
+
+    So the workgroup thread product is ``wg_m * wg_n``.
+    """
+    tile_m, tile_n, _tile_k, mpt, npt = c
+    return (tile_m // mpt) * (tile_n // npt)
+
+
+def _filter_int8_configs_wave_aligned(
+    configs: list[tuple[int, int, int, int, int]],
+    *,
+    subgroup_size: int | None = None,
+) -> list[tuple[int, int, int, int, int]]:
+    """Drop int8 tile configs whose workgroup isn't wave-aligned.
+
+    Mirrors the M-NEW.3 filter on the fp register-tile picker in
+    ``_pick_register_tile_configs``: any kernel whose ``numthreads``
+    product isn't a multiple of the device's subgroup size is rejected
+    by the in-process M27 validator and wastes a slangc cold compile.
+
+    On wave64 (RDNA1) we additionally enforce M17.1's "single-wave only"
+    cap — the multi-wave ``GroupMemoryBarrierWithGroupSync()`` is broken
+    in slangc 2026.5.2 + RADV, so wg-thread-count > 64 on RDNA1 is
+    rejected too.
+
+    The argument is taken as-is rather than reading
+    ``_INT8_TILE_CONFIGS`` so callers (tests) can pass synthetic inputs.
+    """
+    sgs = subgroup_size if subgroup_size is not None else _get_device_subgroup_size()
+    out: list[tuple[int, int, int, int, int]] = []
+    for c in configs:
+        n = _int8_config_wg_threads(c)
+        if n <= 0:
+            continue
+        if n % sgs != 0:
+            continue
+        if sgs == 64 and n > sgs:
+            # RDNA1 barrier bug — must stay single-wave.
+            continue
+        out.append(c)
+    return out
 
 
 def install_external_mm_int8() -> None:
@@ -481,20 +619,33 @@ def install_external_mm_int8() -> None:
         return
 
     from torch._inductor import config as inductor_config
+    from torch._inductor.select_algorithm import ExternKernelChoice
 
-    for tm, tn, tk, mpt, npt in _INT8_TILE_CONFIGS:
-        inductor_config.external_matmul.append(
+    # M-NEW.3.b: drop sub-wave / wave-misaligned configs so the M27
+    # validator doesn't reject a slangc cold compile per such config.
+    filtered = _filter_int8_configs_wave_aligned(_INT8_TILE_CONFIGS)
+    int8_tile_fns: list = []
+    for tm, tn, tk, mpt, npt in filtered:
+        int8_tile_fns.append(
             _make_tile_mm_int8_fn(tm, tn, tk, m_per_thread=mpt, n_per_thread=npt)
         )
+    # M-NEW.1: pre-construct ExternKernelChoices at install time
+    # (same pattern as install_external_mm / bmm / addmm).
+    _ensure_extern_choices(int8_tile_fns, ExternKernelChoice)
+    inductor_config.external_matmul.extend(int8_tile_fns)
 
 
 def _collect_int8_matmul_prewarm_specs() -> list[tuple[str, str]]:
     """Render the (cache_key, slang_src) pairs for int8 mm tile configs.
 
     Returns specs suitable for passing to the SPIR-V prewarm cache.
+
+    M-NEW.3.b: matches the install path's wave-alignment filter so the
+    prewarm cache only contains configs the autotuner will actually try.
     """
     specs: list[tuple[str, str]] = []
-    for tm, tn, tk, mpt, npt in _INT8_TILE_CONFIGS:
+    filtered = _filter_int8_configs_wave_aligned(_INT8_TILE_CONFIGS)
+    for tm, tn, tk, mpt, npt in filtered:
         cache_key = f"slang_mm_int8_{tm}_{tn}_{tk}_r{mpt}x{npt}_n111"
         src = _render_mm_int8_slang(tm, tn, tk, m_per_thread=mpt, n_per_thread=npt)
         specs.append((cache_key, src))

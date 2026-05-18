@@ -34,25 +34,17 @@ def _register_conv_transpose_lowerings() -> None:
     if aten.flip.default not in lowerings:
         make_fallback(aten.flip, override_decomp=True, warn=False)
 
-    def _get_conv2d_lowering():
-        """Look up the ``torch_vulkan::conv2d_with_optional_bias`` lowering
-        by op-overload name. ``register_eager_patch_custom_ops()`` may
-        re-register the custom op (creating a new ``OpOverload`` object
-        with different identity), so caching the OpOverload from
-        ``torch.ops.torch_vulkan.…default`` and using it as a dict key
-        becomes stale. Lookup by ``str(key)`` survives re-registration.
-        """
-        from torch._inductor.lowering import lowerings as _lowerings
-
-        for k, v in _lowerings.items():
-            if str(k).endswith("torch_vulkan.conv2d_with_optional_bias.default"):
-                return v
-        return None
+    # M-pipeline-2: the OpOverload-identity-safe helper now lives in
+    # ``_conv_common.py``. The previous inline definition (M19.5-followup-1
+    # vintage) was duplicated between this module and ``conv.py``; the
+    # extraction keeps both call sites in lockstep.
+    from ._conv_common import _get_conv2d_lowering_by_name as _get_conv2d_lowering  # noqa: F401
 
     def _impl_2d(
         input, weight, bias, stride, padding, output_padding, groups, dilation
     ):
         from torch._inductor.lowering import lowerings as _lowerings
+        from torch_vulkan.inductor.kernel.symbolic import get_static_numel
 
         if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
             return NotImplemented
@@ -67,21 +59,29 @@ def _register_conv_transpose_lowerings() -> None:
         dW = int(dilation[-1] if len(dilation) > 1 else dilation[0])
         g = int(groups)
 
+        # M19.5 — keep weight + input dims as sympy when dynamic. The
+        # weight's spatial kernel size (kH, kW) is always concrete from
+        # the module; the channel counts (C_in, C_out_per_g) are
+        # almost always concrete too. The input batch / spatial dims
+        # may be SymInt under dynamic-shape compile.
         kH = int(weight.get_size()[2])
         kW = int(weight.get_size()[3])
-        H_in = int(input.get_size()[2])
-        W_in = int(input.get_size()[3])
-        N = int(input.get_size()[0])
-        C_in = int(input.get_size()[1])
+        H_in = input.get_size()[2]
+        W_in = input.get_size()[3]
+        N = input.get_size()[0]
+        C_in = input.get_size()[1]
         C_out_per_g = int(weight.get_size()[1])
         C_out = C_out_per_g * g
 
         # Per-group decomposition: slice channels, recurse with groups=1,
         # then concat along channel axis. Bias is sliced per group.
         if g != 1:
-            if C_in % g != 0 or C_out % g != 0:
+            C_in_static = get_static_numel(C_in)
+            if C_in_static is None:
                 return NotImplemented
-            C_in_per_g = C_in // g
+            if C_in_static % g != 0 or C_out % g != 0:
+                return NotImplemented
+            C_in_per_g = C_in_static // g
             outs = []
             for i in range(g):
                 inp_g = _lowerings[aten.slice.Tensor](
@@ -232,14 +232,23 @@ def _register_conv_transpose_lowerings() -> None:
         if kD != 1 or sD != 1 or pD != 0 or oD != 0 or dD != 1:
             return NotImplemented
 
-        N = int(input.get_size()[0])
-        C_in = int(input.get_size()[1])
-        D = int(input.get_size()[2])
-        H_in = int(input.get_size()[3])
-        W_in = int(input.get_size()[4])
-        C_in_w = int(weight.get_size()[0])
-        C_out_per_g = int(weight.get_size()[1])
-        if C_in != C_in_w:
+        # M19.5 — input dims may be SymInt under dynamic-shape compile.
+        # Sympy expressions flow through reshape/squeeze. The
+        # ``C_in != C_in_w`` channel-count check still requires concrete
+        # ints to compare safely against the weight's static channel.
+        from torch_vulkan.inductor.kernel.symbolic import get_static_numel
+
+        t1_sizes = input.get_size()
+        w_sizes = weight.get_size()
+        N = t1_sizes[0]
+        C_in = t1_sizes[1]
+        D = t1_sizes[2]
+        H_in = t1_sizes[3]
+        W_in = t1_sizes[4]
+        C_in_w = int(w_sizes[0])
+        C_out_per_g = int(w_sizes[1])
+        C_in_static = get_static_numel(C_in)
+        if C_in_static is not None and C_in_static != C_in_w:
             return NotImplemented
         g = int(groups)
         C_out = C_out_per_g * g
@@ -258,8 +267,9 @@ def _register_conv_transpose_lowerings() -> None:
         )
         if result_4d is NotImplemented:
             return NotImplemented
-        H_out = int(result_4d.get_size()[2])
-        W_out = int(result_4d.get_size()[3])
+        # H_out / W_out flow into the reshape size list as sympy.
+        H_out = result_4d.get_size()[2]
+        W_out = result_4d.get_size()[3]
         result_4d = _lowerings[aten.clone.default](result_4d)
         return _lowerings[aten.reshape.default](
             result_4d, [N, C_out, D, H_out, W_out]

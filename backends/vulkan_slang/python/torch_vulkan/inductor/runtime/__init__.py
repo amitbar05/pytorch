@@ -160,6 +160,16 @@ from .profile import (  # noqa: F401
 # batcher
 from .batcher import DispatchBatcher  # noqa: F401
 
+# validation-as-codegen-check (M21.2)
+from .validation_codegen import (  # noqa: F401
+    ValidationResult,
+    get_codegen_validation_mode,
+    handle_validation_result,
+    is_codegen_validation_enabled,
+    validate_codegen_dispatch,
+    validate_kernel_source,
+)
+
 
 # ── Cross-cutting helper (touches multiple submodules) ──────────────────
 

@@ -31,11 +31,47 @@ struct DeviceRuntime {
     bool batch_mode = false;
 
     // M17.5: Per-batch descriptor set cache.
-    // Key = VkDescriptorSetLayout pointer from the pipeline.
-    // Value = pre-allocated descriptor set that can be reused by
-    //   subsequent dispatches with the same pipeline in the same batch.
-    // Cleared on flush (end_batch or auto-flush boundary).
-    std::unordered_map<VkDescriptorSetLayout, VkDescriptorSet> desc_set_cache;
+    // Key = (VkDescriptorSetLayout, hash of the bound VkBuffer list).
+    //
+    // M-cpp-new-6: the cache was originally keyed on layout alone, which
+    // is INCORRECT when the same pipeline is dispatched twice in the same
+    // batch with *different* buffers (e.g. a chained `x.relu().relu()`).
+    // Both dispatches would record `vkCmdBindDescriptorSets` with the same
+    // `VkDescriptorSet` handle, then the second `vkUpdateDescriptorSets`
+    // call would overwrite the bindings the first dispatch needs — when
+    // the cmd buffer executes, both dispatches read the LATEST buffer
+    // contents (the 2nd dispatch's), corrupting the chain. Adding the
+    // buffer-list hash to the key preserves M17.5's perf win for repeated
+    // dispatches on the same buffers (the autotune / multi-launch case it
+    // was designed for) while forcing a fresh descriptor set whenever the
+    // buffer list changes.
+    //
+    // The hash needs to combine `VkBuffer` handles in binding order. It
+    // is collision-tolerant in the sense that on a collision we'd reuse a
+    // set with different buffers and get the same bug back — but
+    // `VkBuffer` is a pointer-like handle, so collisions on a 64-bit FNV
+    // are vanishingly rare. If a collision is ever observed in practice,
+    // switching to `std::vector<VkBuffer>` as the key is the canonical
+    // fix and trivial.
+    struct DescSetCacheKey {
+        VkDescriptorSetLayout layout;
+        uint64_t buffers_hash;
+        bool operator==(const DescSetCacheKey& o) const noexcept {
+            return layout == o.layout && buffers_hash == o.buffers_hash;
+        }
+    };
+    struct DescSetCacheKeyHash {
+        size_t operator()(const DescSetCacheKey& k) const noexcept {
+            // Mix layout pointer and buffers hash. The buffers hash is
+            // already well-mixed (FNV-1a on the VkBuffer handles); the
+            // XOR with the layout pointer just folds in the pipeline.
+            return static_cast<size_t>(
+                k.buffers_hash ^
+                (reinterpret_cast<uintptr_t>(k.layout) * 0x9e3779b97f4a7c15ull));
+        }
+    };
+    std::unordered_map<DescSetCacheKey, VkDescriptorSet, DescSetCacheKeyHash>
+        desc_set_cache;
 };
 
 DeviceRuntime& get_runtime(uint32_t device_index = UINT32_MAX);

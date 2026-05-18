@@ -243,6 +243,112 @@ def _register_mm_lowering() -> None:
         return ir.TensorBox.create(kernel)
 
 
+def _register_linear_backward_decomposition() -> None:
+    """M19.1 — decompose ``aten.linear_backward.default`` into mm + sum.
+
+    M17.1-gap context (roadmap § 0.9): the C++ eager
+    ``vulkan_linear_backward`` (csrc/ops/backward_ops.cpp) internally
+    issues 8 sub-dispatches per Linear backward step (two reshape +
+    contiguous on each of self/grad_output, plus mm / mm_ex /
+    sum_dim). At the FX level this appears as a single
+    ``aten.linear_backward`` extern node — opaque to Inductor's
+    scheduler and unfusable.
+
+    By installing a pure-aten decomposition into BOTH the AOT
+    decomposition table (consulted during joint-graph tracing) and the
+    Inductor decomposition table (consulted during the post-graph
+    decomp pass), we trade the opaque extern for fully lowered
+    primitives (``aten.mm`` × 2 + ``aten.sum.dim_IntList``). Each of
+    those routes through our Slang tile / reduction kernels — fewer
+    dispatches and fusable with surrounding pointwise ops.
+
+    Decomposition mirrors ``torch._refs._refs.linear_backward``:
+      grad_input  = grad_output @ weight                     # (B, in)
+      grad_weight = grad_output.transpose(-2,-1) @ self_input # (out, in)
+      grad_bias   = grad_output.flatten(end_dim=-2).sum(0)    # (out,)
+    Handles 3D+ inputs by flattening leading dims into the batch axis.
+
+    Historical regression risk (2026-05-17 M17.8.d, re-confirmed
+    2026-05-18 M19.1): the decomposition lowers
+    ``grad_weight = g2d.t() @ s2d`` via ``torch.mm`` which Inductor
+    emits as ``aten.mm.default``. Upstream's ``tuned_mm`` (overload-
+    specific) picks the ``aten_mm`` extern path, which delegates to
+    the C++ ``vulkan_mm_out`` with a permuted-stride
+    ``reinterpret_tensor`` view as the LHS. ``vulkan_mm_out`` detects
+    the view via ``is_t_transposed`` and dispatches
+    ``matmul_mm_tiled_fwd`` with ``transpose_a=true`` — a path that
+    on RDNA1 wave64 returns only the first row of the expected
+    output (rows 1..M-1 come back as zeros), giving a clear visual
+    signature: ``vk_grad_weight[0, :] != 0`` but
+    ``vk_grad_weight[1:, :] == 0``.
+
+    Because that bug lives in the C++ ``vulkan_mm_dispatch`` /
+    ``matmul_mm_tiled_fwd`` Slang shader (Group A / G files,
+    out of this milestone's lane), M19.1 ships the decomposition
+    function definition + dual-decomp-table installer but **keeps
+    the call site (``__init__.py:_register_linear_backward_decomposition()``)
+    commented out** until the mm tile bug is fixed. Tests for the
+    parity gain are landed with ``xfail(strict=True,
+    reason="M19.1 — gated on mm tile transpose-a fix")``. When the
+    underlying mm path is corrected, the call site flips and the
+    xfails strict-fail (visible signal to ratchet the gate).
+
+    # 2026-05-18: defined + dual-decomp-table installer landed;
+    # call site held until mm tile transpose-a bug fixed in csrc/
+    # — see M19.1 in docs/10-inductor-backend.md § 0.6.2.
+    """
+    import torch
+    from torch._decomp import decomposition_table as _aot_decomps
+    from torch._inductor.decomposition import (
+        decompositions as _ind_decomps,
+        fast_random_decomps,
+    )
+
+    aten = torch.ops.aten
+
+    def _linear_backward_decomp(self_input, grad_output, weight, output_mask):
+        # Flatten any leading dims into a single batch axis so the mm/sum
+        # are 2D and 1D respectively (matches the C++ kernel's reshape).
+        # No ``.contiguous()`` on the reshape outputs — the Slang tile path
+        # materializes non-contiguous inputs at dispatch time
+        # (``_TRUST_INDUCTOR=False``), so the reshapes can stay as
+        # zero-copy ``ReinterpretView`` nodes.
+        out_features = weight.shape[0]
+        in_features = weight.shape[1]
+        g2d = grad_output.reshape(-1, out_features)
+        s2d = self_input.reshape(-1, in_features)
+
+        grad_input = grad_weight = grad_bias = None
+        if output_mask[0]:
+            gi_2d = torch.mm(g2d, weight)
+            grad_input = gi_2d.reshape(self_input.shape)
+        if output_mask[1]:
+            # grad_weight = g2d.T @ s2d  → shape (out, in)
+            # The transposed LHS reaches the mm lowering as an
+            # Inductor ``ReinterpretView`` (Inductor's optimizer elides
+            # the explicit ``.contiguous()`` after ``.t()``). That's
+            # safe HERE because our ``aten.mm.default`` lowering
+            # (``_vulkan_mm`` via the M19.1 dual-registration) routes
+            # through the Slang tile path, which forces materialization
+            # at the dispatch site (``_TRUST_INDUCTOR=False``). The C++
+            # eager ``vulkan_mm_out`` ``is_t_transposed`` fast-path —
+            # which produces zero on a permuted view — is bypassed.
+            grad_weight = torch.mm(g2d.transpose(0, 1).contiguous(), s2d)
+        if output_mask[2]:
+            grad_bias = g2d.sum(dim=0)
+        return grad_input, grad_weight, grad_bias
+
+    # Install in BOTH decomp tables — AOTAutograd's table is consulted
+    # during joint-graph tracing, Inductor's local table is consulted
+    # during the post-graph decomp pass.  Belt-and-suspenders so the
+    # decomposition definitely fires before the eager kernel is reached.
+    _aot_decomps[aten.linear_backward.default] = _linear_backward_decomp
+    _ind_decomps[aten.linear_backward.default] = _linear_backward_decomp
+    # Clear the cached select_decomp_table result so the new entry takes
+    # effect on the next compile (same pattern as OP.23).
+    fast_random_decomps.cache_clear()
+
+
 def _register_matmul_lowering() -> None:
     """GAP 0 — `aten.matmul.default` → `aten.bmm.default` shortcut for 3D.
 
@@ -273,6 +379,8 @@ def _register_matmul_lowering() -> None:
 
         t1_sizes = list(tensor1.get_size())
         t2_sizes = list(tensor2.get_size())
+        ndim1 = len(t1_sizes)
+        ndim2 = len(t2_sizes)
 
         def _as_ints(sizes):
             try:
@@ -282,6 +390,37 @@ def _register_matmul_lowering() -> None:
 
         s1 = _as_ints(t1_sizes)
         s2 = _as_ints(t2_sizes)
+
+        # ── M18.5: 3D+ × 2D fold ─────────────────────────────────────
+        # MHA / Transformer / Linear-on-sequence emit ``matmul(x, w)``
+        # where ``x`` is ``[..., K]`` and ``w`` is ``[K, N]``. The
+        # leading dims may be symbolic (dynamic batch / seq). Fold the
+        # leading dims of ``x`` into a single ``M`` row axis, route
+        # through ``aten.mm``, and reshape the result back.
+        #
+        # This mirrors the ``should_fold`` branch of the upstream
+        # ``aten.matmul`` decomposition
+        # (``torch/_decomp/decompositions.py::matmul``) — by intercepting
+        # here we skip the decomposition entirely and keep the symbolic
+        # leading dims as-is, so dynamic-shape compiles don't bail when
+        # ``_as_ints()`` returns ``None``.
+        if ndim1 >= 2 and ndim2 == 2:
+            # Reshape lhs ``[..., K]`` → ``[prod(leading), K]``. The
+            # ``view`` lowering accepts mixed concrete/sympy sizes and
+            # returns a TensorBox without materializing.
+            view_lowering = L.lowerings[aten.view.default]
+            K = t1_sizes[-1]
+            N = t2_sizes[-1]
+            leading = t1_sizes[:-1]
+            from torch._inductor.utils import sympy_product
+
+            M_flat = sympy_product(leading)
+            t1_2d = view_lowering(tensor1, [M_flat, K])
+            # ``aten.mm`` is our packet-level lowering (``_vulkan_mm``)
+            # so this routes through the Slang tile / fp16 / int8 paths.
+            mm_2d = L.lowerings[aten.mm](t1_2d, tensor2)
+            out_shape = list(leading) + [N]
+            return view_lowering(mm_2d, out_shape)
 
         if s1 is not None and s2 is not None and len(s1) >= 2 and len(s2) >= 2:
             if s1[-1] == s2[-2]:

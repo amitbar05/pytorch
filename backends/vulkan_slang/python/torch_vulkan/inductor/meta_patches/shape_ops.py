@@ -277,7 +277,10 @@ def _convolution_overrideable_fake(
         oH = (iH + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         oW = (iW + 2 * pW - dW * (kW - 1) - 1) // sW + 1
         return torch.empty([N, C_out, oH, oW], dtype=input.dtype, device=input.device)
-    return torch.empty_like(input)
+    # M-pipeline-9: `new_empty` not `empty_like` — see M18.3 (joint-graph
+    # partitioner can collapse shape-only `empty_like` fakes to
+    # `aten.full(shape, 0)`, producing silent zero gradients).
+    return input.new_empty(input.shape)
 
 
 def _convolution_backward_overrideable_fake(
@@ -293,20 +296,31 @@ def _convolution_backward_overrideable_fake(
     groups,
     output_mask,
 ):
+    # M18.8 (2026-05-18): Use the source tensor's stride explicitly via
+    # ``empty_strided`` (rather than ``new_empty`` which is contiguous) so
+    # the proxy tracer preserves the layout AND avoids the
+    # ``empty_like``-shape-only collapse. Contiguous ``new_empty`` here
+    # tripped the conv backward C++ adapter which expects strided layout
+    # matching the input — avg_pool→conv backward returned ``vk_norm=0``
+    # for the conv weight.
     grad_input = (
-        torch.empty_like(input)
+        torch.empty_strided(
+            input.shape, input.stride(), dtype=input.dtype, device=input.device
+        )
         if output_mask[0]
-        else torch.empty(0, dtype=input.dtype, device=input.device)
+        else input.new_empty((0,))
     )
     grad_weight = (
-        torch.empty_like(weight)
+        torch.empty_strided(
+            weight.shape, weight.stride(), dtype=weight.dtype, device=weight.device
+        )
         if output_mask[1]
-        else torch.empty(0, dtype=weight.dtype, device=weight.device)
+        else weight.new_empty((0,))
     )
     grad_bias = (
-        torch.empty(bias_sizes, dtype=grad_output.dtype, device=grad_output.device)
+        grad_output.new_empty(tuple(bias_sizes))
         if output_mask[2] and bias_sizes
-        else torch.empty(0, dtype=grad_output.dtype, device=grad_output.device)
+        else grad_output.new_empty((0,))
     )
     return grad_input, grad_weight, grad_bias
 
@@ -326,21 +340,16 @@ def _native_batch_norm_backward_fake(
     eps,
     output_mask,
 ):
+    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
     grad_input = (
-        torch.empty_like(input)
-        if output_mask[0]
-        else torch.empty(0, dtype=input.dtype, device=input.device)
+        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
     )
     C = int(input.size(1))
     grad_weight = (
-        torch.empty([C], dtype=grad_out.dtype, device=grad_out.device)
-        if output_mask[1]
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        grad_out.new_empty((C,)) if output_mask[1] else grad_out.new_empty((0,))
     )
     grad_bias = (
-        torch.empty([C], dtype=grad_out.dtype, device=grad_out.device)
-        if output_mask[2]
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        grad_out.new_empty((C,)) if output_mask[2] else grad_out.new_empty((0,))
     )
     return grad_input, grad_weight, grad_bias
 
@@ -348,20 +357,19 @@ def _native_batch_norm_backward_fake(
 def _native_layer_norm_backward_fake(
     grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
 ):
+    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
     grad_input = (
-        torch.empty_like(input)
-        if output_mask[0]
-        else torch.empty(0, dtype=input.dtype, device=input.device)
+        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
     )
     grad_weight = (
-        torch.empty_like(weight)
+        weight.new_empty(weight.shape)
         if (output_mask[1] and weight is not None)
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        else grad_out.new_empty((0,))
     )
     grad_bias = (
-        torch.empty_like(bias)
+        bias.new_empty(bias.shape)
         if (output_mask[2] and bias is not None)
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        else grad_out.new_empty((0,))
     )
     return grad_input, grad_weight, grad_bias
 
@@ -369,20 +377,19 @@ def _native_layer_norm_backward_fake(
 def _native_group_norm_backward_fake(
     grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
 ):
+    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
     grad_input = (
-        torch.empty_like(input)
-        if output_mask[0]
-        else torch.empty(0, dtype=input.dtype, device=input.device)
+        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
     )
     grad_weight = (
-        torch.empty([C], dtype=grad_out.dtype, device=grad_out.device)
+        grad_out.new_empty((int(C),))
         if output_mask[1]
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        else grad_out.new_empty((0,))
     )
     grad_bias = (
-        torch.empty([C], dtype=grad_out.dtype, device=grad_out.device)
+        grad_out.new_empty((int(C),))
         if output_mask[2]
-        else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+        else grad_out.new_empty((0,))
     )
     return grad_input, grad_weight, grad_bias
 
@@ -391,7 +398,8 @@ def _native_group_norm_backward_fake(
 
 
 def _gather_fake(self, dim, index, sparse_grad=False):
-    return torch.empty_like(index, dtype=self.dtype)
+    # M-pipeline-9: not `torch.empty_like(index, dtype=...)` — see M18.3.
+    return index.new_empty(index.shape, dtype=self.dtype)
 
 
 def _scatter_src_fake(self, dim, index, src):
@@ -474,7 +482,12 @@ def _sdpa_backward_fake(
     philox_offset=None,
     scale=None,
 ):
-    return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+    # M-pipeline-9: not `torch.empty_like(...)` — see M18.3.
+    return (
+        query.new_empty(query.shape),
+        key.new_empty(key.shape),
+        value.new_empty(value.shape),
+    )
 
 
 # ── FFT ops ───────────────────────────────────────────────────────────────────
@@ -661,7 +674,8 @@ def _index_select_fake(self, dim, index):
 
 
 def _gather_fake_backward(self, dim, index, sparse_grad=False):
-    return torch.empty_like(index, dtype=self.dtype)
+    # M-pipeline-9: not `torch.empty_like(index, dtype=...)` — see M18.3.
+    return index.new_empty(index.shape, dtype=self.dtype)
 
 
 def _scatter_reduce_fake(self, dim, index, src, reduce, include_self=True):

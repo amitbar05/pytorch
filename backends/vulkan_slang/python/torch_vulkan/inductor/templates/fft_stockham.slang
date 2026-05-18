@@ -41,7 +41,8 @@ struct KernelArgs {
     StructuredBuffer</*{{*/ dtype /*}}float*/> src;      // input
     RWStructuredBuffer</*{{*/ dtype /*}}float*/> dst;    // output
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // Groupshared: work buffer (2*N floats for interleaved complex) + twiddle cache
 groupshared /*{{*/ dtype /*}}float*/ gs_data[/*{{*/ 2 * N /*}}512*/];

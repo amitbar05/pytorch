@@ -471,10 +471,13 @@ def _dispatch_flash_attention_bwd(
         BK=BK,
         BQ=BQ,
     )
+    # M20.3: BQ / BK / HEAD_DIM are spec constants (IDs 13-15) so the
+    # SPIR-V hash collapses to (head_layout,) — is_causal is a runtime
+    # push-constant flag and was never SPV-affecting in the backward.
+    # The same SPIR-V module serves every (BQ, BK, head_dim) combo;
+    # the tuple is applied as a pipeline spec-constant override below.
     cache_key = (
-        f"slang_flash_attention_bwd_D{D}_{head_layout}"
-        f"{'causal' if is_causal else ''}"
-        f"_BK{BK}_BQ{BQ}"
+        f"slang_flash_attention_bwd_m20p3_{head_layout}"
     )
 
     # Push constants matching BwdPC struct.
@@ -496,6 +499,13 @@ def _dispatch_flash_attention_bwd(
     grid_y = H * ((N + BQ - 1) // BQ)
     grid_z = 1
 
+    # M20.3: Vulkan spec-constant overrides for (BQ, BK, HEAD_DIM).
+    spec_constants = [
+        (13, BQ),
+        (14, BK),
+        (15, D),
+    ]
+
     compile_and_dispatch(
         src,
         [q, k, v, lse, dO, dQ, dK, dV],
@@ -505,6 +515,7 @@ def _dispatch_flash_attention_bwd(
         push_constants=pc,
         num_outputs=3,
         cache_key=cache_key,
+        spec_constants=spec_constants,
     )
 
 
@@ -553,12 +564,11 @@ class _SlangTileFlashAttentionBwd:
                 BK=self.BK,
                 BQ=self.BQ,
             )
-            self._cache_key = (
-                f"slang_flash_attention_bwd_D{self.head_dim}"
-                f"_bhsd"
-                f"{'causal' if self.is_causal else ''}"
-                f"_BK{self.BK}_BQ{self.BQ}"
-            )
+            # M20.3: spec constants 13-15 carry (BQ, BK, HEAD_DIM); the
+            # cache key collapses to head_layout only because every
+            # other axis is either a runtime push-const (is_causal,
+            # head_dim semantics) or a pipeline-spec override.
+            self._cache_key = "slang_flash_attention_bwd_m20p3_bhsd"
         return self._src, self._cache_key
 
     def __call__(

@@ -122,14 +122,14 @@ public void layer_norm_row<Affine : INormAffine>(
     StructuredBuffer<float> bias,
     RWStructuredBuffer<float> Y,
     uint row, uint D, float eps,
-    uint tid, uint tg
+    uint tid, uint tg, uint simd
 ) {
     float v_local = (tid < D) ? X[row * D + tid] : 0.0f;
     WelfordResult<float> wf;
     wf.mean = (tid < D) ? v_local : 0.0f;
     wf.m2 = 0.0f;
     wf.n = (tid < D) ? 1.0f : 0.0f;
-    WelfordResult<float> stats = wg_welford(wf, tid, tg);
+    WelfordResult<float> stats = wg_welford(wf, tid, tg, simd);
     float mean = stats.mean;
     float var = stats.n > 0.0f ? stats.m2 / stats.n : 0.0f;
     float rstd = 1.0f / sqrt(var + eps);
@@ -145,13 +145,13 @@ public void rms_norm_row<Affine : INormAffine>(
     StructuredBuffer<float> bias,
     RWStructuredBuffer<float> Y,
     uint row, uint D, float eps,
-    uint tid, uint tg
+    uint tid, uint tg, uint simd
 ) {
     float v = (tid < D) ? X[row * D + tid] : 0.0f;
     float sq = (tid < D) ? (v * v) : 0.0f;
-    float sum_sq = wg_reduce<OpSum>(sq, tid, tg);
+    float sum_sq = wg_reduce<OpSum>(sq, tid, tg, simd);
     // tg threads contribute 1.0f each up to D; rest contribute 0.0f.
-    float count = wg_reduce<OpSum>((tid < D) ? 1.0f : 0.0f, tid, tg);
+    float count = wg_reduce<OpSum>((tid < D) ? 1.0f : 0.0f, tid, tg, simd);
     float mean_sq = count > 0.0f ? sum_sq / count : 0.0f;
     float rstd = 1.0f / sqrt(mean_sq + eps);
     if (tid < D) {

@@ -113,57 +113,74 @@ def _slang_tile_conv2d_gn_relu(
     # Layout must match PC struct in conv_gn_relu.slang:
     #   conv dims (15) + strides_in (4) + strides_w (4) + strides_out (4)
     #   + GN params (4 uint + 1 float = 5 fields) + bias_stride + _pad
+    #
+    # M-pipeline-1-followup: every integer field is wrapped with ``int(...)``
+    # so AOT-passed ``SymInt`` values (from tensor metadata via the
+    # post-AOT compile-mode wrapper) coerce to plain ints. Without the
+    # wrap, ``struct.pack("32IfI", ...)`` raises
+    # ``struct.error: required argument is not an integer`` because
+    # ``SymInt`` doesn't satisfy the ``I`` format's int-conversion
+    # protocol on PyTorch 2.11.
     common_fields = (
-        N,
-        C_in,
-        C_out,
-        iH,
-        iW,
-        oH,
-        oW,
-        kH,
-        kW,
-        sH,
-        sW,
-        pH,
-        pW,
-        dH,
-        dW,
-        input_t.stride(0),
-        input_t.stride(1),
-        input_t.stride(2),
-        input_t.stride(3),
-        weight_t.stride(0),
-        weight_t.stride(1),
-        weight_t.stride(2),
-        weight_t.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        G,
-        group_size,
-        channels_per_group,
-        spatial_size,
+        int(N),
+        int(C_in),
+        int(C_out),
+        int(iH),
+        int(iW),
+        int(oH),
+        int(oW),
+        int(kH),
+        int(kW),
+        int(sH),
+        int(sW),
+        int(pH),
+        int(pW),
+        int(dH),
+        int(dW),
+        int(input_t.stride(0)),
+        int(input_t.stride(1)),
+        int(input_t.stride(2)),
+        int(input_t.stride(3)),
+        int(weight_t.stride(0)),
+        int(weight_t.stride(1)),
+        int(weight_t.stride(2)),
+        int(weight_t.stride(3)),
+        int(out.stride(0)),
+        int(out.stride(1)),
+        int(out.stride(2)),
+        int(out.stride(3)),
+        int(G),
+        int(group_size),
+        int(channels_per_group),
+        int(spatial_size),
     )
-    # epsilon is a float packed after the uint fields
-    if has_bias:
-        bias_1d = bias.view(-1)
-        pc = struct.pack(
-            "32IfI",
-            *common_fields,
-            float(eps),
-            bias_1d.stride(0),
-            0,  # _pad
-        )
-    else:
-        pc = struct.pack(
-            "32IfII",
-            *common_fields,
-            float(eps),
-            0,  # stride_bias = 0 (no bias)
-            0,  # _pad
-        )
+    # epsilon is a float packed after the uint fields.
+    # M-pipeline-1-followup: corrected format string. The slang struct
+    # layout (conv_gn_relu.slang::PC) is::
+    #   15 conv dims (uint)            ──┐
+    #    4 stride_in (uint)               │
+    #    4 stride_w  (uint)               ├─ 31 uint
+    #    4 stride_out (uint)              │
+    #    4 GN params (uint)             ──┘
+    #    1 float eps
+    #    1 uint stride_bias (0 when bias absent)
+    #    1 uint _pad
+    # Total = 34 fields = 136 bytes. Format ``"31IfII"`` matches.
+    # Production previously had ``"32IfI"`` / ``"32IfII"`` which
+    # mis-counted the leading uints and produced a layout mismatch
+    # (the eps was packed into an ``I`` slot, truncating the float to
+    # int 0). CPython 3.12 raises ``struct.error: required argument
+    # is not an integer`` for that mismatch — only surfaced now
+    # because M-pipeline-1 just opened the runtime path to this
+    # packer.
+    bias_stride = int(bias.view(-1).stride(0)) if has_bias else 0
+    pc = struct.pack(
+        "31IfII",
+        *common_fields,
+        float(eps),
+        bias_stride,
+        0,  # _pad
+    )
 
     buffers = [input_t, weight_t]
     if has_bias:
@@ -306,45 +323,47 @@ def _slang_tile_conv2d(
     if not weight_t.is_contiguous():
         weight_t = weight_t.contiguous()
 
-    # Pack push constants: 15 uint fields for no-bias, 17 for bias
+    # Pack push constants: 15 uint fields for no-bias, 17 for bias.
+    # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
+    # AOT-passed ``SymInt`` shape / stride metadata coerces cleanly.
     common_fields = (
-        N,
-        C_in,
-        C_out,
-        iH,
-        iW,
-        oH,
-        oW,
-        kH,
-        kW,
-        sH,
-        sW,
-        pH,
-        pW,
-        dH,
-        dW,
-        input_t.stride(0),
-        input_t.stride(1),
-        input_t.stride(2),
-        input_t.stride(3),
-        weight_t.stride(0),
-        weight_t.stride(1),
-        weight_t.stride(2),
-        weight_t.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        tile_w,
-        tile_h,
-        tile_c,
+        int(N),
+        int(C_in),
+        int(C_out),
+        int(iH),
+        int(iW),
+        int(oH),
+        int(oW),
+        int(kH),
+        int(kW),
+        int(sH),
+        int(sW),
+        int(pH),
+        int(pW),
+        int(dH),
+        int(dW),
+        int(input_t.stride(0)),
+        int(input_t.stride(1)),
+        int(input_t.stride(2)),
+        int(input_t.stride(3)),
+        int(weight_t.stride(0)),
+        int(weight_t.stride(1)),
+        int(weight_t.stride(2)),
+        int(weight_t.stride(3)),
+        int(out.stride(0)),
+        int(out.stride(1)),
+        int(out.stride(2)),
+        int(out.stride(3)),
+        int(tile_w),
+        int(tile_h),
+        int(tile_c),
     )
     if has_bias:
         bias_1d = bias.view(-1)
         pc = struct.pack(
             "32I",
             *common_fields,
-            bias_1d.stride(0),
+            int(bias_1d.stride(0)),
             0,  # _pad
         )
     else:
@@ -499,11 +518,27 @@ def _slang_tile_conv2d_bwd(
         threads_h=threads_h,
         has_bias=has_bias,
     )
+    # M20.3: tile sizes are spec constants (IDs 40-44) — they don't
+    # affect the SPIR-V hash, so the cache key collapses to (dtype,
+    # has_bias). The same SPIR-V module serves every tile combo;
+    # the tuple is applied as a pipeline spec-constant override at
+    # dispatch time.
     cache_key = (
-        f"slang_conv_bwd_{tile_w}x{tile_h}x{tile_c}"
-        f"_t{threads_w}x{threads_h}_{dtype_s}"
+        f"slang_conv_bwd_m20p3_{dtype_s}"
         f"{'_bias' if has_bias else ''}"
     )
+
+    # M20.3: Vulkan specialization constant overrides for the tile
+    # tuple (constant_id 40-44). One pipeline per tuple, but the same
+    # SPIR-V module is reused — slangc cost amortises across every
+    # autotuned shape that hits this template.
+    spec_constants = [
+        (40, tile_w),
+        (41, tile_h),
+        (42, tile_c),
+        (43, threads_w),
+        (44, threads_h),
+    ]
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
@@ -517,34 +552,37 @@ def _slang_tile_conv2d_bwd(
     # Layout matches BwdPC in slang_conv_bwd.py.jinja:
     #   dims (15) + stride_in (4) + stride_w (4) + stride_go (4) = 27
     #   + _pad_bwd (1) with bias = 28
+    #
+    # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
+    # AOT-passed ``SymInt`` shape / stride metadata coerces cleanly.
     common_fields = (
-        N,
-        C_in,
-        C_out,
-        iH,
-        iW,
-        oH,
-        oW,
-        kH,
-        kW,
-        sH,
-        sW,
-        pH,
-        pW,
-        dH,
-        dW,
-        input_t.stride(0),
-        input_t.stride(1),
-        input_t.stride(2),
-        input_t.stride(3),
-        weight_t.stride(0),
-        weight_t.stride(1),
-        weight_t.stride(2),
-        weight_t.stride(3),
-        grad_out.stride(0),
-        grad_out.stride(1),
-        grad_out.stride(2),
-        grad_out.stride(3),
+        int(N),
+        int(C_in),
+        int(C_out),
+        int(iH),
+        int(iW),
+        int(oH),
+        int(oW),
+        int(kH),
+        int(kW),
+        int(sH),
+        int(sW),
+        int(pH),
+        int(pW),
+        int(dH),
+        int(dW),
+        int(input_t.stride(0)),
+        int(input_t.stride(1)),
+        int(input_t.stride(2)),
+        int(input_t.stride(3)),
+        int(weight_t.stride(0)),
+        int(weight_t.stride(1)),
+        int(weight_t.stride(2)),
+        int(weight_t.stride(3)),
+        int(grad_out.stride(0)),
+        int(grad_out.stride(1)),
+        int(grad_out.stride(2)),
+        int(grad_out.stride(3)),
     )
     if has_bias:
         pc = struct.pack("28I", *common_fields, 0)  # _pad_bwd
@@ -570,4 +608,5 @@ def _slang_tile_conv2d_bwd(
         num_outputs=2 if not has_bias else 3,
         entry="computeMain",
         cache_key=cache_key,
+        spec_constants=spec_constants,
     )

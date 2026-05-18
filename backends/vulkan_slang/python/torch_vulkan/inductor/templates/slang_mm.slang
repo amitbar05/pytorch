@@ -84,17 +84,43 @@ struct PC {
 
 [[vk::push_constant]] PC pc;
 
-/*{%*/ set c_binding = 2 if has_bias else 2 /*%}*/
-// M17.1 — Buffer bindings use explicit [[vk::binding(N)]] decorations.
-// ParameterBlock at global scope is assigned to Set 1 by slangc 2026.5+.
-// Per-binding decorations avoid the set mismatch entirely.
-// Binding order: a=0, b=1, [bias=2,] c=/*{{*/ c_binding /*}}2*/.
-[[vk::binding(0)]] StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
-[[vk::binding(1)]] StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
+// M20.2 — Restored ParameterBlock<KernelArgs>. Replaces the M17.1
+// per-binding [[vk::binding(N)]] workaround.
+//
+// slang-investigate finding (2026-05-18): slangc 2026.7.1 assigns
+// ParameterBlock<KernelArgs> to DescriptorSet=1 unconditionally — but
+// SO DOES every other working template (conv2d, flash_attention,
+// foreach_optimizer, scatter_atomic, philox_rng, rnn_cell*, etc.). All
+// of them work at runtime because the C++ pipeline (csrc/vulkan/
+// Pipeline.cpp) creates a single VkDescriptorSetLayout, binds it at
+// firstSet=0 via vkCmdBindDescriptorSets, and RADV tolerates the
+// SPIR-V's OpDecorate-says-Set-1-but-runtime-binds-Set-0 mismatch (the
+// Vulkan validation layer would flag this, but production runs without
+// it loaded).
+//
+// The M17.1 narrative ("mm's ParameterBlock at Set 1 broke the
+// pipeline, conv2d's was Set 0 and worked") was a misdiagnosis —
+// verified via SPIR-V OpDecorate disassembly of both templates: both
+// emit DescriptorSet=1. The original failure that motivated M17.1 was
+// likely an unrelated bug (typo in c_binding, descriptor count
+// mismatch, etc.) that the manual-binding workaround obscured.
+//
+// Restoring ParameterBlock:
+//   - eliminates the M22.12 c_binding Jinja typo bug class (= 2 if
+//     has_bias else 2)
+//   - matches every other template's pattern (uniform code style)
+//   - re-enables Slang's resource layout reasoning (which is
+//     bypassed by manual [[vk::binding]] decorations)
+struct KernelArgs {
+    StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
+    StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
 /*{%*/ if has_bias /*%}*/
-[[vk::binding(2)]] StructuredBuffer</*{{*/ dtype_bias | default(dtype_c) /*}}float*/> bias;
+    StructuredBuffer</*{{*/ dtype_bias | default(dtype_c) /*}}float*/> bias;
 /*{%*/ endif /*%}*/
-[[vk::binding(/*{{*/ c_binding /*}}2*/)]] RWStructuredBuffer</*{{*/ dtype_c /*}}float*/> c;
+    RWStructuredBuffer</*{{*/ dtype_c /*}}float*/> c;
+};
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 /*{%*/ if num_stages > 1 /*%}*/
 // Double-buffered: stage 0 occupies the first half, stage 1 the second half.
 // Flat 1-D layout (rather than `[2][N]`) so helpers can index with a single
@@ -142,7 +168,7 @@ void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
         uint global_k = k_base + local_k;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_m < pc.M && global_k < pc.K) {
-            v = (/*{{*/ dtype_acc /*}}float*/)a[batch_a_off + global_m * pc.stride_a_m + global_k * pc.stride_a_k];
+            v = (/*{{*/ dtype_acc /*}}float*/)args.a[batch_a_off + global_m * pc.stride_a_m + global_k * pc.stride_a_k];
         }
         tile_a[off_a + i] = v;
     }
@@ -155,7 +181,7 @@ void load_tiles(uint stage, uint k_base, uint row_base, uint col_base,
         uint global_n = col_base + local_n;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_k < pc.K && global_n < pc.N) {
-            v = (/*{{*/ dtype_acc /*}}float*/)b[batch_b_off + global_k * pc.stride_b_k + global_n * pc.stride_b_n];
+            v = (/*{{*/ dtype_acc /*}}float*/)args.b[batch_b_off + global_k * pc.stride_b_k + global_n * pc.stride_b_n];
         }
         tile_b[off_b + j] = v;
     }
@@ -307,10 +333,10 @@ void computeMain<Epilogue : IDifferentiable>(
             v *= pc.alpha;
 /*{%*/ endif /*%}*/
 /*{%*/ if has_bias /*%}*/
-            v += (/*{{*/ dtype_acc /*}}float*/)bias[col * pc.stride_bias_n];
+            v += (/*{{*/ dtype_acc /*}}float*/)args.bias[col * pc.stride_bias_n];
 /*{%*/ endif /*%}*/
 /*{%*/ if has_beta /*%}*/
-            v += pc.beta * (/*{{*/ dtype_acc /*}}float*/)c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
+            v += pc.beta * (/*{{*/ dtype_acc /*}}float*/)args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
 /*{%*/ endif /*%}*/
 /*{%*/ if epilogue /*%}*/
             v = (/*{{*/ dtype_acc /*}}float*/)Epilogue::apply((float)v);
@@ -321,7 +347,7 @@ void computeMain<Epilogue : IDifferentiable>(
 /*{%*/ if has_clamp /*%}*/
             v = clamp(v, (/*{{*/ dtype_acc /*}}float*/)pc.clamp_min, (/*{{*/ dtype_acc /*}}float*/)pc.clamp_max);
 /*{%*/ endif /*%}*/
-            c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = (/*{{*/ dtype_c /*}}float*/)v;
+            args.c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = (/*{{*/ dtype_c /*}}float*/)v;
         }
     }
 }

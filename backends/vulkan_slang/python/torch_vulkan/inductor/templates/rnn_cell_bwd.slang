@@ -1,5 +1,35 @@
-// OP.25 — RNN cell backward template (LSTM / GRU / RNN-tanh / RNN-relu).
-// Valid Slang with Jinja2 markers in comments — used by slangc validation.
+// M20.1 — RNN cell backward template (LSTM / GRU / RNN-tanh / RNN-relu).
+//
+// Pre-M20.1, this template hand-rolled the chain rule including the
+// inverse derivatives of sigmoid and tanh as inline helpers (d-sigmoid
+// and d-tanh of saved primal). Three known chain-rule-class bugs
+// (M17.8.d.3, M18.2, M18.3) traced to copy-paste errors in this region.
+//
+// Post-M20.1, the activation backwards delegate to lib/pointwise.slang
+// primitives via bwd_diff(sigmoid_fwd) / bwd_diff(tanh_fwd) /
+// bwd_diff(relu_fwd). Those primitives carry validator-clean
+// [BackwardDerivative] partners (sigmoid_fast_bwd, tanh_fast_bwd,
+// relu_fast_bwd) that are unit-tested in the lib. The cell-state chain
+// rule (LSTM's c' = f*c + i*g; h' = o*tanh(c')) is still composed
+// manually here, but it's small (~10 LoC for LSTM, fewer for others)
+// and the activation-derivative bug class is eliminated.
+//
+// Why not full bwd_diff() over a single Slang-Differentiable
+// cell-update? The slang_validator at slang_validate/bwd_diff_scan.py
+// requires every Slang-Differentiable-tagged function to have a
+// paired BackwardDerivative-or-ForwardDerivative annotation;
+// bwd_diff(name)(...) invocations don't satisfy that contract from
+// the validator's regex point of view. Patching the validator is
+// Group F (out of templates/ lane), so M20.1 ratchets to the
+// per-primitive bwd_diff() form and leaves the
+// autodiff-over-the-whole-cell variant for a later milestone after
+// the validator is tightened to recognise bwd_diff() use sites.
+
+import pointwise;
+// M20.1.c: weight + bias grad accumulators use vk_atomic_add to dedupe
+// cross-batch / cross-time-step accumulation. Mirrors slang_conv_bwd.slang's
+// dX/dW/dB accumulators which have used vk_atomic_add since OP.25.
+import atomics;
 
 //# ── Cell-type specific constants ── #//
 /*{%*/ if cell_type == "lstm" /*%}*/
@@ -50,28 +80,49 @@ struct KernelArgs {
 /*{%*/ if has_cell_state /*%}*/
     RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_c_prev;
 /*{%*/ endif /*%}*/
-    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_w_ih;
-    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_w_hh;
-    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_b_ih;
-    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_b_hh;
+    // M20.1.c: bind weight + bias grad accumulators as RWStructuredBuffer<uint>
+    // so the CAS-based vk_atomic_add (in lib/atomics.slang) can reinterpret
+    // the float values via asuint/asfloat. The host-side caller zeros each
+    // buffer before the BPTT loop (lowerings/rnn/bwd_vulkan.py uses
+    // torch.zeros_like(w_ih) etc.) — atomic-add into a zero-init buffer is
+    // the correct semantics for cross-batch + cross-time-step accumulation.
+    RWStructuredBuffer<uint> grad_w_ih;
+    RWStructuredBuffer<uint> grad_w_hh;
+    RWStructuredBuffer<uint> grad_b_ih;
+    RWStructuredBuffer<uint> grad_b_hh;
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 groupshared float scratch_in[/*{{*/ hidden_size /*}}256*/];
 
+// ── M20.1: thin wrappers around lib primitive bwd_diffs ────────────────
+//
+// Each helper returns the gradient w.r.t. the input given the gradient
+// w.r.t. the output and the saved forward primal. They route through
+// bwd_diff(<lib primitive>) so the activation-derivative formulae live
+// in one place (lib/pointwise.slang) and bug fixes there propagate to
+// every consumer.
+
 [ForceInline]
-float _sigmoid(float v) {
-    return 0.5f + 0.5f * tanh(v * 0.5f);
+float _sigmoid_grad(float x_primal, float grad_out) {
+    DifferentialPair<float> dp = diffPair(x_primal, 0.0f);
+    bwd_diff(sigmoid_fwd)(dp, grad_out);
+    return dp.d;
 }
 
 [ForceInline]
-float _dsigmoid_from_val(float sigmoid_val) {
-    return sigmoid_val * (1.0f - sigmoid_val);
+float _tanh_grad(float x_primal, float grad_out) {
+    DifferentialPair<float> dp = diffPair(x_primal, 0.0f);
+    bwd_diff(tanh_fwd)(dp, grad_out);
+    return dp.d;
 }
 
 [ForceInline]
-float _dtanh_from_val(float tanh_val) {
-    return 1.0f - tanh_val * tanh_val;
+float _relu_grad(float x_primal, float grad_out) {
+    DifferentialPair<float> dp = diffPair(x_primal, 0.0f);
+    bwd_diff(relu_fwd)(dp, grad_out);
+    return dp.d;
 }
 
 [shader("compute")]
@@ -92,6 +143,7 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
     uint c_off = batch * pc.stride_c;
 /*{%*/ endif /*%}*/
 
+    // ── Recompute pre-activation raw gate sums (forward mirror). ─
     float ih_gate[/*{{*/ gate_size /*}}4*/];
     float hh_gate[/*{{*/ gate_size /*}}4*/];
     for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
@@ -114,32 +166,59 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
         hh_gate[g] = acc_hh;
     }
 
+    // ── Cell-type-specific gate-gradient computation ─────────────
+    // The activation derivatives use bwd_diff(<lib primitive>) — the
+    // cell-state chain rule (where present) is composed manually.
 /*{%*/ if cell_type == "lstm" /*%}*/
-    float i_val = _sigmoid(ih_gate[0] + hh_gate[0]);
-    float f_val = _sigmoid(ih_gate[1] + hh_gate[1]);
-    float g_val = tanh(ih_gate[2] + hh_gate[2]);
-    float o_val = _sigmoid(ih_gate[3] + hh_gate[3]);
+    // LSTM: c' = f*c + i*g; h' = o * tanh(c')
+    //   ∂L/∂o_raw = ∂σ(o_raw) * (gh * tanh(c'))
+    //   ∂L/∂c'    = gh * o * ∂tanh(c') + gc
+    //   ∂L/∂i_raw = ∂σ(i_raw) * (dc' * g)
+    //   ∂L/∂f_raw = ∂σ(f_raw) * (dc' * c_prev)
+    //   ∂L/∂g_raw = ∂tanh(g_raw) * (dc' * i)
+    //   ∂L/∂c_prev = dc' * f
+    float i_raw = ih_gate[0] + hh_gate[0];
+    float f_raw = ih_gate[1] + hh_gate[1];
+    float g_raw = ih_gate[2] + hh_gate[2];
+    float o_raw = ih_gate[3] + hh_gate[3];
+    float i_val = sigmoid_fwd(i_raw);
+    float f_val = sigmoid_fwd(f_raw);
+    float g_val = tanh_fwd(g_raw);
+    float o_val = sigmoid_fwd(o_raw);
     float c_prev_val = (float)args.c_prev[c_off + hid];
     float c_val = f_val * c_prev_val + i_val * g_val;
-    float tanh_c = tanh(c_val);
+    float tanh_c = tanh_fwd(c_val);
 
     float gh = (float)args.grad_h[h_off + hid];
-    float gc = 0.0f;
-    gc += (float)args.grad_c[h_off + hid];
-    float dc = gh * o_val * _dtanh_from_val(tanh_c) + gc;
-    float di = dc * g_val * _dsigmoid_from_val(i_val);
-    float df = dc * c_prev_val * _dsigmoid_from_val(f_val);
-    float dg = dc * i_val * _dtanh_from_val(g_val);
-    float dout_do = gh * tanh_c * _dsigmoid_from_val(o_val);
+    float gc = (float)args.grad_c[h_off + hid];
+    // dc' propagation: gh contributes through h' = o * tanh(c'), so
+    // dc' includes (gh * o) routed through bwd_diff(tanh_fwd).
+    float dc = _tanh_grad(c_val, gh * o_val) + gc;
+    // di / df / dg / do via per-primitive bwd_diff:
+    float di = _sigmoid_grad(i_raw, dc * g_val);
+    float df = _sigmoid_grad(f_raw, dc * c_prev_val);
+    float dg = _tanh_grad(g_raw, dc * i_val);
+    float dout_do = _sigmoid_grad(o_raw, gh * tanh_c);
 
     float gate_grad[4] = { di, df, dg, dout_do };
     float grad_c_prev_val = dc * f_val;
     args.grad_c_prev[h_off + hid] = (/*{{*/ dtype /*}}float*/)grad_c_prev_val;
+    float dh_prev_direct = 0.0f;
 /*{%*/ elif cell_type == "gru" /*%}*/
-    float r_val = _sigmoid(ih_gate[0] + hh_gate[0]);
-    float z_val = _sigmoid(ih_gate[1] + hh_gate[1]);
-    float n_raw = ih_gate[2] + r_val * hh_gate[2];
-    float n_val = tanh(n_raw);
+    // GRU: r = σ(...), z = σ(...), n = tanh(ih_n + r * hh_n);
+    //      h' = (1-z)*n + z*h_prev
+    //   dn         = gh * (1 - z)
+    //   dz         = gh * (h_prev - n)
+    //   dh_prev (z-route) = gh * z
+    //   dn_raw = bwd_diff(tanh_fwd)(ih_n + r*hh_n, dn) gives gradient
+    //           w.r.t. the tanh input. Split between ih_n and r*hh_n.
+    //   dr = dn_raw * hh_n; then ∂σ(r_raw); dr_sig = dz; etc.
+    float r_raw = ih_gate[0] + hh_gate[0];
+    float z_raw = ih_gate[1] + hh_gate[1];
+    float r_val = sigmoid_fwd(r_raw);
+    float z_val = sigmoid_fwd(z_raw);
+    float n_raw_input = ih_gate[2] + r_val * hh_gate[2];
+    float n_val = tanh_fwd(n_raw_input);
     float h_prev_val = (float)args.h_prev[h_off + hid];
 
     float gh = (float)args.grad_h[h_off + hid];
@@ -147,44 +226,62 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
     float dz = gh * (h_prev_val - n_val);
     float dh_prev_direct = gh * z_val;
 
-    float dn_raw = dn * _dtanh_from_val(n_val);
+    // bwd through tanh on the n-gate input.
+    float dn_raw = _tanh_grad(n_raw_input, dn);
     float dr = dn_raw * hh_gate[2];
-    dr = dr * _dsigmoid_from_val(r_val);
-    dz = dz * _dsigmoid_from_val(z_val);
+    dr = _sigmoid_grad(r_raw, dr);
+    dz = _sigmoid_grad(z_raw, dz);
 
+    // Gate gradients applied to ih vs hh differ for the n-gate:
+    //   ih path of n: dn_raw (direct contribution)
+    //   hh path of n: dn_raw * r_val (through the r-scaling)
     float gate_grad[3] = { dr, dz, dn_raw };
+    float gate_grad_hh[3] = { dr, dz, dn_raw * r_val };
 /*{%*/ elif cell_type == "rnn_tanh" /*%}*/
     float raw = ih_gate[0] + hh_gate[0];
-    float h_val = tanh(raw);
     float gh = (float)args.grad_h[h_off + hid];
-    float d_raw = gh * _dtanh_from_val(h_val);
+    float d_raw = _tanh_grad(raw, gh);
     float gate_grad[1] = { d_raw };
+    float gate_grad_hh[1] = { d_raw };
+    float dh_prev_direct = 0.0f;
 /*{%*/ elif cell_type == "rnn_relu" /*%}*/
     float raw = ih_gate[0] + hh_gate[0];
     float gh = (float)args.grad_h[h_off + hid];
-    float d_raw = (raw > 0.0f) ? gh : 0.0f;
+    float d_raw = _relu_grad(raw, gh);
     float gate_grad[1] = { d_raw };
+    float gate_grad_hh[1] = { d_raw };
+    float dh_prev_direct = 0.0f;
 /*{%*/ endif /*%}*/
 
+    // ── Accumulate W_ih, W_hh, b_ih, b_hh gradients ─────────────
+    // M20.1.c: vk_atomic_add (CAS-based, RDNA1-portable — see
+    // lib/atomics.slang) replaces the prior non-atomic read-modify-write.
+    // The race surfaces under batch_size > 1: each batch element's
+    // workgroup writes to the same (gate_row, k) cell, dropping updates.
+    // Mirrors the canonical pattern from templates/slang_conv_bwd.slang.
     for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
         uint gate_row = g * pc.hidden_size + hid;
-        float gg = gate_grad[g];
+        float gg_ih = gate_grad[g];
+/*{%*/ if cell_type in ("gru", "rnn_tanh", "rnn_relu") /*%}*/
+        float gg_hh = gate_grad_hh[g];
+/*{%*/ else /*%}*/
+        float gg_hh = gg_ih;
+/*{%*/ endif /*%}*/
         for (uint k = 0u; k < pc.input_size; k++) {
             uint idx = gate_row * pc.stride_w_ih + k;
-            float val = (float)args.grad_w_ih[idx];
-            args.grad_w_ih[idx] = (/*{{*/ dtype /*}}float*/)(val + gg * (float)args.x_t[x_off + k]);
+            vk_atomic_add(args.grad_w_ih, idx, gg_ih * (float)args.x_t[x_off + k]);
         }
         for (uint k = 0u; k < pc.hidden_size; k++) {
             uint idx = gate_row * pc.stride_w_hh + k;
-            float val = (float)args.grad_w_hh[idx];
-            args.grad_w_hh[idx] = (/*{{*/ dtype /*}}float*/)(val + gg * (float)args.h_prev[h_off + k]);
+            vk_atomic_add(args.grad_w_hh, idx, gg_hh * (float)args.h_prev[h_off + k]);
         }
         if (pc.has_bias != 0u) {
-            args.grad_b_ih[gate_row] = (/*{{*/ dtype /*}}float*/)((float)args.grad_b_ih[gate_row] + gg);
-            args.grad_b_hh[gate_row] = (/*{{*/ dtype /*}}float*/)((float)args.grad_b_hh[gate_row] + gg);
+            vk_atomic_add(args.grad_b_ih, gate_row, gg_ih);
+            vk_atomic_add(args.grad_b_hh, gate_row, gg_hh);
         }
     }
 
+    // ── Reduce to grad_x[k] ────────────────────────────────────
     for (uint k = 0u; k < pc.input_size; k++) {
         float contrib = 0.0f;
         for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
@@ -208,17 +305,20 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
         GroupMemoryBarrierWithGroupSync();
     }
 
+    // ── Reduce to grad_h_prev[k] ───────────────────────────────
     for (uint k = 0u; k < pc.hidden_size; k++) {
         float contrib = 0.0f;
         for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
             uint gate_row = g * pc.hidden_size + hid;
+/*{%*/ if cell_type in ("gru", "rnn_tanh", "rnn_relu") /*%}*/
+            contrib += gate_grad_hh[g] * (float)args.w_hh[gate_row * pc.stride_w_hh + k];
+/*{%*/ else /*%}*/
             contrib += gate_grad[g] * (float)args.w_hh[gate_row * pc.stride_w_hh + k];
+/*{%*/ endif /*%}*/
         }
-/*{%*/ if cell_type == "gru" /*%}*/
         if (hid == k) {
             contrib += dh_prev_direct;
         }
-/*{%*/ endif /*%}*/
         scratch_in[hid] = contrib;
         GroupMemoryBarrierWithGroupSync();
 

@@ -493,6 +493,11 @@ def _pick_tile_configs() -> list[tuple[int, int, int]]:
 
     N+1.12: When subgroup_size=32 (wave32), prefer smaller tiles;
     when subgroup_size=64 (wave64, RDNA1), prefer larger tiles.
+
+    M-NEW.3: filter sub-wave workgroups (numthreads < subgroup_size)
+    and non-wave-aligned shapes — the M27 in-process validator rejects
+    those anyway, so emitting them only wastes ~10 s of slangc per
+    config per cold compile.
     """
     env = os.environ.get("TORCH_VULKAN_MM_TILES", "")
     if env:
@@ -515,11 +520,23 @@ def _pick_tile_configs() -> list[tuple[int, int, int]]:
     # so threads in different waves cannot see each other's LDS writes.
     sgs = _get_device_subgroup_size()
     if sgs == 64:
-        # Only include tiles where (tile_m/1) * (tile_n/1) <= 64 for 1-opt path
-        return [c for c in _MM_TILE_CONFIGS if c[0] * c[1] <= 64]
+        # M17.1: cap WG at one wave (64 threads, barrier bug).
+        # M-NEW.3: also require the WG to be a multiple of the wave size
+        # (1×64, 2×64, …). For the 1-opt path that means WG ∈ {64} on
+        # RDNA1, so the existing ``c[0] * c[1] <= 64`` filter is
+        # effectively wave-aligned for the canonical 8×8 tile set.
+        return [
+            c
+            for c in _MM_TILE_CONFIGS
+            if c[0] * c[1] <= sgs and (c[0] * c[1]) % sgs == 0
+        ]
     if sgs == 32:
-        # Prefer tiles where max(tile_m, tile_n) <= 32 for wave32
-        return [c for c in _MM_TILE_CONFIGS if max(c[0], c[1]) <= 32]
+        # Wave32: prefer max(TILE_M, TILE_N) <= 32 AND wave-aligned.
+        return [
+            c
+            for c in _MM_TILE_CONFIGS
+            if max(c[0], c[1]) <= 32 and (c[0] * c[1]) % sgs == 0
+        ]
     return _MM_TILE_CONFIGS
 
 
@@ -534,6 +551,16 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
     When subgroup_size=64 (wave64, RDNA1), keep all configs — wave64
     benefits from larger tile sizes that are multiples of 64.
 
+    M-NEW.3: filter out sub-wave / wave-misaligned workgroups. The
+    M27 validator (``slang_validate/workgroup.py``) rejects any kernel
+    whose ``numthreads`` product isn't a multiple of the wave size, so
+    emitting (e.g.) a 32-thread WG on wave64 hardware wastes a slangc
+    cold compile and is silently ignored by the autotuner. Audit Agent
+    3 measured 4/14 (29 %) of post-M-NEW.1 addmm choices being
+    rejected for this reason — all from
+    ``(64, 32, 16, 8, 8)`` and ``(32, 64, 16, 8, 8)`` register tiles
+    that produce 8×4=32 / 4×8=32 thread blocks on wave64.
+
     Set ``TORCH_VULKAN_NO_REGISTER_TILE=1`` to disable register-tile entries —
     Inductor's autotune will fall back to the (much smaller) legacy 1-output-
     per-thread set + aten_mm. Useful for bisecting register-tile correctness
@@ -544,17 +571,27 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
     # N+1.12: wave32/wave64 filter register-tile configs.
     # M17.1: On wave64, only single-wave workgroups work (barrier bug).
     sgs = _get_device_subgroup_size()
+
+    def _wg_threads(c: tuple[int, int, int, int, int]) -> int:
+        return (c[0] // c[3]) * (c[1] // c[4])
+
     if sgs == 64:
+        # M17.1 cap + M-NEW.3 wave alignment: WG must be exactly one
+        # wave (64) on RDNA1 — barrier bug forbids multi-wave WGs, and
+        # sub-wave WGs trigger M27 advisory rejection.
         return [
             c
             for c in _MM_REGISTER_TILE_CONFIGS
-            if (c[0] // c[3]) * (c[1] // c[4]) <= 64  # wg threads <= wave size
+            if _wg_threads(c) == sgs
         ]
     if sgs == 32:
+        # Wave32: register-heavy gate AND wave alignment.
         return [
             c
             for c in _MM_REGISTER_TILE_CONFIGS
-            if c[3] * c[4] <= 16  # m_per_thread * n_per_thread
+            if c[3] * c[4] <= 16
+            and _wg_threads(c) > 0
+            and _wg_threads(c) % sgs == 0
         ]
     return _MM_REGISTER_TILE_CONFIGS
 

@@ -88,7 +88,8 @@ struct KernelArgs {
     RWStructuredBuffer<uint> count;
 /*{%*/ endif /*%}*/
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 /*{%*/ if is_atomic /*%}*/
 // ── Import the canonical atomic-add implementation from lib/atomics.slang

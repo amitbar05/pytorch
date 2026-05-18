@@ -301,7 +301,44 @@ class HeaderMixin:
                 for i, v in enumerate(non_red[:3]):
                     body_code.writeline(f"uint {v.name} = gid.{axes[i]};")
                 if layout_2d is not None:
-                    pass
+                    # M18.10: emit declarations for the reduction-axis root
+                    # variables so downstream codegen in
+                    # ``indexing.py:codegen_iteration_ranges_entry`` doesn't
+                    # reference an undeclared ``r0_index`` symbol on the
+                    # RHS of a derived entry expression (e.g. ``r0_1 =
+                    # ((r0_index) % (16))`` from upstream Inductor's
+                    # CSE-flattened index).
+                    #
+                    # Two persistent-2D shapes (per ``_persistent_2d_layout``):
+                    #   (a) ``len(red_vars) == 2`` — two separate root trees;
+                    #       each root maps directly to one axis. The first
+                    #       root takes ``lid.y``, the second ``lid.x``.
+                    #   (b) ``len(red_vars) == 1`` — one root tree with two
+                    #       sub-entries (e.g. ``sum(dim=(0, 2))`` flattens
+                    #       two reduction axes into one root). The root
+                    #       index is the flat linearization
+                    #       ``lid.y * tx + lid.x`` where ``tx`` is the
+                    #       inner-axis size (the second element of
+                    #       ``layout_2d``).
+                    thread_y, thread_x = layout_2d
+                    if len(red_vars) == 1:
+                        body_code.writeline(
+                            f"uint {red_vars[0].name} = "
+                            f"lid.y * {thread_x}u + lid.x;"
+                        )
+                    else:
+                        for i, v in enumerate(red_vars[:2]):
+                            axis = "y" if i == 0 else "x"
+                            body_code.writeline(
+                                f"uint {v.name} = lid.{axis};"
+                            )
+                    # Tracker for indexing.py: don't re-declare these in
+                    # the per-entry code path. The hoist set is the
+                    # canonical "already declared at function scope" map.
+                    if not hasattr(self, "_hoisted_vars"):
+                        self._hoisted_vars = set()
+                    for v in red_vars:
+                        self._hoisted_vars.add(v.name)
                 else:
                     for v in red_vars:
                         body_code.writeline(f"uint {v.name} = lid.x;")
@@ -509,10 +546,23 @@ class HeaderMixin:
             code.writeline("};")
             # CG.M14: ParameterBlock<KernelArgs> groups all buffer bindings
             # into a single descriptor table. Slang auto-assigns binding
-            # indices in struct-field order. We disable [[vk::constant_id]]
-            # when ParameterBlock is active (see use_spec_constants above)
-            # to keep the descriptor table in set 0.
-            code.writeline("ParameterBlock<KernelArgs> args;")
+            # indices in struct-field order.
+            #
+            # M21.3.01: slangc 2026.7.1 unconditionally assigns
+            # ``ParameterBlock<KernelArgs>`` to ``DescriptorSet=1`` even
+            # when ``[[vk::constant_id]]`` is absent — the C++ pipeline
+            # layout only declares Set 0, which yields
+            # ``VUID-VkComputePipelineCreateInfo-layout-07988`` under the
+            # validation layer and unbound / stale descriptor reads on
+            # RADV in production (EAGER.1.b). Explicit
+            # ``[[vk::binding(0, 0)]]`` forces Set 0 in the SPIR-V.
+            code.writeline(
+                "// M21.3.01: explicit Set 0 binding "
+                "(slangc 2026.7.1 defaults to Set 1)"
+            )
+            code.writeline(
+                "[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;"
+            )
             slot = 0  # unused; keep for compatibility
         else:
             for dtype_str, inner in in_decls:

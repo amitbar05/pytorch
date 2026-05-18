@@ -68,7 +68,8 @@ struct KernelArgs {
     RWStructuredBuffer<{{ output_dtype }}> o;
     RWStructuredBuffer<float> lse;       // [B, H, N] log-sum-exp
 };
-ParameterBlock<KernelArgs> args;
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // CG.M15: groupshared array dimensions use spec-constant BQ, BK, HEAD_DIM.
 groupshared float Q_smem[BQ * HEAD_DIM];

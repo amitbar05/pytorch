@@ -10,6 +10,7 @@ from torch._inductor.virtualized import V
 
 from .symbolic import is_dynamic_stride
 
+
 # dtype → (emit_fn, header_tag) dispatch table used by PointwiseLoadMixin.load().
 # ``emit_fn(var, idx_str)`` returns a Slang expression that loads one
 # element from ``var`` at index ``idx_str`` into a float register.
@@ -24,37 +25,37 @@ def _init_load_dispatch() -> None:
     global _LOAD_DISPATCH
     if _LOAD_DISPATCH:
         return
-    # Sub-32-bit dtypes (bool / uint8 / int8 / int16) bind through Slang
-    # as ``StructuredBuffer<uint>`` (32-bit slots) regardless of PyTorch's
-    # 1- or 2-byte itemsize.  The pointwise STORE path writes ``out[idx] =
-    # cast<uint>(v)`` — one uint per element — so the LOAD path MUST read
-    # the same way; otherwise Inductor-internal buffers (e.g. saved
-    # ``bool`` masks for ``WhereBackward0``) read garbage every time the
-    # idx is not 4-aligned.  This was the root cause of partially-correct
-    # gradients in compiled ``relu().sum().backward()`` (got
-    # ``[1,0,0,0,1,0,0,0]`` instead of ``[1,1,1,0,1,0,0,0]``) — the FW
-    # kernel wrote 4 B per bool, the BW kernel read 1 B per bool via
-    # ``_vk_unpack_u8``, so 3 of every 4 reads picked up zero-padding.
+    # M18.4-followup-C: narrow integer dtypes (bool / int8 / uint8 / int16
+    # / uint16) now bind at their NATIVE element width — ``int8_t`` /
+    # ``uint8_t`` / ``int16_t`` / ``uint16_t`` ``RWStructuredBuffer<T>``
+    # — once the Vulkan ``shaderInt{8,16}`` + 8/16-bit storage features
+    # are enabled in ``csrc/vulkan/Context.cpp``. With element widths
+    # matching PyTorch's ``c10::elementSize(dtype)``, the M17.8.d.3
+    # tail-corruption bug class is structurally CLOSED for the integer
+    # half.
     #
-    # Read 1 uint per element to match the STORE side.  ``_vk_unpack_*``
-    # helpers in ``helpers.slang`` are kept for future external-tensor
-    # paths (CPU bool masks copied with native packed-byte storage), but
-    # never used for compile-internal pointwise loads.
+    # The load expression is now the natural ``(float)(v[i])`` cast for
+    # every signed/unsigned narrow int — Slang's implicit widening from
+    # ``int8_t`` / ``int16_t`` already sign-extends correctly when the
+    # next op is a float cast (the bit-twiddle sign extends we used
+    # before M18.4-followup-C were stopgaps for the
+    # ``StructuredBuffer<uint>`` 4B-slot binding).
+    #
+    # ``bfloat16`` still binds as a 32-bit ``uint`` slot — see the
+    # ``M18.4-followup-bfloat16`` comment in ``overrides.py``. The
+    # ``packed16_bf16`` load path covers eligible fusion shapes; the
+    # bare-load fallback below stays at ``(float)(v[i])`` for now.
     _LOAD_DISPATCH.update(
         {
             torch.bool: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.uint8: (lambda v, i: f"((float)({v}[{i}]))", None),
-            torch.int8: (
-                lambda v, i: f"((float)((int({v}[{i}]) << 24) >> 24))",
-                None,
-            ),
-            torch.int16: (
-                lambda v, i: f"((float)((int({v}[{i}]) << 16) >> 16))",
-                None,
-            ),
+            torch.int8: (lambda v, i: f"((float)({v}[{i}]))", None),
+            torch.int16: (lambda v, i: f"((float)({v}[{i}]))", None),
+            torch.uint16: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.float16: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.bfloat16: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.int32: (lambda v, i: f"((float)({v}[{i}]))", None),
+            torch.uint32: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.int64: (lambda v, i: f"((float)(int)({v}[{i}].x))", None),
         }
     )
@@ -136,10 +137,7 @@ class PointwiseLoadMixin:
                 return False
 
             innermost = non_red[-1]
-            if (
-                is_dynamic_stride(innermost.numel)
-                or int(innermost.numel) % 2 != 0
-            ):
+            if is_dynamic_stride(innermost.numel) or int(innermost.numel) % 2 != 0:
                 self._packed16 = False
                 return False
 

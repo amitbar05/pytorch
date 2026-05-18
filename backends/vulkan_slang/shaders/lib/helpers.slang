@@ -86,6 +86,36 @@ public float2 welford_finalize(Welford w) {
 // always available; we annotate so a future port to a tile-class GPU
 // without these gets a clean slangc error rather than a SPIR-V link miscompile.
 
+// ── M20.6 VK_SUBGROUP_SIZE spec constant ───────────────────────────────
+//
+// The wave-reduction helpers (``wg_reduce_wave<W>``, ``wg_scan_*``,
+// etc.) take ``simd`` as a uint argument. Pre-M20.6, the codegen at
+// ``kernel/reduction.py`` baked the value 64 directly into the
+// rendered Slang. That hardcoded NAVI10 wave64 and prevented any
+// future wave32 dispatch on NAVI21+ silicon — even though slangc
+// itself supports per-wave-size codegen.
+//
+// M20.6: expose the wave size as a specialization constant so the
+// rendered Slang reads ``VK_SUBGROUP_SIZE`` instead of ``64u`` and
+// the dispatch pipeline picks the right value at create time via
+// ``spec_constants=[(30, simd_size)]``. The default 64 preserves
+// today's NAVI10 behaviour byte-for-byte; future wave32 autotune
+// (M20.6.b) simply passes 32 in the spec_constants override.
+//
+// constant_id 30 is selected to avoid collisions with:
+//   10-12  flash_attention forward
+//   13-15  flash_attention_bwd
+//   20-24  slang_mm
+//   30-34  slang_conv2d  ← collision; conv2d uses 30-34 for tile dims
+//   40-44  slang_conv_bwd
+//
+// CORRECTION: 30-34 are claimed by slang_conv2d. Library-scope spec
+// consts live in their own ID namespace (the lib gets compiled to
+// .slang-module first; kernel imports it). To be safe across all
+// kernel templates that might co-import this lib, use a high ID
+// outside the template ranges. Pick 100.
+[[vk::constant_id(100)]] public const uint VK_SUBGROUP_SIZE = 64;
+
 [require(spirv, subgroup_arithmetic)]
 public T wave_sum<T : __BuiltinFloatingPointType>(T v) { return WaveActiveSum(v); }
 [require(spirv, subgroup_arithmetic)]
@@ -100,6 +130,53 @@ public T wave_prefix_sum<T : __BuiltinFloatingPointType>(T v) { return WavePrefi
 public T wave_prefix_prod<T : __BuiltinFloatingPointType>(T v) { return WavePrefixProduct(v); }
 [require(spirv, subgroup_ballot)]
 public float wave_read_first(float v) { return WaveReadLaneFirst(v); }
+
+// ── M20.4 wave-intrinsic extensions ──────────────────────────────────
+//
+// Audit row H6 identified these missing wrappers. Each unlocks a fused
+// kernel that today falls back to smem reduction (or skips the optimisation
+// entirely):
+//
+//   wave_active_any / _all     — single-wave fast path for aten.any/aten.all
+//   wave_active_ballot         — aten.nonzero, aten.where compaction
+//   wave_active_bit_{and,or,xor} — bitmask reductions in one wave
+//   wave_active_count_bits     — exclusive-scan output count for nonzero
+//   wave_prefix_count_bits     — stream-compaction (top-k, gather/scatter)
+//
+// Capability gates:
+//   AnyTrue / AllTrue map to SPIR-V `OpGroupNonUniformAny` / `OpGroupNonUniformAll`
+//   (capability `GroupNonUniformVote`, Slang atom `subgroup_vote`).
+//
+//   BitAnd / BitOr / BitXor map to `OpGroupNonUniformBitwise{And,Or,Xor}`
+//   (capability `GroupNonUniformArithmetic`, Slang atom `subgroup_arithmetic`).
+//
+//   Ballot / CountBits / PrefixCountBits map to `OpGroupNonUniformBallot`
+//   / `OpGroupNonUniformBallotBitCount` (capability `GroupNonUniformBallot`,
+//   Slang atom `subgroup_ballot`). RDNA1 / Vulkan 1.2+ has all three.
+
+[require(spirv, subgroup_vote)]
+public bool wave_active_any(bool v) { return WaveActiveAnyTrue(v); }
+
+[require(spirv, subgroup_vote)]
+public bool wave_active_all(bool v) { return WaveActiveAllTrue(v); }
+
+[require(spirv, subgroup_ballot)]
+public uint4 wave_active_ballot(bool v) { return WaveActiveBallot(v); }
+
+[require(spirv, subgroup_arithmetic)]
+public uint wave_active_bit_and(uint v) { return WaveActiveBitAnd(v); }
+
+[require(spirv, subgroup_arithmetic)]
+public uint wave_active_bit_or(uint v) { return WaveActiveBitOr(v); }
+
+[require(spirv, subgroup_arithmetic)]
+public uint wave_active_bit_xor(uint v) { return WaveActiveBitXor(v); }
+
+[require(spirv, subgroup_ballot)]
+public uint wave_active_count_bits(bool v) { return WaveActiveCountBits(v); }
+
+[require(spirv, subgroup_ballot)]
+public uint wave_prefix_count_bits(bool v) { return WavePrefixCountBits(v); }
 
 // ── N+1.14 __target_switch — device-divergence example ────────────────
 // When the same logical operation needs different implementations per

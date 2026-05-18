@@ -1,5 +1,7 @@
 #include "DescriptorSet.h"
 #include "Context.h"
+
+#include <cstdlib>
 #include <stdexcept>
 
 namespace vulkan {
@@ -18,7 +20,12 @@ DescriptorPool::DescriptorPool(VkDevice device, uint32_t max_sets)
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    // No FREE_DESCRIPTOR_SET_BIT — we only ever reset the whole pool via
+    // vkResetDescriptorPool() (see DescriptorPool::reset). The per-set free
+    // flag adds tracking overhead that the driver flags as a best-practices
+    // warning when unused. See validation hint
+    // BestPractices-vkCreateDescriptorPool-pool-cleared-or-free-set-bit-set.
+    ci.flags = 0;
     if (desc_idx) {
         ci.flags |= VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     }
@@ -61,7 +68,90 @@ VkDescriptorSet DescriptorPool::allocate(VkDescriptorSetLayout layout) {
 
 void DescriptorPool::reset() {
     if (pre_reset_cb_) pre_reset_cb_();
+    // Sync path also drains any pending async resets — they're
+    // redundant now that we've forced a flush, but draining keeps
+    // the pending list bounded.
+    drain_pending_resets();
     vkResetDescriptorPool(device_, pool_, 0);
+    reset_generation_++;  // M-cpp-new-6 Layer 2: invalidate caches
+}
+
+// M-cpp-new-2: env-knob cache. Reads ``TORCH_VULKAN_DESCRIPTOR_POOL_ASYNC_RESET``
+// once at first call and remembers. Treats "0" / "false" as disabled
+// (fall back to synchronous reset); everything else (including unset)
+// is enabled.
+bool DescriptorPool::async_reset_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("TORCH_VULKAN_DESCRIPTOR_POOL_ASYNC_RESET");
+        if (!env) return true;
+        if (env[0] == '0' && env[1] == '\0') return false;
+        if (env[0] == 'f' || env[0] == 'F') return false;  // false/False
+        return true;
+    }();
+    return enabled;
+}
+
+void DescriptorPool::reset_async(VkFence wait_fence) {
+    // Always opportunistically drain at the boundary — picks up any
+    // resets whose fences signaled since the last drain.
+    drain_pending_resets();
+
+    if (!async_reset_enabled() || wait_fence == VK_NULL_HANDLE) {
+        // Fallback: synchronous reset. Caller's ``pre_reset_cb_``
+        // (typically ``flush_stream``) has already waited for the
+        // queue idle in the legacy path, but here we go through the
+        // standard sync path which does the wait too.
+        reset();
+        return;
+    }
+
+    pending_resets_.push_back(wait_fence);
+    async_reset_requests_++;
+
+    // Poll the just-queued fence too — if it's already signaled
+    // (e.g. small fast workload), reset immediately instead of
+    // waiting for the next drain pass. This keeps the async path
+    // perf-equivalent to sync for the cache-warm case.
+    VkResult status = vkGetFenceStatus(device_, wait_fence);
+    if (status == VK_SUCCESS) {
+        drain_pending_resets();
+    }
+}
+
+void DescriptorPool::drain_pending_resets() {
+    if (pending_resets_.empty()) return;
+
+    // Walk the queue; keep entries whose fence has NOT yet signaled.
+    //
+    // VUID-vkResetDescriptorPool-00313: we must not reset the pool
+    // while ANY command buffer using descriptors allocated from it is
+    // still in-flight.  Since every pending fence was submitted after
+    // the descriptors it guards were recorded, we can only reset when
+    // ALL pending fences have signaled — not just any one of them.
+    //
+    // Fences on a single queue signal in submission order, so once
+    // the last entry has signaled, all earlier ones are guaranteed
+    // signaled too.  We still walk the whole list (cheap: at most a
+    // handful of entries) and keep the suffix that hasn't signaled.
+    std::vector<VkFence> still_pending;
+    still_pending.reserve(pending_resets_.size());
+    for (VkFence f : pending_resets_) {
+        VkResult status = vkGetFenceStatus(device_, f);
+        if (status != VK_SUCCESS) {
+            still_pending.push_back(f);
+        }
+    }
+
+    // Only reset when all entries drained — otherwise descriptors
+    // belonging to the still-pending submissions are still in flight.
+    bool all_drained = still_pending.empty();
+    pending_resets_ = std::move(still_pending);
+
+    if (all_drained) {
+        vkResetDescriptorPool(device_, pool_, 0);
+        async_resets_drained_++;
+        reset_generation_++;  // M-cpp-new-6 Layer 2: invalidate caches
+    }
 }
 
 void bind_buffers(VkDevice device,

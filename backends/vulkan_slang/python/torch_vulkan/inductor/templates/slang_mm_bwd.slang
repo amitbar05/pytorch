@@ -66,15 +66,26 @@ struct BwdPC {
 [[vk::push_constant]] BwdPC pc;
 
 // ── Buffer bindings ────────────────────────────────────────────────────
-// M17.1: Per-binding [[vk::binding(N)]] decorations.  ParameterBlock at
-// global scope is assigned to Set 1 by slangc 2026.5+, which doesn't match
-// the C++ Pipeline layout (Set 0 only).
-// Binding order: a=0, b=1, dc=2, da=3, db=4.
-[[vk::binding(0)]] StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
-[[vk::binding(1)]] StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
-[[vk::binding(2)]] StructuredBuffer</*{{*/ dtype_c /*}}float*/> dc;
-[[vk::binding(3)]] RWStructuredBuffer</*{{*/ dtype_a /*}}float*/> da;
-[[vk::binding(4)]] RWStructuredBuffer</*{{*/ dtype_b /*}}float*/> db;
+// M20.2: Restored ParameterBlock<KernelArgs>. Replaces the M17.1 per-
+// binding [[vk::binding(N)]] workaround. See slang_mm.slang for the
+// full slang-investigate finding — slangc 2026.7.1 assigns
+// ParameterBlock to DescriptorSet=1, but so does every other working
+// template (conv2d, flash_attention, etc.); the runtime tolerates the
+// SPIR-V-Set-1-but-pipeline-Set-0 mismatch on RADV in production. The
+// original M17.1 issue was a misdiagnosis.
+//
+// Binding order (was a=0, b=1, dc=2, da=3, db=4 via [[vk::binding]];
+// now derived by ParameterBlock field order: a=0, b=1, dc=2, da=3, db=4
+// — identical, no caller-side change).
+struct KernelArgs {
+    StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
+    StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
+    StructuredBuffer</*{{*/ dtype_c /*}}float*/> dc;
+    RWStructuredBuffer</*{{*/ dtype_a /*}}float*/> da;
+    RWStructuredBuffer</*{{*/ dtype_b /*}}float*/> db;
+};
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // +32 bank-conflict padding (M20)
 groupshared /*{{*/ dtype_acc /*}}float*/ tile_a[TILE_A_ELEMS + 32];
@@ -108,7 +119,7 @@ void load_tiles_bwd(
         uint global_k = k_base + local_k;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_m < M && global_k < K) {
-            v = (/*{{*/ dtype_acc /*}}float*/)a[/*{%*/ if has_batch /*%}*/batch_a_off + /*{%*/ endif /*%}*/global_m * stride_a_m + global_k * stride_a_k];
+            v = (/*{{*/ dtype_acc /*}}float*/)args.a[/*{%*/ if has_batch /*%}*/batch_a_off + /*{%*/ endif /*%}*/global_m * stride_a_m + global_k * stride_a_k];
         }
         tile_a[i] = v;
     }
@@ -122,7 +133,7 @@ void load_tiles_bwd(
         uint global_n = col_base + local_n;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_k < K && global_n < N) {
-            v = (/*{{*/ dtype_acc /*}}float*/)b[/*{%*/ if has_batch /*%}*/batch_b_off + /*{%*/ endif /*%}*/global_k * stride_b_k + global_n * stride_b_n];
+            v = (/*{{*/ dtype_acc /*}}float*/)args.b[/*{%*/ if has_batch /*%}*/batch_b_off + /*{%*/ endif /*%}*/global_k * stride_b_k + global_n * stride_b_n];
         }
         tile_b[j] = v;
     }
@@ -138,7 +149,7 @@ void load_tiles_bwd(
         uint global_n = col_base + local_n;
         /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
         if (global_m < M && global_n < N) {
-            v = (/*{{*/ dtype_acc /*}}float*/)dc[/*{%*/ if has_batch /*%}*/batch_dc_off + /*{%*/ endif /*%}*/global_m * stride_dc_m + global_n * stride_dc_n];
+            v = (/*{{*/ dtype_acc /*}}float*/)args.dc[/*{%*/ if has_batch /*%}*/batch_dc_off + /*{%*/ endif /*%}*/global_m * stride_dc_m + global_n * stride_dc_n];
         }
         tile_dc[c] = v;
     }
@@ -269,7 +280,7 @@ void computeMain(
         [unroll]
         for (uint kk = 0; kk < (uint)TILE_K; kk++) {
             if (kk >= pc.K) continue;
-            da[/*{%*/ if has_batch /*%}*/batch_da_store_off + /*{%*/ endif /*%}*/row * pc.stride_da_m + kk * pc.stride_da_k] = (/*{{*/ dtype_a /*}}float*/)dA_acc[mi][kk];
+            args.da[/*{%*/ if has_batch /*%}*/batch_da_store_off + /*{%*/ endif /*%}*/row * pc.stride_da_m + kk * pc.stride_da_k] = (/*{{*/ dtype_a /*}}float*/)dA_acc[mi][kk];
         }
     }
     // dB: each thread writes TILE_K rows × N_PER_THREAD columns.
@@ -280,7 +291,7 @@ void computeMain(
         [unroll]
         for (uint kk = 0; kk < (uint)TILE_K; kk++) {
             if (kk >= pc.K) continue;
-            db[/*{%*/ if has_batch /*%}*/batch_db_store_off + /*{%*/ endif /*%}*/kk * pc.stride_db_k + col * pc.stride_db_n] = (/*{{*/ dtype_b /*}}float*/)dB_acc[kk][ni];
+            args.db[/*{%*/ if has_batch /*%}*/batch_db_store_off + /*{%*/ endif /*%}*/kk * pc.stride_db_k + col * pc.stride_db_n] = (/*{{*/ dtype_b /*}}float*/)dB_acc[kk][ni];
         }
     }
 }

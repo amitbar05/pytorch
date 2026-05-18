@@ -91,8 +91,8 @@ struct PC {
 // ParameterBlock<KernelArgs> at global scope is assigned to Set 1 by
 // slangc 2026.5+, which doesn't match the C++ Pipeline layout (Set 0).
 // Per-binding decorations avoid the set mismatch entirely.
-// Binding order: a=0, b=1, [bias=2,] c={{ 2 if has_bias else 2 }}.
-{%- set c_binding = 2 if has_bias else 2 %}
+// Binding order: a=0, b=1, [bias=2,] c={{ 3 if has_bias else 2 }}.
+{%- set c_binding = 3 if has_bias else 2 %}
 [[vk::binding(0)]] StructuredBuffer<{{ dtype_a }}> a;
 [[vk::binding(1)]] StructuredBuffer<{{ dtype_b }}> b;
 {% if has_bias %}

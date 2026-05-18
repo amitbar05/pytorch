@@ -1,5 +1,12 @@
 module reduction;
-import helpers;
+// M20.6: __exported so kernels that `import reduction;` also gain access
+// to helpers.slang's VK_SUBGROUP_SIZE specialization constant (declared
+// at constant_id=100 with default 64). Without the re-export, the
+// codegen-emitted reductions that reference VK_SUBGROUP_SIZE would fail
+// with "declaration not accessible" — the spec const is declared
+// `public` in helpers, but a plain `import` doesn't transitively expose
+// imported symbols to downstream consumers.
+__exported import helpers;
 
 // ── Reduction interfaces ──────────────────────────────────────────────
 
@@ -224,12 +231,11 @@ public float wg_reduce_wave<W : IWaveReduction>(
     return result;
 }
 
-// Convenience wrapper — 3-arg form used by norm.slang and other lib
-// modules. Computes n_waves and simd from size, assuming wave64.
+// Convenience wrapper — 4-arg form used by norm.slang and other lib
+// modules. simd is VK_SUBGROUP_SIZE (spec constant, default 64).
 [ForceInline]
-public float wg_reduce<W : IWaveReduction>(float v, uint tid, uint size)
+public float wg_reduce<W : IWaveReduction>(float v, uint tid, uint size, uint simd)
 {
-    uint simd = 64u;
     uint n_waves = (size + simd - 1u) / simd;
     return wg_reduce_wave<W>(v, tid, n_waves, simd);
 }
@@ -275,18 +281,18 @@ groupshared float _welford_smem_n[1024 + 32];
 [require(spirv, subgroup_shuffle)]
 [ForceInline]
 public WelfordResult<float> wg_welford(
-    WelfordResult<float> v, uint tid, uint size)
+    WelfordResult<float> v, uint tid, uint size, uint simd)
 {
     if (size == 1u)
         return v;
 
-    uint lane = tid % 64u;
-    uint wave_id = tid / 64u;
-    uint n_waves = (size + 63u) / 64u;
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
+    uint n_waves = (size + simd - 1u) / simd;
 
     // Wave-level reduction
     WelfordResult<float> acc = v;
-    for (uint offset = 32u; offset > 0u; offset >>= 1u) {
+    for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
         float other_n = WaveReadLaneAt(acc.n, lane + offset);
         if (lane + offset < size) {
             float n_total = acc.n + other_n;
@@ -314,7 +320,7 @@ public WelfordResult<float> wg_welford(
         r.m2 = (tid < n_waves) ? _welford_smem_m2[tid] : 0.0f;
         r.n = (tid < n_waves) ? _welford_smem_n[tid] : 0.0f;
 
-        for (uint offset = 32u; offset > 0u; offset >>= 1u) {
+        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
             float other_n = WaveReadLaneAt(r.n, lane + offset);
             if (lane + offset < n_waves && other_n > 0.0f) {
                 float n_total = r.n + other_n;
@@ -365,14 +371,14 @@ groupshared float _wg_arg_smem_idx[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
 [ForceInline]
-public ArgPair wg_argmax(ArgPair v, uint tid, uint size)
+public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
 {
     if (size == 1u) return v;
-    uint lane = tid % 64u;
-    uint wave_id = tid / 64u;
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
 
     ArgPair acc = v;
-    for (uint offset = 32u; offset > 0u; offset >>= 1u) {
+    for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
         float other_val = WaveReadLaneAt(acc.val, lane + offset);
         if (lane + offset < size && other_val > acc.val) {
             acc.val = other_val;
@@ -380,7 +386,7 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size)
         }
     }
 
-    uint n_waves = (size + 63u) / 64u;
+    uint n_waves = (size + simd - 1u) / simd;
     if (lane == 0u) {
         _wg_arg_smem_val[wave_id] = acc.val;
         _wg_arg_smem_idx[wave_id] = acc.idx;
@@ -392,7 +398,7 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size)
         result.val = (tid < n_waves) ? _wg_arg_smem_val[tid] : -3.402823e38f;
         result.idx = (tid < n_waves) ? _wg_arg_smem_idx[tid] : -1.0f;
         GroupMemoryBarrierWithGroupSync();
-        for (uint offset = 32u; offset > 0u; offset >>= 1u) {
+        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
             float other_val = WaveReadLaneAt(result.val, lane + offset);
             if (lane + offset < n_waves && other_val > result.val) {
                 result.val = other_val;
@@ -473,4 +479,241 @@ public float wg_scan_inclusive<S : IScanOp>(float v, uint tid, uint size, uint s
             acc = S::combine(acc, other);
     }
     return acc;
+}
+
+// ── M18.1 vk_wg_reduce_* helpers ─────────────────────────────────────
+//
+// M20.6: each helper accepts a `simd` parameter (VK_SUBGROUP_SIZE spec
+// constant, default 64). On wave32 hardware (NAVI21+) the spec constant
+// is overridden at pipeline-create time and flows through to lane masks,
+// n_waves computation, and cross-wave smem boundaries.
+
+// vk_wg_reduce_any — boolean-OR via float-count reduction.
+// Codegen passes `value ? 1.0f : 0.0f` and post-tests `!= 0.0f`, so any
+// nonzero sum signals "at least one thread saw true". OpSum already gives
+// us NaN-aware add via combine_sum_nan; that's fine here because the
+// inputs are always 0.0f or 1.0f (no NaN), and the return type is the
+// reduced count.
+//
+// M20.4 fast path: when the reduction fits in a single wave
+// (red_size <= 64 on RDNA1), `WaveActiveAnyTrue` collapses the entire
+// workgroup-vote in one instruction with zero LDS traffic. The smem
+// hop in `wg_reduce_wave<OpSum>` is wasted work in this regime.
+[require(spirv, subgroup_vote)]
+[ForceInline]
+public float vk_wg_reduce_any(float value, uint tid, uint red_size, uint simd)
+{
+    if (red_size <= simd) {
+        // Single-wave fast path: no smem, no barrier, no cross-wave hop.
+        return WaveActiveAnyTrue(value != 0.0f) ? 1.0f : 0.0f;
+    }
+    uint n_waves = (red_size + simd - 1u) / simd;
+    return wg_reduce_wave<OpSum>(value, tid, n_waves, simd);
+}
+
+// vk_wg_reduce_all — boolean-AND dual of vk_wg_reduce_any (M20.4).
+// Not currently called by the kernel/reduction.py codegen (which lowers
+// aten.all via the argmin pathway), but exposed for completeness and
+// future codegen wiring. Same single-wave fast path; the cross-wave
+// path multiplies float values via OpProd, where any zero kills the
+// product — matching the boolean-AND semantics.
+[require(spirv, subgroup_vote)]
+[ForceInline]
+public float vk_wg_reduce_all(float value, uint tid, uint red_size, uint simd)
+{
+    if (red_size <= simd) {
+        return WaveActiveAllTrue(value != 0.0f) ? 1.0f : 0.0f;
+    }
+    uint n_waves = (red_size + simd - 1u) / simd;
+    return wg_reduce_wave<OpProd>(value, tid, n_waves, simd);
+}
+
+// ── Bitwise XOR workgroup reduction (uint) ────────────────────────────
+//
+// `wg_reduce_wave<W>` is float-only (matches OpSum/OpProd/OpMaxReduce/
+// OpMinReduce — all `IWaveReduction` over float). bitwise_xor needs a
+// uint reduction, so we implement it directly with `WaveActiveBitXor`
+// + `groupshared uint` smem. The same wave-then-cross-wave two-stage
+// shape that `wg_reduce_wave` uses.
+//
+// CG.M16: `WaveActiveBitXor` requires `subgroup_arithmetic`; smem
+// shuffle uses `subgroup_shuffle` for the cross-wave stage. RDNA1
+// (wave64) always has both.
+
+// +32 bank-conflict padding (matches _wg_reduce_smem layout).
+groupshared uint _wg_xor_smem[1024 + 32];
+
+[require(spirv, subgroup_arithmetic)]
+[ForceInline]
+public uint vk_wg_reduce_xor(uint value, uint tid, uint red_size, uint simd)
+{
+    if (red_size <= simd) {
+        return WaveActiveBitXor(value);
+    }
+
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
+    uint n_waves = (red_size + simd - 1u) / simd;
+
+    uint wave_result = WaveActiveBitXor(value);
+    if (lane == 0u)
+        _wg_xor_smem[wave_id] = wave_result;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (wave_id == 0u) {
+        uint smem_val = (tid < n_waves) ? _wg_xor_smem[tid] : 0u;
+        uint final_result = WaveActiveBitXor(smem_val);
+        _wg_xor_smem[tid] = final_result;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    return _wg_xor_smem[0];
+}
+
+// 2D variant — partitioned (ty × tx) layout, flat id = lid.y * tx + lid.x,
+// total = tx * ty. The codegen guarantees total <= max_threadgroup_size
+// (1024 on RDNA1), so the same wave-then-cross-wave structure applies.
+// `tx` is accepted for signature parity with the codegen call (see
+// kernel/reduction.py:306) but the flat id already encodes the 2D layout
+// so we only need (flat_idx, total) for the reduction itself.
+[require(spirv, subgroup_arithmetic)]
+[ForceInline]
+public uint vk_wg_reduce_xor_2d(uint value, uint tx, uint flat_idx, uint total, uint simd)
+{
+    return vk_wg_reduce_xor(value, flat_idx, total, simd);
+}
+
+// ── argmax / argmin workgroup reduction (float2) ──────────────────────
+//
+// Codegen packs (value, index) as `float2(val, float(idx))` and expects
+// the same float2 back — the caller extracts `.x` (val) and `.y` (idx).
+// We mirror the existing `wg_argmax(ArgPair, …)` pattern but accept /
+// return `float2` to match the codegen string.
+//
+// On tie (acc.val == other.val) we propagate the *smaller* index for both
+// argmax and argmin — this matches PyTorch's behaviour (first occurrence
+// wins on ties).
+//
+// CG.M16: WaveReadLaneAt requires subgroup_shuffle; RDNA1 (wave64): yes.
+
+// +32 bank-conflict padding (matches _wg_arg_smem_* layout).
+groupshared float _wg_argxx_smem_val[1024 + 32];
+groupshared float _wg_argxx_smem_idx[1024 + 32];
+
+[require(spirv, subgroup_shuffle)]
+[ForceInline]
+public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
+{
+    if (red_size == 1u) return v;
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
+
+    float2 acc = v;
+    for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+        float other_val = WaveReadLaneAt(acc.x, lane + offset);
+        float other_idx = WaveReadLaneAt(acc.y, lane + offset);
+        if (lane + offset < red_size) {
+            bool take = (other_val > acc.x) ||
+                        (other_val == acc.x && other_idx < acc.y);
+            if (take) {
+                acc.x = other_val;
+                acc.y = other_idx;
+            }
+        }
+    }
+
+    uint n_waves = (red_size + simd - 1u) / simd;
+    if (n_waves == 1u) return acc;
+
+    if (lane == 0u) {
+        _wg_argxx_smem_val[wave_id] = acc.x;
+        _wg_argxx_smem_idx[wave_id] = acc.y;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (wave_id == 0u) {
+        float2 r;
+        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : -3.402823e38f;
+        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
+        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+            float other_val = WaveReadLaneAt(r.x, lane + offset);
+            float other_idx = WaveReadLaneAt(r.y, lane + offset);
+            if (lane + offset < n_waves) {
+                bool take = (other_val > r.x) ||
+                            (other_val == r.x && other_idx < r.y);
+                if (take) {
+                    r.x = other_val;
+                    r.y = other_idx;
+                }
+            }
+        }
+        _wg_argxx_smem_val[tid] = r.x;
+        _wg_argxx_smem_idx[tid] = r.y;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float2 result;
+    result.x = _wg_argxx_smem_val[0];
+    result.y = _wg_argxx_smem_idx[0];
+    return result;
+}
+
+[require(spirv, subgroup_shuffle)]
+[ForceInline]
+public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
+{
+    if (red_size == 1u) return v;
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
+
+    float2 acc = v;
+    for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+        float other_val = WaveReadLaneAt(acc.x, lane + offset);
+        float other_idx = WaveReadLaneAt(acc.y, lane + offset);
+        if (lane + offset < red_size) {
+            bool take = (other_val < acc.x) ||
+                        (other_val == acc.x && other_idx < acc.y);
+            if (take) {
+                acc.x = other_val;
+                acc.y = other_idx;
+            }
+        }
+    }
+
+    uint n_waves = (red_size + simd - 1u) / simd;
+    if (n_waves == 1u) return acc;
+
+    if (lane == 0u) {
+        _wg_argxx_smem_val[wave_id] = acc.x;
+        _wg_argxx_smem_idx[wave_id] = acc.y;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (wave_id == 0u) {
+        float2 r;
+        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : 3.402823e38f;
+        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
+        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+            float other_val = WaveReadLaneAt(r.x, lane + offset);
+            float other_idx = WaveReadLaneAt(r.y, lane + offset);
+            if (lane + offset < n_waves) {
+                bool take = (other_val < r.x) ||
+                            (other_val == r.x && other_idx < r.y);
+                if (take) {
+                    r.x = other_val;
+                    r.y = other_idx;
+                }
+            }
+        }
+        _wg_argxx_smem_val[tid] = r.x;
+        _wg_argxx_smem_idx[tid] = r.y;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float2 result;
+    result.x = _wg_argxx_smem_val[0];
+    result.y = _wg_argxx_smem_idx[0];
+    return result;
 }

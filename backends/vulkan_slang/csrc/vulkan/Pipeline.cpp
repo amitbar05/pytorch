@@ -1,5 +1,10 @@
 #include "Pipeline.h"
 #include "Context.h"
+
+#include <c10/util/Exception.h>  // M-pipeline-4: TORCH_WARN for collision telemetry
+
+#include <cstdint>
+#include <ios>  // M-pipeline-4: std::hex / std::dec for collision warning
 #include <stdexcept>
 
 namespace vulkan {
@@ -197,6 +202,34 @@ PipelineCache& PipelineCache::instance() {
     return cache;
 }
 
+namespace {
+
+// M-pipeline-4: 64-bit FNV-1a hash over a SPIR-V blob. Used by
+// PipelineCache to detect (key, SPIR-V) mismatches that signal a
+// Python-side cache-key collision. FNV-1a chosen for:
+//   - zero external deps (no openssl / xxhash linkage)
+//   - well-mixed avalanche for short inputs (SPIR-V blobs are
+//     ~hundreds of bytes for our compute kernels)
+//   - collision rate negligible vs. the ~thousands of distinct kernels
+//     a single training run produces
+// Spec constants and push-constant size are NOT folded in because
+// they're already part of the `Pipeline` construction args (the C++
+// side recreates the pipeline if they differ — only the cache key
+// itself collides). The SPIR-V blob is the primary signal: same key
+// + same SPV → safe cache hit; same key + different SPV → collision.
+static uint64_t fnv1a64(const uint32_t* data, size_t n_words) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    const size_t n_bytes = n_words * sizeof(uint32_t);
+    for (size_t i = 0; i < n_bytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+}  // namespace
+
 Pipeline* PipelineCache::get_or_create(
     VkDevice device,
     const std::string& key,
@@ -206,29 +239,69 @@ Pipeline* PipelineCache::get_or_create(
     uint32_t push_constant_size,
     const std::vector<Pipeline::SpecConstant>& spec_constants) {
 
+    // M-pipeline-4: compute the SPIR-V hash up-front so the fast path
+    // can verify (key → entry) actually matches the requested kernel.
+    // `spirv_size` is the byte count; the FNV-1a helper takes word
+    // count, so divide by sizeof(uint32_t). SPIR-V is required to be
+    // 4-byte aligned by the Vulkan spec, so this division is exact.
+    const uint64_t spv_hash = fnv1a64(spirv_code, spirv_size / sizeof(uint32_t));
+
     // Fast path: check without lock (safe because cache_ is never modified
-    // after initial population, and pointer reads are atomic on x86/ARM)
+    // after initial population, and pointer reads are atomic on x86/ARM).
+    // M-pipeline-4: on the fast path we ALSO verify the SPIR-V hash so
+    // a Python-side key collision (M-pipeline-3 / M-pipeline-7 bug
+    // classes) produces a true cache miss + recompile instead of a
+    // silent miscompile by returning the stale pipeline.
     {
         auto it = cache_.find(key);
         if (it != cache_.end()) {
-            return it->second.get();
+            if (it->second.spirv_hash == spv_hash) {
+                return it->second.pipeline.get();
+            }
+            // Hash mismatch — fall through to the slow path which
+            // takes the lock + recompiles. Logging happens there
+            // (once per collision, under the lock, so the warning
+            // doesn't spam if many threads race).
         }
     }
 
-    // Slow path: acquire lock and create pipeline
+    // Slow path: acquire lock and create pipeline.
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Double-check after acquiring lock
+    // Double-check after acquiring lock — also re-verify the hash so
+    // a concurrent insert from another thread under a colliding key
+    // is detected here too.
     auto it = cache_.find(key);
     if (it != cache_.end()) {
-        return it->second.get();
+        if (it->second.spirv_hash == spv_hash) {
+            return it->second.pipeline.get();
+        }
+        // M-pipeline-4: key collision detected. Log + bump telemetry
+        // counter. We REPLACE the cached entry with the new pipeline
+        // — the stale one is destroyed when the unique_ptr swaps.
+        // (Any callers still holding the raw `Pipeline*` from before
+        // will see use-after-free; today no caller holds across this
+        // call boundary, and the Python-side keys after M-pipeline-3
+        // / M-pipeline-7 should never collide. The counter is the
+        // forward-coverage trip-wire.)
+        collision_count_.fetch_add(1, std::memory_order_relaxed);
+        TORCH_WARN(
+            "PipelineCache: key '", key,
+            "' collision detected — stored SPIR-V hash 0x",
+            std::hex, it->second.spirv_hash, std::dec,
+            " vs new 0x", std::hex, spv_hash, std::dec,
+            ". Treating as miss (silent-miscompile guard, see "
+            "M-pipeline-4). Python-side cache key is not "
+            "content-aware enough — check `kernel.config_key` / "
+            "`compute_combo_config_key`."
+        );
     }
 
     auto pipeline = std::make_unique<Pipeline>(
         device, spirv_code, spirv_size, num_buffers, push_constant_size,
         spec_constants);
     auto* ptr = pipeline.get();
-    cache_[key] = std::move(pipeline);
+    cache_[key] = CachedPipeline{std::move(pipeline), spv_hash};
     return ptr;
 }
 
@@ -241,10 +314,17 @@ Pipeline* PipelineCache::get_or_create(
     uint32_t push_constant_size,
     const std::vector<Pipeline::SpecConstant>& spec_constants) {
 
+    // M-pipeline-4: SPIR-V hash for the collision guard. See the
+    // non-indexed overload above for the full rationale.
+    const uint64_t spv_hash = fnv1a64(spirv_code, spirv_size / sizeof(uint32_t));
+
     {
         auto it = cache_.find(key);
         if (it != cache_.end()) {
-            return it->second.get();
+            if (it->second.spirv_hash == spv_hash) {
+                return it->second.pipeline.get();
+            }
+            // Fall through to slow path for the warning + recompile.
         }
     }
 
@@ -252,20 +332,34 @@ Pipeline* PipelineCache::get_or_create(
 
     auto it = cache_.find(key);
     if (it != cache_.end()) {
-        return it->second.get();
+        if (it->second.spirv_hash == spv_hash) {
+            return it->second.pipeline.get();
+        }
+        collision_count_.fetch_add(1, std::memory_order_relaxed);
+        TORCH_WARN(
+            "PipelineCache (indexed): key '", key,
+            "' collision detected — stored SPIR-V hash 0x",
+            std::hex, it->second.spirv_hash, std::dec,
+            " vs new 0x", std::hex, spv_hash, std::dec,
+            ". Treating as miss (silent-miscompile guard, see "
+            "M-pipeline-4)."
+        );
     }
 
     auto pipeline = std::make_unique<Pipeline>(
         device, spirv_code, spirv_size, descriptor_counts, push_constant_size,
         spec_constants);
     auto* ptr = pipeline.get();
-    cache_[key] = std::move(pipeline);
+    cache_[key] = CachedPipeline{std::move(pipeline), spv_hash};
     return ptr;
 }
 
 void PipelineCache::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     cache_.clear();
+    // Intentionally do NOT reset `collision_count_` — it's a process-
+    // lifetime telemetry counter. If a test wants to reset, add a
+    // separate `reset_collision_count()` method.
 }
 
 } // namespace vulkan

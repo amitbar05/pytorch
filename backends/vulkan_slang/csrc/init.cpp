@@ -5,6 +5,9 @@
 #include <cstdlib>
 
 #include "vulkan/Context.h"
+#include "vulkan/Pipeline.h"  // M-pipeline-4: PipelineCache::collision_count()
+#include "vulkan/DescriptorSet.h"  // M-cpp-new-2-followup-pybind: async reset counters
+#include "vulkan/Stream.h"  // M-NEW.4: submit_count()
 #include "backend/Allocator.h"
 #include "backend/Hooks.h"
 #include "ops/ops.h"
@@ -22,6 +25,12 @@ bool is_available() {
 
 int64_t device_count() {
     return static_cast<int64_t>(vulkan::Context::instance().device_count());
+}
+
+int64_t current_device() {
+    // M22.9: currently single-device (device 0). Multi-GPU support
+    // requires per-thread device-context tracking.
+    return 0;
 }
 
 std::string get_device_name(int64_t device_index) {
@@ -55,6 +64,7 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("_is_available", &is_available);
     m.def("_device_count", &device_count);
+    m.def("_current_device", &current_device);
     m.def("_get_device_name", &get_device_name);
     m.def("_synchronize", &synchronize);
     m.def("_manual_seed", [](uint64_t seed) { ops::vulkan_manual_seed(seed); });
@@ -376,6 +386,119 @@ PYBIND11_MODULE(_C, m) {
     // device (descriptor indexing enabled + extension supported).
     m.def("_descriptor_indexing_enabled", []() -> bool {
         return vulkan::Context::instance().descriptor_indexing_enabled();
+    });
+
+    // M-pipeline-4: PipelineCache collision telemetry. Non-zero means
+    // the Python-side cache key (e.g. ``kernel.config_key`` or
+    // ``compute_combo_config_key``) is not content-aware enough — two
+    // distinct Slang sources mapped to the same key. The C++ side
+    // detected the mismatch via SPIR-V hash and recompiled (preventing
+    // silent miscompile), but the counter records the event so tests
+    // can assert == 0 under a normal training workload.
+    m.def("_pipeline_cache_collisions", []() -> uint64_t {
+        return vulkan::PipelineCache::instance().collision_count();
+    });
+
+    // M-cpp-new-2-followup-pybind: expose the DescriptorPool async-
+    // reset counters added in M-cpp-new-2. Together they let Python
+    // tests assert the M9.2 batching win is preserved (the async
+    // path fires + drains at a healthy ratio).
+    //
+    // ``_descriptor_pool_async_reset_requests()`` — total
+    // ``reset_async`` calls into the pool since process start.
+    //
+    // ``_descriptor_pool_async_resets_drained()`` — total
+    // ``vkResetDescriptorPool`` calls actually executed by the
+    // drainer (each one resets all then-outstanding pending
+    // entries in a single shot). Always ≤ async_reset_requests.
+    m.def("_descriptor_pool_async_reset_requests", []() -> uint64_t {
+        auto& rt = ops::get_runtime();
+        return rt.desc_pool ? rt.desc_pool->async_reset_requests() : 0;
+    });
+    m.def("_descriptor_pool_async_resets_drained", []() -> uint64_t {
+        auto& rt = ops::get_runtime();
+        return rt.desc_pool ? rt.desc_pool->async_resets_drained() : 0;
+    });
+
+    // M-NEW.4: cumulative ``vkQueueSubmit`` calls from the M9.2
+    // batched-flush hot path on the current device's Stream. The
+    // canonical M9.2 win telemetry — post-fix the ratio
+    // ``dispatch_count / submit_count`` should approach
+    // ``MAX_DISPATCHES_PER_CMD`` (32). A ratio near 1 indicates the
+    // deferred-cmd-buffer batching is defeated (regression).
+    m.def("_stream_submit_count", []() -> uint64_t {
+        auto& rt = ops::get_runtime();
+        return rt.stream ? rt.stream->submit_count() : 0;
+    });
+
+    // M22.9-followup-introspection-pybind: return the device index
+    // stored on a tensor's storage ``DataPtr`` — NOT the tensor's
+    // impl-key device.
+    //
+    // The two can differ on multi-GPU rigs pre-M22.9-followup:
+    //   - ``tensor.device.index`` reads the impl's dispatch-key
+    //     device (set by ``_change_backend_component_keys`` per
+    //     M22.9).
+    //   - ``_storage_device_index(tensor)`` reads the underlying
+    //     ``DataPtr.device().index()`` which was wired by the
+    //     allocator (the M22.9-followup fix routes the device
+    //     index through ``VulkanAllocator::allocate(size_t,
+    //     DeviceIndex)``).
+    //
+    // The two MUST agree post-M22.9-followup for any tensor
+    // constructed via ``vulkan_empty`` / ``vulkan_empty_strided``.
+    // Disagreement → silent multi-GPU correctness bug.
+    m.def("_storage_device_index", [](const at::Tensor& t) -> int64_t {
+        const auto& storage = t.storage();
+        return static_cast<int64_t>(storage.data_ptr().device().index());
+    });
+
+    // M-cpp-new-5-followup-test: runtime override for the
+    // descriptor-indexing capability check. Lets tests force the
+    // non-cached fallback path on rigs where the capability flag
+    // would otherwise return true.
+    //
+    // Override values:
+    //   -1 → use the capability flag (default; production behaviour)
+    //    0 → force off (stresses the non-cached fallback path —
+    //        the only safe path on drivers without
+    //        UPDATE_AFTER_BIND_BIT)
+    //    1 → force on (asserts the cached path)
+    //
+    // The override is the only way to flip descriptor indexing
+    // mid-process; the env var ``TORCH_VULKAN_DESCRIPTOR_INDEXING``
+    // is captured at Context init. Use exclusively for tests.
+    m.def("_set_descriptor_indexing_override", [](int v) {
+        vulkan::Context::set_descriptor_indexing_override(v);
+    });
+    m.def("_get_descriptor_indexing_override", []() -> int {
+        return vulkan::Context::get_descriptor_indexing_override();
+    });
+
+    // M18.4-followup-C: device-feature dictionary. Returns the enabled
+    // bits on the current device so Python-side tests can confirm 8/16-bit
+    // storage and shaderInt8/16 are on (without going through vulkaninfo).
+    // Used by TestM184FollowUpCDeviceFeatures.
+    m.def("_device_caps", []() -> py::dict {
+        const auto& caps = vulkan::Context::instance().capabilities();
+        py::dict d;
+        d["float16"] = caps.float16;
+        d["int8"] = caps.int8;
+        d["int16"] = caps.int16;
+        d["int64"] = caps.int64;
+        d["float64"] = caps.float64;
+        d["storage_buffer_8bit"] = caps.storage_buffer_8bit;
+        d["uniform_and_storage_buffer_8bit"] =
+            caps.uniform_and_storage_buffer_8bit;
+        d["storage_buffer_16bit"] = caps.storage_buffer_16bit;
+        d["uniform_and_storage_buffer_16bit"] =
+            caps.uniform_and_storage_buffer_16bit;
+        d["descriptor_indexing"] = caps.descriptor_indexing;
+        d["subgroup_size"] = caps.subgroup_size;
+        d["max_workgroup_size"] = caps.max_workgroup_size;
+        d["max_compute_shared_memory"] = caps.max_compute_shared_memory;
+        d["device_name"] = caps.device_name;
+        return d;
     });
 
     // ── AOTI runtime bindings (P3.4) ────────────────────────────

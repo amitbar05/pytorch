@@ -91,10 +91,19 @@ at::Tensor vulkan_empty(
     auto nbytes = c10::elementSize(dtype);
     for (auto s : size) nbytes *= s;
 
+    // M22.9-followup: route storage allocation through the explicit-
+    // device ``VulkanAllocator::allocate(nbytes, device.index())``
+    // overload. The base ``allocate(nbytes)`` reads
+    // ``Context::current_device()`` which races under concurrent
+    // multi-GPU allocations; the explicit overload binds the storage
+    // to the requested device unconditionally.
     auto allocator = &VulkanAllocator::instance();
+    auto data_ptr = allocator->allocate(
+        static_cast<size_t>(nbytes), device.index());
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
         static_cast<int64_t>(nbytes),
+        std::move(data_ptr),
         allocator,
         /*resizable=*/false);
 
@@ -108,6 +117,12 @@ at::Tensor vulkan_empty(
     // Set sizes and strides
     auto* impl = tensor.unsafeGetTensorImpl();
     impl->set_sizes_contiguous(size);
+
+    // M22.9: bind the requested device to the impl's dispatch keys.
+    // M22.9-followup: the allocator now also receives the device via
+    // the explicit overload above, so the storage's DataPtr-device
+    // matches what we stamp here.
+    impl->_change_backend_component_keys(device);
 
     return tensor;
 }
@@ -176,10 +191,15 @@ at::Tensor vulkan_empty_strided(
     auto nbytes = c10::elementSize(dtype) * num_elements;
     if (nbytes <= 0) nbytes = c10::elementSize(dtype);  // scalar or empty
 
+    // M22.9-followup: explicit-device allocator path (see `vulkan_empty`
+    // above for rationale).
     auto allocator = &VulkanAllocator::instance();
+    auto data_ptr = allocator->allocate(
+        static_cast<size_t>(nbytes), device.index());
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
         static_cast<int64_t>(nbytes),
+        std::move(data_ptr),
         allocator,
         /*resizable=*/false);
 
@@ -193,6 +213,9 @@ at::Tensor vulkan_empty_strided(
     // Set sizes AND custom strides (not set_sizes_contiguous).
     auto* impl = tensor.unsafeGetTensorImpl();
     impl->set_sizes_and_strides(size, stride);
+
+    // M22.9: same device-binding fix as `vulkan_empty` — see comment there.
+    impl->_change_backend_component_keys(device);
 
     return tensor;
 }
@@ -249,13 +272,10 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_batch_norm_adapter(
     return std::make_tuple(result, at::Tensor(), at::Tensor());
 }
 
-// native_group_norm has different signature in 2.10
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_group_norm_adapter(
-    const at::Tensor& input, const std::optional<at::Tensor>& weight_opt,
-    const std::optional<at::Tensor>& bias_opt,
-    int64_t N, int64_t C, int64_t HxW, int64_t group, double eps) {
-    return ops::vulkan_group_norm(input, group, weight_opt, bias_opt, eps);
-}
+// M22.12: `vulkan_group_norm_adapter` (int64_t N/C/HxW variant) deleted —
+// dead refactor leftover. The registered group_norm adapter is
+// `vulkan_group_norm_symint_adapter` (SymInt N/C/HxW), which the dispatcher
+// wires up at line ~926.
 
 // scaled_dot_product_attention: PyTorch 2.10 adds `bool enable_gqa`
 static at::Tensor vulkan_sdpa_adapter(
@@ -281,13 +301,12 @@ static at::Tensor vulkan_nll_loss_backward_adapter(
                                           ignore_index.expect_int(), total_weight);
 }
 
-// cross_entropy_loss: ignore_index is SymInt in 2.10
-static at::Tensor vulkan_cross_entropy_loss_adapter(
-    const at::Tensor& self, const at::Tensor& target,
-    const std::optional<at::Tensor>& weight, int64_t reduction,
-    c10::SymInt ignore_index, double label_smoothing) {
-    return ops::vulkan_cross_entropy_loss(self, target, weight, reduction, ignore_index.expect_int(), label_smoothing);
-}
+// M22.12: `vulkan_cross_entropy_loss_adapter` deleted — see the
+// "NOTE: cross_entropy_loss NOT registered" comment near `m.impl(...)` for
+// nll_loss below. PyTorch decomposes cross_entropy_loss via
+// CompositeImplicitAutograd into log_softmax + nll_loss, so we never bind
+// an adapter for the fused op directly. The `ops::vulkan_cross_entropy_loss`
+// underlying function is still callable from other paths if needed.
 
 // convolution_overrideable: the actual dispatch point for conv1d/conv2d/conv_transpose2d
 static at::Tensor vulkan_convolution_overrideable_adapter(
@@ -324,8 +343,14 @@ static at::Tensor vulkan_convolution_overrideable_adapter(
         TORCH_CHECK(s.size() == 3 && p.size() == 3 && d.size() == 3,
                     "conv3d: expected 3D stride/padding/dilation");
 
-        int64_t N = input.size(0), C_in = input.size(1);
-        int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+        // M22.10: only the temporal extent `D` of the input is used in
+        // this scope (for the D_out formula and the t_in bounds check).
+        // The batch (`N`), input-channel (`C_in`), and spatial (`H`,
+        // `W`) extents are derived inside the inner ops::vulkan_conv2d
+        // call from the slice it receives; locals for them were stale
+        // refactor leftovers — see the -Wunused-variable warnings in
+        // `agent_space/full_rebuild_2026_05_18.log`.
+        int64_t D = input.size(2);
         int64_t C_out = weight.size(0);
         int64_t kD = weight.size(2);
         int64_t sD = s[0], sH = s[1], sW = s[2];
@@ -389,12 +414,38 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_convolution_backwar
     c10::SymIntArrayRef dilation, bool transposed,
     c10::SymIntArrayRef output_padding, c10::SymInt groups,
     std::array<bool, 3> output_mask) {
-    // CPU fallback for convolution backward
-    // Must convert to f32 for CPU backward (f16/bf16 not well-supported on CPU)
+    // CPU fallback for convolution backward.
+    // Must convert to f32 for CPU backward (f16/bf16 not well-supported on CPU).
+    //
+    // M18.9 (2026-05-18): under ``torch.compile``, Inductor's wrapper
+    // routinely passes ``reinterpret_tensor`` views (non-contiguous, e.g.
+    // permuted-stride views of saved-for-backward tensors) into the
+    // ``extern_kernels.conv2d_backward(...)`` call that lands here via
+    // ``aten.convolution_backward.default``. The Vulkan→CPU copy path
+    // in ``vulkan_copy_`` (see ``Registration.cpp:31-50``) reads
+    // ``self.nbytes()`` raw bytes from the underlying buffer, ignoring
+    // stride / storage_offset — so a non-contiguous Vulkan view
+    // materialises to a CPU tensor with the WRONG element ordering,
+    // and ``at::convolution_backward(grad_cpu, input_cpu, weight_cpu,
+    // ...)`` then computes valid CPU math on garbage data, producing
+    // wrong-magnitude gradients (audit numbers: conv.weight ratio 0.60,
+    // conv.bias 5.66 in the conv+GN compile path; conv-only ratio
+    // 0.08 in ``test_conv_compile_backward_matches_cpu``).
+    //
+    // Same bug class as M22.13: ``reinterpret_tensor`` views breaking
+    // C++ kernels when called from the compile path. Same fix pattern:
+    // materialise to a contiguous Vulkan tensor BEFORE the .cpu()
+    // copy. ``.contiguous()`` on Vulkan routes through
+    // ``vulkan_contiguous`` → ``dispatch_strided_copy`` which respects
+    // stride correctly, producing a fresh row-major buffer that
+    // ``.cpu()`` then reads byte-for-byte without mis-interpretation.
     auto orig_dtype = grad_output.scalar_type();
-    auto grad_cpu = grad_output.cpu().to(at::kFloat);
-    auto input_cpu = input.cpu().to(at::kFloat);
-    auto weight_cpu = weight.cpu().to(at::kFloat);
+    auto grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    auto input_contig = input.is_contiguous() ? input : input.contiguous();
+    auto weight_contig = weight.is_contiguous() ? weight : weight.contiguous();
+    auto grad_cpu = grad_contig.cpu().to(at::kFloat);
+    auto input_cpu = input_contig.cpu().to(at::kFloat);
+    auto weight_cpu = weight_contig.cpu().to(at::kFloat);
     auto result = at::convolution_backward(
         grad_cpu, input_cpu, weight_cpu,
         /*bias_sizes_opt=*/output_mask[2] ? std::optional<c10::IntArrayRef>(c10::IntArrayRef{weight.size(0)}) : std::nullopt,
@@ -407,16 +458,13 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_convolution_backwar
         output_mask[2] ? std::get<2>(result).to(orig_dtype).to(dev) : at::Tensor());
 }
 
-// convolution: intercept before _convolution decomposition to handle None bias
-static at::Tensor vulkan_convolution_adapter(
-    const at::Tensor& input, const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_opt,
-    c10::SymIntArrayRef stride, c10::SymIntArrayRef padding,
-    c10::SymIntArrayRef dilation, bool transposed,
-    c10::SymIntArrayRef output_padding, c10::SymInt groups) {
-    return vulkan_convolution_overrideable_adapter(
-        input, weight, bias_opt, stride, padding, dilation, transposed, output_padding, groups);
-}
+// M22.12: `vulkan_convolution_adapter` (aten::convolution interceptor)
+// deleted — dead refactor leftover. It was a trampoline into
+// `vulkan_convolution_overrideable_adapter`. We register the
+// overrideable adapter directly against `convolution_overrideable`
+// at line ~941, which is the canonical hook for PrivateUse1 conv
+// dispatch in PyTorch 2.10+. There's no plain `aten::convolution`
+// binding (PyTorch decomposes it before reaching the dispatcher).
 
 // upsample_nearest2d: SymInt output_size in 2.10
 static at::Tensor vulkan_upsample_nearest2d_adapter(
@@ -639,28 +687,16 @@ static std::tuple<at::Tensor, at::Tensor> vulkan_topk_adapter(
     return ops::vulkan_topk(self, k.expect_int(), dim, largest, sorted);
 }
 
-// embedding autograd adapter (SymInt padding_idx)
-static at::Tensor vulkan_embedding_autograd_adapter(
-    const at::Tensor& weight, const at::Tensor& indices,
-    c10::SymInt padding_idx, bool scale_grad_by_freq, bool sparse) {
-    return ops::vulkan_embedding_autograd(weight, indices, padding_idx.expect_int(), scale_grad_by_freq, sparse);
-}
-
-// layer_norm autograd adapter (SymInt normalized_shape)
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm_autograd_adapter(
-    const at::Tensor& input, c10::SymIntArrayRef normalized_shape,
-    const std::optional<at::Tensor>& weight_opt, const std::optional<at::Tensor>& bias_opt,
-    double eps) {
-    return ops::vulkan_layer_norm_autograd(input, symint_to_int(normalized_shape), weight_opt, bias_opt, eps);
-}
-
-// group_norm autograd adapter (SymInt N/C/HxW)
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_group_norm_autograd_symint_adapter(
-    const at::Tensor& input, const std::optional<at::Tensor>& weight_opt,
-    const std::optional<at::Tensor>& bias_opt,
-    c10::SymInt N, c10::SymInt C, c10::SymInt HxW, int64_t group, double eps) {
-    return ops::vulkan_group_norm_autograd(input, group, weight_opt, bias_opt, eps);
-}
+// M22.12: deleted three dead autograd-namespace adapters here —
+// `vulkan_embedding_autograd_adapter`,
+// `vulkan_layer_norm_autograd_adapter`, and
+// `vulkan_group_norm_autograd_symint_adapter`. None of them were ever
+// reached: the registered autograd dispatch wires up
+// `vulkan_convolution_overrideable_autograd_adapter` (just below) plus the
+// non-autograd plain adapters that already live in
+// `TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)`. The underlying
+// `ops::vulkan_*_autograd` implementations they wrapped are still in use
+// from `csrc/ops/autograd_ops.cpp` and are not affected by these deletions.
 
 // convolution_overrideable autograd adapter
 static at::Tensor vulkan_convolution_overrideable_autograd_adapter(

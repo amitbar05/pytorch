@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
+# M-pipeline-1 (2026-05-18): per-module idempotency guard.  Each
+# ``_ensure_*`` below early-returns when the corresponding op already
+# exists in ``torch.ops.torch_vulkan``.  Without this, the lazy
+# ``_ensure_patch_custom_ops`` shim inside ``_patched_conv2d`` re-runs
+# ``torch.library.custom_op(...)`` on every compile, and Dynamo's skip
+# of ``_library.infer_schema`` produces a graph break — fragmenting
+# ``nn.Sequential(Conv, GN, ReLU)`` into 3 subgraphs and stranding the
+# ``_fuse_conv_patched_gn_relu`` pass / the Vulkan-native conv lowering.
+#
+# Set ``TORCH_VULKAN_FORCE_CUSTOM_OP_RELOAD=1`` to force re-registration
+# during development when iterating on the backward implementation
+# (it overrides the early return).
+_FORCE_RELOAD = os.environ.get("TORCH_VULKAN_FORCE_CUSTOM_OP_RELOAD") == "1"
+
 
 def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
     """Register ``torch_vulkan::conv2d_with_optional_bias`` as a custom_op.
@@ -21,10 +37,13 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
 
     op_name = "torch_vulkan::conv2d_with_optional_bias"
     existing = getattr(torch.ops.torch_vulkan, "conv2d_with_optional_bias", None)
-    # NOTE: Always re-register to pick up source changes to the backward.
-    # The early-return was preventing FakeTensor fixes from taking effect.
-    if existing is not None and hasattr(existing, "default"):
-        pass  # op exists; re-register autograd below
+    # M-pipeline-1: short-circuit when the op is already registered, so
+    # that any re-entry from ``_ensure_patch_custom_ops`` during a
+    # Dynamo trace does NOT re-invoke ``torch.library.custom_op`` (which
+    # would call ``_library.infer_schema``, marked
+    # ``@torch._dynamo.skip``, and produce a graph break).
+    if existing is not None and hasattr(existing, "default") and not _FORCE_RELOAD:
+        return existing.default
 
     Tensor = torch.Tensor
 
@@ -92,7 +111,14 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
         ctx.dilation = list(dilation)
         ctx.groups = int(groups)
 
-    @torch.compiler.disable
+    # M17.8.d.2 / M18.2 (2026-05-17/18): @torch.compiler.disable removed
+    # because it made AOTAutograd emit ``aten.full(shape, 0)`` for
+    # grad_weight / grad_bias (i.e. literal zeros) — Dynamo treated the
+    # backward as opaque and bailed out of differentiation. Without the
+    # decorator, AOTAutograd traces through the function and the
+    # FakeTensor-detection branch (else of _has_real_vulkan_storage)
+    # produces the proper backward via aten.convolution_backward (which
+    # decomposes into primitives Inductor can compile).
     def _conv2d_backward(ctx, grad_output):
         inp, w, saved_b = ctx.saved_tensors
         has_bias = saved_b is not None and saved_b.numel() > 0
@@ -102,18 +128,13 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
         # when groups==1, tensors are on Vulkan, f32, AND have real storage
         # (not FakeTensors during AOT Autograd tracing).
         #
-        # During AOT Autograd's joint graph trace, all inputs are FakeTensors.
-        # We detect this via untyped_storage() and fall through to
-        # aten.convolution_backward which decomposes into primitives that
-        # Inductor can compile (mm, sum, etc.).
+        # During AOT Autograd's joint graph trace, all inputs are FakeTensors
+        # or FunctionalTensors.  Shared helper handles all three wrappers
+        # (FakeTensor / FunctionalTensor / torch.compiler.is_compiling()).
         #
         # At execution time (real tensors), the Slang fused backward kernel
         # computes dX, dW, dB in a single dispatch via bwd_diff(conv_inner_madd).
-        def _has_real_vulkan_storage(t):
-            try:
-                return t.untyped_storage().device.type != "meta"
-            except Exception:
-                return True
+        from ._common import _has_real_vulkan_storage
 
         use_slang_bwd = (
             groups == 1
@@ -203,7 +224,22 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                 g_w = torch.cat(g_w_parts, dim=0)
                 g_b = g_b_val
         else:
-            # groups>1 non-Vulkan/non-f32: fall through to aten
+            # M17.8.d.2 — IDEAL ROUTING (currently blocked):
+            # We would prefer to route through the opaque
+            # ``torch.ops.torch_vulkan.conv2d_backward.default`` custom op
+            # here so AOTAutograd's joint trace lands a single FX node
+            # rather than decomposing into ``empty_like`` sub-ops that the
+            # partitioner collapses to literal zeros. The op IS registered
+            # (see ``_ensure_conv2d_backward_op_registered``) but Inductor
+            # has no lowering for it yet — ``make_fallback`` must be added
+            # in ``lowerings/__init__.py`` (Matmul-3D territory; queued for
+            # parent-agent integration after M19.1).
+            #
+            # Until then, fall through to ``aten.convolution_backward.default``.
+            # The M18.3 fix to ``op_registration.py:_layer_norm_bwd_meta`` /
+            # ``_linear_bwd_meta`` / etc. (now using ``new_empty(shape)``
+            # rather than ``empty_like``) keeps this path producing
+            # non-zero gradients during AOT trace.
             result = torch.ops.aten.convolution_backward.default(
                 grad_output,
                 inp,
@@ -217,13 +253,21 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                 int(groups),
                 [True, True, has_bias],
             )
-            g_inp = result[0] if result[0] is not None else torch.empty_like(inp)
-            g_w = result[1] if result[1] is not None else torch.zeros_like(w)
+            g_inp = (
+                result[0]
+                if result[0] is not None
+                else inp.new_empty(inp.shape).zero_()
+            )
+            g_w = (
+                result[1]
+                if result[1] is not None
+                else w.new_empty(w.shape).zero_()
+            )
             g_b = (
                 result[2]
                 if len(result) > 2 and result[2] is not None and has_bias
                 else (
-                    torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
+                    w.new_empty((int(w.shape[0]),)).zero_()
                     if has_bias
                     else None
                 )
@@ -387,7 +431,14 @@ def _ensure_conv2d_relu_fused_op_registered() -> "object":
         ctx.dilation = list(dilation)
         ctx.groups = int(groups)
 
-    @torch.compiler.disable
+    # M18.2 (2026-05-18): @torch.compiler.disable removed and the local
+    # _has_real_vulkan_storage replaced with the shared M17.8.d.2-fixed
+    # helper.  Same bug class as _conv2d_backward: the old
+    # storage().device check returned True for FunctionalTensor wrappers
+    # during AOTAutograd trace, so the joint graph saw only
+    # torch.zeros_like(...) and collapsed the backward partition to
+    # literal zeros (CPU=30.59 vs VK=12.67 on a tiny Conv+ReLU train
+    # step, per Agent 1 audit).
     def _conv2d_relu_backward(ctx, grad_output):
         inp, w, saved_b, output = ctx.saved_tensors
         has_bias = saved_b is not None and saved_b.numel() > 0
@@ -396,11 +447,7 @@ def _ensure_conv2d_relu_fused_op_registered() -> "object":
         relu_mask = (output > 0).to(dtype=grad_output.dtype)
         grad_output = grad_output * relu_mask
 
-        def _has_real_vulkan_storage(t):
-            try:
-                return t.untyped_storage().device.type != "meta"
-            except Exception:
-                return True
+        from ._common import _has_real_vulkan_storage
 
         use_slang_bwd = (
             ctx.groups == 1
@@ -445,13 +492,15 @@ def _ensure_conv2d_relu_fused_op_registered() -> "object":
             int(ctx.groups),
             [True, True, has_bias],
         )
-        g_inp = result[0] if result[0] is not None else torch.empty_like(inp)
-        g_w = result[1] if result[1] is not None else torch.zeros_like(w)
+        # M18.3 (2026-05-18): safety fallbacks use new_empty(shape) so the
+        # proxy tracer treats these as storage-bound rather than shape-only.
+        g_inp = result[0] if result[0] is not None else inp.new_empty(inp.shape)
+        g_w = result[1] if result[1] is not None else w.new_empty(w.shape).zero_()
         g_b = (
             result[2]
             if len(result) > 2 and result[2] is not None and has_bias
             else (
-                torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
+                w.new_empty((int(w.shape[0]),)).zero_()
                 if has_bias
                 else None
             )
@@ -592,6 +641,14 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
         eps: float,
     ) -> Tensor:
         if input.device.type != "vulkan" or input.dtype != torch.float32:
+            # M18.8.b (2026-05-18): fix forward op order. The FX matcher
+            # ``_fuse_conv_gn_relu`` (decomposition_passes.py:557) replaces
+            # the chain ``relu(group_norm(conv(...)))`` — i.e. produced by
+            # ``nn.Sequential(Conv, GN, ReLU)`` — with this custom op. The
+            # fused op must therefore compute ``conv → GN → ReLU``, NOT the
+            # ``conv → ReLU → GN`` ordering that was here before (which
+            # produced a different function and silently miscomputed
+            # gradients with magnitude ~5.6× the CPU baseline).
             y = torch.ops.aten.convolution.default(
                 input,
                 weight.to(dtype=input.dtype),
@@ -607,10 +664,10 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
                 [0, 0],
                 int(groups),
             )
-            y = torch.relu(y)
-            return torch.nn.functional.group_norm(
+            y = torch.nn.functional.group_norm(
                 y, num_groups, gn_weight, gn_bias, eps
             )
+            return torch.relu(y)
 
         from torch_vulkan.inductor.templates.caller import (
             _slang_tile_conv2d_gn_relu,
@@ -704,22 +761,44 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
         ctx.num_groups = int(num_g) if num_g is not None else 1
         ctx.eps = float(eps) if eps is not None else 1e-5
 
-    @torch.compiler.disable
+    # M18.2 (2026-05-18): @torch.compiler.disable removed and the local
+    # _has_real_vulkan_storage replaced with the shared M17.8.d.2-fixed
+    # helper — see _conv2d_relu_backward / _conv2d_backward.
+    #
+    # M18.8.b (2026-05-18): backward op order fixed to match the corrected
+    # forward (``conv → GN → ReLU``). Previously this assumed
+    # ``conv → ReLU → GN`` — ``pre_gn = relu(conv(inp))`` was fed to GN
+    # backward, and the ReLU backward mask was missing entirely. The result
+    # was conv weight grads ~5.6× larger than the CPU baseline (because the
+    # GN backward output was treated as ``grad(conv_out)`` rather than
+    # ``grad(GN_out)``, skipping the cross-correlation reduction inside GN
+    # backward and the ReLU mask).
     def _conv2d_gn_relu_backward(ctx, grad_output):
         inp, w, saved_b, gn_w, gn_b = ctx.saved_tensors
         has_bias = saved_b is not None and saved_b.numel() > 0
 
+        # M-pipeline-1 (2026-05-18): N/C/HxW must describe the GN INPUT —
+        # i.e. the conv OUTPUT — not the conv INPUT.  Previously this used
+        # inp.shape[1] for C and inp.shape[2:] for HxW; once the M-pipeline-1
+        # fix removed the Dynamo graph break, this codepath actually runs
+        # and ``aten.native_group_norm`` chokes with
+        # ``C_in (=3) % num_groups != 0`` for the SmallCNN test
+        # (Conv2d(3, 8) → GroupNorm(2, 8)).  Compute the output spatial
+        # dims here so both the GN call below and the recomputed conv_out
+        # are sized correctly.
+        sH, sW = ctx.stride[0], ctx.stride[-1]
+        pH, pW = ctx.padding[0], ctx.padding[-1]
+        dH, dW = ctx.dilation[0], ctx.dilation[-1]
+        kH, kW = w.shape[2], w.shape[3]
+        H_in, W_in = inp.shape[2], inp.shape[3]
+        H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+        W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
         N = inp.shape[0]
-        C = inp.shape[1]
-        H, W = inp.shape[2], inp.shape[3]
+        C = int(w.shape[0])  # conv-output channels (= GN input channels)
         G = ctx.num_groups
-        HxW = H * W
+        HxW = H_out * W_out
 
-        def _has_real_vulkan_storage(t):
-            try:
-                return t.untyped_storage().device.type != "meta"
-            except Exception:
-                return True
+        from ._common import _has_real_vulkan_storage
 
         use_slang = (
             ctx.groups == 1
@@ -728,19 +807,14 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
             and _has_real_vulkan_storage(inp)
         )
 
-        # Recompute pre-GN tensor (conv+ReLU output) for GN backward.
-        # This trades compute for memory: we don't save the intermediate
-        # tensor during forward, but recompute it here.
+        # Recompute conv output for GN backward.  Forward is
+        # ``conv → GN → ReLU``, so the GN input is the raw conv output
+        # (no ReLU applied). We also recompute the GN output (used for
+        # the ReLU mask).
         if use_slang:
             from torch_vulkan.inductor.templates.caller import _slang_tile_conv2d
 
-            sH, sW = ctx.stride[0], ctx.stride[-1]
-            pH, pW = ctx.padding[0], ctx.padding[-1]
-            dH, dW = ctx.dilation[0], ctx.dilation[-1]
-            kH, kW = w.shape[2], w.shape[3]
-            H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
-            W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
-            pre_gn = torch.empty(
+            conv_out = torch.empty(
                 (N, C, H_out, W_out),
                 device=inp.device,
                 dtype=inp.dtype,
@@ -748,16 +822,16 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
             _slang_tile_conv2d(
                 inp.contiguous() if not inp.is_contiguous() else inp,
                 w.contiguous() if not w.is_contiguous() else w,
-                pre_gn,
+                conv_out,
                 stride=(sH, sW),
                 padding=(pH, pW),
                 dilation=(dH, dW),
                 groups=1,
                 bias=saved_b if has_bias else None,
-                epilogue="OpReLU",
+                epilogue="OpIdent",
             )
         else:
-            pre_gn = torch.ops.aten.convolution.default(
+            conv_out = torch.ops.aten.convolution.default(
                 inp,
                 w,
                 saved_b
@@ -770,15 +844,34 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
                 [0, 0],
                 int(ctx.groups),
             )
-            pre_gn = torch.relu(pre_gn)
 
-        # GN backward via aten
+        # GN output (= ReLU input). Needed for ReLU mask AND to capture
+        # the saved mean/rstd for the GN backward (passing ``None`` makes
+        # aten error out; the backward needs the exact forward statistics).
+        # Use the explicit aten call (not F.group_norm) because the proxy
+        # tracer can mis-classify F.group_norm's saved-tensor args as
+        # shape-only and drop ``gn_w`` from the joint graph.
+        gn_out_tuple = torch.ops.aten.native_group_norm.default(
+            conv_out, gn_w, gn_b, N, C, HxW, G, ctx.eps
+        )
+        gn_out = gn_out_tuple[0]
+        gn_save_mean = gn_out_tuple[1]
+        gn_save_rstd = gn_out_tuple[2]
+
+        # ReLU backward: zero-out the gradient where the GN output (= ReLU
+        # input) was <= 0.  This converts ``grad(ReLU_out)`` (the incoming
+        # ``grad_output``) into ``grad(ReLU_in) = grad(GN_out)``.
+        relu_mask = (gn_out > 0).to(dtype=grad_output.dtype)
+        grad_gn_out = grad_output * relu_mask
+
+        # GN backward via aten.  Input is the conv output (raw, no ReLU),
+        # output is grad w.r.t. conv output (= GN input).
         gn_grad_input, gn_grad_w, gn_grad_b = (
             torch.ops.aten.native_group_norm_backward.default(
-                grad_output,
-                pre_gn,
-                None,  # mean — aten recomputes if None
-                None,  # rstd — aten recomputes if None
+                grad_gn_out,
+                conv_out,
+                gn_save_mean,
+                gn_save_rstd,
                 gn_w,
                 N,
                 C,
@@ -826,13 +919,15 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
                 int(ctx.groups),
                 [True, True, has_bias],
             )
+            # M18.3 (2026-05-18): safety fallbacks use new_empty(shape) so the
+            # proxy tracer treats these as storage-bound rather than shape-only.
             conv_grads = (
-                result[0] if result[0] is not None else torch.empty_like(inp),
-                result[1] if result[1] is not None else torch.zeros_like(w),
+                result[0] if result[0] is not None else inp.new_empty(inp.shape),
+                result[1] if result[1] is not None else w.new_empty(w.shape).zero_(),
                 result[2]
                 if len(result) > 2 and result[2] is not None and has_bias
                 else (
-                    torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
+                    w.new_empty((int(w.shape[0]),)).zero_()
                     if has_bias
                     else None
                 ),
@@ -932,3 +1027,121 @@ def _ensure_conv1d_with_optional_bias_op_registered() -> "object":
 
     conv_op.register_fake(_conv1d_fake)
     return torch.ops.torch_vulkan.conv1d_with_optional_bias.default
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M17.8.d.2 — opaque conv2d_backward custom op
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _ensure_conv2d_backward_op_registered() -> "object":
+    """Register ``torch_vulkan::conv2d_backward`` as a non-autograd custom_op.
+
+    M17.8.d.2 (2026-05-17): During AOTAutograd's joint-graph trace, the
+    custom-op autograd ``_conv2d_backward`` runs with FakeTensors and
+    previously fell through to ``torch.ops.aten.convolution_backward.default``.
+    That call dispatched to our PrivateUse1 fake (``shape_ops.py::
+    _convolution_backward_overrideable_fake``) whose body uses
+    ``torch.empty_like(input)`` / ``torch.empty_like(weight)``. AOTAutograd's
+    proxy tracer **recorded those sub-ops** into the FX graph instead of
+    preserving a single op node — the joint-partitioner then saw
+    ``empty_like(weight)`` as shape-only and dropped the primals from the
+    backward partition. Inductor lowered the result as ``alloc + zero-init``,
+    silently producing all-zero conv weight gradients in compile mode.
+
+    This op is **non-autograd** and **opaque to the tracer**: a single
+    ``torch_vulkan::conv2d_backward.default`` node lands in the FX graph,
+    the joint-partitioner correctly preserves ``input`` / ``weight`` as
+    backward inputs, and ``make_fallback`` (registered in
+    ``lowerings/__init__.py``) makes Inductor emit a real
+    ``extern_kernels.conv2d_backward(...)`` call that runs the C++ adapter
+    at runtime.
+
+    Idempotent — safe to call multiple times.
+    """
+    import torch
+    from torch import Tensor
+
+    op_name = "torch_vulkan::conv2d_backward"
+    existing = getattr(torch.ops.torch_vulkan, "conv2d_backward", None)
+    if existing is not None and hasattr(existing, "default"):
+        return existing.default
+
+    def _conv2d_backward_impl(
+        input: Tensor,
+        grad_output: Tensor,
+        weight: Tensor,
+        stride: list[int],
+        padding: list[int],
+        dilation: list[int],
+        groups: int,
+        has_bias: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Eager impl: route fp32 Vulkan to ``aten.convolution_backward.default``
+        directly (which hits the working C++ ``vulkan_convolution_backward_overrideable``
+        adapter). For non-Vulkan/non-f32 we fall back to plain aten too.
+        """
+        result = torch.ops.aten.convolution_backward.default(
+            grad_output,
+            input,
+            weight,
+            None,
+            list(stride),
+            list(padding),
+            list(dilation),
+            False,
+            [0] * len(stride),
+            int(groups),
+            [True, True, bool(has_bias)],
+        )
+        g_inp = (
+            result[0]
+            if result[0] is not None
+            else input.new_empty(input.shape).zero_()
+        )
+        g_w = (
+            result[1]
+            if result[1] is not None
+            else weight.new_empty(weight.shape).zero_()
+        )
+        if has_bias:
+            g_b = (
+                result[2]
+                if len(result) > 2 and result[2] is not None
+                else grad_output.new_empty((weight.shape[0],)).zero_()
+            )
+        else:
+            # Return a zero-size bias so the tuple arity is stable. Callers
+            # ignore this when has_bias=False.
+            g_b = grad_output.new_empty((0,))
+        return g_inp, g_w, g_b
+
+    _conv2d_backward_impl.__annotations__ = {
+        "input": Tensor,
+        "grad_output": Tensor,
+        "weight": Tensor,
+        "stride": list[int],
+        "padding": list[int],
+        "dilation": list[int],
+        "groups": int,
+        "has_bias": bool,
+        "return": tuple[Tensor, Tensor, Tensor],
+    }
+    bwd_op = torch.library.custom_op(op_name, mutates_args=())(_conv2d_backward_impl)
+
+    def _conv2d_backward_fake(
+        input, grad_output, weight, stride, padding, dilation, groups, has_bias
+    ):
+        # Shape inference for the opaque op. Use ``new_empty(shape)`` (M18.3
+        # canonical) so the proxy tracer treats these as storage-bound
+        # allocations rather than shape-only proxies.
+        g_inp = input.new_empty(input.shape)
+        g_w = weight.new_empty(weight.shape)
+        if has_bias:
+            g_b = grad_output.new_empty((weight.shape[0],))
+        else:
+            g_b = grad_output.new_empty((0,))
+        return g_inp, g_w, g_b
+
+    bwd_op.register_fake(_conv2d_backward_fake)
+    return torch.ops.torch_vulkan.conv2d_backward.default

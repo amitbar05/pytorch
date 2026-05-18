@@ -32,11 +32,11 @@ SPIR-V-level proxies give a deterministic, cross-driver upper bound — a
 shader whose proxy counts shrink will allocate fewer registers; one
 whose counts grow gets re-reviewed.
 """
+
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-
 
 _SPIRV_MAGIC = 0x07230203
 
@@ -146,7 +146,7 @@ import reduction;
 [numthreads(64, 1, 1)]
 void computeMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {
     float v = (tid.x < n) ? in_x[tid.x] : 0.0;
-    float r = wg_reduce<OpSum>(v, lid.x, 64);
+    float r = wg_reduce<OpSum>(v, lid.x, 64, VK_SUBGROUP_SIZE);
     if (lid.x == 0) out_y[0] = r;
 }
 """
@@ -174,7 +174,7 @@ import norm;
 void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     rms_norm_row<AffineNone>(
         in_x, in_x, in_x, out_y,
-        gid.x, row_size, eps, lid.x, 64u);
+        gid.x, row_size, eps, lid.x, 64u, VK_SUBGROUP_SIZE);
 }
 """
 
@@ -208,7 +208,7 @@ def measure_registered() -> dict[str, OccupancyMetrics]:
     Skips silently if slangc is unavailable (CI without the compiler) so
     the audit's existence doesn't block environments that can't run it.
     """
-    from .runtime import compile_slang_to_spirv, _slangc_available
+    from .runtime import _slangc_available, compile_slang_to_spirv
 
     if not _slangc_available():
         return {}
@@ -216,8 +216,9 @@ def measure_registered() -> dict[str, OccupancyMetrics]:
     out: dict[str, OccupancyMetrics] = {}
     for name, src in _REGISTERED_ENTRIES.items():
         spv = compile_slang_to_spirv(
-            src, entry="computeMain",
-            cache_key=f"p55_occupancy_audit_{name}_v1",
+            src,
+            entry="computeMain",
+            cache_key=f"p55_occupancy_audit_{name}_v2",
         )
         out[name] = parse_spirv_metrics(spv)
     return out

@@ -20,6 +20,38 @@ if TYPE_CHECKING:
     from torch._inductor.scheduler import Scheduler, SchedulerNode
 
 
+def compute_combo_config_key(sub_config_keys) -> str:
+    """M-pipeline-7: derive a content-aware cache key for a combo kernel
+    from the tuple of its sub-kernels' ``config_key`` strings.
+
+    Why this exists: the prior implementation used the literal string
+    ``"combo"`` as the cache key for every combo kernel in the process.
+    The ``_reflection_metrics_by_key`` cross-index in
+    ``runtime/slangc.py`` then returned whichever combo happened to be
+    compiled first, corrupting WG-sizing heuristics for every
+    subsequent combo. Same bug class as M-pipeline-3 (single-kernel
+    collisions) at a different cache layer.
+
+    Order-sensitive: the combo's emitted Slang lays out gtid ranges and
+    binding slots in sub-kernel iteration order, so combos that differ
+    only in sub-kernel order ARE structurally different and must map to
+    distinct cache slots.
+
+    Key format: ``combo2_n{N}_{hash16}``. The ``combo2_`` prefix bumps
+    the cache version so any in-memory entries from the old
+    ``"combo"`` format cannot collide with new entries. The ``nN``
+    component is human-debuggable (you can read the combo size off the
+    key without rehashing). ``hash16`` is a 16-char SHA-1 prefix over
+    ``repr(tuple(sub_config_keys))``.
+    """
+    sub_keys_tuple = tuple(sub_config_keys)
+    n = len(sub_keys_tuple)
+    return (
+        f"combo2_n{n}_"
+        f"{hashlib.sha1(repr(sub_keys_tuple).encode()).hexdigest()[:16]}"
+    )
+
+
 class VulkanScheduling(SIMDScheduling):
     kernel_type = VulkanKernel  # type: ignore[assignment]
 
@@ -564,9 +596,11 @@ class VulkanScheduling(SIMDScheduling):
         n_outputs = combo.n_outputs
         n_pc = 0
         pc_size_bytes = 0
-        # Combo kernels use a fixed config_key; they are not cached by
-        # the per-kernel config-key mechanism (reflection/keyed cache).
-        combo_config_key = "combo"
+        # M-pipeline-7: derive a content-aware combo config_key from the
+        # sub-kernels' own (post-M-pipeline-3) config_keys. See
+        # `compute_combo_config_key` above for the full rationale.
+        sub_keys = tuple(sk.config_key for sk, _numel in combo.subkernels)
+        combo_config_key = compute_combo_config_key(sub_keys)
 
         wrapper.header.splice(
             f"{src_var} = '''{src_code}'''\n"

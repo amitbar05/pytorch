@@ -88,11 +88,19 @@ def _patch_decompositions() -> None:
             grad_output * scale * (self_or_result + alpha / input_scale),
         )
 
+    # M18.3 (2026-05-18): torch.empty_like(t) → t.new_empty(t.shape).
+    # Same bug class as M17.8.d.2: under AOTAutograd's proxy tracer the
+    # symbolic ``aten.empty_like`` call can be recorded into the FX graph
+    # and (mis-)classified as shape-only — the joint partitioner then
+    # collapses to ``aten.full(shape, 0)`` and produces literal-zero
+    # gradients at runtime. ``new_empty(shape)`` materialises through the
+    # input tensor's factory, which the partitioner treats as
+    # storage-bound rather than shape-derived.
     def _softmax_bwd(grad_output, output, dim, input_dtype):
-        return torch.empty_like(grad_output)
+        return grad_output.new_empty(grad_output.shape)
 
     def _log_softmax_bwd(grad_output, output, dim, input_dtype):
-        return torch.empty_like(grad_output)
+        return grad_output.new_empty(grad_output.shape)
 
     def _avg_pool2d_bwd(
         grad_output,
@@ -104,30 +112,28 @@ def _patch_decompositions() -> None:
         count_include_pad,
         divisor_override,
     ):
-        return torch.empty_like(self)
+        return self.new_empty(self.shape)
 
     def _max_pool_bwd(
         grad_output, self, kernel_size, stride, padding, dilation, ceil_mode, indices
     ):
-        return torch.empty_like(self)
+        return self.new_empty(self.shape)
 
     def _linear_bwd(input, grad_output, weight, output_mask):
         gi = (
-            torch.empty_like(input)
+            input.new_empty(input.shape)
             if output_mask[0]
-            else torch.empty(0, dtype=input.dtype, device=input.device)
+            else input.new_empty((0,))
         )
         gw = (
-            torch.empty_like(weight)
+            weight.new_empty(weight.shape)
             if output_mask[1]
-            else torch.empty(0, dtype=weight.dtype, device=weight.device)
+            else weight.new_empty((0,))
         )
         gb = (
-            torch.empty(
-                weight.size(0), dtype=grad_output.dtype, device=grad_output.device
-            )
+            grad_output.new_empty((weight.size(0),))
             if output_mask[2]
-            else torch.empty(0, dtype=grad_output.dtype, device=grad_output.device)
+            else grad_output.new_empty((0,))
         )
         return gi, gw, gb
 
@@ -145,19 +151,19 @@ def _patch_decompositions() -> None:
         for s in normalized_shape:
             norm_size *= int(s)
         gi = (
-            torch.empty_like(input)
+            input.new_empty(input.shape)
             if output_mask[0]
-            else torch.empty(0, dtype=input.dtype, device=input.device)
+            else input.new_empty((0,))
         )
         gw = (
-            torch.empty(norm_size, dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((norm_size,))
             if output_mask[1]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         gb = (
-            torch.empty(norm_size, dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((norm_size,))
             if output_mask[2]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         return gi, gw, gb
 
@@ -165,19 +171,19 @@ def _patch_decompositions() -> None:
         grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
     ):
         gi = (
-            torch.empty_like(input)
+            input.new_empty(input.shape)
             if output_mask[0]
-            else torch.empty(0, dtype=input.dtype, device=input.device)
+            else input.new_empty((0,))
         )
         gw = (
-            torch.empty(int(C), dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((int(C),))
             if output_mask[1]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         gb = (
-            torch.empty(int(C), dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((int(C),))
             if output_mask[2]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         return gi, gw, gb
 
@@ -195,19 +201,19 @@ def _patch_decompositions() -> None:
     ):
         C = input.shape[1]
         gi = (
-            torch.empty_like(input)
+            input.new_empty(input.shape)
             if output_mask[0]
-            else torch.empty(0, dtype=input.dtype, device=input.device)
+            else input.new_empty((0,))
         )
         gw = (
-            torch.empty(C, dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((C,))
             if output_mask[1]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         gb = (
-            torch.empty(C, dtype=grad_out.dtype, device=grad_out.device)
+            grad_out.new_empty((C,))
             if output_mask[2]
-            else torch.empty(0, dtype=grad_out.dtype, device=grad_out.device)
+            else grad_out.new_empty((0,))
         )
         return gi, gw, gb
 

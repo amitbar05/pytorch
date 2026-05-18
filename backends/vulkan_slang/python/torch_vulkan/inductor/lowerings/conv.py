@@ -181,6 +181,21 @@ def _register_conv_and_pool_lowerings() -> None:
     except (AttributeError, RuntimeError):
         conv1d_op = None
 
+    # M-pipeline-2: OpOverload-identity-safe lowering lookup helpers
+    # live in ``lowerings/_conv_common.py``. ``_get_conv2d_lowering_by_name``
+    # is the zero-arg alias preserved for compatibility with the
+    # M19.5-followup-1 call sites below; the generalised
+    # ``get_lowering_by_name(lowerings, target)`` is the canonical entry
+    # point for new code. Both survive ``register_eager_patch_custom_ops()``
+    # re-binding of ``torch_vulkan::conv2d_with_optional_bias``, which
+    # otherwise produces a NEW ``OpOverload`` object whose Python identity
+    # mismatches the key our ``@register_lowering(conv_op)`` decorator
+    # stamped into ``L.lowerings``.
+    from ._conv_common import (  # noqa: F401 — alias used below
+        _get_conv2d_lowering_by_name,
+        get_lowering_by_name,
+    )
+
     # ═════════════════════════════════════════════════════════════════════
     # Path 2: _VulkanConv2dExternKernel — ExternKernelOut subclass that
     # routes conv2d through the dedicated slang_conv2d template.
@@ -262,6 +277,15 @@ def _register_conv_and_pool_lowerings() -> None:
             )
             self.codegen_size_asserts(wrapper)
 
+    # M-pipeline-2: this lowering targets a CUSTOM op
+    # (``torch_vulkan::conv2d_with_optional_bias``) whose ``OpOverload``
+    # identity is NOT stable across ``register_eager_patch_custom_ops()``
+    # re-runs. Any caller that resolves the op fresh
+    # (``torch.ops.torch_vulkan.conv2d_with_optional_bias.default``) and
+    # does ``lowerings[op]`` will MISS — they must use
+    # ``get_lowering_by_name(lowerings, target)`` from `_conv_common.py`
+    # instead. See the conv1d / conv1d_to_conv2d delegations below for
+    # the canonical pattern.
     @register_lowering(conv_op, type_promotion_kind=None)
     def _vulkan_conv2d_with_optional_bias(
         input, weight, bias, stride, padding, dilation, groups
@@ -269,14 +293,36 @@ def _register_conv_and_pool_lowerings() -> None:
         if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
             return NotImplemented
 
+        # M19.5 — input dims (N especially) may be ``SymInt``/``sympy.Expr``
+        # under dynamic-shape compile (e.g. ``torch._dynamo.mark_dynamic
+        # (x, 0)``). Don't ``int()``-coerce — sympy propagates through
+        # the H_out / W_out arithmetic below and ``ir.FixedLayout``
+        # accepts sympy size/stride expressions. Weight dims are
+        # almost always static (nn.Conv2d's kernel shape is concrete
+        # at module-build time); we still keep their values raw rather
+        # than ``int()`` to avoid spuriously dropping a static SymInt
+        # to a Python int (the rest of the lowering tolerates either).
+        from torch_vulkan.inductor.kernel.symbolic import get_static_numel
+
         g = int(groups)
-        N = int(input.get_size()[0])
-        C_in = int(input.get_size()[1])
-        H_in = int(input.get_size()[2])
-        W_in = int(input.get_size()[3])
-        C_out = int(weight.get_size()[0])
-        kH = int(weight.get_size()[2])
-        kW = int(weight.get_size()[3])
+        t1_sizes = input.get_size()
+        w_sizes = weight.get_size()
+        N = t1_sizes[0]
+        C_in = t1_sizes[1]
+        H_in = t1_sizes[2]
+        W_in = t1_sizes[3]
+        C_out = w_sizes[0]
+        kH = w_sizes[2]
+        kW = w_sizes[3]
+
+        # For the groups>1 decomposition path we still need a concrete
+        # C_in/C_out to compute per-group channel slice indices.
+        # ``mark_dynamic`` on the batch dim doesn't affect channels, so
+        # this is normally fine; if a model marks channels dynamic
+        # we fall through to extern (g != 1 branch below will
+        # NotImplement on the % g check anyway).
+        C_in_static = get_static_numel(C_in)
+        C_out_static = get_static_numel(C_out)
 
         if g != 1:
             # M6 Phase 2 — decompose grouped/depthwise conv into per-group
@@ -292,13 +338,17 @@ def _register_conv_and_pool_lowerings() -> None:
             # dedicated ``slang_conv2d`` template.  Backward is inherited
             # automatically from the Conv2d bwd template (CG.M6) because
             # each per-group call has groups=1.
-            if C_in % g != 0 or C_out % g != 0:
+            if C_in_static is None or C_out_static is None:
+                # Dynamic channels under grouped conv — can't compute
+                # per-group slice indices. Fall through to extern.
+                return NotImplemented
+            if C_in_static % g != 0 or C_out_static % g != 0:
                 return NotImplemented
 
             from torch._inductor.lowering import lowerings as _lowerings
 
-            C_in_per_g = C_in // g
-            C_out_per_g = C_out // g
+            C_in_per_g = C_in_static // g
+            C_out_per_g = C_out_static // g
 
             groups_out = []
             for i in range(g):
@@ -313,7 +363,16 @@ def _register_conv_and_pool_lowerings() -> None:
                     bias_g = _lowerings[aten.slice.Tensor](
                         bias, 0, i * C_out_per_g, (i + 1) * C_out_per_g, 1
                     )
-                out_g = _lowerings[conv_op](
+                # M-pipeline-2: use identity-safe lookup. `conv_op` is
+                # the OpOverload captured by the @register_lowering
+                # decorator above, but a future re-binding of the
+                # `torch_vulkan::conv2d_with_optional_bias` custom op
+                # could invalidate the `_lowerings[conv_op]` dict lookup.
+                # The helper iterates by string form, surviving that.
+                _conv2d_lower = get_lowering_by_name(_lowerings, conv_op)
+                if _conv2d_lower is None:
+                    return NotImplemented
+                out_g = _conv2d_lower(
                     inp_g, w_g, bias_g, stride, padding, dilation, 1
                 )
                 if out_g is NotImplemented:
@@ -411,8 +470,14 @@ def _register_conv_and_pool_lowerings() -> None:
             dilation_4d = [1, d]
 
             # Step 4 — dispatch to Conv2d custom-op lowering.
-            conv2d_op = torch.ops.torch_vulkan.conv2d_with_optional_bias.default
-            result_4d = _lowerings[conv2d_op](
+            # M19.5-followup-1: avoid OpOverload-identity drift by looking
+            # up by string-form instead of fresh ``torch.ops.…default``
+            # (which may produce a different ``OpOverload`` instance than
+            # the dict key we registered against).
+            conv2d_lower = _get_conv2d_lowering_by_name()
+            if conv2d_lower is None:
+                return NotImplemented
+            result_4d = conv2d_lower(
                 input_4d,
                 weight_4d,
                 bias,
@@ -475,10 +540,14 @@ def _register_conv_and_pool_lowerings() -> None:
             dilation_2d = (int(dilation[0]), 1)
 
         # Step 4 — dispatch to Conv2d custom-op lowering.
-        # Uses the Vulkan-registered conv2d op instead of aten.convolution
-        # (which has no Vulkan lowering and would raise KeyError).
-        conv2d_op = torch.ops.torch_vulkan.conv2d_with_optional_bias.default
-        result_4d = _lowerings[conv2d_op](
+        # M19.5-followup-1: avoid OpOverload-identity drift by looking
+        # up by string-form (see ``_get_conv2d_lowering_by_name`` above)
+        # instead of re-resolving via ``torch.ops.…default`` which can
+        # return a different ``OpOverload`` instance.
+        conv2d_lower = _get_conv2d_lowering_by_name()
+        if conv2d_lower is None:
+            return NotImplemented
+        result_4d = conv2d_lower(
             input_4d,
             weight_4d,
             bias,
@@ -543,17 +612,26 @@ def _register_conv_and_pool_lowerings() -> None:
             return NotImplemented
 
         from torch._inductor.lowering import lowerings as _lowerings
+        from torch_vulkan.inductor.kernel.symbolic import get_static_numel
 
-        N = int(input.get_size()[0])
-        C_in = int(input.get_size()[1])
-        D = int(input.get_size()[2])
-        H = int(input.get_size()[3])
-        W = int(input.get_size()[4])
+        # M19.5 — input dims may be SymInt under dynamic-shape compile.
+        # Keep raw expressions; sympy propagates through the H/W/D_out
+        # arithmetic and ``reshape``'s size list accepts sympy. The
+        # ``KD == 1 and dD == 1 and sD == 1`` gate below requires
+        # concrete weight/stride/dilation values — kernel shape and
+        # stride/padding/dilation are always concrete from the module.
+        t1_sizes = input.get_size()
+        w_sizes = weight.get_size()
+        N = t1_sizes[0]
+        C_in = t1_sizes[1]
+        D = t1_sizes[2]
+        H = t1_sizes[3]
+        W = t1_sizes[4]
 
-        C_out = int(weight.get_size()[0])
-        KD = int(weight.get_size()[2])
-        KH = int(weight.get_size()[3])
-        KW = int(weight.get_size()[4])
+        C_out = w_sizes[0]
+        KD = int(w_sizes[2])
+        KH = int(w_sizes[3])
+        KW = int(w_sizes[4])
 
         sD = int(stride[0])
         sH = int(stride[1]) if len(stride) > 1 else sD
@@ -574,9 +652,22 @@ def _register_conv_and_pool_lowerings() -> None:
         H_out = (H + 2 * pH - dH * (KH - 1) - 1) // sH + 1
         W_out = (W + 2 * pW - dW * (KW - 1) - 1) // sW + 1
 
-        C_in_per_g = C_in // g
-        C_out_per_g = C_out // g
-        conv_op = torch.ops.torch_vulkan.conv2d_with_optional_bias.default
+        # C_in_per_g / C_out_per_g require concrete channel counts —
+        # channels are almost always static, but if a model marks them
+        # dynamic we can't compute the slice indices.
+        C_in_static = get_static_numel(C_in)
+        C_out_static = get_static_numel(C_out)
+        if C_in_static is None or C_out_static is None:
+            return NotImplemented
+        C_in_per_g = C_in_static // g
+        C_out_per_g = C_out_static // g
+        # M19.5-followup-1: look up the conv2d lowering by op-name string
+        # rather than via fresh ``torch.ops.…default`` which can produce
+        # a stale ``OpOverload`` identity after
+        # ``register_eager_patch_custom_ops()`` re-registration.
+        conv2d_lower = _get_conv2d_lowering_by_name()
+        if conv2d_lower is None:
+            return NotImplemented
 
         if KD == 1 and dD == 1 and sD == 1:
             # Optimised path: reshape [N,C,D,H,W] → [N*D,C,H,W].
@@ -589,7 +680,7 @@ def _register_conv_and_pool_lowerings() -> None:
                 weight, [C_out, C_in_per_g, KH, KW]
             )
             weight_4d = _lowerings[aten.clone.default](weight_4d)
-            result_4d = _lowerings[conv_op](
+            result_4d = conv2d_lower(
                 input_4d, weight_4d, bias, [sH, sW], [pH, pW], [dH, dW], g
             )
             if result_4d is NotImplemented:
@@ -597,8 +688,11 @@ def _register_conv_and_pool_lowerings() -> None:
             # Clone before reshaping back to avoid SqueezeView stride-length
             # assertion failures (same pattern as Conv1d lowering).
             result_4d = _lowerings[aten.clone.default](result_4d)
-            H_out_actual = int(result_4d.get_size()[2])
-            W_out_actual = int(result_4d.get_size()[3])
+            # H_out_actual / W_out_actual are passed straight into
+            # the reshape size list — sympy expressions flow through
+            # without coercion.
+            H_out_actual = result_4d.get_size()[2]
+            W_out_actual = result_4d.get_size()[3]
             return _lowerings[aten.reshape.default](
                 result_4d, [N, C_out, D_out, H_out_actual, W_out_actual]
             )
@@ -660,10 +754,15 @@ def _register_conv_and_pool_lowerings() -> None:
         dH = int(dilation[0])
         dW = int(dilation[-1]) if len(dilation) > 1 else dH
 
-        N = int(input.get_size()[0])
-        C = int(input.get_size()[1])
-        H_in = int(input.get_size()[2])
-        W_in = int(input.get_size()[3])
+        # M19.5 — input dims (N, H_in, W_in especially) may be SymInt
+        # under dynamic-shape compile. Don't ``int()``-coerce — sympy
+        # propagates through the H/W_out arithmetic and ``Reduction.create``
+        # accepts sympy ranges.
+        t1_sizes = input.get_size()
+        N = t1_sizes[0]
+        C = t1_sizes[1]
+        H_in = t1_sizes[2]
+        W_in = t1_sizes[3]
         H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
 

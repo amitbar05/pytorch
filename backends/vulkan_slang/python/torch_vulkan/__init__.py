@@ -53,6 +53,7 @@ def _register():
     vulkan_mod = types.ModuleType("torch.vulkan")
     vulkan_mod.is_available = is_available
     vulkan_mod.device_count = device_count
+    vulkan_mod.current_device = current_device
     vulkan_mod.get_device_name = get_device_name
     vulkan_mod.synchronize = synchronize
     vulkan_mod._is_in_bad_fork = lambda: False
@@ -629,6 +630,20 @@ def device_count() -> int:
     """Returns the number of available Vulkan devices."""
     _ensure_loaded()
     return _c_ext._device_count()
+
+
+def current_device() -> int:
+    """Returns the index of the currently selected Vulkan device.
+
+    Required by upstream ``FakeTensor.__new__`` when constructing
+    fake tensors on PrivateUse1 backends during Dynamo tracing
+    (torch/_subclasses/fake_tensor.py:793). Without this, every
+    ``torch.compile(model.to('vulkan'))`` call crashes with
+    ``AttributeError: module 'torch.vulkan' has no attribute
+    'current_device'``.
+    """
+    _ensure_loaded()
+    return _c_ext._current_device()
 
 
 def get_device_name(device_index: int = 0) -> str:

@@ -2,7 +2,9 @@
 
 #include <vulkan/vulkan.h>
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -97,10 +99,37 @@ public:
 
     void clear();
 
+    // M-pipeline-4: cache-key collision telemetry. A non-zero value
+    // means the Python-side cache key (e.g. ``config_key``) is not
+    // content-aware enough — two distinct Slang sources mapped to the
+    // same key. The C++ side detects this by comparing SPIR-V hashes
+    // and treats the second request as a cache miss (recompiles),
+    // preventing silent miscompiles. Read via ``init.cpp``'s
+    // ``_pipeline_cache_collisions()`` pybind.
+    uint64_t collision_count() const noexcept {
+        return collision_count_.load(std::memory_order_relaxed);
+    }
+
 private:
     PipelineCache() = default;
+
+    // M-pipeline-4: cache entry now stores the SPIR-V hash alongside
+    // the compiled pipeline. On a cache hit, we compare the new
+    // request's hash to the stored one — equal means a true cache
+    // hit (the common case); unequal signals a Python-side key
+    // collision and we treat the request as a miss + recompile.
+    struct CachedPipeline {
+        std::unique_ptr<Pipeline> pipeline;
+        uint64_t spirv_hash;
+    };
+
     std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<Pipeline>> cache_;
+    std::unordered_map<std::string, CachedPipeline> cache_;
+
+    // Number of (key, SPIR-V hash) mismatches observed since process
+    // start. Atomically incremented under the cache lock; readable
+    // from any thread.
+    std::atomic<uint64_t> collision_count_{0};
 };
 
 } // namespace vulkan

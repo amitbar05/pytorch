@@ -351,163 +351,350 @@ def _replace_relu_with_clamp_min(gm: "torch.fx.GraphModule") -> None:
     return gm
 
 
-def _replace_sdpa_with_custom_op(gm: "torch.fx.GraphModule") -> None:
-    """TR.15 — Decompose ``F.scaled_dot_product_attention`` /
-    ``aten.scaled_dot_product_attention.default`` in the pre-grad FX graph
-    into pure aten primitives (matmul + softmax + matmul + scaling).
+# M22.4 (2026-05-18): `_replace_sdpa_with_custom_op` deleted.
+#
+# This was a 160-line pre-grad FX pass that decomposed
+# ``F.scaled_dot_product_attention`` / ``torch._C._nn.scaled_dot_product_attention``
+# into a chain of pure aten primitives (matmul + softmax + matmul + scaling +
+# optional causal triu mask). It was originally written for TR.15 to dodge a
+# ``data_ptr()`` crash during AOTAutograd's metadata collection on FakeTensors
+# that came from non-contiguous ``reshape().transpose()`` chains.
+#
+# OP.26 obsoleted it: a native ``aten.scaled_dot_product_attention`` lowering
+# in ``lowerings/attention.py`` now routes directly to the FlashAttention
+# Slang template, and a companion ``_register_sdpa_meta`` shim provides the
+# missing FakeTensor dispatch. The decomposition pass was kept around for a
+# while but was never wired into any post-grad pass list (TR.15 closeout
+# explicitly notes "SDPA nodes are NO LONGER decomposed here").
+#
+# The TR.15 invariant — SDPA compiles end-to-end through the attention block
+# pattern — is locked by
+# ``TestAttentionBlockReshapeTransposeCompile.test_attention_block_compile_tr_15``
+# in the regression suite, which exercises the native OP.26 path. The
+# structural floor that previously called this function directly
+# (``test_tr15_pre_grad_sdpa_rewrite_lands``) is removed alongside it.
 
-    Why: Dynamo captures ``F.scaled_dot_product_attention(q, k, v, ...)`` as
-    a call_function node whose target is ``torch._C._nn.scaled_dot_product_attention``.
-    AOTAutograd's ``run_functionalized_fw_and_collect_metadata`` re-runs the
-    captured graph against FakeTensors via ``fx.Interpreter``. The C function
-    has no ``register_fake`` shim, so when the SDPA inputs come from a
-    ``reshape().transpose()`` chain (non-contiguous FakeTensors), the C
-    fast-path tries to read ``data_ptr()`` and trips ``RuntimeError: Cannot
-    access data pointer of Tensor (e.g. FakeTensor, FunctionalTensor)``.
 
-    A custom_op replacement (e.g. ``flash_attention_fused`` or
-    ``sdpa_with_optional_mask``) would let fake-trace succeed but introduces a
-    second blocker — joint-trace runs the registered autograd backward
-    concretely on Vulkan tensors and trips an engine stream assertion. The
-    decomposition path sidesteps both: AOT joint-traces a graph of aten
-    primitives whose backwards are all FakeTensor-safe, and the existing
-    post-grad SDPA / scaled_bmm patterns can re-fuse the chain when the
-    envelope qualifies (head_dim ∈ {32, 64, 128} for flash, etc.).
+# ═══════════════════════════════════════════════════════════════════════════
+# M18.8.b — enhanced conv → GN → ReLU fusion that matches Dynamo-emitted forms
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The legacy fusion in ``meta_patches/decomposition_passes.py:_fuse_conv_gn_relu``
+# matches ``aten.relu.default`` ← ``aten.native_group_norm.default`` ←
+# ``aten.convolution.default`` (or ``torch_vulkan::conv2d_with_optional_bias``).
+# Empirically, Dynamo emits a *different* shape for the monkey-patched
+# ``nn.Sequential(Conv, GN, ReLU)`` pattern: the GN node is the closure
+# ``_register_optional_tensor_workarounds.<locals>._patched_group_norm`` and
+# the ReLU node is the raw ``torch.nn.functional.relu`` function reference
+# (NOT ``aten.relu.default``).  The legacy matcher therefore never fires for
+# the most common eager-Vulkan model topology.
+#
+# This pass walks the same pre-grad graph but recognises ALL three forms each
+# op takes after Dynamo trace.  Installed by
+# ``fx_passes/eager/__init__.py:register_eager_patch_custom_ops`` as an
+# additional pre-grad pass — runs first (outermost) so the legacy pass and
+# the relu→clamp_min rewrite see the rewritten chain (i.e. fewer nodes to
+# process).
 
-    Decomposition (no mask / no dropout):
-        scores  = (q @ k.transpose(-2, -1)) * scale
-        if is_causal: scores = scores + triu(full(..., -inf), 1)
-        attn    = softmax(scores, dim=-1)
-        output  = attn @ v
-    Default scale = 1 / sqrt(head_dim) per ``F.sdpa`` semantics.
 
-    Skipped: attn_mask provided (let upstream handle), dropout_p>0, GQA.
+def _is_patched_group_norm_target(target) -> bool:
+    """True if ``target`` is one of the GN forms Dynamo emits.
 
-    Vulkan-gating is handled by the caller (the pre-grad hook only invokes
-    this rewrite when the graph's example inputs are on Vulkan).
+    Recognises:
+
+    1. ``torch_vulkan.__init__._register_optional_tensor_workarounds.<locals>._patched_group_norm``
+       — closure produced by the monkey-patch in ``python/torch_vulkan/__init__.py``.
+       Identified by ``__qualname__`` since the closure object id is unique
+       per-process and we can't import it without circular issues.
+    2. ``torch.nn.functional.group_norm`` — the un-patched form (some
+       trace paths see this when ``_is_vulkan`` returns False or the
+       trace happens before the monkey-patch installs).
+    3. ``torch.ops.aten.native_group_norm.default`` — the post-decomp form
+       (for completeness; the legacy fusion already handles this).
     """
     import torch
 
+    if target is torch.ops.aten.native_group_norm.default:
+        return True
+    if target is torch.nn.functional.group_norm:
+        return True
+    qn = getattr(target, "__qualname__", "")
+    if "_patched_group_norm" in qn:
+        return True
+    return False
+
+
+def _is_conv_with_bias_target(target) -> bool:
+    """True if ``target`` is one of the conv forms Dynamo emits for the
+    Vulkan-patched ``F.conv2d``."""
+    import torch
+
+    try:
+        if target is torch.ops.torch_vulkan.conv2d_with_optional_bias.default:
+            return True
+    except AttributeError:
+        pass
+    if target is torch.ops.aten.convolution.default:
+        return True
+    return False
+
+
+def _is_relu_target_for_fusion(target) -> bool:
+    """True if ``target`` is one of the ReLU forms Dynamo emits."""
+    import torch
+
+    if target is torch.ops.aten.relu.default:
+        return True
+    if target is torch.ops.aten.relu_.default:
+        return True
+    if target is torch.nn.functional.relu:
+        return True
+    if target is torch.relu:
+        return True
+    return False
+
+
+def _fuse_conv_patched_gn_relu(gm: "torch.fx.GraphModule") -> int:
+    """M18.8.b enhanced fusion: replace ``conv → GN → ReLU`` chains with
+    the fused ``torch_vulkan::conv2d_gn_relu_fused`` custom op.
+
+    Matches the Dynamo-emitted forms (see ``_is_patched_group_norm_target``,
+    ``_is_conv_with_bias_target``, ``_is_relu_target_for_fusion``).
+
+    Returns the number of chains fused.
+    """
+    import operator
+
+    import torch
+
     aten = torch.ops.aten
-
-    sdpa_targets: set = {torch._C._nn.scaled_dot_product_attention}
-    sdpa_aten = getattr(aten, "scaled_dot_product_attention", None)
-    if sdpa_aten is not None and hasattr(sdpa_aten, "default"):
-        sdpa_targets.add(sdpa_aten.default)
-
-    def _node_val(node):
-        """Return the FakeTensor stored on a pre-grad FX node.
-
-        Dynamo's pre-grad graph stores it under ``example_value``; AOT-decomposed
-        graphs use ``val``. Check both.
-        """
-        if not hasattr(node, "meta"):
-            return None
-        return node.meta.get("example_value", node.meta.get("val"))
-
-    def _q_head_dim(node) -> int | None:
-        """Best-effort head-dim recovery from node meta or input-graph traversal."""
-        val = _node_val(node)
-        if val is None:
-            return None
-        try:
-            return int(val.shape[-1])
-        except Exception:  # noqa: BLE001
-            return None
-
-    replaced = 0
-    for node in list(gm.graph.nodes):
-        if node.op != "call_function" or node.target not in sdpa_targets:
-            continue
-        if len(node.args) < 3:
-            continue
-        q, k, v = node.args[:3]
-        kwargs = dict(node.kwargs or {})
-        # Positional args after (q, k, v) follow the F.sdpa signature:
-        # (attn_mask, dropout_p, is_causal, scale, enable_gqa).
-        positional = list(node.args[3:])
-
-        def _pop(idx, key, default):
-            if len(positional) > idx:
-                return positional[idx]
-            return kwargs.get(key, default)
-
-        attn_mask = _pop(0, "attn_mask", None)
-        dropout_p = _pop(1, "dropout_p", 0.0)
-        is_causal = _pop(2, "is_causal", False)
-        scale = _pop(3, "scale", None)
-        enable_gqa = _pop(4, "enable_gqa", False)
-
-        try:
-            if bool(enable_gqa):
+    graph = gm.graph
+    fused_count = 0
+    changed = True
+    while changed:
+        changed = False
+        for node in list(graph.nodes):
+            if node.op != "call_function":
                 continue
-            if attn_mask is not None:
+            if not _is_relu_target_for_fusion(node.target):
                 continue
-            if float(dropout_p) > 0.0:
-                continue
-        except Exception:  # noqa: BLE001
-            continue
+            relu_node = node
 
-        # Resolve scale. If meta is missing, fall back to the runtime form
-        # via ``aten.size + reciprocal_sqrt`` — but Dynamo's pre-grad graph
-        # usually has shape info; if not we bail to keep the rewrite safe.
-        head_dim = _q_head_dim(q)
-        if scale is None and head_dim is None:
-            # Cannot infer scale safely; leave the node alone (the original
-            # data_ptr error will still surface, but we don't introduce a
-            # subtly-wrong scale).
-            continue
-        if scale is None:
-            scale_val = 1.0 / (head_dim**0.5)
-        else:
-            try:
-                scale_val = float(scale)
-            except (TypeError, ValueError):
+            # Trace back to the GN node (look through operator.getitem(gn, 0)).
+            gn_node = None
+            relu_in = relu_node.args[0] if len(relu_node.args) > 0 else None
+            if isinstance(relu_in, torch.fx.Node) and relu_in.op == "call_function":
+                if _is_patched_group_norm_target(relu_in.target):
+                    gn_node = relu_in
+                elif (
+                    relu_in.target == operator.getitem
+                    and len(relu_in.args) >= 1
+                    and isinstance(relu_in.args[0], torch.fx.Node)
+                    and relu_in.args[0].op == "call_function"
+                    and _is_patched_group_norm_target(relu_in.args[0].target)
+                ):
+                    gn_node = relu_in.args[0]
+            if gn_node is None:
                 continue
 
-        with gm.graph.inserting_before(node):
-            # k_t = k.transpose(-2, -1)
-            k_t = gm.graph.call_function(aten.transpose.int, args=(k, -2, -1))
-            # scores = q @ k_t
-            scores = gm.graph.call_function(aten.matmul, args=(q, k_t))
-            # scores = scores * scale
-            scores = gm.graph.call_function(aten.mul.Tensor, args=(scores, scale_val))
-            if bool(is_causal):
-                # Pull seq_len from the captured FakeTensor (pre-grad graphs
-                # store it under ``example_value``).
-                q_val = _node_val(q)
-                if q_val is not None and q_val.dim() >= 2:
-                    seq_len = int(q_val.shape[-2])
-                    val = q_val
-                    full_node = gm.graph.call_function(
-                        aten.full.default,
-                        args=([seq_len, seq_len], float("-inf")),
-                        kwargs={
-                            "dtype": val.dtype,
-                            "device": val.device,
-                            "pin_memory": False,
-                        },
-                    )
-                    triu_node = gm.graph.call_function(
-                        aten.triu.default, args=(full_node, 1)
-                    )
-                    scores = gm.graph.call_function(
-                        aten.add.Tensor, args=(scores, triu_node)
-                    )
-                else:
-                    # No shape info — leave the node alone rather than
-                    # generate an incorrect causal mask.
+            # Extract GN args.  Different call forms have different signatures:
+            #   _patched_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5)
+            #   F.group_norm(input, num_groups, weight=None, bias=None, eps=1e-5)
+            #   aten.native_group_norm(input, weight, bias, N, C, HxW, group, eps)
+            if gn_node.target is aten.native_group_norm.default:
+                gn_args_pos = gn_node.args
+                if len(gn_args_pos) < 8:
                     continue
-            attn = gm.graph.call_function(
-                aten._softmax.default, args=(scores, -1, False)
-            )
-            output = gm.graph.call_function(aten.matmul, args=(attn, v))
-            output.meta = node.meta.copy() if hasattr(node, "meta") else {}
+                gn_input = gn_args_pos[0]
+                gn_weight = gn_args_pos[1]
+                gn_bias = gn_args_pos[2]
+                num_groups = gn_args_pos[6]
+                eps = gn_args_pos[7]
+            else:
+                # _patched_group_norm / F.group_norm form.
+                gn_args_pos = gn_node.args
+                gn_kwargs = gn_node.kwargs or {}
+                if len(gn_args_pos) < 2:
+                    continue
+                gn_input = gn_args_pos[0]
+                num_groups = gn_args_pos[1]
+                gn_weight = (
+                    gn_args_pos[2]
+                    if len(gn_args_pos) > 2
+                    else gn_kwargs.get("weight")
+                )
+                gn_bias = (
+                    gn_args_pos[3]
+                    if len(gn_args_pos) > 3
+                    else gn_kwargs.get("bias")
+                )
+                eps = (
+                    gn_args_pos[4]
+                    if len(gn_args_pos) > 4
+                    else gn_kwargs.get("eps", 1e-5)
+                )
 
-        node.replace_all_uses_with(output)
-        gm.graph.erase_node(node)
-        replaced += 1
+            if not isinstance(gn_input, torch.fx.Node):
+                continue
+            if gn_input.op != "call_function":
+                continue
 
-    if replaced:
-        gm.graph.lint()
-        gm.recompile()
+            # Conv must precede GN.
+            conv_node = gn_input
+            if not _is_conv_with_bias_target(conv_node.target):
+                continue
+
+            conv_args = conv_node.args
+            if conv_node.target is aten.convolution.default:
+                # aten.convolution(input, weight, bias, stride, padding,
+                #                  dilation, transposed, output_padding, groups)
+                if len(conv_args) < 9:
+                    continue
+                conv_input = conv_args[0]
+                conv_weight = conv_args[1]
+                conv_bias = conv_args[2]
+                conv_stride = conv_args[3]
+                conv_padding = conv_args[4]
+                conv_dilation = conv_args[5]
+                conv_groups = conv_args[8]
+            else:
+                # torch_vulkan::conv2d_with_optional_bias(input, weight,
+                #                                        bias, stride, padding,
+                #                                        dilation, groups)
+                if len(conv_args) < 7:
+                    continue
+                conv_input = conv_args[0]
+                conv_weight = conv_args[1]
+                conv_bias = conv_args[2]
+                conv_stride = conv_args[3]
+                conv_padding = conv_args[4]
+                conv_dilation = conv_args[5]
+                conv_groups = conv_args[6]
+
+            try:
+                fused_op = torch.ops.torch_vulkan.conv2d_gn_relu_fused.default
+            except AttributeError:
+                continue
+
+            if not isinstance(conv_stride, (list, tuple)):
+                conv_stride = [conv_stride, conv_stride]
+            if not isinstance(conv_padding, (list, tuple)):
+                conv_padding = [conv_padding, conv_padding]
+            if not isinstance(conv_dilation, (list, tuple)):
+                conv_dilation = [conv_dilation, conv_dilation]
+
+            with graph.inserting_before(relu_node):
+                fused = graph.call_function(
+                    fused_op,
+                    args=(
+                        conv_input,
+                        conv_weight,
+                        conv_bias,
+                        list(conv_stride),
+                        list(conv_padding),
+                        list(conv_dilation),
+                        int(conv_groups),
+                        gn_weight,
+                        gn_bias,
+                        int(num_groups) if num_groups is not None else 1,
+                        float(eps) if eps is not None else 1e-5,
+                    ),
+                )
+                fused.meta = dict(relu_node.meta)
+
+            relu_node.replace_all_uses_with(fused)
+            graph.erase_node(relu_node)
+            # gn_node and conv_node may still be referenced by other consumers
+            # (e.g. debug inspection); only erase if no remaining users.
+            if not gn_node.users:
+                graph.erase_node(gn_node)
+            if not conv_node.users:
+                graph.erase_node(conv_node)
+            graph.lint()
+            gm.recompile()
+            fused_count += 1
+            changed = True
+            break  # restart scan after graph mutation
+    return fused_count
+
+
+# Cumulative counter for the test suite to assert that the pass fires.
+_FUSE_CONV_PATCHED_GN_RELU_COUNTER = [0]
+
+
+def install_conv_patched_gn_relu_fusion() -> None:
+    """Install the M18.8.b enhanced fusion as a pre-grad pass.
+
+    Idempotent — guarded on a sentinel attribute on
+    ``torch._inductor.compile_fx``.
+    """
+    import torch
+    import torch._inductor.compile_fx as _cfx
+
+    if getattr(_cfx, "_vulkan_conv_patched_gn_relu_fusion_patched", False):
+        return
+
+    _orig = _cfx.run_pre_grad_passes
+
+    def _detect_vulkan(example_inputs_, model_) -> bool:
+        inputs = example_inputs_ or ()
+        for t in inputs:
+            if not isinstance(t, torch.Tensor):
+                continue
+            try:
+                if t.device.type in ("vulkan", "privateuseone"):
+                    return True
+            except Exception:
+                pass
+            try:
+                fd = getattr(t, "fake_device", None)
+                if fd is not None and fd.type in ("vulkan", "privateuseone"):
+                    return True
+            except Exception:
+                pass
+        if isinstance(model_, torch.fx.GraphModule):
+            try:
+                for node in model_.graph.nodes:
+                    if node.op != "placeholder":
+                        continue
+                    val = node.meta.get("val") if hasattr(node, "meta") else None
+                    if val is None:
+                        continue
+                    for v in val if isinstance(val, (list, tuple)) else [val]:
+                        if not isinstance(v, torch.Tensor):
+                            continue
+                        try:
+                            if v.device.type in ("vulkan", "privateuseone"):
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            fd = getattr(v, "fake_device", None)
+                            if fd is not None and fd.type in (
+                                "vulkan",
+                                "privateuseone",
+                            ):
+                                return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return False
+
+    def _patched(model_, example_inputs_):
+        if _detect_vulkan(example_inputs_, model_) and isinstance(
+            model_, torch.fx.GraphModule
+        ):
+            try:
+                fused = _fuse_conv_patched_gn_relu(model_)
+                _FUSE_CONV_PATCHED_GN_RELU_COUNTER[0] += fused
+            except Exception as e:  # pragma: no cover
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "M18.8.b conv→GN→ReLU fusion failed: %s", e
+                )
+        return _orig(model_, example_inputs_)
+
+    _cfx.run_pre_grad_passes = _patched
+    _cfx._vulkan_conv_patched_gn_relu_fusion_patched = True

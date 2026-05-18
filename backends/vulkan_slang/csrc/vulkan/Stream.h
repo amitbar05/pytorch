@@ -3,6 +3,9 @@
 #include "CommandBuffer.h"
 
 #include <vulkan/vulkan.h>
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_set>
 
@@ -75,6 +78,35 @@ public:
     VkQueue queue() const { return queue_; }
     CommandPool& command_pool() { return *cmd_pool_; }
 
+    // M-cpp-new-2: expose the submission fence so callers can use the
+    // ``DescriptorPool::reset_async(fence)`` path. A fresh fence is
+    // created for every ``vkQueueSubmit`` call (per
+    // VUID-vkQueueSubmit-fence-00064), so this always returns the most
+    // recent submission's fence — exactly what ``reset_async`` needs to
+    // defer pool reset until that submission's descriptors are done.
+    VkFence fence() const { return current_fence_; }
+
+    // M-NEW.4: cumulative ``vkQueueSubmit`` call count from this
+    // stream's batched-flush hot path (``submit_cmd_buffer``). Read
+    // via the ``_stream_submit_count()`` pybind in ``init.cpp``.
+    //
+    // The canonical M9.2 batching telemetry: the ratio
+    // ``g_dispatch_count / submit_count`` should approach
+    // ``MAX_DISPATCHES_PER_CMD`` (32) post-fix, since M9.2 collapses
+    // up to 32 dispatches per ``vkQueueSubmit`` call. A ratio close
+    // to 1 means batching is defeated (regression).
+    uint64_t submit_count() const noexcept {
+        return submit_count_.load(std::memory_order_relaxed);
+    }
+
+    // Set a callback invoked inside synchronize() / submit_and_wait()
+    // after vkQueueWaitIdle but before fence destruction. Used by
+    // DescriptorPool to drain its pending_resets_ queue while the
+    // fences it references are still alive.
+    void set_pre_sync_callback(std::function<void()> cb) {
+        pre_sync_callback_ = std::move(cb);
+    }
+
 private:
     // Submit a single command buffer (internal, no wait).
     void submit_cmd_buffer(VkCommandBuffer cmd);
@@ -82,7 +114,13 @@ private:
     VkDevice device_;
     VkQueue queue_;
     std::unique_ptr<CommandPool> cmd_pool_;
-    VkFence fence_ = VK_NULL_HANDLE;
+
+    // Per-submission fence: created fresh in submit_cmd_buffer() for
+    // every vkQueueSubmit call, retired to retired_fences_ on the next
+    // submission. retired_fences_ are bulk-destroyed in synchronize()
+    // after vkQueueWaitIdle guarantees all have signaled.
+    VkFence current_fence_ = VK_NULL_HANDLE;
+    std::vector<VkFence> retired_fences_;
 
     // Deferred command buffer state
     std::unique_ptr<CommandBuffer> deferred_cmd_;
@@ -102,6 +140,18 @@ private:
 
     // In-flight tracking: how many submissions are pending.
     uint32_t in_flight_cmd_count_ = 0;
+
+    // M-NEW.4: cumulative ``vkQueueSubmit`` count, incremented in
+    // ``submit_cmd_buffer`` immediately after a successful submit.
+    // Atomic so the ``_stream_submit_count()`` pybind can read it
+    // from any thread without locking.
+    std::atomic<uint64_t> submit_count_{0};
+
+    // Invoked by synchronize() after vkQueueWaitIdle but before
+    // fence destruction. DescriptorPool registers drain_pending_resets
+    // so that its pending_resets_ queue is drained while fences are
+    // still valid.
+    std::function<void()> pre_sync_callback_;
 };
 
 } // namespace vulkan
