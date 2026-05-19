@@ -19,11 +19,65 @@ if TYPE_CHECKING:
 from ....vulkan_template_caller import (
     _dtype_to_slang,
 )
-from .dispatch import _TRUST_INDUCTOR
+from .dispatch import _TRUST_INDUCTOR, _pack_mm_pc
 from .render import (
     _render_mm_backward_slang,
     _render_mm_bwd_slang,
 )
+
+
+# A.6: Backward (single-kernel) PC layout — must mirror ``BwdPC`` in
+# ``templates/slang_mm_bwd.py.jinja``.  19 uints; flags currently only gates
+# the batch path (MM_BWD_FLAG_BATCH = 2).
+MM_BWD_FLAG_BATCH = 2
+_MM_BWD_PC_FORMAT = "19I"
+
+
+def _pack_mm_bwd_pc(
+    M: int,
+    N: int,
+    K: int,
+    stride_a_m: int,
+    stride_a_k: int,
+    stride_b_k: int,
+    stride_b_n: int,
+    stride_dc_m: int,
+    stride_dc_n: int,
+    stride_da_m: int,
+    stride_da_k: int,
+    stride_db_k: int,
+    stride_db_n: int,
+    *,
+    stride_a_b: int = 0,
+    stride_b_b: int = 0,
+    stride_dc_b: int = 0,
+    stride_da_b: int = 0,
+    stride_db_b: int = 0,
+    flags: int = 0,
+) -> bytes:
+    """Pack the monolithic mm_bwd PC struct (CG.M5 single-kernel path)."""
+    return struct.pack(
+        _MM_BWD_PC_FORMAT,
+        M,
+        N,
+        K,
+        stride_a_m,
+        stride_a_k,
+        stride_b_k,
+        stride_b_n,
+        stride_dc_m,
+        stride_dc_n,
+        stride_da_m,
+        stride_da_k,
+        stride_db_k,
+        stride_db_n,
+        stride_a_b,
+        stride_b_b,
+        stride_dc_b,
+        stride_da_b,
+        stride_db_b,
+        flags,
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════
 # T4.2 — Matmul backward via forward template reuse
@@ -90,10 +144,11 @@ def _slang_tile_mm_backward(
         m_per_thread=m_per_thread,
         n_per_thread=n_per_thread,
     )
+    # A.6: ``_a6`` tag prevents stale cache hits with the pre-A.6 PC layout.
     cache_key = (
         f"slang_mm_bwd_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
         f"_r{m_per_thread}x{n_per_thread}_{dtype_s}"
-        f"{'_ta' if transpose_a else ''}{'_tb' if transpose_b else ''}"
+        f"{'_ta' if transpose_a else ''}{'_tb' if transpose_b else ''}_a6"
     )
 
     if not _TRUST_INDUCTOR:
@@ -119,8 +174,10 @@ def _slang_tile_mm_backward(
     stride_b_k = b.stride(0)
     stride_b_n = b.stride(1)
 
-    pc = struct.pack(
-        "9I",
+    # A.6: T4.2 backward reuses the forward ``slang_mm`` template — must
+    # pack the same monolithic PC layout.  No flags set; transposition is
+    # already baked into the stride_* fields.
+    pc = _pack_mm_pc(
         M,
         N,
         K,
@@ -130,6 +187,11 @@ def _slang_tile_mm_backward(
         stride_b_n,
         out.stride(0),
         out.stride(1),
+        tile_m,
+        tile_n,
+        tile_k,
+        m_per_thread,
+        n_per_thread,
     )
 
     grid_x = (N + tile_n - 1) // tile_n
@@ -208,15 +270,14 @@ def _slang_tile_mm_bwd(
         m_per_thread=m_per_thread,
         n_per_thread=n_per_thread,
     )
+    # A.6: ``_a6`` tag — see _slang_tile_mm_backward.
     cache_key = (
         f"slang_mm_bwd_{tile_m}_{tile_n}_{tile_k}"
-        f"_r{m_per_thread}x{n_per_thread}_{dtype_s}"
+        f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_a6"
     )
 
-    # Encode strides for all 5 buffers.
-    # A: [M, K], B: [K, N], dC: [M, N], dA: [M, K], dB: [K, N]
-    pc = struct.pack(
-        "13I",
+    # A.6: Monolithic backward PC layout — no flags (non-batched mm bwd).
+    pc = _pack_mm_bwd_pc(
         M,
         N,
         K,
@@ -296,14 +357,14 @@ def _slang_tile_bmm_bwd(
         m_per_thread=m_per_thread,
         n_per_thread=n_per_thread,
     )
+    # A.6: ``_a6`` tag — see _slang_tile_mm_bwd.
     cache_key = (
         f"slang_bmm_bwd_{tile_m}_{tile_n}_{tile_k}"
-        f"_r{m_per_thread}x{n_per_thread}_{dtype_s}"
+        f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_a6"
     )
 
-    # Encode strides for all 5 buffers + batch strides.
-    pc = struct.pack(
-        "18I",
+    # A.6: Monolithic backward PC layout — MM_BWD_FLAG_BATCH selects batch.
+    pc = _pack_mm_bwd_pc(
         M,
         N,
         K,
@@ -317,11 +378,12 @@ def _slang_tile_bmm_bwd(
         dA.stride(2),
         dB.stride(1),
         dB.stride(2),
-        a.stride(0),
-        b.stride(0),
-        dC.stride(0),
-        dA.stride(0),
-        dB.stride(0),
+        stride_a_b=a.stride(0),
+        stride_b_b=b.stride(0),
+        stride_dc_b=dC.stride(0),
+        stride_da_b=dA.stride(0),
+        stride_db_b=dB.stride(0),
+        flags=MM_BWD_FLAG_BATCH,
     )
 
     grid_x = (N + tile_n - 1) // tile_n

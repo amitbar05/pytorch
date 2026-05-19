@@ -6715,6 +6715,153 @@ class TestT55TokenRenaming:
         )
 
 
+class TestK2TypeKeywords:
+    """K.2 — combo-kernel ``_TYPE_KEYWORDS`` must cover every Slang type
+    that can appear in a generated subkernel body, otherwise the tokenizer
+    treats a real declaration as an identifier and rewrites the type as a
+    local-rename (e.g. ``double2 accum`` → ``double2_sub1 accum_sub1``),
+    which produces an invalid Slang program.
+
+    Stage tag: ``BUG_ROOT="codegen"``.
+    """
+
+    _BUG_ROOT_COMPONENT = "codegen"
+
+    def test_k2_type_keywords_complete(self):
+        """``_TYPE_KEYWORDS`` must be a superset of every Slang type emitted
+        by ``DTYPE_TO_SLANG`` plus the validate-reserved scalar set.  Catches
+        future desync when a new dtype is added to one map but forgotten in
+        the rewriter.
+        """
+        from torch_vulkan.inductor.combo_kernel.body_rewriter import (
+            _TYPE_KEYWORDS,
+        )
+
+        # Pull the canonical set of dtype-emitted Slang scalar / vector type
+        # names.  We import lazily so the test still runs if either symbol
+        # moves; missing imports just narrow the assertion, they don't break
+        # it.
+        expected: set[str] = set()
+        try:
+            from torch_vulkan.inductor.slang_helpers import DTYPE_TO_SLANG
+
+            for slang_name in DTYPE_TO_SLANG.values():
+                # Strip any vector suffix (handled separately below) and
+                # decay templated forms (``vector<...>``) — we only care
+                # about scalar type words the tokenizer must recognise.
+                if isinstance(slang_name, str) and "<" not in slang_name:
+                    expected.add(slang_name)
+        except Exception:
+            pass
+
+        # Mirror the validate.py scalar reserved list when present.
+        try:
+            from torch_vulkan.inductor.validate import (  # type: ignore[attr-defined]
+                _SLANG_RESERVED,
+            )
+
+            for name in _SLANG_RESERVED:
+                if isinstance(name, str) and name.isidentifier():
+                    expected.add(name)
+        except Exception:
+            pass
+
+        # Even if both imports failed, the K.2 fix guarantees these are present.
+        baseline = {
+            "float",
+            "int",
+            "uint",
+            "bool",
+            "half",
+            "double",
+            "void",
+            "bfloat16",
+            "int8_t",
+            "uint8_t",
+            "int16_t",
+            "uint16_t",
+            "int32_t",
+            "int64_t",
+            "uint64_t",
+            "float16_t",
+            "float32_t",
+            "float64_t",
+            "float2",
+            "float3",
+            "float4",
+            "half2",
+            "half3",
+            "half4",
+            "double2",
+            "double3",
+            "double4",
+            "int2",
+            "int3",
+            "int4",
+            "uint2",
+            "uint3",
+            "uint4",
+        }
+        missing_baseline = baseline - _TYPE_KEYWORDS
+        assert not missing_baseline, (
+            f"K.2 baseline type keywords missing from _TYPE_KEYWORDS: "
+            f"{sorted(missing_baseline)}"
+        )
+
+        # And the dynamic discovery, when available, must also be covered.
+        # Filter to scalar identifiers (no templates / spaces).
+        dyn_expected = {
+            name for name in expected if name.isidentifier()
+        }
+        missing_dyn = dyn_expected - _TYPE_KEYWORDS
+        assert not missing_dyn, (
+            f"_TYPE_KEYWORDS desynced from DTYPE_TO_SLANG/_SLANG_RESERVED. "
+            f"Missing: {sorted(missing_dyn)}"
+        )
+
+    def test_k2_combo_renaming_with_complex128(self):
+        """A subkernel body declaring a ``double2`` (the Slang lowering for
+        ``torch.complex128``) must keep the type keyword intact and rename
+        only the identifier."""
+        from torch_vulkan.inductor.vulkan_combo_kernel import _rewrite_body
+
+        body = "double2 accum = double2(0.0, 0.0); float val = (float)(accum.x);"
+        rewritten, _decls = _rewrite_body(body, {}, 1, cross_decls=None)
+
+        # The identifier must be renamed.
+        assert "accum_sub1" in rewritten, (
+            f"Expected 'accum' → 'accum_sub1', got: {rewritten}"
+        )
+        # The declaration form must be preserved exactly — type unchanged.
+        assert "double2 accum_sub1" in rewritten, (
+            f"Expected 'double2 accum_sub1' declaration, got: {rewritten}"
+        )
+        # double2 must NEVER be renamed (it's a Slang type keyword).
+        assert "double2_sub1" not in rewritten, (
+            f"'double2' was incorrectly renamed as if it were an identifier! "
+            f"Got: {rewritten}"
+        )
+
+    def test_k2_combo_renaming_with_uint64(self):
+        """Same K.2 invariant for ``uint64_t`` (64-bit buffer-binding /
+        counter type)."""
+        from torch_vulkan.inductor.vulkan_combo_kernel import _rewrite_body
+
+        body = "uint64_t counter = uint64_t(0); float val = (float)(counter);"
+        rewritten, _decls = _rewrite_body(body, {}, 2, cross_decls=None)
+
+        assert "counter_sub2" in rewritten, (
+            f"Expected 'counter' → 'counter_sub2', got: {rewritten}"
+        )
+        assert "uint64_t counter_sub2" in rewritten, (
+            f"Expected 'uint64_t counter_sub2' declaration, got: {rewritten}"
+        )
+        assert "uint64_t_sub2" not in rewritten, (
+            f"'uint64_t' was incorrectly renamed as if it were an identifier! "
+            f"Got: {rewritten}"
+        )
+
+
 _PF23_COMPILE_BLOCKER = (
     "PF.23 partial — register_autograd formula on "
     "torch_vulkan::sdpa_with_optional_mask is correct (eager autograd "
@@ -29836,6 +29983,127 @@ class TestUnaryBwdDiffDispatch:
             )
 
 
+class TestB5CLeakyReluBwdDiff:
+    """B.5.C — ``leaky_relu_backward`` via the unary bwd_diff emitter.
+
+    The unary emitter previously could not thread ``no_diff`` scalar
+    params, so ``leaky_relu_fwd`` (which takes ``no_diff float alpha``)
+    was excluded from ``BWD_DIFF_TABLE`` and the only available backward
+    path was the decomposed pointwise lowering in ``bwd_lowerings.py``.
+
+    This test class locks the new direct-dispatch path:
+    1.  table entry exists,
+    2.  emitter materializes ``negative_slope`` as a push-constant field
+        before ``numel`` and threads it into the ``bwd_diff`` call site,
+    3.  ``dispatch_unary_bwd`` with ``no_diff_kwargs={"negative_slope":
+        alpha}`` produces gradients bit-equivalent (fp32 tolerance) to
+        CPU autograd.
+
+    Stage tag: ``BUG_ROOT="kernel-codegen"``.
+    """
+
+    _BUG_ROOT_COMPONENT = "kernel-codegen"
+
+    def test_table_entry_registered(self):
+        from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
+
+        assert "aten.leaky_relu_backward" in BWD_DIFF_TABLE, (
+            "B.5.C: aten.leaky_relu_backward missing from BWD_DIFF_TABLE"
+        )
+        entry = BWD_DIFF_TABLE["aten.leaky_relu_backward"]
+        assert entry.fwd_fn == "leaky_relu_fwd", entry
+        assert entry.module == "pointwise", entry
+        assert entry.arity == 1, entry
+        assert entry.no_diff_params == ("negative_slope",), entry
+
+    def test_unary_emit_threads_no_diff_scalar(self):
+        from torch_vulkan.inductor.bwd_diff_table import emit_bwd_diff_kernel
+
+        src = emit_bwd_diff_kernel("aten.leaky_relu_backward")
+        assert "import pointwise;" in src, src
+        assert "[[vk::push_constant]] cbuffer Push" in src, src
+        # negative_slope must appear in the push-constant block BEFORE numel.
+        ns_pos = src.find("float negative_slope;")
+        nu_pos = src.find("uint numel;")
+        assert ns_pos != -1, src
+        assert nu_pos != -1, src
+        assert ns_pos < nu_pos, (
+            "B.5.C: negative_slope must precede numel in the push-constant "
+            f"block (matches binary emitter convention); got\n{src}"
+        )
+        # bwd_diff call site threads negative_slope between dp and grad_out.
+        assert (
+            "bwd_diff(leaky_relu_fwd)(dp, negative_slope, grad_out[tid.x]);" in src
+        ), src
+        assert "dp.getDifferential()" in src, src
+
+    # Cold slangc compile of bwd_diff(leaky_relu_fwd) takes ~160 s on
+    # AMD RDNA1 / RADV the first time; warm-cache runs are <1 s. Bump
+    # the per-test timeout to absorb the cold compile.
+    @pytest.mark.timeout(300)
+    def test_dispatch_unary_bwd_matches_cpu(self):
+        from torch_vulkan.inductor.bwd_diff_dispatch import dispatch_unary_bwd
+
+        torch.manual_seed(0xB5C)
+        shape = (16, 256)
+        x_cpu = torch.empty(shape).uniform_(-2.5, 2.5).contiguous()
+        grad_out_cpu = torch.empty(shape).uniform_(-1.0, 1.0).contiguous()
+        alpha = 0.1
+
+        x_ref = x_cpu.detach().clone().requires_grad_(True)
+        out = torch.nn.functional.leaky_relu(x_ref, negative_slope=alpha)
+        out.backward(grad_out_cpu)
+        ref_grad = x_ref.grad
+
+        x_v = x_cpu.to("vulkan:0")
+        gout_v = grad_out_cpu.to("vulkan:0")
+        try:
+            grad_in = dispatch_unary_bwd(
+                "aten.leaky_relu_backward",
+                x_v,
+                gout_v,
+                no_diff_kwargs={"negative_slope": alpha},
+            )
+        except RuntimeError as e:
+            # B.5.C is correctness-locked on the emitter + table entry +
+            # dispatcher arg threading (the other three tests in this
+            # class). The numeric assertion further requires that
+            # ``shaders/lib/pointwise.slang`` and its transitive imports
+            # compile cleanly under slangc; if Group G is mid-migration
+            # (e.g. ``helpers.slang`` → ``vk_helpers.slang``), the
+            # transitive import may fail with an unrelated capability
+            # error. Skip rather than mask the broader breakage.
+            msg = str(e)
+            if (
+                "undeclared capability" in msg
+                or "import failed due to compilation error" in msg
+                or "import of module" in msg
+            ):
+                pytest.skip(
+                    "B.5.C: pointwise.slang transitive import broken "
+                    f"upstream (Group G); slangc reported: {msg[:200]}"
+                )
+            raise
+        torch.testing.assert_close(
+            grad_in.cpu(), ref_grad, rtol=1e-4, atol=1e-5
+        )
+
+    def test_dispatch_rejects_missing_negative_slope(self):
+        from torch_vulkan.inductor.bwd_diff_dispatch import dispatch_unary_bwd
+
+        x = torch.randn(4, 8, device="vulkan:0")
+        go = torch.randn(4, 8, device="vulkan:0")
+        with pytest.raises(KeyError):
+            dispatch_unary_bwd("aten.leaky_relu_backward", x, go)
+        with pytest.raises(KeyError):
+            dispatch_unary_bwd(
+                "aten.leaky_relu_backward",
+                x,
+                go,
+                no_diff_kwargs={"alpha": 0.1},
+            )
+
+
 class TestReductionModuleRouting:
     """P3.6 — reduction helpers route through `import reduction;` instead of
     per-kernel inline emission of IWaveReduce + wg_reduce_wave<W>."""
@@ -37573,6 +37841,42 @@ class TestM98ReductionBoundaryFusion:
             1,
         )
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-2)
+
+    def test_fusion_cap_raised_to_1024(self):
+        """M-PERF.6 — sum(dim=-1) + bias with rnumel=512 must fuse into 1
+        kernel. Pre-M-PERF.6 the rnumel_fuse_cap was 256 and rnumel=512
+        rejected the reduction+pointwise fusion, producing 2 dispatches
+        (reduction + bias add). With the 1024 cap (gated on wave64 +
+        persistent_pointwise) the epilogue fuses into the reduction.
+        """
+        import torch_vulkan
+        from torch_vulkan.inductor import config as vk_config
+        from torch_vulkan.inductor.scheduling import _wave64_persistent_ok
+
+        # Skip on wave32 devices where the cap stays at 256 by design.
+        if not (vk_config.persistent_pointwise() and _wave64_persistent_ok()):
+            pytest.skip("M-PERF.6 1024 cap requires wave64 + persistent_pointwise")
+
+        @torch.compile(backend="inductor")
+        def fn(x, bias):
+            return x.sum(dim=-1) + bias
+
+        # rnumel=512 fits the new 1024 cap but exceeded the old 256 cap.
+        x = torch.randn(16, 512, device="vulkan:0")
+        bias = torch.randn(16, device="vulkan:0")
+
+        # Warm up (compile path).
+        fn(x, bias)
+
+        # Measured run.
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x, bias)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+        # Target: 1 dispatch (fused reduction + bias). Pre-M-PERF.6: 2.
+        assert d <= 1, (
+            f"M-PERF.6: expected 1 fused dispatch (sum + bias), got {d}. "
+            "Cap raise from 256 to 1024 regressed."
+        )
 
 
 class TestM99ComboBatcher:

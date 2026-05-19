@@ -40,6 +40,12 @@ float tile_inner_madd(float a, float b, no_diff float acc)
 }
 
 // ── Push-constant struct ───────────────────────────────────────────────
+// A.6: Monolithic PC layout — batch strides always present (zero when the
+// flag is clear), gated by ``pc.flags``.  Eliminates the binary-incompat
+// risk that the prior Jinja conditional struct posed against Python's
+// ``struct.pack`` (anti-goal #6).
+static const uint MM_BWD_FLAG_BATCH = 2u;
+
 struct BwdPC {
     uint M;
     uint N;
@@ -54,13 +60,14 @@ struct BwdPC {
     uint stride_da_k;
     uint stride_db_k;
     uint stride_db_n;
-{% if has_batch %}
+    // Always present; ignored unless MM_BWD_FLAG_BATCH is set.
     uint stride_a_b;
     uint stride_b_b;
     uint stride_dc_b;
     uint stride_da_b;
     uint stride_db_b;
-{% endif %}
+    // A.6: Bitmask of MM_BWD_FLAG_* gates.
+    uint flags;
 };
 
 [[vk::push_constant]] BwdPC pc;
@@ -92,9 +99,9 @@ void load_tiles_bwd(
     uint stride_a_m, uint stride_a_k,
     uint stride_b_k, uint stride_b_n,
     uint stride_dc_m, uint stride_dc_n,
-{% if has_batch %}
+    // A.6: Always pass batch offsets (zero on non-batch path). The caller
+    // picks values from pc.flags so the helper signature is stable.
     uint batch_a_off, uint batch_b_off, uint batch_dc_off,
-{% endif %}
     uint3 lid)
 {
     uint tid = lid.y * WG_N + lid.x;
@@ -108,7 +115,7 @@ void load_tiles_bwd(
         uint global_k = k_base + local_k;
         {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
         if (global_m < M && global_k < K) {
-            v = ({{ dtype_acc }})a[{% if has_batch %}batch_a_off + {% endif %}global_m * stride_a_m + global_k * stride_a_k];
+            v = ({{ dtype_acc }})a[batch_a_off + global_m * stride_a_m + global_k * stride_a_k];
         }
         tile_a[i] = v;
     }
@@ -122,7 +129,7 @@ void load_tiles_bwd(
         uint global_n = col_base + local_n;
         {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
         if (global_k < K && global_n < N) {
-            v = ({{ dtype_acc }})b[{% if has_batch %}batch_b_off + {% endif %}global_k * stride_b_k + global_n * stride_b_n];
+            v = ({{ dtype_acc }})b[batch_b_off + global_k * stride_b_k + global_n * stride_b_n];
         }
         tile_b[j] = v;
     }
@@ -138,7 +145,7 @@ void load_tiles_bwd(
         uint global_n = col_base + local_n;
         {{ dtype_acc }} v = ({{ dtype_acc }})0.0;
         if (global_m < M && global_n < N) {
-            v = ({{ dtype_acc }})dc[{% if has_batch %}batch_dc_off + {% endif %}global_m * stride_dc_m + global_n * stride_dc_n];
+            v = ({{ dtype_acc }})dc[batch_dc_off + global_m * stride_dc_m + global_n * stride_dc_n];
         }
         tile_dc[c] = v;
     }
@@ -210,13 +217,19 @@ void computeMain(
 {
     uint row_base = gid.y * TILE_M;
     uint col_base = gid.x * TILE_N;
-{% if has_batch %}
-    uint batch_a_off = gid.z * pc.stride_a_b;
-    uint batch_b_off = gid.z * pc.stride_b_b;
-    uint batch_dc_off = gid.z * pc.stride_dc_b;
-    uint batch_da_store_off = gid.z * pc.stride_da_b;
-    uint batch_db_store_off = gid.z * pc.stride_db_b;
-{% endif %}
+    // A.6: Batch offsets gated by MM_BWD_FLAG_BATCH at runtime.
+    uint batch_a_off = 0u;
+    uint batch_b_off = 0u;
+    uint batch_dc_off = 0u;
+    uint batch_da_store_off = 0u;
+    uint batch_db_store_off = 0u;
+    if ((pc.flags & MM_BWD_FLAG_BATCH) != 0u) {
+        batch_a_off = gid.z * pc.stride_a_b;
+        batch_b_off = gid.z * pc.stride_b_b;
+        batch_dc_off = gid.z * pc.stride_dc_b;
+        batch_da_store_off = gid.z * pc.stride_da_b;
+        batch_db_store_off = gid.z * pc.stride_db_b;
+    }
 
     // Per-thread register accumulators for dA and dB.
     // dA: [M_PER_THREAD][TILE_K] — each thread accumulates its M rows across full TILE_K.
@@ -249,9 +262,7 @@ void computeMain(
             pc.stride_a_m, pc.stride_a_k,
             pc.stride_b_k, pc.stride_b_n,
             pc.stride_dc_m, pc.stride_dc_n,
-{% if has_batch %}
             batch_a_off, batch_b_off, batch_dc_off,
-{% endif %}
             lid);
         GroupMemoryBarrierWithGroupSync();
         mma_bwd_tile(k_base, pc.K, lid, dA_acc, dB_acc);
@@ -267,7 +278,7 @@ void computeMain(
         [unroll]
         for (uint kk = 0; kk < (uint)TILE_K; kk++) {
             if (kk >= pc.K) continue;
-            da[{% if has_batch %}batch_da_store_off + {% endif %}row * pc.stride_da_m + kk * pc.stride_da_k] = ({{ dtype_a }})dA_acc[mi][kk];
+            da[batch_da_store_off + row * pc.stride_da_m + kk * pc.stride_da_k] = ({{ dtype_a }})dA_acc[mi][kk];
         }
     }
     // dB: each thread writes TILE_K rows × N_PER_THREAD columns.
@@ -278,7 +289,7 @@ void computeMain(
         [unroll]
         for (uint kk = 0; kk < (uint)TILE_K; kk++) {
             if (kk >= pc.K) continue;
-            db[{% if has_batch %}batch_db_store_off + {% endif %}kk * pc.stride_db_k + col * pc.stride_db_n] = ({{ dtype_b }})dB_acc[kk][ni];
+            db[batch_db_store_off + kk * pc.stride_db_k + col * pc.stride_db_n] = ({{ dtype_b }})dB_acc[kk][ni];
         }
     }
 }

@@ -673,6 +673,24 @@ class HeaderMixin:
             code.writeline(f'[shader("compute")] [numthreads({tx}, {ty}, 1)]')
         else:
             thread_count = self.max_threadgroup_size
+            # M-PERF.3: Reflection-driven numthreads override at emit
+            # time.  When SPIR-V reflection has reported >128 actual
+            # VGPRs for a prior compile of this config, force a 64-
+            # thread WG so RDNA1 keeps 2-4 waves/CU of headroom
+            # (256 VGPRs/CU ÷ 128 VGPRs/lane = 2 lanes/CU at saturation;
+            # a 256-thread WG would force 1 wave/CU and tank occupancy).
+            # The 64-thread floor matches wave64 = 1 wave/WG, giving the
+            # scheduler the most flexibility to interleave waves.
+            try:
+                _actual_vgprs = self._get_actual_vgprs()
+            except Exception:
+                _actual_vgprs = None
+            if (
+                _actual_vgprs is not None
+                and _actual_vgprs > 128
+                and thread_count > 64
+            ):
+                thread_count = 64
             code.writeline(f'[shader("compute")] [numthreads({thread_count}, 1, 1)]')
         code.writeline(
             "void computeMain(uint3 gtid : SV_DispatchThreadID, "

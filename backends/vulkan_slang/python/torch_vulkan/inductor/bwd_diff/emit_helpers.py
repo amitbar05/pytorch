@@ -7,6 +7,7 @@ flash-attention), and reduction backward broadcast.
 
 from __future__ import annotations
 
+import functools
 import struct
 
 import torch
@@ -117,6 +118,7 @@ class _ResolvedBackward:
         return self.kind == BackwardKind.BACKWARD_DERIVATIVE
 
 
+@functools.lru_cache(maxsize=128)
 def resolve_backward_kind(op_name: str):
     """Check the BWD_TEMPLATE_REGISTRY for a backward routing decision.
 
@@ -131,6 +133,11 @@ def resolve_backward_kind(op_name: str):
 
     Returns ``None`` (not NotImplemented) — callers should fall through
     to their existing default path.
+
+    B.4.B: ``lru_cache(maxsize=128)`` — ``op_name`` is hashable; the
+    ``BWD_TEMPLATE_REGISTRY`` and the ``_OP_TO_FWD_KEY`` mapping are
+    populated once at module import and are not mutated thereafter, so
+    the cache is sound.
     """
     from torch_vulkan.inductor.bwd_template_registry import (
         BWD_TEMPLATE_REGISTRY,

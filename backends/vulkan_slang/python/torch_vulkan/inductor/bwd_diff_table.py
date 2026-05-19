@@ -49,6 +49,18 @@ BWD_DIFF_TABLE: dict[str, BwdDiffEntry] = {
     "aten.relu_backward": BwdDiffEntry("relu_fwd", "pointwise", 1),
     # C1: threshold_backward(grad, output, 0) IS relu backward — same Slang.
     "aten.threshold_backward": BwdDiffEntry("relu_fwd", "pointwise", 1),
+    # B.5.C: leaky_relu_fwd carries a ``no_diff float alpha`` param that
+    # Slang's autodiff threads through unchanged. The unary emitter
+    # materializes ``negative_slope`` in the push-constant block (before
+    # ``numel``) and forwards it to ``bwd_diff(leaky_relu_fwd)``. The
+    # caller passes ``no_diff_kwargs={"negative_slope": ...}`` to
+    # ``dispatch_unary_bwd``.
+    "aten.leaky_relu_backward": BwdDiffEntry(
+        "leaky_relu_fwd",
+        "pointwise",
+        1,
+        no_diff_params=("negative_slope",),
+    ),
     "aten.sigmoid_backward": BwdDiffEntry("sigmoid_fwd", "pointwise", 1),
     "aten.tanh_backward": BwdDiffEntry("tanh_fwd", "pointwise", 1),
     "aten.gelu_backward": BwdDiffEntry("gelu_fwd", "pointwise", 1),
@@ -153,10 +165,6 @@ EXCLUDED_DIFFERENTIABLE_FWDS: dict[str, str] = {
     "ln_no_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_no_affine_elem": "norm: Welford reduction not autodiff-safe (P2.3)",
-    # CG.M1: leaky_relu_fwd takes no_diff float alpha; the unary bwd_diff
-    # emitter doesn't handle no_diff scalars yet (binary emitter does).
-    # leaky_relu backward is handled by a dedicated lowering in activation.py.
-    "leaky_relu_fwd": "activation: no_diff scalar not yet in unary emitter (CG.M1)",
 }
 
 
@@ -181,10 +189,18 @@ def emit_bwd_diff_kernel(
 
 
 def _emit_unary(entry: BwdDiffEntry, *, dtype: str, numthreads: int) -> str:
+    # B.5.C: ``no_diff`` scalars (e.g. ``leaky_relu_fwd``'s
+    # ``negative_slope``) are emitted as fields of the push-constant
+    # block — in declaration order, before ``numel`` — and forwarded
+    # to ``bwd_diff(<fwd>)`` between the DifferentialPair argument and
+    # the trailing ``dOut``. Mirrors ``_emit_binary``.
+    pc_fields = "".join(f"    {dtype} {name};\n" for name in entry.no_diff_params)
+    no_diff_args = "".join(f"{name}, " for name in entry.no_diff_params)
     return (
         f"import {entry.module};\n"
         f"\n"
         f"[[vk::push_constant]] cbuffer Push {{\n"
+        f"{pc_fields}"
         f"    uint numel;\n"
         f"}};\n"
         f"\n"
@@ -198,7 +214,8 @@ def _emit_unary(entry: BwdDiffEntry, *, dtype: str, numthreads: int) -> str:
         f"    if (tid.x >= numel) return;\n"
         f"    DifferentialPair<{dtype}> dp = "
         f"diffPair(x[tid.x], ({dtype})0);\n"
-        f"    bwd_diff({entry.fwd_fn})(dp, grad_out[tid.x]);\n"
+        f"    bwd_diff({entry.fwd_fn})("
+        f"dp, {no_diff_args}grad_out[tid.x]);\n"
         f"    grad_in[tid.x] = dp.getDifferential();\n"
         f"}}\n"
     )

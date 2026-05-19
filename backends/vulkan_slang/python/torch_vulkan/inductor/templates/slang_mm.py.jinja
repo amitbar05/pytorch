@@ -40,6 +40,21 @@ import pointwise;
 static const uint WG_M = TILE_M / M_PER_THREAD;
 static const uint WG_N = TILE_N / N_PER_THREAD;
 
+// A.6: Monolithic PC struct — all fields always present, regardless of the
+// has_bias / has_batch / has_alpha / has_beta / has_scale / has_clamp
+// Jinja flags.  Optional behaviour is gated by ``pc.flags`` at runtime, which
+// eliminates the binary-incompatibility risk from a Jinja typo silently
+// misaligning the Python ``struct.pack`` layout against the Slang
+// push-constant block (anti-goal #6).  Unused fields are written as 0 by the
+// caller.  Push constants are wave-uniform on RDNA1, so the runtime branch
+// collapses to a scalar test outside the K-loop hot path.
+static const uint MM_FLAG_BIAS  = 1u;
+static const uint MM_FLAG_BATCH = 2u;
+static const uint MM_FLAG_ALPHA = 4u;
+static const uint MM_FLAG_BETA  = 8u;
+static const uint MM_FLAG_SCALE = 16u;
+static const uint MM_FLAG_CLAMP = 32u;
+
 struct PC {
     uint M;
     uint N;
@@ -50,18 +65,13 @@ struct PC {
     uint stride_b_n;
     uint stride_c_m;
     uint stride_c_n;
-{% if has_bias %}
+    // Always present; ignored unless MM_FLAG_BIAS is set in pc.flags.
     uint stride_bias_n;
-{% endif %}
-{% if has_batch %}
-    // Batch (BMM) strides — element offsets between consecutive batches in
-    // each operand. For mm (no batch), these fields are absent and `gid.z`
-    // is unused (grid_z=1). The shader unconditionally adds the batch
-    // contribution only when `has_batch` is set.
+    // Always present; ignored unless MM_FLAG_BATCH is set in pc.flags.
+    // Batch strides are element offsets between consecutive batches.
     uint stride_a_b;
     uint stride_b_b;
     uint stride_c_b;
-{% endif %}
     // N+1.11: Runtime tile sizes — loop bounds use these push-constant
     // values so the same SPIR-V module (with fixed groupshared / numthreads
     // from specialization constants) handles multiple tile configurations.
@@ -70,19 +80,14 @@ struct PC {
     uint tile_k;
     uint m_per_thread;
     uint n_per_thread;
-{% if has_alpha %}
+    // A.6: Bitmask of MM_FLAG_* gates above.
+    uint flags;
+    // Always present; ignored unless their corresponding flag is set.
     float alpha;
-{% endif %}
-{% if has_beta %}
     float beta;
-{% endif %}
-{% if has_scale %}
     float scale;
-{% endif %}
-{% if has_clamp %}
     float clamp_min;
     float clamp_max;
-{% endif %}
 };
 
 [[vk::push_constant]] PC pc;
@@ -226,19 +231,17 @@ void computeMain<Epilogue : IDifferentiable>(
     // N+1.11: row_base/col_base use pc.tile_m/pc.tile_n for correct grid offset.
     uint row_base = gid.y * pc.tile_m;
     uint col_base = gid.x * pc.tile_n;
-{% if has_batch %}
-    // BMM: each grid_z slice maps to one batch. The PC carries per-tensor
-    // batch strides (element offsets). For a contiguous [B,M,K] A this is
-    // M*K, for [B,K,N] B it's K*N, etc. Without this offset every output
-    // batch was reading batch 0 of A and B — silent miscompute.
-    uint batch_a_off = gid.z * pc.stride_a_b;
-    uint batch_b_off = gid.z * pc.stride_b_b;
-    uint batch_c_off = gid.z * pc.stride_c_b;
-{% else %}
+    // A.6: Batch offsets gated by MM_FLAG_BATCH at runtime.  For non-batch
+    // matmul, the caller packs stride_*_b as 0 and grid_z=1, so the math is
+    // a no-op even without the gate; the explicit gate keeps intent clear.
     uint batch_a_off = 0u;
     uint batch_b_off = 0u;
     uint batch_c_off = 0u;
-{% endif %}
+    if ((pc.flags & MM_FLAG_BATCH) != 0u) {
+        batch_a_off = gid.z * pc.stride_a_b;
+        batch_b_off = gid.z * pc.stride_b_b;
+        batch_c_off = gid.z * pc.stride_c_b;
+    }
 
     // M17.1: Precompute local row/col from linear tid to work around a
     // slangc 2026.5.2 compiler bug on RDNA1/wave64: using both lid.y and
@@ -307,24 +310,32 @@ void computeMain<Epilogue : IDifferentiable>(
             uint col = col_base + local_col * pc.n_per_thread + ni;
             if (col >= pc.N) continue;
             {{ dtype_acc }} v = acc[mi][ni];
-{% if has_alpha %}
-            v *= pc.alpha;
-{% endif %}
+            // A.6: Epilogue blocks gated by pc.flags at runtime, not Jinja.
+            // All branches read fields that are always present in the PC
+            // struct (zeros when the corresponding flag is clear).
+            if ((pc.flags & MM_FLAG_ALPHA) != 0u) {
+                v *= ({{ dtype_acc }})pc.alpha;
+            }
 {% if has_bias %}
-            v += ({{ dtype_acc }})bias[col * pc.stride_bias_n];
+            // Bias buffer presence is a structural SPIR-V binding choice and
+            // remains Jinja-gated.  The bias-add itself is still flag-gated
+            // for parity with the rest of the epilogue.
+            if ((pc.flags & MM_FLAG_BIAS) != 0u) {
+                v += ({{ dtype_acc }})bias[col * pc.stride_bias_n];
+            }
 {% endif %}
-{% if has_beta %}
-            v += pc.beta * ({{ dtype_acc }})c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
-{% endif %}
+            if ((pc.flags & MM_FLAG_BETA) != 0u) {
+                v += ({{ dtype_acc }})pc.beta * ({{ dtype_acc }})c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n];
+            }
 {% if epilogue %}
             v = ({{ dtype_acc }})Epilogue::apply((float)v);
 {% endif %}
-{% if has_scale %}
-            v *= pc.scale;
-{% endif %}
-{% if has_clamp %}
-            v = clamp(v, ({{ dtype_acc }})pc.clamp_min, ({{ dtype_acc }})pc.clamp_max);
-{% endif %}
+            if ((pc.flags & MM_FLAG_SCALE) != 0u) {
+                v *= ({{ dtype_acc }})pc.scale;
+            }
+            if ((pc.flags & MM_FLAG_CLAMP) != 0u) {
+                v = clamp(v, ({{ dtype_acc }})pc.clamp_min, ({{ dtype_acc }})pc.clamp_max);
+            }
             c[batch_c_off + row * pc.stride_c_m + col * pc.stride_c_n] = ({{ dtype_c }})v;
         }
     }

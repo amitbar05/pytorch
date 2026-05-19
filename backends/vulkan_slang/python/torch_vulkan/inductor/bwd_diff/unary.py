@@ -25,12 +25,18 @@ def dispatch_unary_bwd(
     x: torch.Tensor,
     grad_out: torch.Tensor,
     *,
+    no_diff_kwargs: dict[str, float] | None = None,
     out: torch.Tensor | None = None,
     numthreads: int = _DEFAULT_NUMTHREADS,
 ) -> torch.Tensor:
     """Dispatch the autodiff-emitted backward for a unary entry.
 
     Returns ``grad_in`` with the same shape/dtype/device as ``x``.
+
+    ``no_diff_kwargs`` supplies values for any ``no_diff_params`` declared
+    on the entry (e.g. ``leaky_relu.negative_slope``); ``KeyError`` if a
+    required key is missing or an unexpected key is provided. Mirrors
+    ``dispatch_binary_bwd``.
 
     f16/bf16 inputs are widened to f32 for the compute kernel (T3.1).
 
@@ -69,6 +75,21 @@ def dispatch_unary_bwd(
             f"does not match x {tuple(x.shape)}"
         )
     _check_vulkan(grad_in_f32)
+    # B.5.C: validate / pack no_diff scalars (e.g. leaky_relu negative_slope).
+    no_diff_kwargs = dict(no_diff_kwargs or {})
+    missing = [k for k in entry.no_diff_params if k not in no_diff_kwargs]
+    if missing:
+        raise KeyError(
+            f"PF.6.b: aten op {aten_op!r} requires no_diff_kwargs "
+            f"{missing}; got keys {list(no_diff_kwargs)}"
+        )
+    extra = [k for k in no_diff_kwargs if k not in entry.no_diff_params]
+    if extra:
+        raise KeyError(
+            f"PF.6.b: aten op {aten_op!r} has no_diff_params "
+            f"{list(entry.no_diff_params)}; received unexpected keys "
+            f"{extra}"
+        )
     numel = x_f32.numel()
     slang_dtype = _slang_dtype_str(orig_dtype)
     src = emit_bwd_diff_kernel(
@@ -76,7 +97,9 @@ def dispatch_unary_bwd(
         dtype=slang_dtype,
         numthreads=numthreads,
     )
-    pc = struct.pack("<I", numel)
+    fmt = "<" + "f" * len(entry.no_diff_params) + "I"
+    values = [float(no_diff_kwargs[k]) for k in entry.no_diff_params]
+    pc = struct.pack(fmt, *values, numel)
     wg_x = (numel + numthreads - 1) // numthreads
     compile_and_dispatch(
         src,
@@ -89,7 +112,6 @@ def dispatch_unary_bwd(
         entry="bwd_op",
         cache_key=_cache_key(aten_op, orig_dtype, numthreads),
     )
-    _ = entry
     if out is not None:
         if out.dtype != orig_dtype:
             out.copy_(_narrow_from_f32(grad_in_f32, orig_dtype))

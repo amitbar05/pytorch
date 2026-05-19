@@ -47,15 +47,6 @@ def _register_loss_lowerings() -> None:
             )
         return NotImplemented
 
-    def _numel(t) -> int:
-        n = 1
-        for s in t.get_size():
-            try:
-                n *= int(s)
-            except Exception:
-                return -1
-        return n
-
     @register_lowering(aten.mse_loss, type_promotion_kind=None)
     def _vulkan_mse_loss(self, target, reduction=1):
         if not _is_vulkan(self):

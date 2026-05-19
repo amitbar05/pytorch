@@ -1,12 +1,13 @@
-module reduction;
+module vk_reduction;
 // M20.6: __exported so kernels that `import reduction;` also gain access
-// to helpers.slang's VK_SUBGROUP_SIZE specialization constant (declared
+// to vk_helpers.slang's VK_SUBGROUP_SIZE specialization constant (declared
 // at constant_id=100 with default 64). Without the re-export, the
 // codegen-emitted reductions that reference VK_SUBGROUP_SIZE would fail
 // with "declaration not accessible" — the spec const is declared
-// `public` in helpers, but a plain `import` doesn't transitively expose
+// `public` in vk_helpers, but a plain `import` doesn't transitively expose
 // imported symbols to downstream consumers.
-__exported import helpers;
+// NOTE: "helpers" is a reserved module name in slangc v2026.5.2 (causes segfault).
+__exported import vk_helpers;
 
 // ── Reduction interfaces ──────────────────────────────────────────────
 
@@ -279,11 +280,7 @@ groupshared float _welford_smem_m2[1024 + 32];
 groupshared float _welford_smem_n[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: [ForceInline] removed — combination of spec-constant
-// loop bound (simd = VK_SUBGROUP_SIZE) and nested subgroup-shuffle loops
-// causes slangc 2026.5.2 to hang > 30 s during inlining. Letting slangc
-// keep wg_welford as a callable function compiles in < 1 s with no
-// measurable runtime impact (single call per kernel).
+[ForceInline]
 public WelfordResult<float> wg_welford(
     WelfordResult<float> v, uint tid, uint size, uint simd)
 {
@@ -374,8 +371,7 @@ groupshared float _wg_arg_smem_val[1024 + 32];
 groupshared float _wg_arg_smem_idx[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: see wg_welford comment — [ForceInline] dropped to
-// avoid slangc 2026.5.2 hang on the simd-bounded inner shuffle loops.
+[ForceInline]
 public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
 {
     if (size == 1u) return v;
@@ -484,8 +480,9 @@ public float reduce_fold_prod(float a, float b) {
 //           Phase-1 inclusive scan. Result is the workgroup-wide
 //           inclusive prefix scan.
 //
-// Exclusive variant: compute inclusive, then shift right by one lane
-//                    within the workgroup. Lane 0 of WG returns identity.
+// Exclusive variant: compute inclusive, then `combine(identity, prev_lane)`
+//                    via shuffle — i.e. shift right by one lane within the
+//                    workgroup. Lane 0 of WG returns identity.
 
 public interface IScanOp {
     static float identity();
@@ -522,9 +519,8 @@ public struct IScanMin : IScanOp {
 // covers + only; max/min have no direct intrinsic).
 //
 // CG.M16: WaveReadLaneAt requires subgroup_shuffle (RDNA1: always on).
-// M-AUDIT-PERF.1: no [ForceInline] — keeps slangc inlining cheap on the
-// shuffle ladder (mirrors the wg_welford / wg_argmax convention here).
 [require(spirv, subgroup_shuffle)]
+[ForceInline]
 public float wave_scan_inclusive<S : IScanOp>(float v, uint lane, uint simd)
 {
     float acc = v;
@@ -540,10 +536,12 @@ public float wave_scan_inclusive<S : IScanOp>(float v, uint lane, uint simd)
 }
 
 // +32 bank-conflict padding (matches existing smem layouts in this file).
+// 33 entries is enough (1024 / 32 = 32 waves max on wave32; only 16 on
+// wave64) but keeping it generous + aligned with the surrounding pattern.
 groupshared float _wg_scan_smem[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: see wg_welford — [ForceInline] dropped (simd-bounded loop).
+[ForceInline]
 public float wg_scan_inclusive<S : IScanOp>(float v, uint tid, uint size, uint simd)
 {
     if (size == 1u) return v;
@@ -587,16 +585,17 @@ public float wg_scan_inclusive<S : IScanOp>(float v, uint tid, uint size, uint s
 }
 
 // Exclusive scan: shift the inclusive result right by one lane within
-// the workgroup. tid 0 returns the identity element.
+// the workgroup. Lane 0 (tid 0) returns the identity element.
 //
-// We derive it from wg_scan_inclusive without re-scanning:
+// We avoid recomputing the scan by deriving it from wg_scan_inclusive:
 //   exclusive(tid) = inclusive(tid - 1)   if tid > 0
 //                  = identity             if tid == 0
 //
-// Across a wave boundary we use the wave's exclusive-prefix slot
-// (wave_prefix already holds that). Within a wave we use WaveReadLaneAt
-// on the per-lane inclusive value.
+// Across a wave boundary we use WaveReadLaneAt to fetch lane (simd-1)
+// of the previous wave from smem (wave_prefix already holds that).
+// Within a wave we use WaveReadLaneAt on the per-lane inclusive value.
 [require(spirv, subgroup_shuffle)]
+[ForceInline]
 public float wg_scan_exclusive<S : IScanOp>(float v, uint tid, uint size, uint simd)
 {
     if (size == 1u) return S::identity();
@@ -636,7 +635,7 @@ public float wg_scan_exclusive<S : IScanOp>(float v, uint tid, uint size, uint s
     GroupMemoryBarrierWithGroupSync();
 
     // Phase 4: combine wave's exclusive prefix with intra-wave *exclusive* scan.
-    // Intra-wave exclusive = shift wave_incl right by one lane within the wave.
+    // Intra-wave exclusive = shift wave_incl right by one lane.
     float wave_prefix = _wg_scan_smem[wave_id];
     float prev_incl = WaveReadLaneAt(wave_incl, lane - 1u);
     float intra_excl = (lane == 0u) ? S::identity() : prev_incl;
@@ -765,7 +764,7 @@ groupshared float _wg_argxx_smem_val[1024 + 32];
 groupshared float _wg_argxx_smem_idx[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: see wg_welford — [ForceInline] dropped (simd-bounded loop).
+[ForceInline]
 public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
 {
     if (red_size == 1u) return v;
@@ -823,7 +822,7 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
 }
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: see wg_welford — [ForceInline] dropped (simd-bounded loop).
+[ForceInline]
 public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
 {
     if (red_size == 1u) return v;

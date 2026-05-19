@@ -28,6 +28,94 @@ from .render import _render_mm_int8_slang, _render_mm_slang
 _TRUST_INDUCTOR = os.environ.get("TORCH_VULKAN_TRUST_INDUCTOR") == "1"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# A.6 — Unified mm push-constant layout
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A single monolithic PC struct serves every mm variant (mm, addmm, addmm+gelu,
+# bmm, plus future alpha/beta/scale/clamp paths).  Fields are always present;
+# the kernel reads bits from ``pc.flags`` to gate optional behaviour.
+#
+# Any change to this layout MUST be mirrored in the matching ``struct PC``
+# block in ``templates/slang_mm.py.jinja`` (and the link-time wrapper in
+# ``render.py``).
+#
+# Layout: 19 uint + 5 float = 96 bytes (well below the 128 B push-constant
+# limit on RDNA1).
+MM_FLAG_BIAS = 1
+MM_FLAG_BATCH = 2
+MM_FLAG_ALPHA = 4
+MM_FLAG_BETA = 8
+MM_FLAG_SCALE = 16
+MM_FLAG_CLAMP = 32
+
+# Format string for ``struct.pack`` — must match the Slang struct field order.
+_MM_PC_FORMAT = "19I5f"
+
+
+def _pack_mm_pc(
+    M: int,
+    N: int,
+    K: int,
+    stride_a_m: int,
+    stride_a_k: int,
+    stride_b_k: int,
+    stride_b_n: int,
+    stride_c_m: int,
+    stride_c_n: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_per_thread: int,
+    n_per_thread: int,
+    *,
+    stride_bias_n: int = 0,
+    stride_a_b: int = 0,
+    stride_b_b: int = 0,
+    stride_c_b: int = 0,
+    flags: int = 0,
+    alpha: float = 0.0,
+    beta: float = 0.0,
+    scale: float = 0.0,
+    clamp_min: float = 0.0,
+    clamp_max: float = 0.0,
+) -> bytes:
+    """Pack the monolithic mm PC struct.
+
+    Mirrors ``struct PC`` in ``templates/slang_mm.py.jinja``.  Optional
+    fields default to 0 / 0.0 when their corresponding ``MM_FLAG_*`` bit is
+    clear, so a single helper serves every mm dispatch (mm / addmm / bmm /
+    addmm+gelu).
+    """
+    return struct.pack(
+        _MM_PC_FORMAT,
+        M,
+        N,
+        K,
+        stride_a_m,
+        stride_a_k,
+        stride_b_k,
+        stride_b_n,
+        stride_c_m,
+        stride_c_n,
+        stride_bias_n,
+        stride_a_b,
+        stride_b_b,
+        stride_c_b,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_per_thread,
+        n_per_thread,
+        flags,
+        alpha,
+        beta,
+        scale,
+        clamp_min,
+        clamp_max,
+    )
+
+
 def _check_workgroup_fits(
     tile_m: int,
     tile_n: int,
@@ -94,7 +182,7 @@ def _slang_tile_mm(
         # N+1.11: _n111 prevents stale cache hits with old PC layout.
         cache_key = (
             f"slang_mm_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
-            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111"
+            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111_a6"
         )
         if epilogue_struct is not None:
             cache_key += f"_epi_{epilogue_struct}"
@@ -115,12 +203,9 @@ def _slang_tile_mm(
     stride_b_k = b.stride(0)
     stride_b_n = b.stride(1) if b.dim() > 1 else 1
 
-    # N+1.11: PC layout now includes tile config fields after strides.
-    # Order: M, N, K, stride_a_m, stride_a_k, stride_b_k, stride_b_n,
-    #        stride_c_m, stride_c_n, tile_m, tile_n, tile_k,
-    #        m_per_thread, n_per_thread
-    pc = struct.pack(
-        "14I",
+    # A.6: Monolithic PC layout — all fields always present; flags=0 means
+    # no bias / batch / alpha / etc. (plain mm).
+    pc = _pack_mm_pc(
         M,
         N,
         K,
@@ -204,7 +289,7 @@ def _slang_tile_addmm(
         )
         cache_key = (
             f"slang_addmm_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
-            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111"
+            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111_a6"
         )
         if epilogue_struct is not None:
             cache_key += f"_epi_{epilogue_struct}"
@@ -227,12 +312,8 @@ def _slang_tile_addmm(
     stride_b_n = b.stride(1) if b.dim() > 1 else 1
     stride_bias_n = 1
 
-    # N+1.11: PC layout now includes tile config after stride_bias_n.
-    # Order: M, N, K, stride_a_m, stride_a_k, stride_b_k, stride_b_n,
-    #        stride_c_m, stride_c_n, stride_bias_n,
-    #        tile_m, tile_n, tile_k, m_per_thread, n_per_thread
-    pc = struct.pack(
-        "15I",
+    # A.6: Monolithic PC layout — MM_FLAG_BIAS gates the bias-add branch.
+    pc = _pack_mm_pc(
         M,
         N,
         K,
@@ -242,12 +323,13 @@ def _slang_tile_addmm(
         stride_b_n,
         out.stride(0),
         out.stride(1),
-        stride_bias_n,
         tile_m,
         tile_n,
         tile_k,
         m_per_thread,
         n_per_thread,
+        stride_bias_n=stride_bias_n,
+        flags=MM_FLAG_BIAS,
     )
 
     grid_x = (N + tile_n - 1) // tile_n
@@ -311,9 +393,10 @@ def _slang_tile_addmm_gelu(
             m_per_thread=m_per_thread,
             n_per_thread=n_per_thread,
         )
+        # A.6: ``_a6`` tag — monolithic PC layout (closes the 10I undercount).
         cache_key = (
             f"slang_addmm_epi_OpGELU_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
-            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}"
+            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_a6"
         )
 
     if not _TRUST_INDUCTOR:
@@ -327,8 +410,11 @@ def _slang_tile_addmm_gelu(
     if not _TRUST_INDUCTOR and not bias_1d.is_contiguous():
         bias_1d = bias_1d.contiguous()
 
-    pc = struct.pack(
-        "10I",
+    # A.6: Pre-A.6 this path packed only 10 uints, leaving pc.tile_m /
+    # pc.tile_n / pc.tile_k / pc.m_per_thread / pc.n_per_thread (the N+1.11
+    # runtime tile fields) reading garbage on the GPU.  The unified packer
+    # writes the full layout, closing that latent miscompute risk.
+    pc = _pack_mm_pc(
         M,
         N,
         K,
@@ -338,7 +424,13 @@ def _slang_tile_addmm_gelu(
         1,
         out.stride(0),
         out.stride(1),
-        1,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_per_thread,
+        n_per_thread,
+        stride_bias_n=1,
+        flags=MM_FLAG_BIAS,
     )
 
     grid_x = (N + tile_n - 1) // tile_n
@@ -400,7 +492,7 @@ def _slang_tile_bmm(
         # N+1.11: _n111 prevents stale cache hits with old PC layout.
         cache_key = (
             f"slang_bmm_v2_{tile_m}_{tile_n}_{tile_k}"
-            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111"
+            f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111_a6"
         )
         if epilogue_struct is not None:
             cache_key += f"_epi_{epilogue_struct}"
@@ -413,12 +505,8 @@ def _slang_tile_bmm(
         if not out.is_contiguous():
             out = out.contiguous()
 
-    # N+1.11: PC layout includes batch strides then tile config fields.
-    # Order: M, N, K, stride_a_m, stride_a_k, stride_b_k, stride_b_n,
-    #        stride_c_m, stride_c_n, stride_a_b, stride_b_b, stride_c_b,
-    #        tile_m, tile_n, tile_k, m_per_thread, n_per_thread
-    pc = struct.pack(
-        "17I",
+    # A.6: Monolithic PC layout — MM_FLAG_BATCH selects the batch path.
+    pc = _pack_mm_pc(
         M,
         N,
         K,
@@ -428,14 +516,15 @@ def _slang_tile_bmm(
         b.stride(2),
         out.stride(1),
         out.stride(2),
-        a.stride(0),
-        b.stride(0),
-        out.stride(0),
         tile_m,
         tile_n,
         tile_k,
         m_per_thread,
         n_per_thread,
+        stride_a_b=a.stride(0),
+        stride_b_b=b.stride(0),
+        stride_c_b=out.stride(0),
+        flags=MM_FLAG_BATCH,
     )
 
     grid_x = (N + tile_n - 1) // tile_n

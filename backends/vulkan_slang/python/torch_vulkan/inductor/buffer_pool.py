@@ -53,6 +53,7 @@ and ``pool_release(buffer)`` keep the hot path readable.
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 from collections import deque
@@ -79,6 +80,11 @@ _SCRATCH_LIFETIME = "scratch"
 _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
 _PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
 _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
+# M-PERF.1: snapshot the env-override flag at module load so the hot-path
+# cap lookup (``_per_key_cap_for``) can be ``@lru_cache``-d on the class
+# name alone.  ``_reset_disabled_cache`` (test hook) re-reads the env and
+# clears the cache so per-test env mutations stay observable.
+_PER_KEY_ENV_OVERRIDE = "TORCH_VULKAN_BUFFER_POOL_PER_KEY" in os.environ
 # M9.6: adaptive per-key caps per lifetime class. Higher caps for high-churn
 # classes (scratch/transient) reduce eviction pressure; lower caps for
 # long-lived classes (save_for_backward) bound memory without hurting reuse.
@@ -119,8 +125,111 @@ _buckets: dict[tuple, deque] = {}
 # per-class bucket.  On ``release_class``, matching entries are removed
 # from the LIFO as well (the gradient bucket is reclaimed at the
 # optimizer boundary).
-_lifo: list[tuple[tuple, object]] = []  # [(key, tensor), ...]
+#
+# F.D.2 / D.2 (M-PERF): 2-level index — the prior implementation stored
+# every release in a single Python list and the acquire path did an
+# O(_LIFO_MAX) linear scan checking ``(numel, dtype)`` for every entry.
+# At 16 entries that's ~200–400 ns/acquire on the hot training path.
+#
+# The new layout is two parallel structures:
+#   ``_lifo_by_kd`` — ``dict[(numel, dtype) -> deque[(full_key, tensor)]]``.
+#     Per-(numel, dtype) deque, newest at the right.  Acquire reads the
+#     deque in O(1) and pops the rightmost entry to preserve LIFO order
+#     (newest released → first reused, the same-graph alloc/free/alloc
+#     pattern the hot-cache is designed for).
+#   ``_lifo_order`` — ``deque[(numel, dtype)]``, newest at the right.
+#     Tracks global FIFO eviction order; may contain stale entries that
+#     were already consumed by acquire (lazy invalidation).  Drained on
+#     every push that triggers an eviction, so length stays
+#     ≤ 2 × ``_LIFO_MAX``.
+#   ``_lifo_live_count`` — ``int``.  ``sum(len(d) for d in _lifo_by_kd.values())``.
+#     Cached to avoid summing on every push.
+_lifo_by_kd: dict[tuple, deque] = {}
+_lifo_order: deque = deque()
+_lifo_live_count = 0
 _LIFO_MAX = 16
+
+
+def _lifo_snapshot() -> list[tuple[tuple, object]]:
+    """Materialize a read-only snapshot of the LIFO in global-FIFO order.
+
+    F.D.2 / D.2 back-compat: prior tests imported the module-level
+    ``_lifo`` list directly to assert ``len(_lifo)`` and iterate
+    ``(key, tensor)`` pairs.  After the 2-level-index refactor the
+    underlying storage is split across ``_lifo_by_kd`` and ``_lifo_order``;
+    this helper rebuilds the legacy list shape on demand.
+
+    Order: oldest first (matches the legacy ``list.pop(0)`` eviction
+    contract).  Stale ``_lifo_order`` entries are skipped.  Per-kd deques
+    are walked left-to-right so that the relative order of releases for
+    the same ``(numel, dtype)`` is preserved (oldest-of-kd → newest-of-kd).
+    """
+    if _lifo_live_count == 0:
+        return []
+    # Per-kd cursors track how many of each kd we've already emitted.
+    cursors: dict[tuple, int] = {}
+    out: list[tuple[tuple, object]] = []
+    seen_stale = False
+    for kd in _lifo_order:
+        bucket = _lifo_by_kd.get(kd)
+        if not bucket:
+            seen_stale = True
+            continue
+        idx = cursors.get(kd, 0)
+        if idx >= len(bucket):
+            # The corresponding live entry was already consumed by a
+            # prior acquire — this _lifo_order slot is stale.
+            seen_stale = True
+            continue
+        out.append(bucket[idx])
+        cursors[kd] = idx + 1
+    # If stale entries left some kd un-emitted, pick them up from the
+    # remaining cursor offsets.  This keeps the snapshot consistent when
+    # ``_lifo_order`` has drifted (rare; only happens when acquire pops
+    # before the next push drains stales).
+    if seen_stale:
+        for kd, bucket in _lifo_by_kd.items():
+            idx = cursors.get(kd, 0)
+            while idx < len(bucket):
+                out.append(bucket[idx])
+                idx += 1
+    return out
+
+
+class _LifoView:
+    """F.D.2 / D.2 back-compat: live view of the 2-level LIFO index.
+
+    Prior tests do ``from buffer_pool import _lifo`` and then assert
+    ``len(_lifo) == N`` / iterate ``(key, tensor)`` pairs.  Python's
+    ``from x import y`` binds the local name once, so a module-level
+    ``__getattr__`` cannot satisfy these tests — the local name would
+    capture whatever the snapshot was at import time.
+
+    This sentinel object captures the live behaviour without keeping a
+    parallel list around: every ``len()`` / ``iter()`` / index access
+    rebuilds the snapshot from ``_lifo_by_kd``.  Hot-path code must
+    never touch this object — it exists purely as a test scaffold.
+    """
+
+    __slots__ = ()
+
+    def __len__(self) -> int:
+        return _lifo_live_count
+
+    def __iter__(self):
+        return iter(_lifo_snapshot())
+
+    def __getitem__(self, idx):
+        return _lifo_snapshot()[idx]
+
+    def __bool__(self) -> bool:
+        return _lifo_live_count > 0
+
+    def __repr__(self) -> str:
+        return f"_LifoView(len={_lifo_live_count})"
+
+
+_lifo = _LifoView()
 
 _size_now = 0
 _stats = {
@@ -145,18 +254,21 @@ _release_counts: dict[str, int] = {cls: 0 for cls in LIFETIME_CLASSES}
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@functools.lru_cache(maxsize=8)
 def _per_key_cap_for(lifetime_class: str) -> int:
     """Return the per-key capacity for a given lifetime class.
 
-    M9.6: adaptive caps — scratch=8, transient=6, save_for_backward=4.
-    If ``TORCH_VULKAN_BUFFER_POOL_PER_KEY`` is explicitly set in the
-    environment, that value overrides all classes (preserving the legacy
-    behaviour for tests and tuning). Otherwise, each class uses its own cap;
-    classes not in ``_PER_KEY_CAPS`` fall back to ``_PER_KEY_CAP_DEFAULT``
-    (4, or the env-var override).
+    M9.6: adaptive caps — scratch=16, transient=12, save_for_backward=8
+    (M17.7 raised these).  Classes not in ``_PER_KEY_CAPS`` fall back to
+    ``_PER_KEY_CAP_DEFAULT`` (4, or the env-var override).
+
+    M-PERF.1: ``@lru_cache`` removes a ~50 ns/call dict-lookup +
+    ``os.environ`` probe from the release hot path.  The env-override
+    flag (``_PER_KEY_ENV_OVERRIDE``) and the default cap are snapshot at
+    module import; ``_reset_disabled_cache`` clears the cache so test
+    hooks that mutate the env stay observable.
     """
-    # When the env var is explicitly set (not default), use it for all classes.
-    if "TORCH_VULKAN_BUFFER_POOL_PER_KEY" in os.environ:
+    if _PER_KEY_ENV_OVERRIDE:
         return _PER_KEY_CAP_DEFAULT
     return _PER_KEY_CAPS.get(lifetime_class, _PER_KEY_CAP_DEFAULT)
 
@@ -303,15 +415,28 @@ def _lifo_acquire(size, stride, dtype, lifetime_class: str):
 
     Lifetime class is ignored for same-graph reuse — the original buffer
     was freed, so its storage is available regardless of its former class.
-    Returns ``(tensor, popped_index)`` on hit, ``(None, -1)`` on miss.
-    The caller must ``as_strided`` the tensor if size/stride don't match.
+    Returns the matched tensor on hit, ``None`` on miss.  The caller must
+    ``as_strided`` the tensor if size/stride don't match.
+
+    F.D.2 / D.2 (M-PERF): O(1) lookup via ``_lifo_by_kd``.  The deque pop
+    returns the rightmost (newest) entry — preserving LIFO semantics for
+    the same-graph alloc/free/alloc pattern this cache targets.  A stale
+    entry is left behind in ``_lifo_order``; it is drained the next time
+    an eviction popleft visits it.
     """
-    target_numel = _numel(size)
-    for i, (lifo_key, t) in enumerate(_lifo):
-        if lifo_key[0] == target_numel and lifo_key[1] == dtype:
-            del _lifo[i]
-            return t
-    return None
+    global _lifo_live_count
+    kd = (_numel(size), dtype)
+    bucket = _lifo_by_kd.get(kd)
+    if not bucket:
+        return None
+    _full_key, t = bucket.pop()  # rightmost = newest released = LIFO
+    if not bucket:
+        # Drop the empty deque so ``release_class`` and ``pool_total_bytes``
+        # don't walk it.  ``_lifo_order`` may still carry stale ``kd``
+        # entries; they are skipped lazily on eviction.
+        del _lifo_by_kd[kd]
+    _lifo_live_count -= 1
+    return t
 
 
 def _lifo_push(key, tensor):
@@ -322,11 +447,34 @@ def _lifo_push(key, tensor):
     modified here — the caller (:func:`vulkan_pool_release`) handles
     the increment.  Evicting from LIFO to bucket is just a data-structure
     move, not a net size change.
+
+    F.D.2 / D.2: stale entries in ``_lifo_order`` (left behind by prior
+    acquires) are drained here on the way to finding a real victim.
     """
-    if len(_lifo) >= _LIFO_MAX:
-        evict_key, evict_t = _lifo.pop(0)
+    global _lifo_live_count
+    # Drain stale entries first; then evict the oldest live entry if we
+    # are at the cap.  Stale = an ``_lifo_order`` head whose per-kd deque
+    # is empty (the entry was already consumed by acquire).
+    while _lifo_live_count >= _LIFO_MAX and _lifo_order:
+        victim_kd = _lifo_order.popleft()
+        victim_deque = _lifo_by_kd.get(victim_kd)
+        if not victim_deque:
+            # Stale entry — skip and keep draining.
+            continue
+        evict_key, evict_t = victim_deque.popleft()  # oldest of this kd
+        if not victim_deque:
+            del _lifo_by_kd[victim_kd]
+        _lifo_live_count -= 1
         _push_to_bucket(evict_key, evict_t)
-    _lifo.append((key, tensor))
+        break
+    kd = (key[0], key[1])  # (numel, dtype)
+    bucket = _lifo_by_kd.get(kd)
+    if bucket is None:
+        bucket = deque()
+        _lifo_by_kd[kd] = bucket
+    bucket.append((key, tensor))
+    _lifo_order.append(kd)
+    _lifo_live_count += 1
 
 
 def _push_to_bucket(key, tensor):
@@ -344,12 +492,15 @@ def _push_to_bucket(key, tensor):
         bucket = deque()
         _buckets[key] = bucket
     lt = key[2] if len(key) > 2 else _DEFAULT_LIFETIME
-    if len(bucket) >= _per_key_cap_for(lt):
+    # M-PERF.1: call the lru-cached helper once; the trace branch reuses
+    # the same value rather than re-entering the lookup.
+    per_key_cap = _per_key_cap_for(lt)
+    if len(bucket) >= per_key_cap:
         _stats["evictions"] += 1
         _record_pool_event(
             "release_evict_per_key",
             key=str(key),
-            per_key_cap=_per_key_cap_for(lt),
+            per_key_cap=per_key_cap,
         )
         if _POOL_STATS_ENABLED:
             global _POOL_BYTES_EVICTED
@@ -477,16 +628,31 @@ def vulkan_pool_release(tensor, lifetime_class: str = _DEFAULT_LIFETIME) -> None
 def _release_class_from_lifo(lifetime_class: str) -> int:
     """M17.7: remove entries with ``lifetime_class`` from the LIFO hot-cache.
 
-    Iterates in reverse so ``del _lifo[i]`` does not shift unvisited indices.
-    Returns the number of tensors removed.  Does NOT modify ``_size_now`` —
-    the caller (:func:`release_class`) handles the accounting.
+    F.D.2 / D.2: walks every ``_lifo_by_kd`` deque and drops the
+    ``(full_key, tensor)`` pairs whose full_key carries ``lifetime_class``.
+    Returns the number of tensors removed.  Does NOT modify ``_size_now``
+    — the caller (:func:`release_class`) handles the accounting.
+    Stale ``_lifo_order`` entries are pruned lazily by :func:`_lifo_push`.
     """
+    global _lifo_live_count
     dropped = 0
-    for i in range(len(_lifo) - 1, -1, -1):
-        lifo_key, _t = _lifo[i]
-        if lifo_key[2] == lifetime_class:
-            del _lifo[i]
-            dropped += 1
+    empty_kds: list[tuple] = []
+    for kd, bucket in _lifo_by_kd.items():
+        # Build a new deque without the matching entries (preserves order).
+        keep = deque(
+            entry for entry in bucket if entry[0][2] != lifetime_class
+        )
+        removed_here = len(bucket) - len(keep)
+        if removed_here:
+            dropped += removed_here
+            if keep:
+                bucket.clear()
+                bucket.extend(keep)
+            else:
+                empty_kds.append(kd)
+    for kd in empty_kds:
+        del _lifo_by_kd[kd]
+    _lifo_live_count -= dropped
     return dropped
 
 
@@ -520,7 +686,7 @@ def release_class(lifetime_class: str) -> int:
     if _size_now < 0:
         # Defensive: counter drift should never put us negative. Reset
         # to the actual residual so subsequent stats stay coherent.
-        _size_now = sum(len(b) for b in _buckets.values()) + len(_lifo)
+        _size_now = sum(len(b) for b in _buckets.values()) + _lifo_live_count
     _stats["size_now"] = _size_now
     _release_counts[lifetime_class] = _release_counts.get(lifetime_class, 0) + 1
     return dropped
@@ -538,10 +704,12 @@ def release_count_for_class(lifetime_class: str) -> int:
 
 def reset_pool() -> None:
     """Drop every cached tensor and zero the stats. Test hook."""
-    global _size_now, _POOL_TRACE_INDEX
+    global _size_now, _POOL_TRACE_INDEX, _lifo_live_count
     global _POOL_BYTES_ACQUIRED, _POOL_BYTES_RELEASED, _POOL_BYTES_EVICTED
     _buckets.clear()
-    _lifo.clear()
+    _lifo_by_kd.clear()
+    _lifo_order.clear()
+    _lifo_live_count = 0
     _size_now = 0
     for k in _stats:
         _stats[k] = 0
@@ -577,8 +745,9 @@ def pool_total_bytes() -> int:
     for bucket in _buckets.values():
         for t in bucket:
             total += t.element_size() * t.numel()
-    for _, t in _lifo:
-        total += t.element_size() * t.numel()
+    for kd_bucket in _lifo_by_kd.values():
+        for _full_key, t in kd_bucket:
+            total += t.element_size() * t.numel()
     return total
 
 
@@ -604,8 +773,15 @@ def pool_stats_detailed() -> dict:
 
 
 def _reset_disabled_cache() -> None:
-    """Re-read ``TORCH_VULKAN_BUFFER_POOL`` from the env. Test hook."""
-    global _POOL_DISABLED, _PER_KEY_CAP_DEFAULT, _GLOBAL_CAP
+    """Re-read ``TORCH_VULKAN_BUFFER_POOL`` from the env. Test hook.
+
+    M-PERF.1: also re-snapshots the ``TORCH_VULKAN_BUFFER_POOL_PER_KEY``
+    env-override flag and clears the ``_per_key_cap_for`` lru_cache so
+    tests that mutate the env between cases stay observable.
+    """
+    global _POOL_DISABLED, _PER_KEY_CAP_DEFAULT, _GLOBAL_CAP, _PER_KEY_ENV_OVERRIDE
     _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
     _PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
     _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
+    _PER_KEY_ENV_OVERRIDE = "TORCH_VULKAN_BUFFER_POOL_PER_KEY" in os.environ
+    _per_key_cap_for.cache_clear()

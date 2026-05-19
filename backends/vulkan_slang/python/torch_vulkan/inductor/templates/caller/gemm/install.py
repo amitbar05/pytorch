@@ -380,7 +380,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
             # N+1.11: _n111 prevents stale cache hits with old PC layout.
             specs.append(
                 (
-                    f"slang_mm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111",
+                    f"slang_mm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111_a6",
                     _render_mm_slang(
                         tm,
                         tn,
@@ -397,7 +397,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
             )
             specs.append(
                 (
-                    f"slang_addmm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111",
+                    f"slang_addmm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111_a6",
                     _render_mm_slang(
                         tm,
                         tn,
@@ -416,7 +416,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
             )
             specs.append(
                 (
-                    f"slang_addmm_epi_OpGELU_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111",
+                    f"slang_addmm_epi_OpGELU_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111_a6",
                     _render_mm_slang(
                         tm,
                         tn,
@@ -436,7 +436,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
             )
         specs.append(
             (
-                f"slang_bmm_v2_{tm}_{tn}_{tk}_r{mpt}x{npt}_{dt}_n111",
+                f"slang_bmm_v2_{tm}_{tn}_{tk}_r{mpt}x{npt}_{dt}_n111_a6",
                 _render_mm_slang(
                     tm,
                     tn,

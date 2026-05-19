@@ -52,6 +52,44 @@ def compute_combo_config_key(sub_config_keys) -> str:
     )
 
 
+_cached_wave64_ok: Optional[bool] = None
+
+
+def _wave64_persistent_ok() -> bool:
+    """M-PERF.6: True iff device subgroup size is 64 (RDNA1/2/GCN).
+
+    Gates the reduction+pointwise ``rnumel`` cap raise to 1024
+    (16 waves of 64 fits RDNA1's 1024-thread WG ceiling). On wave32
+    hardware (Nvidia/Intel/RDNA3) we keep the 256 cap. Cached on first
+    call; falls back to False if the device probe fails.
+    """
+    global _cached_wave64_ok
+    if _cached_wave64_ok is not None:
+        return _cached_wave64_ok
+    sgs: Optional[int] = None
+    try:
+        from .device_profile import current
+
+        profile = current()
+        if profile is not None:
+            limits = profile.get("limits", {})
+            if limits.get("subgroup_size_min") == limits.get("subgroup_size_max"):
+                sgs = limits.get("subgroup_size_max")
+    except Exception:
+        pass
+    if sgs is None:
+        try:
+            from torch._dynamo.device_interface import get_interface_for_device
+
+            iface = get_interface_for_device("vulkan")
+            props = iface.Worker.get_device_properties()
+            sgs = getattr(props, "subgroup_size", None)
+        except Exception:
+            pass
+    _cached_wave64_ok = sgs == 64
+    return _cached_wave64_ok
+
+
 class VulkanScheduling(SIMDScheduling):
     kernel_type = VulkanKernel  # type: ignore[assignment]
 
@@ -120,9 +158,16 @@ class VulkanScheduling(SIMDScheduling):
                     )
                     return cap
 
-            # Pre-descriptor-indexing path: reserve 4 slots; clamp to [12, 60].
+            # Pre-descriptor-indexing path: reserve 4 slots; clamp to [12, 80].
+            # F.1 (2026-05-19): raised cap 60 → 80. Original 60 targeted older
+            # mobile-class binding ceilings (~64/stage on Intel UHD / Mali /
+            # Adreno). Modern desktop drivers (RADV / NVIDIA / Intel ARC)
+            # advertise >=64; RDNA1 specifically advertises 64. 80 stays
+            # below the 96/128 tier older mobile drivers enforce while
+            # admitting larger fused combos. On RDNA1 with descriptor
+            # indexing enabled (default), this branch is not reached.
             usable = raw - 4
-            cls._cached_max_storage_bufs = max(12, min(usable, 60))
+            cls._cached_max_storage_bufs = max(12, min(usable, 80))
         except Exception:
             cls._cached_max_storage_bufs = 16
 
@@ -274,9 +319,15 @@ class VulkanScheduling(SIMDScheduling):
         # Reduction + pointwise fusion: allow fusing when the
         # reduction's rnumel fits within a reasonable wave budget.
         # DR.1+: aggressive_fusion raises the threshold from 64 to 256.
-        # The pointwise epilogue element-wise consumes the reduction
-        # output and benefits from skipping the intermediate write.
-        rnumel_fuse_cap = 256 if config.aggressive_fusion() else 64
+        # M-PERF.6 (2026-05-19): on RDNA1/wave64 with persistent_pointwise
+        # the wave-cooperative reduction in `shaders/lib/vk_reduction`
+        # handles rnumel up to 1024 (16 waves of 64). Unlocks layer-norm
+        # fusion in stable diffusion / Llama training (~2-3 us/norm).
+        rnumel_fuse_cap = 64
+        if config.aggressive_fusion():
+            rnumel_fuse_cap = 256
+            if config.persistent_pointwise() and _wave64_persistent_ok():
+                rnumel_fuse_cap = 1024
         if node1.is_reduction() and not node2.is_reduction():
             if (
                 rnumel1 != 1
@@ -426,10 +477,16 @@ class VulkanScheduling(SIMDScheduling):
         # due to tiling incompatibility), override if the reduction's
         # rnumel fits within the wave budget.  This allows patterns like
         # GN + ReLU + GlobalAvg to fuse into a single kernel.
+        # M-PERF.6 (2026-05-19): same cap-raise logic as can_fuse_horizontal —
+        # wave64 + persistent_pointwise lifts the ceiling to 1024.
         if not base:
             _, (numel1, rnumel1) = node1.group
             _, (numel2, rnumel2) = node2.group
-            rnumel_fuse_cap = 256 if config.aggressive_fusion() else 64
+            rnumel_fuse_cap = 64
+            if config.aggressive_fusion():
+                rnumel_fuse_cap = 256
+                if config.persistent_pointwise() and _wave64_persistent_ok():
+                    rnumel_fuse_cap = 1024
             if node1.is_reduction() and not node2.is_reduction():
                 if (
                     rnumel1 != 1

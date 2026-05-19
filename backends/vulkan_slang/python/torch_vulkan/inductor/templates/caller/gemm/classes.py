@@ -213,28 +213,28 @@ class _SlangTileGEMM:
             cache_key = (
                 f"slang_bmm_v2_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111"
+                f"{_sgs_tag}{_ld_tag}_n111_a6"
             )
         elif self.has_bias and self.epilogue == "OpGELU":
             cache_key = (
                 f"slang_addmm_epi_OpGELU_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111"
+                f"{_sgs_tag}{_ld_tag}_n111_a6"
             )
         elif self.has_bias:
             cache_key = (
                 f"slang_addmm_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111"
+                f"{_sgs_tag}{_ld_tag}_n111_a6"
             )
         else:
             cache_key = (
                 f"slang_mm_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111"
+                f"{_sgs_tag}{_ld_tag}_n111_a6"
             )
         if self.epilogue is not None and not (
             self.has_bias and self.epilogue == "OpGELU"

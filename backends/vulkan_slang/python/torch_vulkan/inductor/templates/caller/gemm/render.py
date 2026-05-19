@@ -238,7 +238,17 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("import mm_tile;")
     lines.append("")
 
-    # Push-constant struct
+    # A.6: Monolithic PC struct — must match struct PC in slang_mm.py.jinja
+    # exactly so a single _pack_mm_pc helper serves both render paths.  The
+    # link-time wrapper is gated off today (use_lt=False above) but kept in
+    # sync so re-enabling it can't reintroduce a layout divergence.
+    lines.append("static const uint MM_FLAG_BIAS  = 1u;")
+    lines.append("static const uint MM_FLAG_BATCH = 2u;")
+    lines.append("static const uint MM_FLAG_ALPHA = 4u;")
+    lines.append("static const uint MM_FLAG_BETA  = 8u;")
+    lines.append("static const uint MM_FLAG_SCALE = 16u;")
+    lines.append("static const uint MM_FLAG_CLAMP = 32u;")
+    lines.append("")
     lines.append("struct PC {")
     lines.append("    uint M;")
     lines.append("    uint N;")
@@ -249,17 +259,21 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("    uint stride_b_n;")
     lines.append("    uint stride_c_m;")
     lines.append("    uint stride_c_n;")
-    if has_bias:
-        lines.append("    uint stride_bias_n;")
-    if has_alpha:
-        lines.append("    float alpha;")
-    if has_beta:
-        lines.append("    float beta;")
-    if has_scale:
-        lines.append("    float scale;")
-    if has_clamp:
-        lines.append("    float clamp_min;")
-        lines.append("    float clamp_max;")
+    lines.append("    uint stride_bias_n;")
+    lines.append("    uint stride_a_b;")
+    lines.append("    uint stride_b_b;")
+    lines.append("    uint stride_c_b;")
+    lines.append("    uint tile_m;")
+    lines.append("    uint tile_n;")
+    lines.append("    uint tile_k;")
+    lines.append("    uint m_per_thread;")
+    lines.append("    uint n_per_thread;")
+    lines.append("    uint flags;")
+    lines.append("    float alpha;")
+    lines.append("    float beta;")
+    lines.append("    float scale;")
+    lines.append("    float clamp_min;")
+    lines.append("    float clamp_max;")
     lines.append("};")
     lines.append("")
     lines.append("[[vk::push_constant]] PC pc;")
@@ -307,11 +321,15 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("        row_base, col_base, mm_pc, a, b, c, gid, lid);")
     lines.append("")
 
-    # Post-module epilogue: alpha, beta, bias, clamp, scale
-    # These are applied per-element AFTER the module's store_epilogue
-    # to support operations not expressible as pure IPointwise.
+    # A.6: Post-module epilogue gates on pc.flags at runtime, matching the
+    # main slang_mm.py.jinja path.  The branches are uniform across the wave
+    # (push-constants are wave-uniform on RDNA1) so this collapses to a
+    # single scalar test per output element, well outside the K-loop hot
+    # path.  Bias buffer presence is still gated on the structural
+    # ``has_bias`` Python flag because the SPIR-V binding can't be runtime-
+    # selected.
     if has_alpha or has_beta or has_bias or has_scale or has_clamp:
-        lines.append("    // Post-module epilogue adjustments")
+        lines.append("    // A.6: Post-module epilogue (pc.flags-gated)")
         lines.append("    [unroll]")
         lines.append("    for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {")
         lines.append("        uint row = row_base + lid.y * (uint)M_PER_THREAD + mi;")
@@ -326,23 +344,31 @@ def _render_mm_linktime_wrapper_slang(
             f"            {dtype_acc} v = ({dtype_acc})"
             f"c[row * pc.stride_c_m + col * pc.stride_c_n];"
         )
-        if has_alpha:
-            lines.append("            v *= pc.alpha;")
+        lines.append("            if ((pc.flags & MM_FLAG_ALPHA) != 0u) {")
+        lines.append(f"                v *= ({dtype_acc})pc.alpha;")
+        lines.append("            }")
         if has_bias:
-            lines.append(f"            v += ({dtype_acc})bias[col * pc.stride_bias_n];")
-        if has_beta:
+            lines.append("            if ((pc.flags & MM_FLAG_BIAS) != 0u) {")
             lines.append(
-                f"            v = pc.beta * v +"
-                f" (1.0 - pc.beta) * ({dtype_acc})"
-                f"c[row * pc.stride_c_m + col * pc.stride_c_n];"
+                f"                v += ({dtype_acc})bias[col * pc.stride_bias_n];"
             )
-        if has_scale:
-            lines.append("            v *= pc.scale;")
-        if has_clamp:
-            lines.append(
-                f"            v = clamp(v, ({dtype_acc})pc.clamp_min,"
-                f" ({dtype_acc})pc.clamp_max);"
-            )
+            lines.append("            }")
+        lines.append("            if ((pc.flags & MM_FLAG_BETA) != 0u) {")
+        lines.append(
+            f"                v = ({dtype_acc})pc.beta * v +"
+            f" (1.0 - ({dtype_acc})pc.beta) * ({dtype_acc})"
+            f"c[row * pc.stride_c_m + col * pc.stride_c_n];"
+        )
+        lines.append("            }")
+        lines.append("            if ((pc.flags & MM_FLAG_SCALE) != 0u) {")
+        lines.append(f"                v *= ({dtype_acc})pc.scale;")
+        lines.append("            }")
+        lines.append("            if ((pc.flags & MM_FLAG_CLAMP) != 0u) {")
+        lines.append(
+            f"                v = clamp(v, ({dtype_acc})pc.clamp_min,"
+            f" ({dtype_acc})pc.clamp_max);"
+        )
+        lines.append("            }")
         lines.append(
             f"            c[row * pc.stride_c_m + col * pc.stride_c_n] = ({dtype_c})v;"
         )

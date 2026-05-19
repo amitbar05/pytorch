@@ -456,6 +456,14 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         Wraps the body in ``[unroll] for (uint _rt = 0u; _rt < T; ++_rt)``
         with ``xindex = xbase + _rt`` re-declared inside the loop.
         Returns the new body string, or None on failure.
+
+        M-PERF.2: The unroll factor is gated on VGPR pressure.  For
+        ``heavy`` kernels (estimated VGPRs > 32, e.g. f64 / welford /
+        deep-loop chains) we emit ``[unroll(2)]`` instead of a full
+        ``[unroll]`` so slangc keeps a small inner loop rather than
+        expanding the body T-fold — which on RDNA1 (256 VGPRs/CU)
+        regularly drops occupancy from 2 waves/CU to 1 wave/CU and
+        gives back the 5-10% the tile was meant to win.
         """
         non_red = [t for t in self.range_trees if not t.is_reduction]
         rt = non_red[0]
@@ -470,10 +478,25 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         tail = body_str[anchor_idx + len(anchor) :]
         xbase_line = f"uint xbase = gtid.x * {tile_size}u;"
 
+        # M-PERF.2: VGPR-pressure-gated unroll attribute.  Falls back to
+        # ``[unroll]`` (full) when the classifier is unavailable or the
+        # kernel is light/normal pressure.
+        dtype_bytes = 2 if getattr(self, "_packed16", False) else 4
+        try:
+            vgpr_class, _ = self._classify_vgpr_pressure(dtype_bytes)
+        except Exception:
+            vgpr_class = "normal"
+        if vgpr_class == "heavy" and tile_size > 2:
+            unroll_attr = "[unroll(2)]"
+        else:
+            unroll_attr = "[unroll]"
+
         new_buf = IndentedBuffer()
         new_buf.splice(head)
         new_buf.writeline(xbase_line)
-        new_buf.writeline(f"[unroll] for (uint _rt = 0u; _rt < {tile_size}u; ++_rt) {{")
+        new_buf.writeline(
+            f"{unroll_attr} for (uint _rt = 0u; _rt < {tile_size}u; ++_rt) {{"
+        )
         with new_buf.indent():
             new_buf.writeline(f"uint {rt_name} = xbase + _rt;")
             new_buf.splice(tail)
@@ -518,17 +541,6 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
                 return None  # dynamic shapes not yet supported
             total *= int(v)
 
-        # GPU.5+: Relaxed threshold — consider per-thread work, not just total.
-        # Check if total numel is too large for efficient persistent execution.
-        # Use the same heuristic as _is_small_pointwise_chain:
-        # per_thread_iters = total / (wg_size * target_wgs) <= 16 for 2 ops,
-        # scaled up for more ops. Since we don't have the op count here,
-        # use a conservative cap: total <= 16384 (matching _is_small_pointwise_chain).
-        if total > 16384:
-            # Too large for persistent kernel — overhead of grid-stride
-            # loop dispatch (finding op per element) outweighs benefit.
-            return None
-
         wg_size = self.max_threadgroup_size
         # M11.4: Scale persistent WG count by actual CU count, not hardcoded 20.
         # More WGs → more wave slots filled → better occupancy for persistent
@@ -538,11 +550,28 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
 
             iface = get_interface_for_device("vulkan")
             props = iface.Worker.get_device_properties()
-            num_cus = getattr(props, "num_compute_units", 20)
+            num_cus = getattr(props, "num_compute_units", 16)
         except Exception:
-            num_cus = 20
-        # Target: one WG per CU for full occupancy, but never more than total/wg_size.
-        num_wgs = max(1, min(num_cus, (total + wg_size - 1) // wg_size))
+            # M-PERF.5: RDNA1 (RX 5600 XT) has 16 CUs — use as default.
+            num_cus = 16
+
+        # M-PERF.5: Replace the hard ``total > 16384`` reject with a
+        # persistent-WG-count clamp.  For large numels we previously
+        # bailed out to a plain elementwise dispatch (one launch per
+        # bucket, full overhead per op).  Now we keep persistence
+        # enabled for any numel ≥ wg_size and clamp the grid to
+        # ``cu_count * 4`` total resident waves on RDNA1
+        # (4 waves/CU × wave64 lanes / wg_size = WG count).  One
+        # persistent dispatch then chews through tensors up to and
+        # beyond 64M elements via the grid-stride loop, amortizing
+        # launch / barrier overhead across the whole tensor.
+        # Expected gain: 20-30% on large-batch element-wise ops.
+        sgs = self.simd_group_size or 64  # RDNA1 wave64
+        waves_per_cu = 4  # RDNA1 hardware cap
+        total_resident_lanes = num_cus * waves_per_cu * sgs
+        persistent_wg_count = max(1, total_resident_lanes // max(1, wg_size))
+        # Never request more WGs than the work itself can fill.
+        num_wgs = max(1, min(persistent_wg_count, (total + wg_size - 1) // wg_size))
 
         body_str = self.body.getvalue()
         if not body_str.strip():

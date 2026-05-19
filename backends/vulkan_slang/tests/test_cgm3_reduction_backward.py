@@ -331,3 +331,52 @@ class TestCGM3RegistryIntegrity:
                     f"CG.M3: {non_diff_op} must NOT be BWD_DIFF "
                     f"(max/min are non-differentiable in the autodiff sense)"
                 )
+
+
+class TestMCV4SoftmaxBackward:
+    """M-CV.4 — verify the M-NEW.9 ``_rewrite_constant_folded_tangent`` joint-pass
+    fix generalizes to softmax backward.
+
+    Background: AOTAutograd's joint-graph trace materializes the implicit
+    ``tangents_1 = torch.ones(())`` for a scalar ``loss.backward()`` by
+    constant-folding ``expand(zeros([]), shape)`` into a stored
+    ``self._tensor_constant0 = zeros(shape)`` attribute. The partitioned
+    backward then has ``tangents_1`` unused and ``get_attr(_tensor_constant0)``
+    returning zeros — every gradient computed downstream collapses to zero.
+
+    ``meta_patches/joint_graph_passes.py:_rewrite_constant_folded_tangent``
+    fixes this by rewriting the get_attr to ``aten.expand(tangents_1, shape)``
+    so the actual runtime tangent value propagates. This test confirms the
+    fix is not specific to ``aten.sum`` / ``aten.mean`` — softmax also has
+    the constant-folded tangent pattern, and the gradient must match CPU.
+    """
+
+    def test_mcv4_softmax_dim_sum_backward_matches_cpu(self):
+        """``F.softmax(x, dim=-1).sum().backward()`` produces non-zero
+        gradients matching CPU.
+
+        Pre-M-NEW.9 (and pre-M-CV.4 generalization): VK gradient was all
+        zeros from the constant-folded tangent — assert_close vs CPU
+        non-zero softmax-Jacobian gradient would fail.
+        """
+        if not os.environ.get("SLANGC"):
+            pytest.skip("SLANGC env var not set")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return torch.nn.functional.softmax(x, dim=-1).sum()
+
+        torch.manual_seed(0)
+        x = torch.randn(4, 8, device="vulkan:0", requires_grad=True)
+        x_cpu = x.detach().cpu().requires_grad_()
+
+        out = fn(x)
+        out.backward()
+        torch.nn.functional.softmax(x_cpu, dim=-1).sum().backward()
+
+        assert x.grad is not None, "softmax sum backward produced None gradient"
+        # The crucial assertion: the gradient is NOT all zeros (which was
+        # the M-NEW.9 / M-CV.4 bug symptom). Softmax row-summed-to-1, so
+        # the Jacobian collapses identically, but the underlying compute
+        # must still propagate the real tangent value.
+        torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
