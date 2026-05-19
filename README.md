@@ -374,6 +374,9 @@ if defined CMAKE_PREFIX_PATH (
 python -m pip install --no-build-isolation -v -e .
 ```
 
+**Vulkan-Based Build**
+TBD
+
 ##### Adjust Build Options (Optional)
 
 You can adjust the configuration of cmake variables optionally (without building first), by doing
