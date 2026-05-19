@@ -36,6 +36,58 @@
 
 ---
 
+## 0.0.6 CONV-TRAINING CRITICAL PATH (2026-05-19, user-directed focus)
+
+**Goal:** `TestSmallCNNTrain` (test_e2e_models.py:1172) trains end-to-end
+through `torch.compile(backend="inductor")` with **non-zero, correct
+gradients** on every parameter, and at least matches eager-mode loss
+trajectory over 10 steps.
+
+Pipeline under test:
+`Conv2d → GroupNorm → ReLU → MaxPool2d → ... → Linear → CrossEntropyLoss`.
+
+### Session 2026-05-20 progress (this commit)
+
+| # | Item | Status | Evidence |
+|---|------|--------|----------|
+| **1** | **M-NEW.9 + M-AUDIT-PERF.1-followup** (unified) — rewrite AOTAutograd's constant-folded tangent get_attr back to `aten.view+expand(tangents_N, target_shape)` for **both** scalar AND non-scalar tangent shapes via greedy right-to-left dim-matching. | ✅ **DONE 2026-05-20** | `_rewrite_constant_folded_tangent` added to `meta_patches/joint_graph_passes.py:448-686` running inside `_chained` before `_stamp_factory_devices`. **gate: tests/test_cgm3_reduction_backward.py 14/14 PASS** (including the 6 previously-broken sum/mean tests). Fix also handles `sum(dim=[0,2])`-style mid-axis broadcasts via greedy `_compute_view_shape` (insert size-1 dims where target dim doesn't match tangent dim). |
+| **2** | **M18.2** verification — `_has_real_vulkan_storage` helper + `@torch.compiler.disable` removal | ✅ **already in tree** (no edits needed) | `fx_passes/eager/_common.py:16` exposes `_has_real_vulkan_storage`; `fx_passes/eager/conv.py:442,776` both `_conv2d_relu_backward` and `_conv2d_gn_relu_backward` import the shared helper. Only comments mentioning `@torch.compiler.disable` remain, never the decorator. |
+| **3** | **M22.14** verification — `_ensure_conv2d_backward_op_registered` + `make_fallback` | ✅ **already in tree** (no edits needed) | `fx_passes/eager/conv.py:1037` defines the registration; `fx_passes/eager/__init__.py:80` calls it on package init; `lowerings/__init__.py:256` does `make_fallback(torch.ops.torch_vulkan.conv2d_backward.default)`. |
+| **4** | **M19.1** verification — `_register_linear_backward_decomposition` call site live | ✅ **already in tree** (no edits needed) | `lowerings/__init__.py:335` uncommented; `lowerings/matmul.py:246` defines the dual-decomp-table installer. |
+| **5** | **conv_gn_relu PC overflow** — 136B push constant exceeded RDNA1 128B cap | ✅ **FIXED 2026-05-20** | Dropped `_pad` + `spatial_size` + `channels_per_group` (derived in-shader): `templates/conv_gn_relu.slang` PC struct now 29 uints + 1 float + 1 uint = 124B; matching `struct.pack("29IfI", ...)` in `templates/caller/conv.py:_slang_tile_conv2d_gn_relu`. |
+| **6** | **slang_mm duplicate extern kernel** — `lazy_register_extern_choice` cache poisoned by `_ensure_extern_choices`'s pre-construction | ✅ **FIXED 2026-05-20** | `templates/caller/gemm/install.py::_ensure_extern_choices` now pre-populates upstream's `torch._inductor.kernel.mm.lazy_register_extern_choice` cache with the SAME ExternKernelChoice instance via direct call. Before fix: upstream's `tuned_mm` re-constructed `ExternKernelChoice(fn)` and tripped `duplicate extern kernel: slang_mm_8_8_8_s1_r1x1` because the name was already registered. |
+
+### Remaining blockers surfaced by SmallCNN end-to-end run
+
+| # | Item | Status | Evidence |
+|---|------|--------|----------|
+| **A** | **`vulkan` vs `vulkan:0` device-tag normalization** — user-created tensors via `device="vulkan"` get `device.index=None`; compiled backward returns `device.index=0`. Autograd engine rejects: `Function CompiledFunctionBackward returned an invalid gradient at index 2 - expected device vulkan but got vulkan:0`. **Workaround**: user writes `device="vulkan:0"` explicitly. **Real fix**: normalize either in the C++ `PrivateUse1` registration (auto-set index=0 on `vulkan` → `vulkan:0`) or in a Dynamo input-handling pass. | 📋 OPEN 2026-05-20 | Reproducer in `agent_space/probe_constant_folded_tangent.py`; affects every model created via `device="vulkan"`. |
+| **B** | **`extern_kernels.convolution(..., out=buf4)` codegen** — Inductor's wrapper codegen emits `out=` kwarg for `aten.convolution.default` fallback, but the aten op signature has no `out=` parameter. `TypeError: convolution() got an unexpected keyword argument 'out'` fires at backward runtime once a conv recompute is needed (e.g. inside `_conv2d_gn_relu_backward`). | 📋 OPEN 2026-05-20 | Existing comment in `lowerings/conv.py:702` already flagged "same aten.convolution out= kwarg issue" — the conv3d Phase 3 path was abandoned because of this. Fix: either patch the wrapper-codegen for `aten.convolution.default` to NOT emit `out=`, or register a `convolution.out` overload that accepts it, or stop generating in-place buffer reuse for convolution. |
+| **C** | **conv+ReLU compile-mode `LocalSizeId` / `maintenance4` SPIR-V validation error** — slangc emits SPIR-V using `OpExecutionMode LocalSizeId` which requires Vulkan `maintenance4`. RDNA1 Vulkan 1.2 doesn't have it enabled, so validation rejects the shader. Affects `TestM18FunctionalTensorClassification::test_conv_relu_compile_backward_matches_cpu`. | 📋 OPEN 2026-05-20 | Either enable `VK_KHR_maintenance4` in `Context.cpp`'s device feature set OR pass `-target spirv` / disable `LocalSizeId` codegen. Pure validation-layer error today — kernel still compiles & runs, but the warning surfaces as test fail in strict mode. |
+
+### Verification gates
+
+```bash
+cd backends/vulkan_slang
+# Step 1 (DONE)
+SLANGC=$(realpath third_party/slang/build/slang-2026.5.2-linux-x86_64/bin/slangc) \
+  .venv/bin/python -m pytest tests/test_cgm3_reduction_backward.py -p no:faulthandler
+# Step 5 (DONE, but needs the matching test)
+SLANGC=$(realpath third_party/slang/build/slang-2026.5.2-linux-x86_64/bin/slangc) \
+  .venv/bin/python agent_space/test_small_cnn_training.py
+# After A + B + C land:
+.venv/bin/python -m pytest tests/test_e2e_models.py::TestSmallCNNTrain -p no:faulthandler
+```
+
+### Out-of-scope (filed but not on the critical path)
+
+- C++ A.1–A.5 (M-CPP-AUDIT.1-4 + Allocator) — stability, not correctness. Defer to after § 0.0.6 lands.
+- helpers→vk_helpers rename completion — codegen still emits `import helpers;` which resolves; transition is non-blocking.
+- 8 worktree branches — refactors, no behavior change.
+- layer_norm dynamic-batch fwd wrong values — only affects M19 LayerNorm models, not SmallCNN.
+
+---
+
 ## 0.0.7 RECONCILIATION — actual working-tree state at session close (2026-05-19)
 
 The original § 0.0.8 was written from dispatched-agent reports. After

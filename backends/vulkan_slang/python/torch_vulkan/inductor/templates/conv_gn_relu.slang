@@ -59,15 +59,14 @@ struct PC {
     uint stride_out_h;
     uint stride_out_w;
     // ── GroupNorm params ──
+    // (channels_per_group = C_out / num_groups, derived in shader)
+    // (spatial_size = oH * oW, derived in shader)
     uint num_groups;
     uint group_size;
-    uint channels_per_group;
-    uint spatial_size;
     float eps;
-    // ── Bias stride (0 if no bias) + pad ──
+    // ── Bias stride (0 if no bias) ──
     uint stride_bias;
-    uint _pad;
-};
+};  // PC struct = 30 uints + 1 float + 1 uint = 128 bytes (RDNA1 push-constant cap)
 
 [[vk::push_constant]] PC pc;
 
@@ -95,7 +94,10 @@ void computeMain(
 
     uint n         = row / pc.num_groups;
     uint group_idx = row % pc.num_groups;
-    uint co_start  = group_idx * pc.channels_per_group;
+    // Derived (kept out of PC to fit 128B push-constant cap):
+    uint channels_per_group = pc.C_out / pc.num_groups;
+    uint spatial_size       = pc.oH * pc.oW;
+    uint co_start  = group_idx * channels_per_group;
     uint S         = pc.group_size;
 
     // Precompute base offsets
@@ -111,8 +113,8 @@ void computeMain(
 
     for (uint d = tid; d < S; d += 256) {
         // Decode (co, oh, ow) from flat index within the group row
-        uint co_local    = d / pc.spatial_size;
-        uint spatial_idx = d % pc.spatial_size;
+        uint co_local    = d / spatial_size;
+        uint spatial_idx = d % spatial_size;
         uint oh          = spatial_idx / pc.oW;
         uint ow          = spatial_idx % pc.oW;
         uint co          = co_start + co_local;
@@ -175,8 +177,8 @@ void computeMain(
     // Pass 3: recompute conv + bias + ReLU, normalize, affine, store
     // ═══════════════════════════════════════════════════════════════
     for (uint d = tid; d < S; d += 256) {
-        uint co_local    = d / pc.spatial_size;
-        uint spatial_idx = d % pc.spatial_size;
+        uint co_local    = d / spatial_size;
+        uint spatial_idx = d % spatial_size;
         uint oh          = spatial_idx / pc.oW;
         uint ow          = spatial_idx % pc.oW;
         uint co          = co_start + co_local;

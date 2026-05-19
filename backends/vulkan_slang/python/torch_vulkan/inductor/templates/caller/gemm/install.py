@@ -64,12 +64,34 @@ def _ensure_extern_choices(tile_fns, extern_kernel_choice_cls) -> None:
     subsequent compile (the wrapper references
     ``extern_kernels.slang_addmm_*`` directly without going through
     our lowering).
+
+    M19.1-followup (2026-05-20): also pre-populate upstream's
+    ``torch._inductor.kernel.mm.lazy_register_extern_choice`` cache.
+    Upstream's ``tuned_mm`` iterates ``inductor_config.external_matmul``
+    and calls ``lazy_register_extern_choice(fn)`` for each entry. Without
+    pre-population that triggers ``ExternKernelChoice(fn)`` — which fails
+    the ``not hasattr(extern_kernels, name)`` assertion because we
+    already registered the name here. Pre-poking the upstream cache
+    with the SAME ExternKernelChoice instance avoids that path.
     """
     # Resolve the upstream ``extern_kernels`` namespace so we can also
     # short-circuit when the name is already registered there (e.g.
     # ``install_external_*`` re-entered after a partial init, or when
     # the same fn name appears across both bmm and addmm tile lists).
     from torch._inductor.select_algorithm import extern_kernels
+
+    # Best-effort: also poke upstream's ``lazy_register_extern_choice``
+    # process-wide cache. The function is ``@functools.cache``-decorated
+    # — we directly populate its ``__wrapped__`` cache via ``cache_info``
+    # / a re-implementation of ``cache_clear`` is not possible, but the
+    # functools cache exposes ``__wrapped__`` and shares object identity
+    # by ``functools.cache`` semantics. The cleanest pre-population path
+    # is to call the function ourselves with the same fn — once
+    # constructed, subsequent upstream calls hit the cache.
+    try:
+        from torch._inductor.kernel.mm import lazy_register_extern_choice as _upstream_lz
+    except Exception:  # noqa: BLE001
+        _upstream_lz = None
 
     for fn in tile_fns:
         if fn.__name__ in _EXTERN_CHOICE_CACHE:
@@ -78,7 +100,14 @@ def _ensure_extern_choices(tile_fns, extern_kernel_choice_cls) -> None:
             # Some other path constructed the choice already (rare).
             # Skip rather than re-trigger the duplicate assertion.
             continue
-        _EXTERN_CHOICE_CACHE[fn.__name__] = extern_kernel_choice_cls(fn)
+        # If upstream's lazy_register_extern_choice is available, use it
+        # so the SAME instance ends up in BOTH caches (ours +
+        # upstream's). Otherwise fall back to constructing directly.
+        if _upstream_lz is not None:
+            choice = _upstream_lz(fn)
+        else:
+            choice = extern_kernel_choice_cls(fn)
+        _EXTERN_CHOICE_CACHE[fn.__name__] = choice
 
 
 def install_external_mm() -> None:

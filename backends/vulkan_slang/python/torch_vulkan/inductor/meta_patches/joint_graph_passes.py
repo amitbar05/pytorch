@@ -445,6 +445,244 @@ def _install_joint_partition_device_fix() -> None:
             fx_g.recompile()
         return fx_g
 
+    def _rewrite_constant_folded_tangent(fx_g):
+        """M-NEW.9 + M-AUDIT-PERF.1-followup — undo AOTAutograd's constant
+        fold of the implicit upstream gradient.
+
+        When the user calls ``loss.backward()`` on a scalar loss, AOT autograd
+        traces the joint graph with a *concrete* ``tangents_1 = torch.ones(())``
+        on the vulkan device. The partitioner's constant-folder then evaluates
+        ``expand(tangents_1, target_shape)`` and lifts the result as
+        ``self._tensor_constantN`` on the GraphModule — a vulkan tensor with
+        ``data_ptr() == 0`` (null storage). At runtime the wrapper never
+        allocates a real buffer for it, so every read returns garbage / zero
+        and **every reachable gradient is zero**.
+
+        The placeholder ``tangents_N`` is still present in the graph but has
+        ``users == 0``. The backward module's actual upstream gradient (passed
+        in at run time by the autograd engine) is silently discarded.
+
+        Fix: walk the joint graph, find each ``tangents_N`` placeholder with
+        zero users and a matching ``get_attr`` whose:
+
+          - dtype matches the placeholder val's dtype,
+          - shape is broadcast-compatible *from* the placeholder val's shape
+            (i.e. the placeholder shape is a suffix of the get_attr shape,
+            or the placeholder is 0-dim), and
+          - the underlying tensor has ``data_ptr() == 0`` OR all-zero
+            strides (the canonical broadcast-only constant-fold pattern).
+
+        Replace every consumer of the get_attr with
+        ``aten.expand.default(tangents_N, target_shape)``. The placeholder is
+        now live, so the runtime wrapper threads the real upstream gradient
+        through. The get_attr is left in place — the constant attribute is
+        owned by the partitioner; erasing it can confuse downstream cache
+        keys, and once it has no users it costs nothing.
+
+        Handles both:
+          - **Scalar tangent** (``sum().backward()`` etc.): placeholder
+            ``tangents_1`` shape ``[]``, get_attr shape e.g. ``[8, 16]``.
+          - **Non-scalar tangent** (``sum(dim=0).sum().backward()`` etc., or
+            ``.backward(grad)`` with a non-scalar grad): placeholder shape
+            ``[k1, ..., kN]``, get_attr shape ``[m1, ..., mP, k1, ..., kN]``.
+
+        Vulkan-only — gated by the outer ``_has_vulkan_input`` check on
+        ``_chained``.
+        """
+        import re
+
+        tangent_re = re.compile(r"^tangents?_\d+$")
+
+        # 1. Collect unused tangent placeholders.
+        unused_tangents: list = []
+        for node in fx_g.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            if not tangent_re.match(node.name):
+                continue
+            if len(node.users) != 0:
+                continue
+            val = node.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                continue
+            unused_tangents.append(node)
+
+        if not unused_tangents:
+            return fx_g
+
+        # 2. Collect candidate get_attr nodes (null-storage or zero-stride
+        #    broadcast on a vulkan tensor).
+        def _is_null_storage(t: torch.Tensor) -> bool:
+            try:
+                return t.data_ptr() == 0
+            except RuntimeError:
+                return True
+
+        def _is_zero_stride_broadcast(t: torch.Tensor) -> bool:
+            try:
+                strides = t.stride()
+            except Exception:  # noqa: BLE001
+                return False
+            if not strides:
+                return False
+            if any(s != 0 for s in strides):
+                return False
+            return t.dim() > 0
+
+        candidates: list = []  # (get_attr_node, attr_tensor)
+        for node in fx_g.graph.nodes:
+            if node.op != "get_attr":
+                continue
+            try:
+                attr = getattr(fx_g, node.target, None)
+            except Exception:  # noqa: BLE001
+                attr = None
+            if not isinstance(attr, torch.Tensor):
+                continue
+            if attr.device.type != "vulkan":
+                continue
+            if not (_is_null_storage(attr) or _is_zero_stride_broadcast(attr)):
+                continue
+            candidates.append((node, attr))
+
+        if not candidates:
+            return fx_g
+
+        # 3. Compute a view-shape that lets tangent_shape broadcast to
+        #    target_shape. Walks right-to-left greedily: each tangent dim
+        #    either matches a target dim or is treated as size-1; extra
+        #    target dims become size-1 in the view. Returns None if the
+        #    tangent has unconsumed dims (no compatible broadcasting).
+        #
+        #    Examples:
+        #      [] → [8, 16]              => [1, 1]
+        #      [16] → [8, 16, 32]        => [1, 16, 1]   (sum(dim=[0,2]))
+        #      [64] → [8, 64]            => [1, 64]      (sum(dim=0))
+        #      [16, 32] → [8, 16, 32]    => [1, 16, 32]  (sum(dim=0))
+        #      [4] → [4, 32]             => [4, 1]       (mean(dim=-1))
+        #      [4, 8] → [4, 8, 16]       => [4, 8, 1]    (mean(dim=-1))
+        def _compute_view_shape(t_shape, g_shape):
+            if len(t_shape) > len(g_shape):
+                return None
+            view = [1] * len(g_shape)
+            t_idx = len(t_shape) - 1
+            for g_idx in range(len(g_shape) - 1, -1, -1):
+                if t_idx < 0:
+                    break
+                ts = t_shape[t_idx]
+                gs = g_shape[g_idx]
+                if ts == gs or ts == 1:
+                    view[g_idx] = ts
+                    t_idx -= 1
+                # Otherwise leave view[g_idx] = 1 (this target dim is broadcast)
+            if t_idx >= 0:
+                return None  # leftover tangent dims — incompatible
+            return view
+
+        modified = False
+        used_candidates: set = set()
+        for tangent in unused_tangents:
+            t_val = tangent.meta["val"]
+            t_shape = tuple(t_val.shape)
+            t_dtype = t_val.dtype
+
+            # Pick the first unused candidate whose dtype matches and whose
+            # shape admits a view-shape for broadcasting from the tangent.
+            picked = None
+            picked_view = None
+            for (gnode, attr) in candidates:
+                if id(gnode) in used_candidates:
+                    continue
+                if attr.dtype != t_dtype:
+                    continue
+                view_shape = _compute_view_shape(t_shape, tuple(attr.shape))
+                if view_shape is None:
+                    continue
+                picked = (gnode, attr)
+                picked_view = view_shape
+                break
+
+            if picked is None:
+                continue
+            gnode, attr = picked
+            used_candidates.add(id(gnode))
+            target_shape = list(attr.shape)
+
+            # Insert (optionally) view(tangent, view_shape) then
+            # expand(..., target_shape). Skip view when t_shape already
+            # equals view_shape (no reshape needed). When tangent is 0-dim
+            # (`[]`), aten.expand handles broadcasting directly without a
+            # view step.
+            tv_val = tangent.meta.get("val")
+            fm = None
+            if isinstance(tv_val, _ft.FakeTensor):
+                fm = tv_val.fake_mode
+
+            # Insert view (if needed) and expand in topological order.
+            # Each inserting_after() context pushes new nodes immediately
+            # after the anchor, so we must anchor the SECOND insertion on
+            # the FIRST node (not on `tangent`) — otherwise the expand
+            # ends up positioned before its source `view`.
+            #
+            # IMPORTANT: mint FakeTensor metadata using the tangent's
+            # actual device (preserving index=None vs index=0). PyTorch
+            # treats ``torch.device("vulkan")`` (index=None) and
+            # ``torch.device("vulkan:0")`` (index=0) as DIFFERENT devices
+            # — the autograd engine cross-checks the gradient device
+            # against the parameter device exactly, so a hardcoded
+            # ``_vulkan_dev = torch.device("vulkan", 0)`` here produces
+            # gradients on ``vulkan:0`` and trips
+            # ``RuntimeError: Function X returned an invalid gradient ...
+            #   expected device vulkan but got vulkan:0`` when the user
+            # model lives on the un-indexed ``vulkan`` device.
+            t_device = tv_val.device if isinstance(tv_val, torch.Tensor) else _vulkan_dev
+            source = tangent
+            anchor = tangent
+            if list(t_shape) != picked_view and len(t_shape) > 0:
+                with fx_g.graph.inserting_after(anchor):
+                    view_node = fx_g.graph.call_function(
+                        torch.ops.aten.view.default,
+                        (tangent, list(picked_view)),
+                    )
+                if fm is not None:
+                    view_node.meta["val"] = fm.from_tensor(
+                        torch.empty(
+                            list(picked_view),
+                            dtype=t_dtype,
+                            device=t_device,
+                        ),
+                        static_shapes=True,
+                    )
+                source = view_node
+                anchor = view_node
+            with fx_g.graph.inserting_after(anchor):
+                expand_node = fx_g.graph.call_function(
+                    torch.ops.aten.expand.default,
+                    (source, target_shape),
+                )
+            # Borrow gnode meta so downstream FakeTensor / lifetime passes
+            # see a vulkan tensor of the right shape/dtype.
+            expand_node.meta = dict(gnode.meta)
+            v = expand_node.meta.get("val")
+            if not (
+                isinstance(v, torch.Tensor) and v.device.type == "vulkan"
+            ) and fm is not None:
+                expand_node.meta["val"] = fm.from_tensor(
+                    torch.empty(
+                        target_shape,
+                        dtype=t_dtype,
+                        device=t_device,
+                    ),
+                    static_shapes=True,
+                )
+            gnode.replace_all_uses_with(expand_node)
+            modified = True
+
+        if modified:
+            fx_g.graph.lint()
+            fx_g.recompile()
+        return fx_g
+
     def _chained(fx_g, joint_inputs):
         if callable(existing):
             fx_g = existing(fx_g, joint_inputs)
@@ -453,6 +691,12 @@ def _install_joint_partition_device_fix() -> None:
             # the device-stamp pass so we don't end up with empty(vulkan)
             # zombies that read uninitialized memory at runtime.
             fx_g = _rewrite_empty_meta_to_tangent_expand(fx_g)
+            # M-NEW.9 + M-AUDIT-PERF.1-followup: rewrite constant-folded
+            # tangent get_attrs back to expand(tangent_placeholder, shape).
+            # Must run after _rewrite_empty_meta_to_tangent_expand (which
+            # also might leave tangents unused) but BEFORE device-stamp /
+            # lifetime annotation (which expect a coherent graph).
+            fx_g = _rewrite_constant_folded_tangent(fx_g)
             fx_g = _stamp_factory_devices(fx_g)
             # PF.40: annotate node.meta["lifetime_class"] on the joint
             # graph. The annotation propagates into fw_module / bw_module

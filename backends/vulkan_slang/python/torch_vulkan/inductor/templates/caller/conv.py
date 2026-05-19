@@ -151,35 +151,20 @@ def _slang_tile_conv2d_gn_relu(
         int(out.stride(3)),
         int(G),
         int(group_size),
-        int(channels_per_group),
-        int(spatial_size),
     )
-    # epsilon is a float packed after the uint fields.
-    # M-pipeline-1-followup: corrected format string. The slang struct
-    # layout (conv_gn_relu.slang::PC) is::
-    #   15 conv dims (uint)            ──┐
-    #    4 stride_in (uint)               │
-    #    4 stride_w  (uint)               ├─ 31 uint
-    #    4 stride_out (uint)              │
-    #    4 GN params (uint)             ──┘
-    #    1 float eps
-    #    1 uint stride_bias (0 when bias absent)
-    #    1 uint _pad
-    # Total = 34 fields = 136 bytes. Format ``"31IfII"`` matches.
-    # Production previously had ``"32IfI"`` / ``"32IfII"`` which
-    # mis-counted the leading uints and produced a layout mismatch
-    # (the eps was packed into an ``I`` slot, truncating the float to
-    # int 0). CPython 3.12 raises ``struct.error: required argument
-    # is not an integer`` for that mismatch — only surfaced now
-    # because M-pipeline-1 just opened the runtime path to this
-    # packer.
+    # PC layout (conv_gn_relu.slang::PC) — trimmed to 124B (≤128B RDNA1 cap):
+    #   15 conv dims + 4 stride_in + 4 stride_w + 4 stride_out
+    #   + 2 GN params (num_groups, group_size)               = 29 uints
+    #   + 1 float eps                                         =  4 bytes
+    #   + 1 uint stride_bias                                  =  4 bytes
+    # Total = 29*4 + 4 + 4 = 124 bytes.
+    # (Removed: spatial_size, channels_per_group, _pad — derived in shader.)
     bias_stride = int(bias.view(-1).stride(0)) if has_bias else 0
     pc = struct.pack(
-        "31IfII",
+        "29IfI",
         *common_fields,
         float(eps),
         bias_stride,
-        0,  # _pad
     )
 
     buffers = [input_t, weight_t]

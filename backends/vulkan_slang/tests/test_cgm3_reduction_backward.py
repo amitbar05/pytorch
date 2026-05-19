@@ -289,8 +289,10 @@ class TestCGM3RegistryIntegrity:
         import torch_vulkan
 
         pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        # torch_vulkan lives at backends/vulkan_slang/python/torch_vulkan/,
+        # shaders live at backends/vulkan_slang/shaders/. Go up two levels.
         reduction_path = os.path.normpath(
-            os.path.join(pkg_dir, "..", "shaders", "lib", "reduction.slang")
+            os.path.join(pkg_dir, "..", "..", "shaders", "lib", "reduction.slang")
         )
 
         with open(reduction_path) as f:
