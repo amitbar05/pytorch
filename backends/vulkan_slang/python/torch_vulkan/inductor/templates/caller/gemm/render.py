@@ -279,14 +279,16 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("[[vk::push_constant]] PC pc;")
     lines.append("")
 
-    # Buffer bindings
-    lines.append(f"[[vk::binding(0)]] StructuredBuffer<{dtype_a}> a;")
-    lines.append(f"[[vk::binding(1)]] StructuredBuffer<{dtype_b}> b;")
+    # Buffer bindings — Blocker E: explicit Set 0 (slangc 2026.7.1 defaults
+    # bindings to Set 1 when no global/[[vk::constant_id]] is present, but
+    # our C++ pipeline layout only declares Set 0).
+    lines.append(f"[[vk::binding(0, 0)]] StructuredBuffer<{dtype_a}> a;")
+    lines.append(f"[[vk::binding(1, 0)]] StructuredBuffer<{dtype_b}> b;")
     if has_bias:
         lines.append(
-            f"[[vk::binding({bias_binding_idx})]] StructuredBuffer<{dtype_bias}> bias;"
+            f"[[vk::binding({bias_binding_idx}, 0)]] StructuredBuffer<{dtype_bias}> bias;"
         )
-    lines.append(f"[[vk::binding({out_binding_idx})]] RWStructuredBuffer<{dtype_c}> c;")
+    lines.append(f"[[vk::binding({out_binding_idx}, 0)]] RWStructuredBuffer<{dtype_c}> c;")
     lines.append("")
 
     # Entry point — delegates to mm_tile::computeTile<Epilogue>
@@ -564,9 +566,10 @@ def _render_mm_int8_slang(
     lines.append("")
 
     # Buffer bindings: A/B are packed uint (4×int8 per word), C is float32.
-    lines.append("[[vk::binding(0)]] StructuredBuffer<uint> a;")
-    lines.append("[[vk::binding(1)]] StructuredBuffer<uint> b;")
-    lines.append("[[vk::binding(2)]] RWStructuredBuffer<float> c;")
+    # Blocker E: explicit Set 0 (slangc 2026.7.1 defaults to Set 1).
+    lines.append("[[vk::binding(0, 0)]] StructuredBuffer<uint> a;")
+    lines.append("[[vk::binding(1, 0)]] StructuredBuffer<uint> b;")
+    lines.append("[[vk::binding(2, 0)]] RWStructuredBuffer<float> c;")
     lines.append("")
 
     # Entry point — delegates to mm_int8::computeTile

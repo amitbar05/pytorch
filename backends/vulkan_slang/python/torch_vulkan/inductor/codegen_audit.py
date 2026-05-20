@@ -152,7 +152,7 @@ def assert_under_locked_ceilings() -> None:
 # before submitting to the real SPIR-V compiler.
 
 _VALIDATE_BRACE_RE = re.compile(r"[{}]")
-_VALIDATE_BINDING_RE = re.compile(r"\[\[vk::binding\((\d+)\)\]\]")
+_VALIDATE_BINDING_RE = re.compile(r"\[\[vk::binding\((\d+)(?:\s*,\s*\d+)?\)\]\]")
 _VALIDATE_GROUPSHARED_RE = re.compile(
     r"groupshared\s+(\w+(?:<[^>]+>)?)\s+(\w+)\s*\[\s*(\d+)\s*\]"
 )

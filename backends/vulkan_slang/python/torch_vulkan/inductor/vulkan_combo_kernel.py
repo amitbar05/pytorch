@@ -304,17 +304,21 @@ class VulkanComboKernel:
                 for dtype_str, name, _outer in rw_decls:
                     code.writeline(f"RWStructuredBuffer<{dtype_str}> {name};")
             code.writeline("};")
-            code.writeline("ParameterBlock<KernelArgs> args;")
+            # Blocker E: pin ParameterBlock to Set 0 — slangc 2026.7.1
+            # otherwise places it on Set 1, which doesn't match the C++
+            # pipeline layout (Set 0 only).
+            code.writeline("[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;")
         else:
             slot = 0
+            # Blocker E: explicit Set 0 (`, 0`) on every binding.
             for dtype_str, name, _outer in in_decls:
                 code.writeline(
-                    f"[[vk::binding({slot})]] StructuredBuffer<{dtype_str}> {name};"
+                    f"[[vk::binding({slot}, 0)]] StructuredBuffer<{dtype_str}> {name};"
                 )
                 slot += 1
             for dtype_str, name, _outer in rw_decls:
                 code.writeline(
-                    f"[[vk::binding({slot})]] RWStructuredBuffer<{dtype_str}> {name};"
+                    f"[[vk::binding({slot}, 0)]] RWStructuredBuffer<{dtype_str}> {name};"
                 )
                 slot += 1
 

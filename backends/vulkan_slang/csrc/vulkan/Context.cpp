@@ -9,11 +9,24 @@
 #include "../backend/Allocator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 
 namespace vulkan {
+
+// Blocker F regression test counter — incremented inside ``debug_callback``
+// whenever a validation message identifies VUID-vkResetDescriptorPool-
+// descriptorPool-00313. Exposed via the static accessor and the
+// ``_descriptor_pool_reset_validation_errors`` pybind so tests can
+// assert that no descriptor-pool race fires under a tight dispatch loop.
+static std::atomic<uint64_t> g_descriptor_pool_reset_validation_errors{0};
+
+uint64_t Context::descriptor_pool_reset_validation_errors() {
+    return g_descriptor_pool_reset_validation_errors.load(
+        std::memory_order_relaxed);
+}
 
 // ── Debug callback ───────────────────────────────────────────────
 VkBool32 VKAPI_CALL Context::debug_callback(
@@ -39,6 +52,19 @@ VkBool32 VKAPI_CALL Context::debug_callback(
     if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)  type_tag += "VALIDATION|";
     if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) type_tag += "PERFORMANCE|";
     if (!type_tag.empty()) type_tag.pop_back();  // drop trailing '|'
+
+    // Blocker F regression hook: count VUID-vkResetDescriptorPool-
+    // descriptorPool-00313 hits independent of stderr verbosity. The
+    // message id stays stable across validation-layer versions, so
+    // tests can assert this counter == 0 even when WARNING+ logging
+    // is suppressed.
+    if (data && data->pMessageIdName &&
+        std::strstr(data->pMessageIdName,
+                    "VUID-vkResetDescriptorPool-descriptorPool-00313") !=
+            nullptr) {
+        g_descriptor_pool_reset_validation_errors.fetch_add(
+            1, std::memory_order_relaxed);
+    }
 
     // When TORCH_VULKAN_DEBUG_UTILS is set, surface every message
     // (including INFO-level best-practices hints) so the M21.3 sweep

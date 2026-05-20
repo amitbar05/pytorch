@@ -73,7 +73,7 @@ class SlangValidationError(Exception):
 
 # ── Regex patterns ────────────────────────────────────────────────────────
 
-_BINDING_RE = re.compile(r"\[\[vk::binding\((\d+)\)\]\]")
+_BINDING_RE = re.compile(r"\[\[vk::binding\((\d+)(?:\s*,\s*\d+)?\)\]\]")
 _GROUPSHARED_RE = re.compile(
     r"groupshared\s+(\w+(?:\s*<[^>]+>)?)\s+(\w+)\s*\[([^\]]+)\]\s*;"
 )

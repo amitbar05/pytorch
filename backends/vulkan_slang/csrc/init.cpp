@@ -420,6 +420,18 @@ PYBIND11_MODULE(_C, m) {
         return rt.desc_pool ? rt.desc_pool->async_resets_drained() : 0;
     });
 
+    // Blocker F regression hook: counts
+    // ``VUID-vkResetDescriptorPool-descriptorPool-00313`` validation
+    // messages the debug-utils messenger has observed since process
+    // start. A correct dispatch loop must hold this at 0 — every
+    // non-zero hit is a Vulkan-spec violation of the form "reset
+    // descriptor pool while command buffer is still in flight".
+    // Tests skip if the validation layer is not active (counter
+    // would always read 0 in that case, masking regressions).
+    m.def("_descriptor_pool_reset_validation_errors", []() -> uint64_t {
+        return vulkan::Context::descriptor_pool_reset_validation_errors();
+    });
+
     // M-NEW.4: cumulative ``vkQueueSubmit`` calls from the M9.2
     // batched-flush hot path on the current device's Stream. The
     // canonical M9.2 win telemetry — post-fix the ratio

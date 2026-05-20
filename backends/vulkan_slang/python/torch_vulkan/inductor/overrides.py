@@ -374,6 +374,20 @@ class VulkanOverrides(OpOverrides):
     # Return _SlangExpr with dtype=torch.bool so that CSE declares the
     # intermediate variable as `bool` (not `float`).  Bool output buffers
     # are StructuredBuffer<uint>; the store path casts bool→uint.
+    #
+    # Blocker D (M18.x): Slang lowers `bool_a < bool_b` to `OpULessThan
+    # %bool ...`, which SPIR-V rejects (`Expected operands to be scalar or
+    # vector int: ULessThan`). This shows up under `torch.max(dim=…)`
+    # codegen, which emits `(a != a) > (b != b)` to push NaN to the end.
+    # Cast bool operands to `uint` before the ordering compare so SPIR-V
+    # sees `OpULessThan %uint ...`. `eq`/`ne` are fine on bools (they
+    # lower to `OpLogicalEqual` / `OpLogicalNotEqual`).
+
+    @staticmethod
+    def _cast_if_bool(x) -> str:
+        if hasattr(x, "dtype") and x.dtype == torch.bool:
+            return f"(uint)({x})"
+        return f"{x}"
 
     @staticmethod
     def eq(a, b):
@@ -385,19 +399,27 @@ class VulkanOverrides(OpOverrides):
 
     @staticmethod
     def lt(a, b):
-        return _SlangExpr(f"({a} < {b})", dtype=torch.bool)
+        a_s = VulkanOverrides._cast_if_bool(a)
+        b_s = VulkanOverrides._cast_if_bool(b)
+        return _SlangExpr(f"({a_s} < {b_s})", dtype=torch.bool)
 
     @staticmethod
     def gt(a, b):
-        return _SlangExpr(f"({a} > {b})", dtype=torch.bool)
+        a_s = VulkanOverrides._cast_if_bool(a)
+        b_s = VulkanOverrides._cast_if_bool(b)
+        return _SlangExpr(f"({a_s} > {b_s})", dtype=torch.bool)
 
     @staticmethod
     def le(a, b):
-        return _SlangExpr(f"({a} <= {b})", dtype=torch.bool)
+        a_s = VulkanOverrides._cast_if_bool(a)
+        b_s = VulkanOverrides._cast_if_bool(b)
+        return _SlangExpr(f"({a_s} <= {b_s})", dtype=torch.bool)
 
     @staticmethod
     def ge(a, b):
-        return _SlangExpr(f"({a} >= {b})", dtype=torch.bool)
+        a_s = VulkanOverrides._cast_if_bool(a)
+        b_s = VulkanOverrides._cast_if_bool(b)
+        return _SlangExpr(f"({a_s} >= {b_s})", dtype=torch.bool)
 
     @staticmethod
     def logical_not(a) -> str:

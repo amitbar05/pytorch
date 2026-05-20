@@ -102,6 +102,15 @@ public:
     static void set_descriptor_indexing_override(int value);
     static int get_descriptor_indexing_override();
 
+    // Blocker F regression test hook: number of
+    // ``VUID-vkResetDescriptorPool-descriptorPool-00313`` validation
+    // errors the messenger has observed since process start. Bumped
+    // from ``debug_callback`` whenever a message containing the VUID
+    // identifier flows through. The pybind ``_descriptor_pool_reset_
+    // validation_errors()`` in ``init.cpp`` reads this counter so
+    // tests can assert == 0.
+    static uint64_t descriptor_pool_reset_validation_errors();
+
     // Release all Vulkan resources held by other singletons before
     // destroying VkDevice. Called automatically from the destructor.
     void shutdown();

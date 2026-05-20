@@ -565,19 +565,23 @@ class HeaderMixin:
             )
             slot = 0  # unused; keep for compatibility
         else:
+            # Blocker E: explicit Set 0 (`, 0`) on every binding.  slangc
+            # 2026.7.1 defaults bare ``[[vk::binding(N)]]`` to Set 1, which
+            # triggers VUID-VkComputePipelineCreateInfo-layout-07988 because
+            # the C++ pipeline layout only declares Set 0.
             for dtype_str, inner in in_decls:
                 code.writeline(
-                    f"[[vk::binding({slot})]] StructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
+                    f"[[vk::binding({slot}, 0)]] StructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
                 )
                 slot += 1
             for dtype_str, inner in out_decls:
                 code.writeline(
-                    f"[[vk::binding({slot})]] RWStructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
+                    f"[[vk::binding({slot}, 0)]] RWStructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
                 )
                 slot += 1
             for dtype_str, inner in inout_decls:
                 code.writeline(
-                    f"[[vk::binding({slot})]] RWStructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
+                    f"[[vk::binding({slot}, 0)]] RWStructuredBuffer<{_binding_dtype(inner, dtype_str)}> {inner};"
                 )
                 slot += 1
 
@@ -618,8 +622,9 @@ class HeaderMixin:
         if not self._use_parameter_block:
             for ws_arg in self.args.workspace_args:
                 ws_dtype_str = self.dtype_to_str(ws_arg.dtype)
+                # Blocker E: explicit Set 0.
                 code.writeline(
-                    f"[[vk::binding({slot})]] RWStructuredBuffer<{ws_dtype_str}> {ws_arg.inner_name};"
+                    f"[[vk::binding({slot}, 0)]] RWStructuredBuffer<{ws_dtype_str}> {ws_arg.inner_name};"
                 )
                 slot += 1
 

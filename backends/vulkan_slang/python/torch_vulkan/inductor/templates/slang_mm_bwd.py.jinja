@@ -73,15 +73,17 @@ struct BwdPC {
 [[vk::push_constant]] BwdPC pc;
 
 // ── Buffer bindings ────────────────────────────────────────────────────
-// M17.1: Per-binding [[vk::binding(N)]] decorations.  ParameterBlock at
+// M17.1: Per-binding [[vk::binding(N, 0)]] decorations.  ParameterBlock at
 // global scope is assigned to Set 1 by slangc 2026.5+, which doesn't match
 // the C++ Pipeline layout (Set 0 only).
+// Blocker E: bare `[[vk::binding(N)]]` (no set qualifier) also lands on
+// Set 1 with slangc 2026.7.1; the explicit `, 0` pins to Set 0.
 // Binding order: a=0, b=1, dc=2, da=3, db=4.
-[[vk::binding(0)]] StructuredBuffer<{{ dtype_a }}> a;
-[[vk::binding(1)]] StructuredBuffer<{{ dtype_b }}> b;
-[[vk::binding(2)]] StructuredBuffer<{{ dtype_c }}> dc;
-[[vk::binding(3)]] RWStructuredBuffer<{{ dtype_a }}> da;
-[[vk::binding(4)]] RWStructuredBuffer<{{ dtype_b }}> db;
+[[vk::binding(0, 0)]] StructuredBuffer<{{ dtype_a }}> a;
+[[vk::binding(1, 0)]] StructuredBuffer<{{ dtype_b }}> b;
+[[vk::binding(2, 0)]] StructuredBuffer<{{ dtype_c }}> dc;
+[[vk::binding(3, 0)]] RWStructuredBuffer<{{ dtype_a }}> da;
+[[vk::binding(4, 0)]] RWStructuredBuffer<{{ dtype_b }}> db;
 
 // +32 bank-conflict padding (M20)
 groupshared {{ dtype_acc }} tile_a[TILE_A_ELEMS + 32];

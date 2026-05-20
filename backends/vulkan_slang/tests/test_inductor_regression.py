@@ -3019,6 +3019,425 @@ class TestExprPrinterSimplify:
         assert out == "0", f"expected '0', got {out!r}"
 
 
+class TestBlockerDBoolOrderingCompare:
+    """Blocker D — Slang lowers `bool_a < bool_b` to SPIR-V
+    `OpULessThan %bool ...`, which spirv-val rejects with
+    ``Expected operands to be scalar or vector int: ULessThan``.
+
+    This crashed SmallCNN training: ``torch.max(dim=…)`` codegen emits
+    ``(a != a) > (b != b)`` (NaN-to-end ordering) where both operands are
+    bool. The fix in ``VulkanOverrides.{lt,gt,le,ge}`` casts bool operands
+    to ``uint`` before the comparison so SPIR-V sees ``OpULessThan %uint``.
+
+    ``eq``/``ne`` are intentionally left alone — they lower to
+    ``OpLogicalEqual`` / ``OpLogicalNotEqual`` which accept bool.
+    """
+
+    def _bool_expr(self, name: str):
+        import torch as _torch
+
+        from torch_vulkan.inductor.overrides import _SlangExpr
+
+        return _SlangExpr(name, dtype=_torch.bool)
+
+    def test_gt_casts_bool_operands_to_uint(self):
+        from torch_vulkan.inductor.overrides import VulkanOverrides
+
+        a = self._bool_expr("tmp7")
+        b = self._bool_expr("tmp8")
+        out = VulkanOverrides.gt(a, b)
+        assert "(uint)(tmp7)" in out and "(uint)(tmp8)" in out, (
+            f"bool > bool must cast both sides to uint, got: {out!r}"
+        )
+
+    def test_lt_casts_bool_operands_to_uint(self):
+        from torch_vulkan.inductor.overrides import VulkanOverrides
+
+        a = self._bool_expr("a")
+        b = self._bool_expr("b")
+        out = VulkanOverrides.lt(a, b)
+        assert "(uint)(a)" in out and "(uint)(b)" in out, (
+            f"bool < bool must cast both sides to uint, got: {out!r}"
+        )
+
+    def test_ge_le_cast_bool_operands(self):
+        from torch_vulkan.inductor.overrides import VulkanOverrides
+
+        a = self._bool_expr("a")
+        b = self._bool_expr("b")
+        for op in (VulkanOverrides.ge, VulkanOverrides.le):
+            out = op(a, b)
+            assert "(uint)(a)" in out and "(uint)(b)" in out, (
+                f"{op.__name__}(bool, bool) must cast to uint, got: {out!r}"
+            )
+
+    def test_non_bool_operands_unchanged(self):
+        """Float / int comparisons must NOT get a spurious uint cast —
+        that would corrupt signed/float ordering."""
+        import torch as _torch
+
+        from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
+
+        a = _SlangExpr("tmp3", dtype=_torch.float32)
+        b = _SlangExpr("tmp4", dtype=_torch.float32)
+        out = VulkanOverrides.gt(a, b)
+        assert "(uint)" not in out, (
+            f"float > float must not insert (uint) cast, got: {out!r}"
+        )
+
+    def test_eq_ne_on_bool_unchanged(self):
+        """`eq`/`ne` on bools lower to OpLogicalEqual/NotEqual — adding a
+        uint cast would defeat that and emit a redundant comparison."""
+        from torch_vulkan.inductor.overrides import VulkanOverrides
+
+        a = self._bool_expr("a")
+        b = self._bool_expr("b")
+        for op in (VulkanOverrides.eq, VulkanOverrides.ne):
+            out = op(a, b)
+            assert "(uint)" not in out, (
+                f"{op.__name__}(bool, bool) must not insert uint cast, got: {out!r}"
+            )
+
+    def test_mixed_bool_and_float_casts_only_bool(self):
+        import torch as _torch
+
+        from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
+
+        a = self._bool_expr("flag")
+        b = _SlangExpr("val", dtype=_torch.float32)
+        out = VulkanOverrides.gt(a, b)
+        assert "(uint)(flag)" in out, (
+            f"bool side must be cast, got: {out!r}"
+        )
+        assert "(uint)(val)" not in out, (
+            f"float side must NOT be cast, got: {out!r}"
+        )
+
+
+class TestBlockerEPipelineLayoutSet0:
+    """Blocker E — slangc 2026.7.1 places ``[[vk::binding(N)]]`` (no set
+    qualifier) on Descriptor Set 1 instead of Set 0 when no global
+    parameter / ``[[vk::constant_id]]`` is present in the module.  This
+    triggers ``VUID-VkComputePipelineCreateInfo-layout-07988`` because the
+    C++ pipeline layout in ``csrc/vulkan/Pipeline.cpp`` only declares
+    Set 0, and silently corrupts descriptor reads on RADV.
+
+    Every codegen / template emit site must use the explicit
+    ``[[vk::binding(N, 0)]]`` form to pin bindings to Set 0.  This test
+    enforces the invariant at every Python emit site we ship.
+    """
+
+    _BARE_BINDING_RE = r"\[\[vk::binding\((\d+)\)\]\]"
+    _SET0_BINDING_RE = r"\[\[vk::binding\(\s*\d+\s*,\s*0\s*\)\]\]"
+
+    def test_gemm_caller_renders_set0_bindings(self):
+        """``templates/caller/gemm/render.py`` (``_render_mm_slang``) must
+        emit ``[[vk::binding(N, 0)]]`` on every binding for the mm caller.
+        """
+        import re
+
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_slang,
+        )
+
+        src = _render_mm_slang(
+            tile_m=64,
+            tile_n=64,
+            tile_k=16,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_acc="float",
+            dtype_bias="float",
+            epilogue_struct="OpGELU",
+            num_stages=1,
+            has_bias=True,
+            m_per_thread=4,
+            n_per_thread=4,
+        )
+        bare = re.findall(self._BARE_BINDING_RE, src)
+        assert not bare, (
+            f"Blocker E regressed — _render_mm_slang emits bare "
+            f"`[[vk::binding(N)]]` (no set qualifier; slangc 2026.7.1 "
+            f"places these on Set 1): bindings={bare}\n"
+            f"--- source ---\n{src}"
+        )
+        assert re.search(self._SET0_BINDING_RE, src) is not None, (
+            "_render_mm_slang emitted zero Set 0 bindings — expected at "
+            "least one `[[vk::binding(N, 0)]]`."
+        )
+
+    def test_gemm_int8_caller_renders_set0_bindings(self):
+        """``_render_mm_int8_slang`` (OP.24 wrapper) — Blocker E reproducer
+        was an int8 matmul autotune candidate; check the int8 wrapper too.
+        """
+        import re
+
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_int8_slang,
+        )
+
+        src = _render_mm_int8_slang(
+            tile_m=32,
+            tile_n=32,
+            tile_k=16,
+            m_per_thread=4,
+            n_per_thread=4,
+        )
+        bare = re.findall(self._BARE_BINDING_RE, src)
+        assert not bare, (
+            f"Blocker E regressed — _render_mm_int8_slang emits bare "
+            f"`[[vk::binding(N)]]`: bindings={bare}\n"
+            f"--- source ---\n{src}"
+        )
+        # OP.24 wrapper has exactly 3 bindings (a, b, c).
+        set0 = re.findall(self._SET0_BINDING_RE, src)
+        assert len(set0) == 3, (
+            f"_render_mm_int8_slang must declare exactly 3 Set 0 bindings, "
+            f"got {len(set0)}."
+        )
+
+    def test_mm_bwd_caller_renders_set0_bindings(self):
+        """``_render_mm_bwd_slang`` (slang_mm_bwd template) must emit
+        ``[[vk::binding(N, 0)]]`` on every binding.
+        """
+        import re
+
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_bwd_slang,
+        )
+
+        src = _render_mm_bwd_slang(
+            tile_m=32,
+            tile_n=32,
+            tile_k=16,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_acc="float",
+        )
+        bare = re.findall(self._BARE_BINDING_RE, src)
+        assert not bare, (
+            f"Blocker E regressed — _render_mm_bwd_slang emits bare "
+            f"`[[vk::binding(N)]]`: bindings={bare}"
+        )
+
+    def test_codegen_header_uses_set0_for_parameter_block(self):
+        """The ParameterBlock branch in ``kernel/header.py`` emits
+        ``[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;`` so the
+        whole descriptor table lands on Set 0.  Sanity-check the source.
+        """
+        from pathlib import Path
+
+        header_py = (
+            Path(__import__("torch_vulkan").__file__).parent
+            / "inductor"
+            / "kernel"
+            / "header.py"
+        )
+        text = header_py.read_text()
+        assert (
+            '[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;' in text
+        ), (
+            "kernel/header.py must emit `[[vk::binding(0, 0)]] "
+            "ParameterBlock<KernelArgs> args;` — Blocker E pin."
+        )
+        # And the legacy (non-ParameterBlock) branch — every binding line
+        # we emit must include the `, 0` set qualifier.
+        import re
+
+        # Find every `[[vk::binding({slot}...)]]` literal in the source
+        # (these are the codegen emit f-strings).  Each must include
+        # `, 0` somewhere before the closing paren.
+        emit_calls = re.findall(
+            r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text
+        )
+        bad = [c for c in emit_calls if ", 0)" not in c]
+        assert not bad, (
+            f"kernel/header.py legacy-branch binding emits missing `, 0` "
+            f"set qualifier: {bad}"
+        )
+
+    def test_combo_kernel_uses_set0_bindings(self):
+        """``vulkan_combo_kernel.py`` emits ParameterBlock and legacy
+        binding lines; both must pin to Set 0.
+        """
+        from pathlib import Path
+
+        ck_py = (
+            Path(__import__("torch_vulkan").__file__).parent
+            / "inductor"
+            / "vulkan_combo_kernel.py"
+        )
+        text = ck_py.read_text()
+        assert (
+            '[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;' in text
+        ), (
+            "vulkan_combo_kernel.py must emit "
+            "`[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;`."
+        )
+        import re
+
+        emit_calls = re.findall(
+            r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text
+        )
+        bad = [c for c in emit_calls if ", 0)" not in c]
+        assert not bad, (
+            f"vulkan_combo_kernel.py legacy-branch binding emits missing "
+            f"`, 0` set qualifier: {bad}"
+        )
+
+    def test_mm_caller_jinja_template_source_uses_set0(self):
+        """Source-level lock on the .jinja templates so a future author
+        can't drop the `, 0` set qualifier and silently regress Blocker E.
+        Targets ``slang_mm.py.jinja`` and ``slang_mm_bwd.py.jinja`` —
+        the two templates that ship bare bindings (no ParameterBlock).
+        """
+        import re
+        from pathlib import Path
+
+        templates_dir = (
+            Path(__import__("torch_vulkan").__file__).parent
+            / "inductor"
+            / "templates"
+        )
+        for name in ("slang_mm.py.jinja", "slang_mm_bwd.py.jinja"):
+            path = templates_dir / name
+            text = path.read_text()
+            # Drop comments before searching so banner text mentioning
+            # `[[vk::binding(N)]]` doesn't trigger a false positive.
+            text_nc = re.sub(r"//[^\n]*", "", text)
+            bare = re.findall(self._BARE_BINDING_RE, text_nc)
+            assert not bare, (
+                f"Blocker E regressed in {name} — bare "
+                f"`[[vk::binding(N)]]` literal (no set qualifier; slangc "
+                f"places these on Set 1): bindings={bare}"
+            )
+
+
+class TestBlockerFDescriptorPoolReset:
+    """Blocker F — ``vkResetDescriptorPool`` race.
+
+    ``DescriptorPool::reset_async(fence)`` is called immediately after
+    every ``flush_async()`` submits a cmd buffer with ``current_fence_``.
+    The cmd buffer that was just submitted is now in-flight and still
+    references descriptor sets allocated from this pool — yet the prior
+    implementation walked ``pending_resets_`` BEFORE pushing the new
+    fence, so an earlier signaled fence could trigger
+    ``vkResetDescriptorPool`` while a newly-submitted cmd buffer was
+    still executing.  That fires
+    ``VUID-vkResetDescriptorPool-descriptorPool-00313`` and corrupts
+    subsequent dispatches whose descriptor sets are recycled mid-flight.
+
+    The fix in ``csrc/vulkan/DescriptorSet.cpp:reset_async`` is to push
+    the new fence BEFORE the opportunistic drain pass so the drain sees
+    every fence covering work that has used this pool.
+    """
+
+    def _validation_layer_active(self) -> bool:
+        """Best-effort check: the validation layer must be enabled for
+        the counter to mean anything. We detect it via two signals:
+        ``VK_INSTANCE_LAYERS`` mentions ``VK_LAYER_KHRONOS_validation``,
+        or the ``TORCH_VULKAN_VALIDATION`` alias is set to a non-zero
+        value. Either way, if no layer is loaded the counter sits at 0
+        regardless of pool-reset correctness, so a passing test would
+        be vacuous.
+        """
+        layers = os.environ.get("VK_INSTANCE_LAYERS", "") or ""
+        if "VK_LAYER_KHRONOS_validation" in layers:
+            return True
+        alias = os.environ.get("TORCH_VULKAN_VALIDATION", "")
+        if alias and alias != "0":
+            return True
+        return False
+
+    def test_descriptor_pool_no_vuid_00313_under_dispatch_loop(self):
+        """Tight ``mm`` dispatch loop must not trigger any
+        ``VUID-vkResetDescriptorPool-descriptorPool-00313`` validation
+        errors.
+
+        The loop runs enough iterations to cross
+        ``Stream::MAX_DISPATCHES_PER_CMD`` (32) several times so the
+        ``flush_async() → reset_async(fence)`` path fires repeatedly —
+        which is exactly where the race lived.
+        """
+        import torch_vulkan
+        from torch_vulkan import _C as _C_ext
+
+        if not hasattr(
+            _C_ext, "_descriptor_pool_reset_validation_errors"
+        ):
+            pytest.skip(
+                "C++ pybind ``_descriptor_pool_reset_validation_errors"
+                "`` missing — backend has not been rebuilt with the "
+                "Blocker F counter."
+            )
+        if not self._validation_layer_active():
+            pytest.skip(
+                "Vulkan validation layer not active — the counter "
+                "will read 0 regardless of correctness. Re-run with "
+                "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation."
+            )
+
+        # Snapshot the counter before exercising the dispatch loop.
+        before = _C_ext._descriptor_pool_reset_validation_errors()
+
+        # Force several batched flushes: each mm submits a handful of
+        # dispatches and 50 × ~3 dispatches per mm easily crosses the
+        # 32-dispatch flush threshold ~5 times.
+        for _ in range(50):
+            a = torch.randn(64, 64, device="vulkan")
+            b = torch.randn(64, 64, device="vulkan")
+            (a @ b).cpu()  # forces flush + readback per iter
+
+        after = _C_ext._descriptor_pool_reset_validation_errors()
+        new_errors = after - before
+        assert new_errors == 0, (
+            f"Blocker F regressed — observed {new_errors} "
+            f"VUID-vkResetDescriptorPool-descriptorPool-00313 hits "
+            f"across a 50-iteration mm dispatch loop. "
+            f"``DescriptorPool::reset_async`` is resetting the pool "
+            f"while a just-submitted command buffer still uses "
+            f"descriptors from it."
+        )
+
+    def test_descriptor_pool_async_drain_progresses(self):
+        """Sanity-check telemetry: under the same dispatch loop the
+        async-reset path should both fire AND drain. If
+        ``async_resets_drained`` lags ``async_reset_requests`` by an
+        unbounded amount the queue is growing without bound — a
+        latent correctness risk even when VUID-00313 isn't tripped.
+        """
+        import torch_vulkan
+        from torch_vulkan import _C as _C_ext
+
+        if not hasattr(_C_ext, "_descriptor_pool_async_reset_requests"):
+            pytest.skip("async-reset counters missing from pybind")
+
+        req0 = _C_ext._descriptor_pool_async_reset_requests()
+        drained0 = _C_ext._descriptor_pool_async_resets_drained()
+
+        for _ in range(50):
+            a = torch.randn(64, 64, device="vulkan")
+            b = torch.randn(64, 64, device="vulkan")
+            (a @ b).cpu()
+
+        req = _C_ext._descriptor_pool_async_reset_requests() - req0
+        drained = _C_ext._descriptor_pool_async_resets_drained() - drained0
+
+        # We don't require ``drained == req`` (a single drain pass may
+        # collapse several queued resets into one), but ``drained``
+        # must be > 0 once ``req`` is > 0.
+        if req > 0:
+            assert drained > 0, (
+                f"Async-reset queue is not draining: "
+                f"requests={req} drained={drained}. The descriptor "
+                f"pool's pending_resets_ list is growing without "
+                f"bound — synchronize()'s pre_sync_callback may not "
+                f"be wired correctly."
+            )
+
+
 class TestMatmulTemplateCompiles:
     """The Slang matmul Jinja template must produce slangc-compilable SPIR-V
     for every (num_stages, has_bias) combination the runtime ships. Regression

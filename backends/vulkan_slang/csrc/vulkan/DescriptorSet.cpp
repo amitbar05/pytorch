@@ -92,10 +92,6 @@ bool DescriptorPool::async_reset_enabled() {
 }
 
 void DescriptorPool::reset_async(VkFence wait_fence) {
-    // Always opportunistically drain at the boundary — picks up any
-    // resets whose fences signaled since the last drain.
-    drain_pending_resets();
-
     if (!async_reset_enabled() || wait_fence == VK_NULL_HANDLE) {
         // Fallback: synchronous reset. Caller's ``pre_reset_cb_``
         // (typically ``flush_stream``) has already waited for the
@@ -105,13 +101,25 @@ void DescriptorPool::reset_async(VkFence wait_fence) {
         return;
     }
 
+    // Blocker F fix: push the new fence BEFORE attempting any drain.
+    // ``reset_async(F_N)`` is called immediately after ``flush_async()``
+    // submits cmd buffer N with fence ``F_N``; that cmd buffer is now
+    // in-flight and still references descriptors allocated from this
+    // pool. If we drain BEFORE pushing, ``drain_pending_resets()`` sees
+    // only earlier fences (e.g. ``[F_{N-1}]``); if ``F_{N-1}`` has
+    // signaled, drain will call ``vkResetDescriptorPool`` while cmd
+    // buffer N is still using descriptors — VUID-vkResetDescriptorPool-
+    // descriptorPool-00313. Pushing first guarantees the drain pass
+    // only resets when ALL queued fences (including the one we just
+    // pushed) have signaled.
     pending_resets_.push_back(wait_fence);
     async_reset_requests_++;
 
-    // Poll the just-queued fence too — if it's already signaled
-    // (e.g. small fast workload), reset immediately instead of
-    // waiting for the next drain pass. This keeps the async path
-    // perf-equivalent to sync for the cache-warm case.
+    // Poll opportunistically: if ``wait_fence`` is already signaled
+    // (e.g. small fast workload), drain immediately to reset the pool.
+    // Fences signal in queue submission order, so a signaled
+    // ``wait_fence`` implies every earlier pending fence has signaled
+    // too — safe to reset.
     VkResult status = vkGetFenceStatus(device_, wait_fence);
     if (status == VK_SUCCESS) {
         drain_pending_resets();

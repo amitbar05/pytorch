@@ -92,18 +92,20 @@ struct PC {
 
 [[vk::push_constant]] PC pc;
 
-// M17.1 — Buffer bindings use explicit [[vk::binding(N)]] decorations.
+// M17.1 — Buffer bindings use explicit [[vk::binding(N, 0)]] decorations.
 // ParameterBlock<KernelArgs> at global scope is assigned to Set 1 by
 // slangc 2026.5+, which doesn't match the C++ Pipeline layout (Set 0).
-// Per-binding decorations avoid the set mismatch entirely.
+// Blocker E: bare `[[vk::binding(N)]]` (no set qualifier) also lands on
+// Set 1 with slangc 2026.7.1; the explicit `, 0` pins bindings to Set 0
+// to match the pipeline layout.
 // Binding order: a=0, b=1, [bias=2,] c={{ 3 if has_bias else 2 }}.
 {%- set c_binding = 3 if has_bias else 2 %}
-[[vk::binding(0)]] StructuredBuffer<{{ dtype_a }}> a;
-[[vk::binding(1)]] StructuredBuffer<{{ dtype_b }}> b;
+[[vk::binding(0, 0)]] StructuredBuffer<{{ dtype_a }}> a;
+[[vk::binding(1, 0)]] StructuredBuffer<{{ dtype_b }}> b;
 {% if has_bias %}
-[[vk::binding(2)]] StructuredBuffer<{{ dtype_bias | default(dtype_c) }}> bias;
+[[vk::binding(2, 0)]] StructuredBuffer<{{ dtype_bias | default(dtype_c) }}> bias;
 {% endif %}
-[[vk::binding({{ c_binding }})]] RWStructuredBuffer<{{ dtype_c }}> c;
+[[vk::binding({{ c_binding }}, 0)]] RWStructuredBuffer<{{ dtype_c }}> c;
 {% if num_stages > 1 %}
 // Double-buffered: stage 0 occupies the first half, stage 1 the second half.
 // Flat 1-D layout (rather than `[2][N]`) so helpers can index with a single
