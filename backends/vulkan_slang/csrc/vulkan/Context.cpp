@@ -256,11 +256,19 @@ void Context::init_device(uint32_t index) {
     desc_idx_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
 
+    // 2026-05-20: query VK_KHR_maintenance4 feature. Enables
+    // SPIR-V LocalSizeId execution mode (slangc 2026.5.2 emits this
+    // for kernels with spec-constant numthreads).
+    VkPhysicalDeviceMaintenance4Features maint4_features{};
+    maint4_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES;
+    maint4_features.pNext = &desc_idx_features;
+
     // M18.4-followup-C: Vulkan 1.1 features expose
     // ``storageBuffer16BitAccess`` + ``uniformAndStorageBuffer16BitAccess``.
     VkPhysicalDeviceVulkan11Features vk11_features{};
     vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-    vk11_features.pNext = &desc_idx_features;
+    vk11_features.pNext = &maint4_features;
 
     VkPhysicalDeviceVulkan12Features vk12_features{};
     vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -281,6 +289,8 @@ void Context::init_device(uint32_t index) {
     dev.caps.storage_buffer_16bit = vk11_features.storageBuffer16BitAccess;
     dev.caps.uniform_and_storage_buffer_16bit =
         vk11_features.uniformAndStorageBuffer16BitAccess;
+    // 2026-05-20: stash maintenance4 cap for device-create step.
+    dev.caps.maintenance4 = maint4_features.maintenance4;
 
     // ── Descriptor indexing support ─────────────────────────
     // Gate: env var TORCH_VULKAN_DESCRIPTOR_INDEXING (default 1 on
@@ -391,12 +401,42 @@ void Context::init_device(uint32_t index) {
     // M18.4-followup-C: shaderInt16 unlocks 16-bit arithmetic in shaders.
     enabled_features.shaderInt16 = dev.caps.int16 ? VK_TRUE : VK_FALSE;
 
+    // 2026-05-20: enable VK_KHR_maintenance4 if supported. slangc 2026.5.2
+    // emits SPIR-V using OpExecutionMode LocalSizeId, which requires
+    // maintenance4 OR Vulkan 1.3. Probe device-level extension support
+    // and only enable when the device actually advertises it.
+    VkPhysicalDeviceMaintenance4Features enabled_maint4{};
+    enabled_maint4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES;
+    enabled_maint4.maintenance4 = dev.caps.maintenance4 ? VK_TRUE : VK_FALSE;
+    if (dev.caps.maintenance4) {
+        enabled_maint4.pNext = enabled_vk12.pNext;
+        enabled_vk12.pNext = &enabled_maint4;
+    }
+
+    std::vector<const char*> device_extensions;
+    if (dev.caps.maintenance4) {
+        uint32_t dev_ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(
+            dev.physical, nullptr, &dev_ext_count, nullptr);
+        std::vector<VkExtensionProperties> dev_exts(dev_ext_count);
+        vkEnumerateDeviceExtensionProperties(
+            dev.physical, nullptr, &dev_ext_count, dev_exts.data());
+        for (const auto& ext : dev_exts) {
+            if (strcmp(ext.extensionName, "VK_KHR_maintenance4") == 0) {
+                device_extensions.push_back("VK_KHR_maintenance4");
+                break;
+            }
+        }
+    }
+
     VkDeviceCreateInfo device_ci{};
     device_ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_ci.pNext = &enabled_vk12;
     device_ci.queueCreateInfoCount = 1;
     device_ci.pQueueCreateInfos = &queue_ci;
-    device_ci.enabledExtensionCount = 0;
+    device_ci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_ci.ppEnabledExtensionNames =
+        device_extensions.empty() ? nullptr : device_extensions.data();
     device_ci.pEnabledFeatures = &enabled_features;
 
     VkResult result = vkCreateDevice(dev.physical, &device_ci, nullptr, &dev.logical);

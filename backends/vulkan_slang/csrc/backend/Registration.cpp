@@ -87,6 +87,20 @@ at::Tensor vulkan_empty(
 
     auto dtype = dtype_opt.value_or(at::ScalarType::Float);
     auto device = device_opt.value_or(c10::Device(c10::DeviceType::PrivateUse1, 0));
+    // 2026-05-20: normalize unindexed ``vulkan`` (DeviceIndex == -1) to
+    // ``vulkan:0``. PyTorch's autograd engine cross-checks the gradient
+    // device against the parameter device exactly. If the user creates
+    // tensors via ``torch.randn(..., device="vulkan")`` they land with
+    // ``device.index == -1``, while every allocation we make goes to
+    // device 0 — the eventual ``CompiledFunctionBackward`` returns
+    // ``vulkan:0`` and trips
+    // ``RuntimeError: returned an invalid gradient ... expected device
+    //   vulkan but got vulkan:0``. Normalizing the user-supplied device
+    // index here, at the entry point to PrivateUse1 tensor creation,
+    // closes that mismatch class for every model and every input.
+    if (device.is_privateuseone() && device.index() < 0) {
+        device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    }
 
     auto nbytes = c10::elementSize(dtype);
     for (auto s : size) nbytes *= s;
@@ -175,6 +189,11 @@ at::Tensor vulkan_empty_strided(
     // what the kernels expect.
     auto dtype = dtype_opt.value_or(at::ScalarType::Float);
     auto device = device_opt.value_or(c10::Device(c10::DeviceType::PrivateUse1, 0));
+    // 2026-05-20: normalize unindexed ``vulkan`` (DeviceIndex == -1) to
+    // ``vulkan:0`` — see ``vulkan_empty`` for rationale.
+    if (device.is_privateuseone() && device.index() < 0) {
+        device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    }
 
     // Compute the required storage size: max linear offset + 1.
     // For a tensor with shape (d0,...,dn) and strides (s0,...,sn),

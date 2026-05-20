@@ -569,6 +569,15 @@ def _register_device_module():
             return _c_ext._device_count()
 
         @staticmethod
+        def current_device():
+            """2026-05-20: needed for PyTorch's device-index resolution.
+            ``torch.device("vulkan")`` (index=None) calls this to map to
+            ``vulkan:<idx>`` for some operations. Returning 0 keeps a
+            single-device backend consistent with the C++ side, which
+            also normalizes index=-1 → index=0 in ``vulkan_empty``."""
+            return 0
+
+        @staticmethod
         def get_device_name(device_index=0):
             return _c_ext._get_device_name(device_index)
 

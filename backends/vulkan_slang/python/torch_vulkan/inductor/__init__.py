@@ -354,6 +354,117 @@ def _backend_version_tag() -> str:
     return h.hexdigest()[:12]
 
 
+def _patch_extern_convolution_out_kwarg() -> None:
+    """2026-05-20: wrap ``extern_kernels.convolution`` to accept ``out=``.
+
+    Inductor's wrapper codegen — at least for our PrivateUse1 backward
+    path — emits ``extern_kernels.convolution(args, ..., out=buf)`` for
+    the recomputed-conv-in-backward case. ``extern_kernels.convolution``
+    is set by upstream's ``ExternKernelChoice(torch.convolution, ...)``
+    constructor, so it resolves to ``torch.convolution`` which has no
+    ``out=`` parameter.
+
+    The expected codegen path (`ExternKernelAlloc` because
+    ``aten_convolution.has_out_variant = False``) emits ``out_name =
+    extern_kernels.convolution(args)`` with no ``out=``, so this
+    workaround only fires on the path where the wrapper does emit
+    ``out=``. The patched callable handles both shapes:
+
+    1. With ``out=`` — runs ``torch.convolution(args)``, copies into
+       ``out``, returns ``out``.
+    2. Without ``out=`` — passes through to ``torch.convolution`` as
+       before.
+
+    Idempotent and best-effort: if ``extern_kernels`` isn't importable
+    yet (very early import), the patch is skipped and the caller can
+    re-invoke later.
+    """
+    try:
+        import torch
+        from torch._inductor.select_algorithm import extern_kernels
+    except Exception:  # noqa: BLE001
+        return
+
+    existing = getattr(extern_kernels, "convolution", None)
+    if existing is None:
+        # Upstream hasn't constructed ``aten_convolution`` yet — kick its
+        # import so the attribute exists, then re-fetch.
+        try:
+            import torch._inductor.kernel.conv  # noqa: F401
+        except Exception:  # noqa: BLE001
+            return
+        existing = getattr(extern_kernels, "convolution", None)
+    if existing is None:
+        return
+    if getattr(existing, "_vulkan_out_kwarg_patched", False):
+        return  # already patched
+
+    def _vulkan_convolution_wrapper(*args, out=None, **kwargs):
+        # 2026-05-20: ``torch.convolution`` on the PrivateUse1 device
+        # chokes when ``bias`` is passed as None via kwargs ("tensor
+        # does not have a device" inside the dispatcher). The same call
+        # works against ``torch.ops.aten.convolution_overrideable``,
+        # which is our registered backend op. Route through it.
+        #
+        # Wrapper handles positional (input, weight, bias) and the kwarg
+        # form Inductor emits.
+        import torch
+        if len(args) >= 2 and isinstance(args[0], torch.Tensor) and isinstance(args[1], torch.Tensor):
+            input_t, weight_t = args[0], args[1]
+            bias_t = args[2] if len(args) >= 3 else kwargs.pop("bias", None)
+            stride = kwargs.pop("stride", (1,) * (input_t.dim() - 2))
+            padding = kwargs.pop("padding", (0,) * (input_t.dim() - 2))
+            dilation = kwargs.pop("dilation", (1,) * (input_t.dim() - 2))
+            transposed = kwargs.pop("transposed", False)
+            output_padding = kwargs.pop("output_padding", (0,) * (input_t.dim() - 2))
+            groups = kwargs.pop("groups", 1)
+            # Synthesize a zero bias when None — the C++ PrivateUse1
+            # dispatcher's path through aten.convolution / overrideable
+            # trips ``tensor does not have a device`` if bias is None
+            # (the optional-tensor unboxing path queries .device() on
+            # the undefined tensor before checking definedness). Passing
+            # an explicit zero tensor side-steps the bug; mathematically
+            # equivalent (bias=0 is identity for convolution).
+            if bias_t is None:
+                bias_t = torch.zeros(
+                    int(weight_t.shape[0]),
+                    device=weight_t.device,
+                    dtype=weight_t.dtype,
+                )
+            # Route via convolution_overrideable so our registered
+            # PrivateUse1 adapter handles the dispatch.
+            result = torch.ops.aten.convolution_overrideable(
+                input_t,
+                weight_t,
+                bias_t,
+                list(stride),
+                list(padding),
+                list(dilation),
+                bool(transposed),
+                list(output_padding),
+                int(groups),
+            )
+        else:
+            result = existing(*args, **kwargs)
+        if out is None:
+            return result
+        # ``out`` is a pre-allocated buffer whose shape matches the
+        # convolution result. Copy and return it so the caller's buffer
+        # is filled in-place (matching the upstream out= contract).
+        if out.shape != result.shape:
+            if out.numel() == result.numel():
+                out.view_as(result).copy_(result)
+            else:
+                return result
+        else:
+            out.copy_(result)
+        return out
+
+    _vulkan_convolution_wrapper._vulkan_out_kwarg_patched = True
+    _vulkan_convolution_wrapper.__name__ = "convolution"
+    setattr(extern_kernels, "convolution", _vulkan_convolution_wrapper)
+
+
 def _legacy_register() -> None:
     """Body of the historical scattered registration.
 
@@ -367,6 +478,12 @@ def _legacy_register() -> None:
         return
 
     _namespace_inductor_cache()
+
+    # 2026-05-20: patch ``extern_kernels.convolution`` to accept ``out=``.
+    # Workaround for an Inductor codegen quirk where the backward wrapper
+    # emits ``extern_kernels.convolution(..., out=buf)`` — see the
+    # function docstring for details.
+    _patch_extern_convolution_out_kwarg()
 
     # PF.30.h — install Vulkan autotune harness support before any
     # lowering or template registration triggers autotune code paths.

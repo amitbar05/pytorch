@@ -41,6 +41,11 @@ struct DeviceCapabilities {
     bool uniform_and_storage_buffer_8bit = false;
     bool storage_buffer_16bit = false;
     bool uniform_and_storage_buffer_16bit = false;
+    // 2026-05-20: VK_KHR_maintenance4 enables SPIR-V LocalSizeId execution
+    // mode (slangc 2026.5.2 emits it for spec-constant numthreads kernels).
+    // Without it, kernels using SPIR-V 1.5+ LocalSizeId fail validation:
+    // "LocalSizeId is used but maintenance4 feature was not enabled".
+    bool maintenance4 = false;
 };
 
 class Context {
