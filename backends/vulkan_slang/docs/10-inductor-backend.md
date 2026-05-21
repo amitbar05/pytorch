@@ -36,6 +36,63 @@
 
 ---
 
+## 0.0.5 CONV-TRAINING E2E SESSION 2026-05-21
+
+User ran the SmallCNN training E2E and worked through each error.
+
+**Landed (commit `f4666c76ec9`):**
+- **slangc resolver** picks 2026.7.1 from repo-root `third_party/slang/`
+  (the backend-root tree carries a stale 2026.5.2 that segfaults).
+  Sorts candidates by parsed semver, prefers newest.  Matches the
+  conftest auto-resolver so standalone `python -c` works.
+- **`-ignore-capabilities` slangc flag** added to every runtime
+  invocation site.  slangc 2026.7.1 trips on `subgroup_ballot` →
+  `wave_active_count_bits` (`helpers.slang:175`) with `E36104:
+  undeclared capability 'spvGroupNonUniform'` and crashes the
+  compiler under thread-pool concurrency.  The runtime SPIR-V is
+  unaffected; every device we ship to supports subgroupVote/Ballot.
+- **`aten::random_.from`** PrivateUse1 IMPL in `philox_dispatch.py`
+  via the existing uniform → floor → cast path.  Allows eager
+  `torch.randint(low, high, size, device="vulkan")` to work.
+- **Library lifetime trap fixed.**  `_rng_lib` is now module-global,
+  not a local in `install()`.  Decorator-style `@torch.library.impl
+  (lib, name)` accidentally keeps the lib alive via closure on the
+  produced wrapper; direct `lib.impl(name, fn)` does NOT — the lib
+  GCs on `install()` return and PyTorch unregisters every kernel.
+- **Eager-side philox install hook** in `torch_vulkan._register()`
+  so `torch.randint` works in eager mode before any `torch.compile`.
+
+**Test status (after the above):**
+- ✅ `test_forward_compiles`
+- ✅ `test_forward_output_shape` (B ∈ {1, 4, 8})
+- ✅ `test_3step_training_loss` (SmallCNN trains E2E, loss strictly
+  decreasing over 3 SGD steps — 226 s cold)
+- ✅ `test_dispatch_count`
+- 🔥 `test_forward_vs_cpu` — output is ~2× the CPU output
+  (`abs_max_err ≈ 1.12` post-cache-clear).  Probe in isolation:
+  *Conv alone* matches CPU to fp32 precision (`max_err 4.8e-7`);
+  *Conv + GroupNorm* gives ~2× CPU; *GroupNorm alone* gives ~1.42×
+  (sqrt(2)) on the same shape.  Pattern: VK variance is consistently
+  smaller than CPU's by a factor that depends on input distribution,
+  not a constant — points at a Welford-reduction codegen bug in the
+  `aten.var_mean.correction` lowering (`lowerings/norm.py:81`), not
+  the conv_gn_relu fused template (which is unused without ReLU).
+- 🔥 `test_grad_parity`, `test_10step_no_nan`, `test_forward_backward`
+  — backward path produces NaN gradients for conv1.weight; suspected
+  cascade from the 2× GN forward bug.
+
+**Open follow-up — M-NEW.10 Welford correctness in GN forward:**
+The 2× GN forward bug is the next training-correctness blocker.
+Steps to repro live at `agent_space/probe_gn_2x.py` (gn_only, conv_gn,
+conv_gn_relu — all show the consistent variance underestimate).
+Hypothesis: the welford partial-reduction stage in `kernel/reduction.py`
+sums `m2` correctly but the final divisor (`stats.n`) is over-counted
+when the tree reduction combines per-subgroup partials.  Confirm by
+dumping intermediate `(mean, m2, n)` from `wg_welford` and comparing
+against a single-thread reference for the same input.
+
+---
+
 ## 0.0.6 CONV-TRAINING CRITICAL PATH (2026-05-19, user-directed focus)
 
 **Goal:** `TestSmallCNNTrain` (test_e2e_models.py:1172) trains end-to-end
