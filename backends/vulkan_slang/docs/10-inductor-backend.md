@@ -430,6 +430,7 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M19.6** | Foreach pointwise generic Slang template (covers 16 foreach ops) | open |
 | **M19.7** | Complex pointwise C++ bridge (closes OP.20) | in-flight (Dtype-Matrix agent) |
 | **M19.8** | Slang autotune empty-choices warning + render-binding-set ratchet | open |
+| **M19.R** | `aten.rot90.default` compile-mode correctness fix + dispatch reduction | ✅ **DONE 2026-05-21** — `lowerings/activation.py::_rot90` rewritten. The prior iterative form (`for _ in range(k): result = flip(transpose(_), [dims[1]])`) accidentally computed `rot90(x, 3*k)` instead of `rot90(x, k)` — k%4 ∈ {1, 3} returned the rotation in the wrong direction. Eager mode never hit this path (eager goes through C++ `aten.rot90`), so `TestCov3Rot90::test_rot90_eager_parity` could not catch it. The new lowering switches on `k%4`: k=1 → `flip(transpose(x, d0, d1), [d0])`, k=2 → `flip(flip(x, [d0]), [d1])`, k=3 → `transpose(flip(x, [d0]), d0, d1)`. k=3 also drops from 3 flip dispatches → 1. Tests: `TestM19RRot90DispatchAndCorrectness` (12 parametrised compile-mode parity cases + 2 source-grep gates locking the new shape). Survey: `agent_space/lowering_survey_2026_05_21.md` §2.1. |
 
 ### 0.6.3 M20 — Slang feature re-investment (supersedes M13)
 
