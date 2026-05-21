@@ -144,6 +144,17 @@ def _register():
 
     install_zero_grad_runtime_hook()
 
+    # 2026-05-21: install the Philox PrivateUse1 IMPL overrides at eager-
+    # register time, not lazily at inductor-backend-register time.  These
+    # supply ``aten::rand`` / ``randn`` / ``uniform`` / ``random_.from`` /
+    # ``native_dropout`` for the Vulkan device. Without this call,
+    # ``torch.randint(low, high, size, device="vulkan")`` (a common
+    # eager-only call before any ``torch.compile`` invocation) errors with
+    # ``Operation 'aten::random_.from … is not yet implemented``.
+    from torch_vulkan.inductor.philox_dispatch import install as _install_philox
+
+    _install_philox()
+
 
 def _register_serialization():
     """Register hooks so torch.save/load works with Vulkan tensors."""

@@ -41,6 +41,7 @@ def _resolve_slangc(raw: str) -> str:
     if os.path.isabs(raw) and os.path.exists(raw):
         return raw
     # Already on PATH → done.
+    import re
     import shutil
 
     which = shutil.which(raw)
@@ -58,18 +59,39 @@ def _resolve_slangc(raw: str) -> str:
             "..",
         )
     )
+    # …repo root sits one more level up: 5 dirnames from this file.
+    repo_root = os.path.normpath(os.path.join(backend_root, "..", ".."))
     candidates = [
         os.path.join(backend_root, raw),
         os.path.join(os.getcwd(), raw),
     ]
-    # Auto-detect slangc in third_party/slang/build/
-    third_party_root = os.path.join(backend_root, "third_party", "slang", "build")
-    if os.path.isdir(third_party_root):
-        for entry in sorted(os.listdir(third_party_root), reverse=True):
-            candidate = os.path.join(third_party_root, entry, "bin", "slangc")
+    # Auto-detect slangc.  Search BOTH ``third_party/slang/build/`` roots
+    # (repo-root and backend-root) and prefer the newest version by parsed
+    # ``slang-MAJOR.MINOR.PATCH-…`` tag.  Matches the conftest behavior so
+    # standalone ``python -c`` invocations resolve to the same binary as
+    # the test suite — without this, an older 2026.5.2 build sitting in
+    # ``backend/third_party/`` shadows the 2026.7.1 at the repo root,
+    # producing slangc-side segfaults on every prewarm dispatch.
+
+    def _ver_key(path: str) -> tuple[int, ...]:
+        m = re.search(r"slang-(\d+)\.(\d+)\.(\d+)", path)
+        return tuple(int(g) for g in m.groups()) if m else (0, 0, 0)
+
+    third_party_roots = [
+        os.path.join(repo_root, "third_party", "slang", "build"),
+        os.path.join(backend_root, "third_party", "slang", "build"),
+    ]
+    seen: list[str] = []
+    for tpr in third_party_roots:
+        if not os.path.isdir(tpr):
+            continue
+        for entry in os.listdir(tpr):
+            candidate = os.path.join(tpr, entry, "bin", "slangc")
             if os.path.isfile(candidate):
-                candidates.append(candidate)
-                break
+                seen.append(candidate)
+    if seen:
+        seen.sort(key=_ver_key, reverse=True)
+        candidates.append(seen[0])
     for c in candidates:
         if os.path.exists(c):
             return os.path.abspath(c)
@@ -961,6 +983,12 @@ def _slangc_supports_modules() -> bool:
                     "-o",
                     out_path,
                     "-matrix-layout-row-major",
+            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
+            # ``helpers.wave_active_count_bits`` even though every Vulkan
+            # device we ship to supports subgroupVote/Ballot; the error
+            # path then crashes the compiler in the thread-pool case.
+            # Bypass the static check — runtime SPIR-V is unaffected.
+            "-ignore-capabilities",
                     "-I",
                     _SHADERS_LIB_DIR,
                 ],
@@ -1703,6 +1731,12 @@ def _compile_slang_to_spirv_inner(
             "-reflection-json",
             refl_path,
             "-matrix-layout-row-major",
+            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
+            # ``helpers.wave_active_count_bits`` even though every Vulkan
+            # device we ship to supports subgroupVote/Ballot; the error
+            # path then crashes the compiler in the thread-pool case.
+            # Bypass the static check — runtime SPIR-V is unaffected.
+            "-ignore-capabilities",
         ]
         for ip in module_includes:
             cmd.extend(["-I", ip])
@@ -1761,6 +1795,12 @@ def _compile_slang_to_spirv_inner(
                 "-reflection-json",
                 refl_path,
                 "-matrix-layout-row-major",
+            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
+            # ``helpers.wave_active_count_bits`` even though every Vulkan
+            # device we ship to supports subgroupVote/Ballot; the error
+            # path then crashes the compiler in the thread-pool case.
+            # Bypass the static check — runtime SPIR-V is unaffected.
+            "-ignore-capabilities",
                 "-I",
                 _SHADERS_LIB_DIR,
             ]
@@ -1848,6 +1888,12 @@ def _compile_slang_to_spirv_inner(
                                 "-reflection-json",
                                 new_refl_path,
                                 "-matrix-layout-row-major",
+            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
+            # ``helpers.wave_active_count_bits`` even though every Vulkan
+            # device we ship to supports subgroupVote/Ballot; the error
+            # path then crashes the compiler in the thread-pool case.
+            # Bypass the static check — runtime SPIR-V is unaffected.
+            "-ignore-capabilities",
                             ]
                             if used_module_includes:
                                 for ip in module_includes:
