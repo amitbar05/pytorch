@@ -36,6 +36,39 @@
 
 ---
 
+## 0.0.5.1 SLANGC UPGRADE ATTEMPT 2026-05-22 (REVERTED)
+
+User asked to upgrade slangc to the latest. Tried v2026.8.1 and v2026.9.1
+(downloaded the official linux-x86_64 release binaries). Both **segfault**
+reproducibly on `import helpers;` from any entry file outside `shaders/lib/`
+(any cwd, any -I form, with or without -ignore-capabilities). The minimal
+repro fits in one line:
+
+```bash
+echo 'import helpers; [shader("compute")] [numthreads(64,1,1)] void computeMain(uint3 lid : SV_GroupThreadID, RWStructuredBuffer<float> buf) { buf[lid.x] = float(lid.x); }' > /tmp/t.slang
+slangc-2026.9.1 /tmp/t.slang -target spirv -entry computeMain -o /tmp/t.spv -I backends/vulkan_slang/shaders/lib -ignore-capabilities
+# → Segmentation fault (core dumped); exit 139
+```
+
+The same kernel + lib set under v2026.7.1 compiles cleanly (just with the
+known `spvGroupNonUniform` capability noise we already mask with
+`-ignore-capabilities`). Bisected: a stripped reconstruction of
+`helpers.slang` placed in `/tmp/` (same content, same module name) compiles
+fine — so the crash is data-dependent on the entry path resolving an
+external module through a directory full of sibling .slang files. Looks
+like a slangc 2026.8+ regression in cross-directory module discovery /
+implicit-load.
+
+**Decision**: stay on v2026.7.1. The 2026.9.1 + 2026.8.1 binaries were
+removed from `third_party/slang/build/`. The runtime resolver
+(`runtime/slangc.py:_resolve_slangc`) sorts by semver and now picks
+v2026.7.1 again.
+
+**Follow-up**: file the segfault upstream once we have a reduced repro
+that doesn't involve our `__exported import` re-export pattern.
+
+---
+
 ## 0.0.5 CONV-TRAINING E2E SESSION 2026-05-21
 
 User ran the SmallCNN training E2E and worked through each error.
@@ -188,6 +221,75 @@ at the **second conv2d** dispatch (extern_kernels.convolution), which
 emits a constant repeated output — a SEPARATE bug in the
 extern-conv lowering path (NOT in Group D scope), filed as the
 next follow-up.
+
+**M-NEW.12 ✅ CLOSED 2026-05-22** — `DispatchBatcher` direct-dispatch
+race in the wrapper codegen.
+
+Bisection initially hypothesised that the second conv2d was going
+through `extern_kernels.convolution` and dropping the call.  The
+actual root cause is structural: the wrapper queues Triton-style
+kernel dispatches via ``_batcher.add(...)`` (see
+``wrapper.py::_generate_kernel_call_helper``) and flushes only at
+``_batcher.__exit__`` at the end of the wrapper.  Custom-op /
+template-caller lines — ``torch.ops.torch_vulkan.conv2d_gn_relu_fused.
+default(...)``, ``_slang_tile_conv2d(buf2, primals_6, buf3, ...)``,
+etc. — are emitted by ``ir.FallbackKernel.codegen`` /
+``ir.ExternKernelOut.codegen`` / custom ``codegen()`` methods on
+lowering nodes as **immediate** Python function calls.  When a
+direct call reads from a buffer that a still-queued kernel was
+supposed to populate, the read sees uninitialised (zero) data.
+
+Repro probe `agent_space/probe_second_conv2d.py` (Test C: full
+chain) — pre-fix output was `2 × 32 × 16 × 16` with **only 32 unique
+values** (one per output channel = the bias broadcast across all
+spatial positions); the actual conv kernel never ran because the
+preceding queued MaxPool2d hadn't fired yet.  Setting
+`TORCH_VULKAN_BATCH_DISPATCH=0` made the bug disappear, confirming
+the diagnosis.
+
+Fix (Group F + Group H + `__init__.py`):
+
+1. ``runtime/batcher.py`` — add class-level ``DispatchBatcher._current``
+   (set/cleared on ``__enter__`` / ``__exit__``) plus a public
+   ``DispatchBatcher.flush_current_if_active()`` classmethod that
+   any direct-call site can invoke.
+
+2. ``wrapper.py`` — emit a
+   ``DispatchBatcher.flush_current_if_active()`` line at the head of
+   every direct-dispatch path:
+   * ``generate_extern_kernel_alloc`` (for ``ExternKernelAlloc`` /
+     ``FallbackKernel`` allocations with ``out=`` rewriting),
+   * ``generate_extern_kernel_out`` (for ``ExternKernelOut`` —
+     covers the ``_slang_tile_conv2d`` / ``_slang_tile_mm`` template
+     caller lines whose lowering custom-overrides ``codegen()``),
+   * ``generate_fallback_kernel`` (for the FallbackKernel path
+     that emits ``buf_N = torch.ops.foo.default(...)`` without
+     going through extern_kernel_alloc — this was the missed hook
+     in the first attempt; ``conv2d_gn_relu_fused`` goes through
+     here because it has ``MultiOutputLayout``).
+
+3. ``python/torch_vulkan/inductor/__init__.py`` —
+   ``_patch_direct_call_template_helpers_flush_batcher`` wraps
+   ``_slang_tile_conv2d`` and ``_slang_tile_mm`` in
+   ``vulkan_template_caller`` so they flush the active batcher
+   (defence in depth — catches any future direct-dispatch caller
+   that bypasses the wrapper-side hook).
+
+Regression gate:
+``tests/test_inductor_regression.py::TestM_NEW_12_SecondConv2dCorrectness``
+(four tests: `pool_then_conv2`, `full_chain_relu2`,
+`two_convs_back_to_back`, `dispatchbatcher_active_tracking`).
+
+Layer-bisect re-run with M-NEW.12 confirms **all 10 stages** of the
+SmallCNN forward (`conv1 … fc`) match CPU to ≤ 2.9e-6.
+`tests/test_e2e_models.py::TestSmallCNNTrain::test_forward_vs_cpu`
+passes.
+
+Forward path is closed.  Remaining red tests
+(`test_grad_parity`, `test_10step_no_nan`, `test_forward_backward`)
+all fail with `Non-finite grad for conv1.weight` (NaN gradients) —
+a SEPARATE backward-path issue.  Not in M-NEW.12 scope; tracked as
+M-NEW.13 follow-up.
 
 ---
 
