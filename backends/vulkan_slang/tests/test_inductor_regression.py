@@ -4939,6 +4939,113 @@ class TestVarMeanWelford:
         torch.testing.assert_close(mean.cpu(), mean_ref, rtol=1e-4, atol=1e-5)
 
 
+class TestMNEW10WelfordVariance:
+    """M-NEW.10: ``wg_welford`` (shaders/lib/reduction.slang) produced a
+    half-magnitude variance for any reduction whose total ``size`` exceeded
+    the subgroup width (size >= 256 on RDNA1 wave64), and a near-zero
+    variance for reductions with size < simd (e.g. size=16).
+
+    Root cause was twofold:
+      (1) ``lane + offset < size`` was the wrong butterfly guard: ``lane``
+          is the within-wave index (0..simd-1) but ``size`` is the total
+          workgroup-reduction extent.  When size > simd the guard was
+          always true so high lanes issued ``WaveReadLaneAt(..., lane +
+          offset >= simd)`` — an out-of-range subgroup shuffle that
+          returns undefined data on RDNA1.
+      (2) The function was emitted **out-of-line** by slangc.  In the
+          multistage code path (per-thread n>1) the out-of-line callable
+          version mishandled the cross-wave ``groupshared`` writes,
+          dropping roughly half the per-thread contributions.
+
+    Fix (in ``shaders/lib/reduction.slang``):
+      - Replaced the wave-level guard with ``lane + offset < wave_valid``
+        where ``wave_valid = min(simd, size - wave_id*simd)``, snapshotted
+        all three neighbour reads (mean, m2, n) before any local write,
+        and broadcast lane 0's result to every lane via ``WaveReadLaneAt``
+        for ``n_waves == 1`` (so unguarded post-reduction stores see a
+        uniform value).
+      - Re-added ``[ForceInline]`` on ``wg_welford`` (the M-AUDIT-PERF.1
+        slangc-hang justification no longer reproduces on slangc 2026.7.1).
+
+    Regression: ``aten.var_mean.correction`` (and therefore
+    ``F.group_norm``) over any reduction extent must match CPU to fp32
+    precision.  Covers size <= simd, size > simd, and the multistage
+    n>1 per-thread code path."""
+
+    def _run_var_mean(self, shape):
+        torch.manual_seed(0)
+        x_cpu = torch.randn(*shape)
+        x_vk = x_cpu.to("vulkan")
+
+        def fn(x):
+            return torch.var_mean(x, dim=[2], correction=0, keepdim=True)
+
+        var_cpu, mean_cpu = fn(x_cpu)
+        compiled = torch.compile(fn, backend="inductor")
+        var_vk, mean_vk = compiled(x_vk)
+        var_vk_cpu = var_vk.cpu()
+        mean_vk_cpu = mean_vk.cpu()
+
+        var_err = (var_vk_cpu - var_cpu).abs().max().item()
+        mean_err = (mean_vk_cpu - mean_cpu).abs().max().item()
+        assert var_err < 1e-4, (
+            f"var max-abs err {var_err:.3e} >= 1e-4 for shape {shape}"
+        )
+        assert mean_err < 1e-4, (
+            f"mean max-abs err {mean_err:.3e} >= 1e-4 for shape {shape}"
+        )
+
+    def test_size_16_subgroup_partial(self):
+        # size < simd (= 64 on RDNA1): only first 16 lanes hold real data.
+        # Pre-fix: variance == 0 because lane 63's stale m2 won the
+        # unguarded post-reduction write race.
+        self._run_var_mean([1, 1, 16])
+
+    def test_size_64_single_wave(self):
+        # Exactly one wave's worth of data.
+        self._run_var_mean([1, 1, 64])
+
+    def test_size_128_two_waves(self):
+        # Two waves: exercises cross-wave smem reduction.
+        self._run_var_mean([1, 1, 128])
+
+    def test_size_256_four_waves(self):
+        # Four waves: exercises the OOB-shuffle bug (lane+offset >= simd).
+        # Pre-fix: variance ~0.61× CPU.
+        self._run_var_mean([1, 1, 256])
+
+    def test_size_1024_full_threadgroup(self):
+        # Full max_threadgroup_size (RDNA1).  Pre-fix: variance ~0.51× CPU.
+        self._run_var_mean([1, 1, 1024])
+
+    def test_size_4096_multistage(self):
+        # Multistage path: 256 threads × 16 elements/thread.  Per-thread
+        # accumulator has n=16, exercising the n>1 path that the
+        # out-of-line wg_welford mishandled.  Pre-fix: variance ~0.51× CPU.
+        self._run_var_mean([1, 1, 4096])
+
+    def test_group_norm_forward_matches_cpu(self):
+        # End-to-end through ``aten.native_group_norm`` (the original
+        # surface where the bug presented as a ~2× output).
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        x_cpu = torch.randn(2, 16, 32, 32)
+        w_cpu = torch.randn(16)
+        b_cpu = torch.randn(16)
+        ref = F.group_norm(x_cpu, num_groups=4, weight=w_cpu, bias=b_cpu)
+
+        def fn(x, w, b):
+            return F.group_norm(x, num_groups=4, weight=w, bias=b)
+
+        compiled = torch.compile(fn, backend="inductor")
+        out_vk = compiled(
+            x_cpu.to("vulkan"), w_cpu.to("vulkan"), b_cpu.to("vulkan")
+        ).cpu()
+        err = (out_vk - ref).abs().max().item()
+        assert err < 1e-3, f"group_norm max-abs err {err:.3e} >= 1e-3"
+
+
 class TestReductionOrderStability:
     """P5.6: when WG-size autotune picks a different workgroup, the reduction
     tree changes and the final value drifts by a few ULP. The drift must be

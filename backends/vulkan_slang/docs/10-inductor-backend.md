@@ -81,15 +81,47 @@ User ran the SmallCNN training E2E and worked through each error.
   — backward path produces NaN gradients for conv1.weight; suspected
   cascade from the 2× GN forward bug.
 
-**Open follow-up — M-NEW.10 Welford correctness in GN forward:**
-The 2× GN forward bug is the next training-correctness blocker.
-Steps to repro live at `agent_space/probe_gn_2x.py` (gn_only, conv_gn,
-conv_gn_relu — all show the consistent variance underestimate).
-Hypothesis: the welford partial-reduction stage in `kernel/reduction.py`
-sums `m2` correctly but the final divisor (`stats.n`) is over-counted
-when the tree reduction combines per-subgroup partials.  Confirm by
-dumping intermediate `(mean, m2, n)` from `wg_welford` and comparing
-against a single-thread reference for the same input.
+**M-NEW.10 ✅ CLOSED 2026-05-21** — Welford correctness fix in
+`shaders/lib/reduction.slang::wg_welford` (+ mirror in
+`vk_reduction.slang`).  Two stacked bugs:
+
+* **(B1) OOB shuffle.**  The wave-level butterfly guard was
+  `lane + offset < size`, but `lane` is within-wave (0..simd-1) and
+  `size` is the total workgroup-reduction extent.  Whenever
+  `size > simd`, the guard was vacuously true, so lanes near simd-1
+  issued `WaveReadLaneAt(..., lane+offset >= simd)` — an out-of-range
+  subgroup shuffle that returns undefined data on RDNA1.  Symptom:
+  variance ~0.51× CPU for size ≥ 256, and variance ≈ 0 for size < simd
+  (lane 63's stale m2 won the unguarded post-reduction store race).
+  Fix: replaced the guard with `lane + offset < wave_valid` where
+  `wave_valid = min(simd, size - wave_id*simd)`, snapshotted all three
+  neighbour reads (mean, m2, n) before any local write, and broadcast
+  lane 0's result to every lane via `WaveReadLaneAt(..., 0)` for the
+  `n_waves == 1` fast path (so unguarded post-reduction pointwise stores
+  see a uniform value).
+
+* **(B2) Out-of-line callable mis-codegens groupshared writes.**  With
+  `[ForceInline]` removed under M-AUDIT-PERF.1, slangc emits
+  `wg_welford` as an out-of-line callable.  In the multistage code
+  path (per-thread n>1 input, e.g. `numthreads=256` with 16 elements
+  per thread for size=4096), the out-of-line version dropped roughly
+  half the per-thread contributions in the cross-wave smem fold.
+  Confirmed in isolation: the same algorithm inlined into the kernel
+  matches CPU bit-for-bit; emitted as a function call produces m2 at
+  half magnitude.  Fix: re-added `[ForceInline]`.  The M-AUDIT-PERF.1
+  slangc-hang justification (slangc 2026.5.2 > 30 s inlining) no
+  longer reproduces on slangc 2026.7.1.
+
+Regression gate: `tests/test_inductor_regression.py::TestMNEW10WelfordVariance`
+covers seven shapes (size in {16, 64, 128, 256, 1024, 4096}) plus an
+end-to-end `F.group_norm` parity check.  All match CPU to fp32
+precision.
+
+Repro probe: `agent_space/probe_gn_2x.py` (now passes for every shape).
+The end-to-end `test_forward_vs_cpu` still fails with `max err ≈ 0.87`
+post-fix — the Welford bug was real but only part of the picture; the
+remaining error traces to a downstream slang_addmm / linear-layer
+path, not GroupNorm.  Filed as separate follow-up.
 
 ---
 

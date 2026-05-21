@@ -280,6 +280,10 @@ groupshared float _welford_smem_m2[1024 + 32];
 groupshared float _welford_smem_n[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
+// M-NEW.10: [ForceInline] re-added — see reduction.slang for the bug
+// rationale (out-of-line callable produces half-magnitude m2 in the
+// multistage code path).  M-AUDIT-PERF.1's slangc-hang justification
+// no longer reproduces on slangc 2026.7.1.
 [ForceInline]
 public WelfordResult<float> wg_welford(
     WelfordResult<float> v, uint tid, uint size, uint simd)
@@ -292,20 +296,39 @@ public WelfordResult<float> wg_welford(
     uint n_waves = (size + simd - 1u) / simd;
 
     // Wave-level reduction
+    // M-NEW.10: see reduction.slang for the full bug write-up.  Summary:
+    // (1) clamp combine to `wave_valid` (within-wave partner only); the
+    //     prior `lane + offset < size` was always true once size > simd,
+    //     so high lanes did OOB WaveReadLaneAt picking up undefined data.
+    // (2) snapshot all three neighbor reads before mutating local acc.
+    // (3) broadcast lane 0's result for n_waves==1 so unguarded post-
+    //     reduction pointwise stores see a consistent value.
     WelfordResult<float> acc = v;
+    uint wave_base = wave_id * simd;
+    uint wave_valid = min(simd, size > wave_base ? size - wave_base : 0u);
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+        float other_mean = WaveReadLaneAt(acc.mean, lane + offset);
+        float other_m2 = WaveReadLaneAt(acc.m2, lane + offset);
         float other_n = WaveReadLaneAt(acc.n, lane + offset);
-        if (lane + offset < size) {
+        if (lane + offset < wave_valid) {
             float n_total = acc.n + other_n;
-            float delta = WaveReadLaneAt(acc.mean, lane + offset) - acc.mean;
-            acc.mean = acc.mean + delta * other_n / n_total;
-            acc.m2 = acc.m2 + WaveReadLaneAt(acc.m2, lane + offset) + delta * delta * acc.n * other_n / n_total;
+            float inv = n_total > 0.0f ? 1.0f / n_total : 0.0f;
+            float delta = other_mean - acc.mean;
+            float new_mean = acc.mean + delta * other_n * inv;
+            float new_m2 = acc.m2 + other_m2 + delta * delta * acc.n * other_n * inv;
+            acc.mean = new_mean;
+            acc.m2 = new_m2;
             acc.n = n_total;
         }
     }
 
-    if (n_waves == 1u)
-        return acc;
+    if (n_waves == 1u) {
+        WelfordResult<float> bcast;
+        bcast.mean = WaveReadLaneAt(acc.mean, 0u);
+        bcast.m2 = WaveReadLaneAt(acc.m2, 0u);
+        bcast.n = WaveReadLaneAt(acc.n, 0u);
+        return bcast;
+    }
 
     if (lane == 0u) {
         _welford_smem_mean[wave_id] = acc.mean;
@@ -315,35 +338,26 @@ public WelfordResult<float> wg_welford(
 
     GroupMemoryBarrierWithGroupSync();
 
-    if (wave_id == 0u) {
-        WelfordResult<float> r;
-        r.mean = (tid < n_waves) ? _welford_smem_mean[tid] : 0.0f;
-        r.m2 = (tid < n_waves) ? _welford_smem_m2[tid] : 0.0f;
-        r.n = (tid < n_waves) ? _welford_smem_n[tid] : 0.0f;
-
-        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-            float other_n = WaveReadLaneAt(r.n, lane + offset);
-            if (lane + offset < n_waves && other_n > 0.0f) {
-                float n_total = r.n + other_n;
-                float delta = WaveReadLaneAt(r.mean, lane + offset) - r.mean;
-                r.mean = r.mean + delta * other_n / n_total;
-                r.m2 = r.m2 + WaveReadLaneAt(r.m2, lane + offset) + delta * delta * r.n * other_n / n_total;
-                r.n = n_total;
-            }
+    // Every thread runs the serial fold redundantly — no `if (tid == 0u)`
+    // means no divergence around the final state, no second barrier
+    // required, and no chance for slangc to elide per-lane stores around
+    // a divergent barrier.  See reduction.slang for the full rationale.
+    WelfordResult<float> r = WelfordResult<float>(
+        _welford_smem_mean[0], _welford_smem_m2[0], _welford_smem_n[0]);
+    for (uint i = 1u; i < n_waves; ++i) {
+        float b_mean = _welford_smem_mean[i];
+        float b_m2 = _welford_smem_m2[i];
+        float b_n = _welford_smem_n[i];
+        if (b_n > 0.0f) {
+            float n_total = r.n + b_n;
+            float inv = 1.0f / n_total;
+            float delta = b_mean - r.mean;
+            r.mean = r.mean + delta * b_n * inv;
+            r.m2 = r.m2 + b_m2 + delta * delta * r.n * b_n * inv;
+            r.n = n_total;
         }
-
-        _welford_smem_mean[tid] = r.mean;
-        _welford_smem_m2[tid] = r.m2;
-        _welford_smem_n[tid] = r.n;
     }
-
-    GroupMemoryBarrierWithGroupSync();
-
-    WelfordResult<float> result;
-    result.mean = _welford_smem_mean[0];
-    result.m2 = _welford_smem_m2[0];
-    result.n = _welford_smem_n[0];
-    return result;
+    return r;
 }
 
 // ── 2D wave reduction for partitioned layouts ────────────────────────

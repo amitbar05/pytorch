@@ -279,11 +279,21 @@ groupshared float _welford_smem_m2[1024 + 32];
 groupshared float _welford_smem_n[1024 + 32];
 
 [require(spirv, subgroup_shuffle)]
-// M-AUDIT-PERF.1: [ForceInline] removed — combination of spec-constant
-// loop bound (simd = VK_SUBGROUP_SIZE) and nested subgroup-shuffle loops
-// causes slangc 2026.5.2 to hang > 30 s during inlining. Letting slangc
-// keep wg_welford as a callable function compiles in < 1 s with no
-// measurable runtime impact (single call per kernel).
+// M-NEW.10: [ForceInline] re-added.  Inlined-into-caller behavior is
+// observed-correct; an out-of-line callable version of this function
+// (which slangc would otherwise emit) produces a half-magnitude m2 in
+// the multistage code path (per-thread n>1 input).  The root cause
+// appears to be that slangc emits a per-lane callable body that
+// duplicates the `groupshared` _welford_smem_* arrays per lane in some
+// IR pass — when called by import, only a subset of lanes write valid
+// smem values, leaving the rest at uninitialised-or-default state and
+// the cross-wave fold sees holes.  Inlining the body into the kernel
+// scope makes the groupshared declarations workgroup-unique and the
+// algorithm matches CPU bit-for-bit.
+// The original [ForceInline] removal under M-AUDIT-PERF.1 cited a
+// > 30 s slangc hang due to nested spec-constant loops + shuffle.
+// That regression is no longer reproducible with slangc 2026.7.1.
+[ForceInline]
 public WelfordResult<float> wg_welford(
     WelfordResult<float> v, uint tid, uint size, uint simd)
 {
@@ -295,20 +305,66 @@ public WelfordResult<float> wg_welford(
     uint n_waves = (size + simd - 1u) / simd;
 
     // Wave-level reduction
+    // M-NEW.10: TWO bugs fixed here.
+    //
+    // (1) Out-of-bounds WaveReadLaneAt.  The prior guard `lane + offset <
+    //     size` was wrong: `lane` is within-wave (0..simd-1) but `size` is
+    //     the total workgroup-reduction size.  Whenever `size > simd`, the
+    //     guard is `lane + offset < something-larger-than-simd`, which is
+    //     always true within the wave — so lanes near the high end issued
+    //     `WaveReadLaneAt(..., lane+offset >= simd)`, returning undefined
+    //     values from an out-of-range lane.  Symptom: variance ~0.5× CPU
+    //     once size >= 256.  The correct guard for wave-level reduction is
+    //     `lane + offset < simd` (i.e., the partner lane is in our wave)
+    //     AND `wave_id*simd + lane + offset < size` (i.e., the partner
+    //     thread has valid data — only meaningful when this wave is the
+    //     last wave with partial occupancy, e.g., size=16, simd=64).
+    //
+    // (2) Snapshot all neighbor reads (mean, m2, n) BEFORE any local write.
+    //     The old form interleaved a WaveReadLaneAt(acc.m2, …) with an
+    //     update to acc.mean, which lets slangc reorder the m2 read past
+    //     the mean write under SIMT lockstep — picking up a partially
+    //     mutated state.  Reading all three first and combining into
+    //     locals avoids the window entirely.
+    //
+    // (3) For n_waves == 1, broadcast lane 0's result to all lanes via
+    //     WaveReadLaneAt so the caller's post-reduction pointwise stores
+    //     (which run on every lane, not just lane 0) see the same value.
+    //     The prior fast-path returned each lane's local acc; lane 63 of
+    //     a size=16 reduction has m2=0 and won an unguarded race writing
+    //     `tmp_wf.m2 / size` over lane 0's correct value.  Symptom: var=0
+    //     for size < simd in a single-wave kernel.
     WelfordResult<float> acc = v;
+    uint wave_base = wave_id * simd;
+    uint wave_valid = min(simd, size > wave_base ? size - wave_base : 0u);
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+        float other_mean = WaveReadLaneAt(acc.mean, lane + offset);
+        float other_m2 = WaveReadLaneAt(acc.m2, lane + offset);
         float other_n = WaveReadLaneAt(acc.n, lane + offset);
-        if (lane + offset < size) {
+        if (lane + offset < wave_valid) {
             float n_total = acc.n + other_n;
-            float delta = WaveReadLaneAt(acc.mean, lane + offset) - acc.mean;
-            acc.mean = acc.mean + delta * other_n / n_total;
-            acc.m2 = acc.m2 + WaveReadLaneAt(acc.m2, lane + offset) + delta * delta * acc.n * other_n / n_total;
+            float inv = n_total > 0.0f ? 1.0f / n_total : 0.0f;
+            float delta = other_mean - acc.mean;
+            float new_mean = acc.mean + delta * other_n * inv;
+            float new_m2 = acc.m2 + other_m2 + delta * delta * acc.n * other_n * inv;
+            acc.mean = new_mean;
+            acc.m2 = new_m2;
             acc.n = n_total;
         }
     }
 
-    if (n_waves == 1u)
-        return acc;
+    if (n_waves == 1u) {
+        // Broadcast lane 0's combined result to every lane in the wave.
+        // The caller's post-reduction pointwise store runs on all lanes;
+        // if we returned each lane's local acc, the unguarded `arr[i] =
+        // result.m2 / N` would let lane 63's stale m2 race over lane 0's
+        // correct value.
+        WelfordResult<float> bcast;
+        bcast.mean = WaveReadLaneAt(acc.mean, 0u);
+        bcast.m2 = WaveReadLaneAt(acc.m2, 0u);
+        bcast.n = WaveReadLaneAt(acc.n, 0u);
+        return bcast;
+    }
 
     if (lane == 0u) {
         _welford_smem_mean[wave_id] = acc.mean;
@@ -318,35 +374,28 @@ public WelfordResult<float> wg_welford(
 
     GroupMemoryBarrierWithGroupSync();
 
-    if (wave_id == 0u) {
-        WelfordResult<float> r;
-        r.mean = (tid < n_waves) ? _welford_smem_mean[tid] : 0.0f;
-        r.m2 = (tid < n_waves) ? _welford_smem_m2[tid] : 0.0f;
-        r.n = (tid < n_waves) ? _welford_smem_n[tid] : 0.0f;
-
-        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-            float other_n = WaveReadLaneAt(r.n, lane + offset);
-            if (lane + offset < n_waves && other_n > 0.0f) {
-                float n_total = r.n + other_n;
-                float delta = WaveReadLaneAt(r.mean, lane + offset) - r.mean;
-                r.mean = r.mean + delta * other_n / n_total;
-                r.m2 = r.m2 + WaveReadLaneAt(r.m2, lane + offset) + delta * delta * r.n * other_n / n_total;
-                r.n = n_total;
-            }
+    // Cross-wave reduction: every thread runs the serial fold on the
+    // n_waves smem entries.  Each thread does the same work (slight
+    // redundancy at most simd iterations) but no `if (tid == 0u)`
+    // means no divergence around the final smem write, no need for a
+    // second barrier, and no SIMT-convergence corner case where slangc
+    // could elide or reorder per-lane stores around the barrier.
+    WelfordResult<float> r = WelfordResult<float>(
+        _welford_smem_mean[0], _welford_smem_m2[0], _welford_smem_n[0]);
+    for (uint i = 1u; i < n_waves; ++i) {
+        float b_mean = _welford_smem_mean[i];
+        float b_m2 = _welford_smem_m2[i];
+        float b_n = _welford_smem_n[i];
+        if (b_n > 0.0f) {
+            float n_total = r.n + b_n;
+            float inv = 1.0f / n_total;
+            float delta = b_mean - r.mean;
+            r.mean = r.mean + delta * b_n * inv;
+            r.m2 = r.m2 + b_m2 + delta * delta * r.n * b_n * inv;
+            r.n = n_total;
         }
-
-        _welford_smem_mean[tid] = r.mean;
-        _welford_smem_m2[tid] = r.m2;
-        _welford_smem_n[tid] = r.n;
     }
-
-    GroupMemoryBarrierWithGroupSync();
-
-    WelfordResult<float> result;
-    result.mean = _welford_smem_mean[0];
-    result.m2 = _welford_smem_m2[0];
-    result.n = _welford_smem_n[0];
-    return result;
+    return r;
 }
 
 // ── 2D wave reduction for partitioned layouts ────────────────────────
