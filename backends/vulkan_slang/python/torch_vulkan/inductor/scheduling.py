@@ -419,10 +419,18 @@ class VulkanScheduling(SIMDScheduling):
 
         # DR.1+: Multi-consumer fusion — when base says no because node1's
         # output has multiple consumers, check if all those consumers are
-        # pointwise nodes that could be fused into the same kernel. If so,
-        # allow the fusion — the scheduler can skip materialization.
+        # nodes that could be fused into the same kernel. If so, allow the
+        # fusion — the scheduler can skip materialization.
+        #
+        # M19.3 (2026-05-21): the consumer-pattern check was previously
+        # pointwise-only, which left the GN + ReLU + GlobalAvg chain at
+        # 3 dispatches (welford+normalize+ReLU into 1, GAP reduction as a
+        # second, plus an output-store boundary as a third).  Allowing
+        # consumers whose ``rnumel`` fits the wave-budget cap closes the
+        # last gap — the GAP-style reduction folds into the upstream
+        # pointwise kernel, taking ``GN+ReLU+GAP`` from 3 down to 2.
         if config.aggressive_fusion() and not base:
-            if self._all_consumers_are_fusible_pointwise(node1, node2):
+            if self._all_consumers_are_fusible(node1, node2):
                 return True
 
         # When only one node has a fusion group (the other is None),
@@ -506,15 +514,25 @@ class VulkanScheduling(SIMDScheduling):
         # to the base class result.
         return base
 
-    def _all_consumers_are_fusible_pointwise(self, node1, node2) -> bool:
-        """Check if all consumers of node1's output buffers are pointwise
-        nodes that can be fused with node2 into the same kernel.
+    def _all_consumers_are_fusible(self, node1, node2) -> bool:
+        """Check if all consumers of ``node1``'s output buffers are fusible
+        with ``node2`` into the same kernel.
 
         This enables multi-consumer fusion: when a buffer has multiple
-        consumers that are all pointwise, the scheduler can skip
-        materialization and fuse them into the consumer kernel.
+        consumers and **all** of them either (a) are pointwise with the
+        same numel as ``node2`` or (b) are reductions whose ``rnumel``
+        fits the wave-budget cap (the same cap policy as the M9.8 /
+        M-PERF.6 reduction-boundary relaxation), the scheduler can skip
+        materialising the intermediate buffer and fuse them into a single
+        kernel.
 
-        DR.1+: gated by aggressive_fusion().
+        DR.1+: gated by ``aggressive_fusion()``.
+
+        M19.3 (2026-05-21): the historical name
+        ``_all_consumers_are_fusible_pointwise`` is preserved as a
+        backwards-compat alias below — the test suite (and any in-flight
+        agent diff) refers to that name.  Internally we use the broader
+        name because reductions are now admissible.
         """
         # Get node1's output buffer names
         node1_bufs = set()
@@ -525,6 +543,18 @@ class VulkanScheduling(SIMDScheduling):
                 node1_bufs.add(n.get_name())
         if not node1_bufs:
             return False
+
+        # Same wave-budget cap policy as M9.8 + M-PERF.6: 64 default,
+        # 256 with aggressive fusion, 1024 with wave64 + persistent
+        # pointwise.  Reduction consumers fold into the upstream kernel
+        # iff their ``rnumel`` fits this cap.
+        from . import config as _config
+
+        rnumel_fuse_cap = 64
+        if _config.aggressive_fusion():
+            rnumel_fuse_cap = 256
+            if _config.persistent_pointwise() and _wave64_persistent_ok():
+                rnumel_fuse_cap = 1024
 
         # Find all scheduler nodes that consume node1's buffers
         try:
@@ -551,19 +581,46 @@ class VulkanScheduling(SIMDScheduling):
                 # No other consumers — let base heuristics handle single-consumer
                 return False
 
-            # Check: are all consumers pointwise?
+            _, (n2_numel, _n2_rnumel) = node2.group
             for consumer in all_consumers:
-                if consumer.is_reduction():
-                    return False
-                # Also check numel compatibility
                 _, (c_numel, c_rnumel) = consumer.group
-                _, (n2_numel, n2_rnumel) = node2.group
-                if c_numel != n2_numel:
-                    return False
+                if consumer.is_reduction():
+                    # M19.3: admit small-rnumel reduction consumers.
+                    # Bail on symbolic or oversized rnumels — we can't
+                    # prove the merged kernel fits in the wave budget
+                    # without an integer bound.
+                    if not isinstance(c_rnumel, sympy.Integer):
+                        return False
+                    if int(c_rnumel) > rnumel_fuse_cap:
+                        return False
+                    # Also bail if numel is symbolic — the broadcast
+                    # check below relies on integer comparison.
+                    if not isinstance(c_numel, sympy.Integer):
+                        return False
+                    # The reduction's input iteration space is
+                    # ``c_numel * c_rnumel``; that must match node2's
+                    # output numel so the merged kernel covers exactly
+                    # the upstream pointwise's output.
+                    if isinstance(n2_numel, sympy.Integer):
+                        if int(c_numel) * int(c_rnumel) != int(n2_numel):
+                            return False
+                    # Symbolic n2_numel: we already gave up further up
+                    # for symbolic c_numel, so fall through and accept
+                    # — the base scheduler will catch any leftover
+                    # incompatibility downstream.
+                else:
+                    # Pointwise consumer: original numel-equality contract.
+                    if c_numel != n2_numel:
+                        return False
 
             return True
         except Exception:
             return False
+
+    # Backwards-compat alias.  The historical (pre-M19.3) name is
+    # referenced by parallel agent diffs and existing regression-test
+    # mocks; keeping the alias avoids breaking those at the import-time.
+    _all_consumers_are_fusible_pointwise = _all_consumers_are_fusible
 
     def codegen_mix_order_reduction(self, node):
         # T5.13 (2026-05-09): autotune is now safe for mix-order reduction.
