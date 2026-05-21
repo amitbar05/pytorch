@@ -52522,3 +52522,117 @@ class TestM221OrphanIntegration:
             "CallKernelMixin already provides it. Remove the duplicate "
             "to keep header.py under the 800-line cap."
         )
+
+
+class TestMAG51ActivationDecompRouting:
+    """M-AG5.1 Tier-0/Tier-1 closeout (anti-goal #5 cleanup).
+
+    Nine activation backward ops (hardswish, hardsigmoid, mish,
+    threshold, silu, leaky_relu, elu, sigmoid, tanh) had decomposition
+    entries in ``meta_patches/decomposition_passes.py`` that competed
+    with the autodiff path in ``bwd_diff_table.py`` + ``bwd_lowerings.py``.
+    The decomp entries were symptom-patches; deleting them lets the
+    autodiff path own these ops outright.
+
+    The tests below lock in the deletion at the structural level — they
+    inspect the ``_patch_decompositions`` source and the routing tables.
+    They deliberately do NOT inspect ``torch._decomp.decomposition_table``
+    after init because PyTorch core also ships defaults for the same
+    backward ops; the point of M-AG5.1 is that our patch no longer
+    overrides those upstream entries.
+
+    * ``test_patch_does_not_override_deleted_ops`` — the
+      ``replacements`` dict in ``_patch_decompositions`` does NOT include
+      any of the nine Tier-0/Tier-1 aten backward ops.
+    * ``test_patch_still_overrides_retained_ops`` — the four Tier-2/3/4
+      entries (``hardtanh``, ``softplus``, ``relu`` fwd, ``gelu``) ARE
+      still overridden, with their documented blockers.
+    * ``test_bwd_diff_routing_intact`` — every deleted op still has
+      either a ``BWD_DIFF_TABLE`` entry or a direct ``register_lowering``.
+    """
+
+    _BUG_ROOT_COMPONENT = "fx-meta-patches"
+
+    # Aten ops whose decomp entries were deleted.
+    _DELETED_OPS = (
+        "hardswish_backward",
+        "hardsigmoid_backward",
+        "mish_backward",
+        "threshold_backward",
+        "silu_backward",
+        "leaky_relu_backward",
+        "elu_backward",
+        "sigmoid_backward",
+        "tanh_backward",
+    )
+
+    # Decomp entries that remain (each with a documented blocker).
+    _RETAINED_OPS = (
+        "hardtanh_backward",  # Tier-3 (no hardtanh_fwd in BWD_DIFF_TABLE)
+        "softplus_backward",  # Tier-2 (needs no_diff_params on beta/threshold)
+        "gelu_backward",  # Tier-4 (string approximate= arg)
+    )
+
+    @staticmethod
+    def _patch_source() -> str:
+        import inspect
+
+        from torch_vulkan.inductor.meta_patches.decomposition_passes import (
+            _patch_decompositions,
+        )
+
+        return inspect.getsource(_patch_decompositions)
+
+    def test_patch_does_not_override_deleted_ops(self):
+        src = self._patch_source()
+        for short in self._DELETED_OPS:
+            needle = f"aten.{short}.default"
+            assert needle not in src, (
+                f"M-AG5.1: ``{needle}`` is still mapped inside "
+                f"_patch_decompositions() — the decomp entry must be "
+                f"removed in favour of the autodiff path "
+                f"(bwd_diff_table.py + bwd_lowerings.py)."
+            )
+
+    def test_patch_still_overrides_retained_ops(self):
+        src = self._patch_source()
+        for short in self._RETAINED_OPS:
+            needle = f"aten.{short}.default"
+            assert needle in src, (
+                f"M-AG5.1: ``{needle}`` is missing from "
+                f"_patch_decompositions() — it is documented as Tier-2/3/4 "
+                f"and must remain overridden until its blocker is closed."
+            )
+        # ``aten.relu.default`` (forward decomp, ReluBackward0 safety net)
+        assert "aten.relu.default" in src, (
+            "M-AG5.1: ``aten.relu.default`` forward decomp missing from "
+            "_patch_decompositions() — this is the C1 safety net so "
+            "ReluBackward0 never enters the joint trace."
+        )
+
+    def test_bwd_diff_routing_intact(self):
+        """Every deleted decomp op must still have a Vulkan backward path.
+
+        Either via ``BWD_DIFF_TABLE`` (autodiff codegen) or a direct
+        ``@register_lowering`` in ``bwd_lowerings.py`` (algebraic
+        decomposition).
+        """
+        import torch_vulkan  # noqa: F401
+        from torch._inductor import lowering as L
+        from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
+
+        aten = torch.ops.aten
+        for short in self._DELETED_OPS:
+            aten_key = f"aten.{short}"
+            target = getattr(aten, short)
+            has_table = aten_key in BWD_DIFF_TABLE
+            try:
+                target_default = target.default
+            except AttributeError:
+                target_default = target
+            has_lowering = target in L.lowerings or target_default in L.lowerings
+            assert has_table or has_lowering, (
+                f"M-AG5.1: aten.{short} has no Vulkan backward routing "
+                f"after the decomp deletion — neither BWD_DIFF_TABLE entry "
+                f"nor register_lowering. Restore one or revert the deletion."
+            )

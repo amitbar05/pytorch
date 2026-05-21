@@ -13,11 +13,26 @@ import torch
 def _patch_decompositions() -> None:
     """Override decomposition table for activation backward ops.
 
-    M15.2 audit: 12 entries are (b) — real-computation decompositions that
-    exist because PyTorch's default decompositions fail on Vulkan FakeTensors
-    (device-mixing: meta saved-input × vulkan grad). Should route through
-    autodiff (bwd_diff_table.py) per M12. 10 entries are (a) — shape-only
-    decompositions redundant with _OP_IMPLS fake_impls (see M15.2.b).
+    M-AG5.1 Tier-0/Tier-1 closeout (2026-05-21): nine activation backward
+    decomp entries were removed (anti-goal #5 cleanup) — they competed with
+    the autodiff path in ``bwd_diff_table.py``. The remaining four entries
+    each have a documented blocker:
+
+    * ``aten.hardtanh_backward`` — Tier-3: no ``hardtanh_fwd`` in
+      ``bwd_diff_table`` yet.
+    * ``aten.softplus_backward`` — Tier-2: unary emitter does not yet
+      support ``no_diff_params`` for ``beta``/``threshold``.
+    * ``aten.relu.default`` — forward decomposition retained as a
+      ``ReluBackward0`` safety net so the joint trace never sees it.
+    * ``aten.gelu_backward`` — Tier-4: string ``approximate=`` arg
+      unsupported in ``bwd_diff`` codegen.
+
+    Shape-only backward decomps (``_softmax_bwd``, ``_log_softmax_bwd``,
+    ``_avg_pool2d_bwd``, ``_max_pool_bwd``, ``_linear_bwd``,
+    ``_layer_norm_bwd``, ``_group_norm_bwd``, ``_batch_norm_bwd``) remain;
+    they hand out ``new_empty`` proxies so the partitioner sees a
+    storage-bound tensor (M18.3 — replaces the ``empty_like`` literal-zero
+    trap).
     """
     import torch
     from torch._decomp import decomposition_table
@@ -28,25 +43,9 @@ def _patch_decompositions() -> None:
         mask = (self > min_val) & (self < max_val)
         return grad_output * mask
 
-    def _hardswish_bwd(grad_output, self):
-        return torch.where(
-            self < -3.0,
-            torch.zeros_like(grad_output),
-            torch.where(self > 3.0, grad_output, grad_output * (self / 3.0 + 0.5)),
-        )
-
-    def _hardsigmoid_bwd(grad_output, self):
-        mask = (self > -3.0) & (self < 3.0)
-        return grad_output * mask * (1.0 / 6.0)
-
     def _softplus_bwd(grad_output, self, beta, threshold):
         bx = beta * self
         return torch.where(bx > threshold, grad_output, grad_output * torch.sigmoid(bx))
-
-    def _mish_bwd(grad_output, self):
-        sp = torch.nn.functional.softplus(self)
-        tsp = torch.tanh(sp)
-        return grad_output * (tsp + self * (1.0 - tsp * tsp) * torch.sigmoid(self))
 
     # C1: Provide REAL decompositions, not shape-only proxies.
     # The previous approach (torch.empty_like for all backwards) caused
@@ -59,34 +58,9 @@ def _patch_decompositions() -> None:
         # joint trace even if the pre-grad rewrite misses.
         return torch.where(self > 0, self, torch.zeros_like(self))
 
-    def _threshold_bwd(grad_output, self, threshold):
-        return torch.where(self > threshold, grad_output, 0.0)
-
     def _gelu_bwd(grad_output, self, approximate="none"):
         # Use the built-in gelu_backward which inductor can lower
         return torch.ops.aten.gelu_backward(grad_output, self, approximate=approximate)
-
-    def _silu_bwd(grad_output, self):
-        sig = torch.sigmoid(self)
-        return grad_output * sig * (1.0 + self * (1.0 - sig))
-
-    def _tanh_bwd(grad_output, self):
-        return grad_output * (1.0 - self * self)
-
-    def _sigmoid_bwd(grad_output, self):
-        return grad_output * self * (1.0 - self)
-
-    def _leaky_relu_bwd(grad_output, self, negative_slope, self_is_result):
-        return torch.where(self > 0, grad_output, grad_output * negative_slope)
-
-    def _elu_bwd(
-        grad_output, alpha, scale, input_scale, self_or_result, self_is_result
-    ):
-        return torch.where(
-            self_or_result > 0,
-            grad_output * scale,
-            grad_output * scale * (self_or_result + alpha / input_scale),
-        )
 
     # M18.3 (2026-05-18): torch.empty_like(t) → t.new_empty(t.shape).
     # Same bug class as M17.8.d.2: under AOTAutograd's proxy tracer the
@@ -217,22 +191,33 @@ def _patch_decompositions() -> None:
         )
         return gi, gw, gb
 
+    # M-AG5.1 Tier-0/Tier-1 (2026-05-21): 9 activation-backward decomp
+    # entries deleted (anti-goal #5). The decomp entries duplicated work
+    # that already routes through ``bwd_diff_table.py`` →
+    # ``[BackwardDerivative]`` annotations in ``shaders/lib/pointwise.slang``
+    # (or, for ``leaky_relu``/``sigmoid``/``tanh``/``gelu``, the dedicated
+    # ``register_lowering`` in ``bwd_lowerings.py``). Decomp suppression
+    # was a symptom-patch that competed with the autodiff path.
+    #
+    # Deleted: ``hardswish_backward``, ``hardsigmoid_backward``,
+    # ``mish_backward``, ``threshold_backward``, ``silu_backward``,
+    # ``leaky_relu_backward``, ``elu_backward``, ``sigmoid_backward``,
+    # ``tanh_backward``.
+    #
+    # Kept (separate handling reasons documented above each helper):
+    #   * ``aten.hardtanh_backward`` — no fwd in ``bwd_diff_table`` yet
+    #     (Tier-3 plan; needs a new ``[Differentiable]`` ``hardtanh_fwd``).
+    #   * ``aten.softplus_backward`` — needs the ``no_diff_params`` extension
+    #     of the unary emitter (Tier-2 plan).
+    #   * ``aten.relu.default`` — forward C1 safety net so
+    #     ``ReluBackward0`` never enters the joint trace.
+    #   * ``aten.gelu_backward`` — ``approximate=`` string param not
+    #     supported in ``bwd_diff`` codegen yet (Tier-4 plan).
     replacements = {
         aten.hardtanh_backward.default: _hardtanh_bwd,
-        aten.hardswish_backward.default: _hardswish_bwd,
-        aten.hardsigmoid_backward.default: _hardsigmoid_bwd,
         aten.softplus_backward.default: _softplus_bwd,
-        aten.mish_backward.default: _mish_bwd,
         aten.relu.default: _relu_fwd_decomp,
-        aten.threshold_backward.default: _threshold_bwd,
-        # Shape-only backward decompositions (input-saving ops that would
-        # mix meta saved-input device with vulkan:0 gradient device)
         aten.gelu_backward.default: _gelu_bwd,
-        aten.silu_backward.default: _silu_bwd,
-        aten.leaky_relu_backward.default: _leaky_relu_bwd,
-        aten.elu_backward.default: _elu_bwd,
-        aten.sigmoid_backward.default: _sigmoid_bwd,
-        aten.tanh_backward.default: _tanh_bwd,
         aten._softmax_backward_data.default: _softmax_bwd,
         aten._log_softmax_backward_data.default: _log_softmax_bwd,
         aten.avg_pool2d_backward.default: _avg_pool2d_bwd,

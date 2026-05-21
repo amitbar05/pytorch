@@ -250,7 +250,7 @@ file diff lands in `git status` before declaring done.
 | `worktree-agent-a503af5f1b7879f89` | M22a Stage 1 `slangc.py` → `common.py` extraction (slangc.py 2264→2035, common.py 336L new) | refactor |
 | `worktree-agent-a43be97e9acbc6296` | M22e `kernel/main.py` 1009→802 + new `threadgroup_sizing.py` 233L | refactor |
 | `worktree-agent-a5c1934d15f18510b` | M22d `templates/caller/rnn.py` 1053 → 5 files all ≤598L | refactor |
-| `worktree-agent-af3d2aae0f230df72` | M-AG5.1 Tier-0 delete 9 redundant activation backward decomps (-36 LoC) | deletion |
+| `worktree-agent-af3d2aae0f230df72` | M-AG5.1 Tier-0 delete 9 redundant activation backward decomps (-36 LoC) | **✅ INTEGRATED 2026-05-21** (decomp deletion landed on main with regression gate `TestMAG51ActivationDecompRouting`). Worktree branch retired. |
 
 Total: 8 worktree branches awaiting integration. The integration order
 matters because G.1 and M22j both touch `shape_ops.py` (apply G.1 first
@@ -297,7 +297,7 @@ Listed for visibility so the next session doesn't double-dispatch.
 
 | # | Title | Plan / Status |
 |---|-------|---------------|
-| **M-AG5.1** | 12-op activation backward routing plan | Tier-0 = 9 ops just need decomp deletion (worktree in flight). Tier-1 = `leaky_relu` (already wired). Tier-2 = `softplus` (needs `no_diff_params`). Tier-3 = `hardtanh` (full new path). Tier-4 = `gelu` (string-param blocker — defer). |
+| **M-AG5.1** | 12-op activation backward routing plan | **Tier-0/Tier-1 ✅ LANDED 2026-05-21** (`meta_patches/decomposition_passes.py:194-229`). 9 redundant decomp entries (`hardswish`/`hardsigmoid`/`mish`/`threshold`/`silu`/`leaky_relu`/`elu`/`sigmoid`/`tanh` backward) deleted; each op still routes via `BWD_DIFF_TABLE` (autodiff) or `bwd_lowerings.py` (algebraic). Regression gate: `tests/test_inductor_regression.py::TestMAG51ActivationDecompRouting` (3 tests, PASS). Anti-goal #5 footprint -50 LoC. Tier-2 = `softplus` (needs `no_diff_params`), Tier-3 = `hardtanh` (full new path), Tier-4 = `gelu` (string-param blocker — defer) — all still open. |
 | **G.1** | 15 dead `fake_impl` entries in `meta_patches/__init__.py` | Identified via diff against active registry. Worktree deletion in flight. |
 | **K.2** | 9 missing types in combo_kernel `_TYPE_KEYWORDS` | Worktree fix in flight (+12 types covering u8/i8/i16/u16/u32/u64/f16/bf16/c64). |
 | **M22a** | 7-way split plan for `runtime/slangc.py` (2348 L → ≤500 L each) | Stage 1 worktree (common.py extraction) in flight. Tracks anti-goal #7 file-size cap. |
