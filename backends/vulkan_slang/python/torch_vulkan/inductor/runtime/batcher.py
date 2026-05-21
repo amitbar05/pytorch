@@ -34,6 +34,15 @@ class DispatchBatcher:
     _end_batch = None
     _batch_probed: bool = False
 
+    # M-NEW.12: class-level "current active" batcher reference so direct-call
+    # template callers (``_slang_tile_conv2d`` / ``_slang_tile_mm`` — which are
+    # emitted by the wrapper as immediate Python function calls, NOT routed
+    # through ``_batcher.add``) can flush queued dispatches before they read
+    # from buffers populated by a still-queued kernel. Without this, the
+    # second conv2d in a ``maxpool → conv2`` chain reads a zero-initialised
+    # buf2 (the maxpool kernel hasn't run yet) and emits bias-only output.
+    _current: "DispatchBatcher | None" = None
+
     def __init__(self):
         self._pending: list[tuple] = []  # (kernel_callable, args_tuple)
         self._active: bool = False
@@ -42,6 +51,9 @@ class DispatchBatcher:
     def __enter__(self):
         self._active = True
         self._pending.clear()
+        # M-NEW.12: register as the current active batcher so direct-call
+        # template invocations can locate us and flush before dispatching.
+        DispatchBatcher._current = self
         # M17.5: Engage C++ batch mode to suppress per-8-dispatch auto-flush.
         # When batch mode is active, all dispatches accumulate in a single
         # command buffer and are submitted together on __exit__.
@@ -65,7 +77,29 @@ class DispatchBatcher:
             except Exception:
                 pass
             self._batch_active = False
+        # M-NEW.12: clear current-batcher reference iff it still points to us
+        # (defensive against nested batchers that may share the slot).
+        if DispatchBatcher._current is self:
+            DispatchBatcher._current = None
         return False  # propagate exceptions
+
+    @classmethod
+    def flush_current_if_active(cls) -> None:
+        """Flush any queued dispatches on the currently active batcher.
+
+        Direct-call template helpers (``_slang_tile_conv2d`` etc.) emitted by
+        custom lowerings as immediate Python function calls must invoke this
+        before dispatching, because the wrapper's ``_batcher.add(...)`` queue
+        defers writes that the direct call expects to read from. Without
+        this flush, a queued ``MaxPool2d`` kernel filling ``buf2`` will not
+        have run when the immediate ``_slang_tile_conv2d(buf2, ..., out)``
+        reads ``buf2`` — yielding a stale (zero-initialised) read.
+        """
+        cur = cls._current
+        if cur is None or not cur._active:
+            return
+        if cur._pending:
+            cur._flush()
 
     def add(self, kernel_handle, *dispatch_args):
         """Collect a kernel dispatch for batched submission.

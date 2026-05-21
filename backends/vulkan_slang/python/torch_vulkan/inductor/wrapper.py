@@ -408,6 +408,32 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             return
         super().codegen_deferred_input_asserts(input_names)
 
+    def _flush_batcher_before_direct_call(self) -> None:
+        """M-NEW.12: emit ``_batcher._flush()`` before any direct (non-
+        ``_batcher.add``) GPU-touching call.
+
+        The wrapper queues Triton-style kernel dispatches via
+        ``_batcher.add(kernel, ...)`` (see ``_generate_kernel_call_helper``)
+        and only flushes at ``_batcher.__exit__``. But custom-op /
+        template-caller lines such as ``torch.ops.torch_vulkan.foo(...)``
+        and ``_slang_tile_conv2d(buf2, ...)`` are emitted as immediate
+        function calls that dispatch synchronously. If a direct call
+        reads a buffer that a queued kernel was supposed to populate,
+        the read sees uninitialised (zero) data.
+
+        Repro (pre-fix): SmallCNN's ``conv1 → gn1 → relu → maxpool →
+        conv2 → gn2 → relu`` yields bias-only output at the second
+        ``conv2d_gn_relu_fused`` because the preceding ``vulkan_kernel_0``
+        (MaxPool2d) is queued and unflushed when ``conv2d_gn_relu_fused``
+        runs. unique-value count: 32 (one per output channel = the bias
+        per-channel value) instead of the expected per-spatial values.
+
+        Idempotent on the no-pending path (``flush_current_if_active``
+        no-ops if nothing is queued).
+        """
+        if _batch_dispatch_enabled():
+            self.writeline("DispatchBatcher.flush_current_if_active()")
+
     def generate_extern_kernel_alloc(self, node: ir.ExternKernelAlloc) -> None:
         """PF.33: Route extern-kernel (FallbackKernel) output allocations
         through the buffer pool instead of letting the C++ dispatcher
@@ -435,6 +461,9 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         """
         if node.get_device() is None or node.get_device().type != "vulkan":
             return super().generate_extern_kernel_alloc(node)
+
+        # M-NEW.12: this is a direct dispatch; flush queued batcher work first.
+        self._flush_batcher_before_direct_call()
 
         # NoneLayout (no return) and non-Layout outputs (MultiOutput,
         # mutation) must go through the default path — we can only
@@ -513,7 +542,34 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
     def generate_extern_kernel_out(self, node: ir.ExternKernelOut) -> None:
         if node.get_device() is None or node.get_device().type != "vulkan":
             return super().generate_extern_kernel_out(node)
+        # M-NEW.12: this is a direct dispatch (e.g. ``torch.ops.foo.out(...)``
+        # or a template caller line emitted from a custom ``codegen()`` —
+        # see ``lowerings/conv.py::_VulkanConv2dExternKernel``); flush any
+        # queued ``_batcher.add`` dispatches first so the call reads
+        # populated input buffers rather than zero-initialised ones.
+        self._flush_batcher_before_direct_call()
         super().generate_extern_kernel_out(node)
+
+    def generate_fallback_kernel(self, node) -> None:
+        """M-NEW.12: flush the ``DispatchBatcher`` before any FallbackKernel
+        line (custom ops like ``torch.ops.torch_vulkan.conv2d_gn_relu_fused``).
+
+        These fall through ``ExternKernelAllocLine`` rather than
+        ``generate_extern_kernel_alloc``, so the batcher-flush injection in
+        ``generate_extern_kernel_alloc`` doesn't reach them. See the
+        SmallCNN second-block trace: a ``conv2d_gn_relu_fused`` call
+        immediately after a queued maxpool kernel reads from an
+        un-flushed buffer.
+        """
+        # Determine if this node touches a vulkan device. FallbackKernel
+        # nodes always have a device; non-vulkan goes straight to super().
+        try:
+            dev = node.get_device()
+        except Exception:  # noqa: BLE001
+            dev = None
+        if dev is not None and dev.type == "vulkan":
+            self._flush_batcher_before_direct_call()
+        super().generate_fallback_kernel(node)
 
     def make_allocation(
         self, name, device, dtype, shape, stride, allocation_shape=None, is_pinned=False

@@ -53028,3 +53028,148 @@ class TestMNew11ConvGnReluFusedCorrectness:
         )
         err = (out_vk - out_cpu).abs().max().item()
         assert err < 1e-3, f"max_err={err:.6e}"
+
+
+class TestM_NEW_12_SecondConv2dCorrectness:
+    """Regression gate for the **DispatchBatcher / direct-dispatch race**.
+
+    Bug (closed 2026-05-22): the wrapper codegen queues Triton-style
+    kernel dispatches via ``_batcher.add(...)`` and only flushes them
+    at ``_batcher.__exit__``.  Custom-op and template-caller lines such
+    as ``torch.ops.torch_vulkan.conv2d_gn_relu_fused.default(...)`` and
+    ``_slang_tile_conv2d(buf2, ...)`` are emitted as immediate Python
+    function calls that dispatch synchronously.  When a direct call
+    reads from a buffer that a still-queued kernel was supposed to
+    populate, it reads uninitialised (zero) data.
+
+    Repro before fix: the second ``conv2d_gn_relu_fused`` in a
+    ``conv1 → gn1 → relu → maxpool → conv2 → gn2 → relu`` chain emitted
+    bias-only output — ``32 unique values per (B, 32, 16, 16) tensor``,
+    one per output channel (the per-channel bias value).
+
+    Fix: ``DispatchBatcher.flush_current_if_active()`` flushes any
+    queued dispatches; the wrapper emits this call before every direct
+    extern-kernel / fallback-kernel / template-caller line.  Wrappers
+    around ``_slang_tile_conv2d`` and ``_slang_tile_mm`` in
+    ``torch_vulkan.inductor.__init__`` also flush (defence in depth).
+
+    These tests verify the symptom is gone:
+
+    * ``test_pool_then_conv2`` — pool → conv2 (the structural pattern
+      with the failure)
+    * ``test_full_chain_relu2`` — ``conv1 → gn1 → relu → pool → conv2 →
+      gn2 → relu`` (matches SmallCNN's second-block forward), with the
+      unique-output-value assertion that catches the bias-only failure.
+    * ``test_two_convs_back_to_back`` — sanity check that pure
+      conv2d chains stay correct.
+    * ``test_dispatchbatcher_active_tracking`` — unit-level check
+      that ``DispatchBatcher._current`` tracks correctly.
+    """
+
+    @staticmethod
+    def _compile_compare(model_factory, x_shape, atol=1e-3):
+        import torch
+        import torch_vulkan  # noqa: F401
+
+        torch.manual_seed(0)
+        m_cpu = model_factory()
+        m_vk = model_factory().to("vulkan")
+        m_vk.load_state_dict({k: v.to("vulkan") for k, v in m_cpu.state_dict().items()})
+        x_cpu = torch.randn(*x_shape)
+        x_vk = x_cpu.to("vulkan")
+        compiled = torch.compile(lambda m, x: m(x), backend="inductor")
+        out_cpu = m_cpu(x_cpu)
+        out_vk = compiled(m_vk, x_vk).cpu()
+        err = (out_vk - out_cpu).abs().max().item()
+        unique = int(torch.unique(out_vk.flatten()).numel())
+        return out_vk, out_cpu, err, unique
+
+    def test_pool_then_conv2(self):
+        """MaxPool2d → Conv2d: pool kernel is queued, conv2d is direct."""
+        import torch.nn as nn
+
+        def factory():
+            class M(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.pool = nn.MaxPool2d(2, 2)
+                    self.conv = nn.Conv2d(16, 32, 3, padding=1)
+
+                def forward(self, x):
+                    return self.conv(self.pool(x))
+
+            return M()
+
+        out_vk, out_cpu, err, unique = self._compile_compare(factory, (2, 16, 32, 32))
+        assert err < 1e-3, f"max_err={err:.6e}"
+        assert unique > 1000, (
+            f"unique-value count too low ({unique}); the queued pool "
+            f"kernel was not flushed before the direct conv2d read."
+        )
+
+    def test_full_chain_relu2(self):
+        """SmallCNN-shaped: conv1 → gn1 → relu → pool → conv2 → gn2 → relu."""
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        def factory():
+            class M(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                    self.gn1 = nn.GroupNorm(4, 16)
+                    self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+                    self.gn2 = nn.GroupNorm(8, 32)
+                    self.pool = nn.MaxPool2d(2, 2)
+
+                def forward(self, x):
+                    x = F.relu(self.gn1(self.conv1(x)))
+                    x = self.pool(x)
+                    x = F.relu(self.gn2(self.conv2(x)))
+                    return x
+
+            return M()
+
+        out_vk, out_cpu, err, unique = self._compile_compare(factory, (2, 3, 32, 32))
+        assert err < 1e-3, f"max_err={err:.6e}"
+        # Pre-fix unique == 32 (one per output channel = bias broadcast).
+        # Healthy output has thousands of distinct values.
+        assert unique > 1000, (
+            f"unique-value count {unique} suggests the second "
+            f"conv2d_gn_relu_fused read from an un-flushed batcher buffer. "
+            f"DispatchBatcher.flush_current_if_active() emission may be "
+            f"missing from the wrapper for FallbackKernel or "
+            f"ExternKernelAlloc lines."
+        )
+
+    def test_two_convs_back_to_back(self):
+        """Sanity: no pool in between; both convs run with empty batcher."""
+        import torch.nn as nn
+
+        def factory():
+            class M(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.c1 = nn.Conv2d(3, 16, 3, padding=1)
+                    self.c2 = nn.Conv2d(16, 32, 3, padding=1)
+
+                def forward(self, x):
+                    return self.c2(self.c1(x))
+
+            return M()
+
+        _, _, err, _ = self._compile_compare(factory, (2, 3, 32, 32))
+        assert err < 1e-3, f"max_err={err:.6e}"
+
+    def test_dispatchbatcher_active_tracking(self):
+        """Unit-level: ``DispatchBatcher._current`` follows __enter__/__exit__."""
+        import torch_vulkan  # noqa: F401
+        from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+
+        assert DispatchBatcher._current is None
+        b = DispatchBatcher()
+        with b:
+            assert DispatchBatcher._current is b
+            # flush_current_if_active is a no-op on empty queue
+            DispatchBatcher.flush_current_if_active()
+        assert DispatchBatcher._current is None

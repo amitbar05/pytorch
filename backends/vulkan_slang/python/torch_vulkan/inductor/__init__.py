@@ -465,6 +465,67 @@ def _patch_extern_convolution_out_kwarg() -> None:
     setattr(extern_kernels, "convolution", _vulkan_convolution_wrapper)
 
 
+def _patch_direct_call_template_helpers_flush_batcher() -> None:
+    """M-NEW.12: wrap direct-call template helpers to flush the active
+    ``DispatchBatcher`` before dispatching.
+
+    Custom lowerings (``lowerings/conv.py::_VulkanConv2dExternKernel``,
+    ``lowerings/matmul.py::_VulkanMMTileExternKernel``) override
+    ``codegen()`` and emit a direct Python call:
+
+        _slang_tile_conv2d(buf2, primals_6, buf3, stride=..., padding=...,
+                           dilation=..., bias=primals_7)
+
+    instead of going through the normal ``_generate_kernel_call_helper`` →
+    ``_batcher.add(...)`` route. Meanwhile, preceding pointwise/reduction
+    kernels (e.g. a MaxPool2d) ARE routed via ``_batcher.add`` and only
+    flushed at ``_batcher.__exit__`` at the end of the wrapper. As a
+    result, ``_slang_tile_conv2d`` reads ``buf2`` BEFORE the queued
+    MaxPool kernel has written it — yielding bias-only output (one
+    unique value per output channel; `2*3*16*16*32 numel → only 32
+    unique values`).
+
+    The fix flushes any pending queued dispatches on the currently active
+    batcher before invoking the wrapped helper. Idempotent on the
+    no-batcher / no-pending path.
+
+    Same wrap applied to ``_slang_tile_mm`` for symmetry — even though no
+    current SmallCNN repro exercises an mm-after-queued-write pattern,
+    the codegen invariant is identical.
+    """
+    try:
+        from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+        from torch_vulkan.inductor import vulkan_template_caller as _vtc
+    except Exception:  # noqa: BLE001
+        return
+
+    def _wrap(orig):
+        if getattr(orig, "_vulkan_batcher_flush_patched", False):
+            return orig
+
+        def _wrapped(*args, **kwargs):
+            DispatchBatcher.flush_current_if_active()
+            return orig(*args, **kwargs)
+
+        _wrapped._vulkan_batcher_flush_patched = True
+        _wrapped.__name__ = getattr(orig, "__name__", "wrapped")
+        _wrapped.__doc__ = getattr(orig, "__doc__", None)
+        return _wrapped
+
+    for name in ("_slang_tile_conv2d", "_slang_tile_mm"):
+        orig = getattr(_vtc, name, None)
+        if orig is None:
+            continue
+        wrapped = _wrap(orig)
+        if wrapped is orig:
+            continue
+        setattr(_vtc, name, wrapped)
+        # Re-export at the templates.caller package level too — the lowerings
+        # import via ``from torch_vulkan.inductor.vulkan_template_caller
+        # import _slang_tile_conv2d`` so the attribute on ``_vtc`` is what
+        # the generated wrapper code resolves at call-time.
+
+
 def _legacy_register() -> None:
     """Body of the historical scattered registration.
 
@@ -484,6 +545,13 @@ def _legacy_register() -> None:
     # emits ``extern_kernels.convolution(..., out=buf)`` — see the
     # function docstring for details.
     _patch_extern_convolution_out_kwarg()
+
+    # M-NEW.12 (2026-05-21): wrap direct-call template helpers
+    # (``_slang_tile_conv2d`` / ``_slang_tile_mm``) so they flush the
+    # active ``DispatchBatcher`` before dispatching. Without this the
+    # second conv2d in a ``maxpool → conv2`` chain reads from a buffer
+    # whose preceding maxpool kernel is still queued in the batcher.
+    _patch_direct_call_template_helpers_flush_batcher()
 
     # PF.30.h — install Vulkan autotune harness support before any
     # lowering or template registration triggers autotune code paths.
