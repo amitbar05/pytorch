@@ -52636,3 +52636,112 @@ class TestMAG51ActivationDecompRouting:
                 f"after the decomp deletion — neither BWD_DIFF_TABLE entry "
                 f"nor register_lowering. Restore one or revert the deletion."
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M-NEW.11 — conv2d + GroupNorm + ReLU fused-op correctness
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMNew11ConvGnReluFusedCorrectness:
+    """Correctness gate for the ``_slang_tile_conv2d_gn_relu`` caller.
+
+    Catches two regressions investigated 2026-05-21:
+
+    1. **Op-order semantic bug** — the pre-fix shader composed
+       ``gn(relu(conv(x)))`` instead of the PyTorch-canonical
+       ``relu(gn(conv(x)))``.  Even after that fix, slangc 2026.7.1
+       miscompiled Pass-3 of the fused shader and dropped Wave 1's
+       stores when the stored value depended on both the conv chain
+       and the welford output.  The Group-D mitigation routes the
+       caller through a 3-dispatch ``aten.convolution`` + ``F.group_norm``
+       + ``F.relu`` fallback so eager / compile-mode users keep
+       getting correct values while the shader is being rewritten.
+
+    These tests lock in the **callable-level** correctness — they call
+    ``_slang_tile_conv2d_gn_relu`` directly (not through the
+    ``conv2d_gn_relu_fused`` custom op) so they exercise the Group-D
+    Python entry point without depending on FX-pass plumbing.  The
+    tolerance is ``1e-3`` to match the SmallCNN E2E gate.
+    """
+
+    @staticmethod
+    def _run_case(N, C_in, C_out, H, W, num_groups, *, with_bias=True):
+        import torch
+        import torch.nn.functional as F
+
+        import torch_vulkan  # noqa: F401
+
+        from torch_vulkan.inductor.templates.caller.conv import (
+            _slang_tile_conv2d_gn_relu,
+        )
+
+        torch.manual_seed(0)
+        x_vk = torch.randn(N, C_in, H, W, device="vulkan")
+        w_vk = torch.randn(C_out, C_in, 3, 3, device="vulkan")
+        b_vk = torch.randn(C_out, device="vulkan") if with_bias else None
+        gw_vk = torch.randn(C_out, device="vulkan")
+        gb_vk = torch.randn(C_out, device="vulkan")
+
+        x_cpu = x_vk.cpu()
+        w_cpu = w_vk.cpu()
+        b_cpu = b_vk.cpu() if with_bias else None
+        gw_cpu = gw_vk.cpu()
+        gb_cpu = gb_vk.cpu()
+
+        out_vk = torch.empty(N, C_out, H, W, device="vulkan")
+        _slang_tile_conv2d_gn_relu(
+            x_vk, w_vk, b_vk, gw_vk, gb_vk, out_vk,
+            stride=(1, 1), padding=(1, 1), dilation=(1, 1),
+            num_groups=num_groups, eps=1e-5,
+        )
+
+        out_cpu = F.relu(
+            F.group_norm(
+                F.conv2d(x_cpu, w_cpu, b_cpu, stride=1, padding=1),
+                num_groups, gw_cpu, gb_cpu, eps=1e-5,
+            )
+        )
+        return out_vk.cpu(), out_cpu
+
+    def test_smallcnn_first_block(self):
+        """SmallCNN's first conv_gn_relu block (3→16 chans, 32×32, G=4)."""
+        out_vk, out_cpu = self._run_case(N=2, C_in=3, C_out=16, H=32, W=32, num_groups=4)
+        err = (out_vk - out_cpu).abs().max().item()
+        assert err < 1e-3, f"max_err={err:.6e}"
+        # No negatives — ReLU is the outermost op.
+        assert (out_vk >= 0).all(), "ReLU was not applied as the outermost op"
+
+    def test_smallcnn_second_block(self):
+        """SmallCNN's second conv_gn_relu block (16→32 chans, 16×16, G=8)."""
+        out_vk, out_cpu = self._run_case(N=2, C_in=16, C_out=32, H=16, W=16, num_groups=8)
+        err = (out_vk - out_cpu).abs().max().item()
+        assert err < 1e-3, f"max_err={err:.6e}"
+        assert (out_vk >= 0).all()
+
+    def test_tiny_case(self):
+        """Tiny case (1→4 chans, 8×8, G=2) — reproduces the slangc Wave-1
+        store-drop signature: half the channels would be left at the
+        pre-fill value before the Group-D fallback landed."""
+        import torch
+
+        out_vk, out_cpu = self._run_case(N=1, C_in=1, C_out=4, H=8, W=8, num_groups=2)
+        err = (out_vk - out_cpu).abs().max().item()
+        assert err < 1e-3, f"max_err={err:.6e}"
+        # Every channel must have at least one non-zero value (otherwise
+        # the channel was never touched — the Wave-1 miscompile fingerprint).
+        for c in range(out_vk.shape[1]):
+            assert (out_vk[0, c] > 0).any(), (
+                f"Channel {c} produced all-zero output — slangc Wave-1 "
+                f"store-drop regression in conv_gn_relu fused path. "
+                f"Was the 3-dispatch fallback in "
+                f"``_slang_tile_conv2d_gn_relu`` removed?"
+            )
+
+    def test_no_bias(self):
+        """has_bias=False path (bias=None)."""
+        out_vk, out_cpu = self._run_case(
+            N=2, C_in=4, C_out=8, H=16, W=16, num_groups=2, with_bias=False
+        )
+        err = (out_vk - out_cpu).abs().max().item()
+        assert err < 1e-3, f"max_err={err:.6e}"

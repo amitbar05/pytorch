@@ -123,6 +123,72 @@ post-fix — the Welford bug was real but only part of the picture; the
 remaining error traces to a downstream slang_addmm / linear-layer
 path, not GroupNorm.  Filed as separate follow-up.
 
+**M-NEW.11 ✅ PARTIAL CLOSEOUT 2026-05-21** — investigated the
+remaining `max err ≈ 0.87` and confirmed it is NOT a slang_addmm bug.
+Direct probe of compiled `nn.Linear(2048→10)` at SmallCNN-shaped
+inputs (B ∈ {1, 2, 4, 8, 64}) shows the tile-matmul path is correct to
+fp32 precision (≤ 2e-6 max abs err vs CPU); compiled raw
+`aten.addmm/aten.mm` show only normal fp32 reduction noise at K=2048
+(~1.5e-4 — well inside the test's 1e-3 atol).  Layer-bisect probe
+(`agent_space/probe_smallcnn_layer_bisect.py`) pins the first
+divergence at the `relu1` stage of the SmallCNN forward — i.e. the
+fused **conv → GN → ReLU** custom op (M17.2 Phase 3,
+`torch_vulkan::conv2d_gn_relu_fused`).
+
+Two bugs in `templates/conv_gn_relu.slang` + caller:
+
+1. **Op-order semantic bug.** The shader pre-clamped `relu(conv+bias)`
+   *before* feeding it into the Welford accumulator, computing the
+   composition `gn(relu(conv(x)))` instead of the
+   PyTorch-canonical `relu(gn(conv(x)))`.  Pass-1 + Pass-3 now compute
+   the raw conv+bias and apply ReLU only at the end of Pass-3, after
+   the affine transform.
+
+2. **slangc 2026.7.1 write-coverage miscompile** (Group-D probe-only,
+   not yet filed upstream).  When Pass-3's stored value depends on
+   both the conv-load chain (``args.input``, ``args.weight``,
+   ``args.bias``) AND the welford outputs (``mean``, ``rstd``), slangc
+   silently drops Wave 1's (lanes 64..127 on RDNA1 wave64)
+   ``OpStore``s.  Verified via three orthogonal probes:
+   * `agent_space/probe_cgr_direct.py` — direct call to the caller
+     with pre-filled output shows half the channels per WG never
+     touched (mean stays at the pre-fill value).
+   * `agent_space/probe_cgr_write_test.py` — replacing the math with
+     a constant + tid sentinel writes EVERY cell.  Forwarding the
+     constant + a `sum*0 + mean*0 + rstd*0` term to fake the data
+     dependency triggers the miscompile again — confirming the
+     trigger is the structural dependency, not the produced value.
+   * `agent_space/probe_cgr_write_pattern.py` — encodes
+     ``co * 10000 + oh * 100 + ow`` as the stored value, demonstrating
+     half the channels never get written even though every cell
+     theoretically has exactly one writer.
+
+Mitigation (Group D): `_slang_tile_conv2d_gn_relu`
+(`templates/caller/conv.py`) now routes through a 3-dispatch eager
+decomp (`aten.convolution` + `F.group_norm` + `F.relu`) until either
+the slangc bug is narrowed or a different shader structure is found.
+The shader file is left in-tree (with the op-order fix and bug
+documentation) as a regression baseline; the dispatch wiring below
+the early-return is preserved so the fast path can be re-armed by
+deleting a single block of code once the underlying issue is fixed.
+
+Regression gate:
+`tests/test_inductor_regression.py::TestMNew11ConvGnReluFusedCorrectness`
+covers the SmallCNN first / second blocks, a tiny case that
+specifically reproduces the Wave-1 store-drop fingerprint
+(must have at least one non-zero per channel), and a `bias=None`
+path (which forced an additional fallback fix to synthesise a
+zero bias around the existing PrivateUse1 "tensor does not have a
+device" blocker from § 0.0.6 row B).  All four pass.
+
+Layer-bisect re-run with the M-NEW.11 fix confirms `conv1 → gn1 →
+relu1 → pool1` now matches CPU to ~1e-6 (previously `relu1`
+diverged at 4.3 abs err).  The remaining SmallCNN failure surfaces
+at the **second conv2d** dispatch (extern_kernels.convolution), which
+emits a constant repeated output — a SEPARATE bug in the
+extern-conv lowering path (NOT in Group D scope), filed as the
+next follow-up.
+
 ---
 
 ## 0.0.6 CONV-TRAINING CRITICAL PATH (2026-05-19, user-directed focus)

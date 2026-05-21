@@ -9,15 +9,32 @@
 // Each WG handles group_size = (C_out / G) * oH * oW output elements.
 // 256 threads stride across the group_size elements.
 //
+// PyTorch semantics being matched (SmallCNN-style):
+//   ``F.relu(F.group_norm(F.conv2d(x, w, bias)))``
+//   i.e. compose order is  ReLU ∘ GN ∘ (Conv+bias).
+//
 // Algorithm (2-pass, no LDS output buffer — works for any group_size):
 //   1. Each thread computes its share of conv outputs (strided),
-//      applies bias + ReLU, and accumulates Welford stats locally.
+//      applies bias, and accumulates Welford stats over the
+//      pre-normalisation conv+bias outputs.  (NO ReLU here — GN
+//      must see the raw conv+bias values, otherwise the mean/var
+//      collapse onto the clamped distribution and the post-GN
+//      result diverges from CPU by O(1).)
 //   2. Workgroup-level Welford reduction → mean, var, rstd.
-//   3. Each thread recomputes its share, normalizes, applies
-//      GN affine (weight, bias), and writes to output.
+//   3. Each thread recomputes its share, normalises with the
+//      Welford stats, applies the GN affine (weight, bias),
+//      finally applies ReLU, and writes to output.
 //
 // Conv groups=1 only (not depthwise).  GN groups can be any divisor of C_out.
 // f32 only.
+//
+// Bug-history note (Group-D fix, 2026-05-21):
+// Earlier versions of this shader applied ReLU **before** the Welford
+// accumulation, computing ``gn(relu(conv(x)))`` instead of the requested
+// ``relu(gn(conv(x)))``.  The two are not equivalent — the Welford stats
+// differ, and the unrelued post-GN tensor still contains negative values
+// (which never appear in the CPU oracle), so SmallCNN
+// ``test_forward_vs_cpu`` failed with ``max abs err ≈ 0.87``.
 //
 // Jinja2 parameters:
 //   group_size      — (C_out / G) * oH * oW  (literal for documentation)
@@ -105,7 +122,10 @@ void computeMain(
     uint out_batch_base = n * pc.stride_out_n;
 
     // ═══════════════════════════════════════════════════════════════
-    // Pass 1: compute conv + bias + ReLU, accumulate Welford stats
+    // Pass 1: compute conv + bias, accumulate Welford stats over the
+    // pre-norm distribution.  ReLU is intentionally NOT applied here
+    // because PyTorch composes as ``relu(gn(conv(x)))`` — GN must see
+    // the raw conv+bias values.
     // ═══════════════════════════════════════════════════════════════
     float local_mean = 0.0f;
     float local_m2   = 0.0f;
@@ -150,14 +170,14 @@ void computeMain(
         sum += args.bias[co];
         /*{%*/ endif /*%}*/
 
-        // ── ReLU ──
-        float relu_val = sum > 0.0f ? sum : 0.0f;
-
-        // ── Online Welford (single-pass mean + M2) ──
-        float delta = relu_val - local_mean;
+        // ── Online Welford (single-pass mean + M2) over conv+bias ──
+        // Pre-norm value; the fix vs the old shader is that we do NOT
+        // pre-clamp at ReLU before accumulating.
+        float pre_norm = sum;
+        float delta = pre_norm - local_mean;
         local_n += 1.0f;
         local_mean += delta / local_n;
-        local_m2   += delta * (relu_val - local_mean);
+        local_m2   += delta * (pre_norm - local_mean);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -174,7 +194,22 @@ void computeMain(
     float rstd = 1.0f / sqrt(var + pc.eps);
 
     // ═══════════════════════════════════════════════════════════════
-    // Pass 3: recompute conv + bias + ReLU, normalize, affine, store
+    // Pass 3: recompute conv + bias, normalize with the Welford
+    // statistics, apply GN affine, then ReLU, then store.
+    // PyTorch semantics: ``relu(gn(conv(x) + bias))`` — ReLU is the
+    // OUTERMOST op, so it runs after the affine transform.
+    //
+    // NOTE (Group-D 2026-05-21): slangc 2026.7.1 has a write-coverage
+    // miscompile in this shader — Wave 1 (lanes 64..127 on RDNA1
+    // wave64) silently drops its ``OpStore`` when Pass 3's stored
+    // value depends on both the conv-load chain AND the welford
+    // results.  Verified via probe_cgr_write_pattern.py.  Multiple
+    // loop-shape rewrites in this file did not lift the miscompile,
+    // so the Python caller (``_slang_tile_conv2d_gn_relu``) now
+    // bypasses this kernel and falls back to a 3-dispatch decomp
+    // (conv + group_norm + relu) until either the slangc bug is
+    // narrowed or a different shader structure is found.  This block
+    // is preserved as a regression baseline + documentation.
     // ═══════════════════════════════════════════════════════════════
     for (uint d = tid; d < S; d += 256) {
         uint co_local    = d / spatial_size;
@@ -214,12 +249,13 @@ void computeMain(
         sum += args.bias[co];
         /*{%*/ endif /*%}*/
 
-        // ── ReLU ──
-        float relu_val = sum > 0.0f ? sum : 0.0f;
+        // ── Normalize the raw conv+bias value, then apply GN affine ──
+        // Mirrors ``F.group_norm`` exactly: ``(x - mean) * rstd * gamma + beta``.
+        float normed = (sum - mean) * rstd;
+        float affine = normed * args.gn_weight[co] + args.gn_bias[co];
 
-        // ── Normalize + affine + store ──
-        float normed = (relu_val - mean) * rstd;
-        float result = normed * args.gn_weight[co] + args.gn_bias[co];
+        // ── ReLU (outermost op) ──
+        float result = max(affine, 0.0f);
 
         uint out_idx = out_batch_base
                      + co * pc.stride_out_c

@@ -67,10 +67,35 @@ def _slang_tile_conv2d_gn_relu(
     num_groups: int,
     eps: float,
 ) -> None:
-    """Execute combined Conv2D + GroupNorm + ReLU in a single dispatch.
+    """Execute combined Conv2D + GroupNorm + ReLU.
 
-    M17.2 Phase 3: replaces the two-dispatch (conv+ReLU then GN) approach
-    with a single compute shader that does everything in one pass.
+    M17.2 Phase 3 originally introduced a single Slang shader
+    (``conv_gn_relu.slang``) that does conv compute, Welford reduction,
+    GN normalisation + affine, and the final ReLU in one
+    ``vkQueueSubmit``.  That shader has two known bugs investigated in
+    detail on 2026-05-21:
+
+      1. Op-order: the shader pre-clamps with ReLU before the Welford
+         accumulation, computing ``gn(relu(conv(x)))`` instead of
+         ``relu(gn(conv(x)))`` — fixed in the shader body.
+      2. slangc 2026.7.1 write-coverage miscompile: Wave 1 (lanes
+         64..127 on RDNA1 wave64) silently drops its ``OpStore`` when
+         Pass 3's stored value depends on both the conv-load chain and
+         the welford results.  Verified via
+         ``agent_space/probe_cgr_write_pattern.py``: a constant store
+         hits every cell, but a store dependent on ``sum``/``mean``/
+         ``rstd`` leaves the second channel-per-WG entirely at the
+         pre-fill value.  Loop-shape rewrites did not lift the
+         miscompile.
+
+    Until a clean shader-side fix lands, this entry point falls back to
+    a 3-dispatch decomp using the existing eager aten ops
+    (``aten.convolution`` + ``F.group_norm`` + ``F.relu``).  Functional
+    correctness is preserved; the dispatch-count win from M17.2-Phase-3
+    is temporarily forfeit.  The original PC packing and dispatch wiring
+    below the early-return is intentionally retained so the dispatch
+    path can be re-armed by deleting the fallback once the underlying
+    shader is fixed.
 
     Input:  [N, C_in, iH, iW]  (NCHW)
     Weight: [C_out, C_in, kH, kW]  (groups=1)
@@ -79,7 +104,50 @@ def _slang_tile_conv2d_gn_relu(
     GN bias:   [C_out]  (beta)
     Output: [N, C_out, oH, oW]  (NCHW)
     """
+    import torch.nn.functional as F
+
     from ...runtime import compile_and_dispatch
+
+    # ── Group-D fallback (2026-05-21): bypass the broken fused shader ──
+    # The slangc 2026.7.1 miscompile drops Wave 1 stores; verified via
+    # the probe in agent_space/probe_cgr_write_pattern.py.  Until a
+    # clean shader rewrite lands, route through 3 eager aten dispatches.
+    # This preserves SmallCNN's forward-vs-CPU correctness at the cost
+    # of an extra dispatch per fused block.
+    #
+    # NB: a ``bias=None`` ``aten.convolution`` call on PrivateUse1 trips
+    # a ``tensor does not have a device`` error inside torch core (the
+    # same blocker documented in row B of § 0.0.6 of the roadmap), so
+    # we synthesise a zero bias to keep the fallback path exception-free.
+    _input_c = input_t.contiguous() if not input_t.is_contiguous() else input_t
+    _weight_c = weight_t.contiguous() if not weight_t.is_contiguous() else weight_t
+    if bias is not None:
+        _bias = bias
+    else:
+        _bias = torch.zeros(
+            _weight_c.shape[0], dtype=_input_c.dtype, device=_input_c.device
+        )
+    _conv_out = torch.ops.aten.convolution.default(
+        _input_c,
+        _weight_c,
+        _bias,
+        list(stride),
+        list(padding),
+        list(dilation),
+        False,
+        [0, 0],
+        1,
+    )
+    _gn_out = F.group_norm(
+        _conv_out,
+        int(num_groups),
+        gn_weight.view(-1),
+        gn_bias.view(-1),
+        float(eps),
+    )
+    out.copy_(F.relu(_gn_out))
+    return
+    # ── End fallback; original dispatch wiring retained below ──
 
     N, C_in, iH, iW = input_t.shape
     C_out, C_in_w, kH, kW = weight_t.shape
@@ -101,7 +169,14 @@ def _slang_tile_conv2d_gn_relu(
     has_bias = bias is not None
     dtype_s = _dtype_to_slang(input_t.dtype)
     src = _render_conv_gn_relu_slang(has_bias=has_bias)
-    cache_key = f"conv_gn_relu_{dtype_s}{'_bias' if has_bias else ''}_m17p3"
+    # ``_relufix2`` (2026-05-21, Group D): bumped twice in one session —
+    # (1) corrected the op-order bug (was ``gn(relu(conv(x)))``,
+    #     should be ``relu(gn(conv(x)))``), and
+    # (2) reshaped the Pass-3 loop nest to work around a slangc 2026.7.1
+    #     miscompile that dropped Wave 1's stores when Pass 3's
+    #     ``d``-stride loop mirrored Pass 1's.
+    # Cache-busting tag prevents stale SPIR-V blobs from being reused.
+    cache_key = f"conv_gn_relu_{dtype_s}{'_bias' if has_bias else ''}_m17p3_relufix2"
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
