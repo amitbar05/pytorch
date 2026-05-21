@@ -11,12 +11,38 @@ Checks performed:
   4. ``groupshared`` budget check (sum of groupshared arrays ≤ device limit)
   5. ``numthreads`` product check (numthreads.x * y * z ≤ device max invocations)
   6. Simple syntax checks (unclosed string literals, unclosed block comments)
+
+The heavier checks live in sibling modules to keep this file under the
+800-line anti-goal cap:
+
+* ``validate_resource_limits`` — groupshared / numthreads.
+* ``validate_identifiers`` — single-use identifier detection.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import re
+
+from torch_vulkan.inductor.validate_identifiers import (
+    _SLANG_RESERVED,
+    check_undefined_identifiers,
+)
+from torch_vulkan.inductor.validate_resource_limits import (
+    check_groupshared_budget,
+    check_numthreads_product,
+)
+from torch_vulkan.inductor.validate_types import SlangValidationIssue
+
+
+__all__ = [
+    "SlangValidationError",
+    "SlangValidationIssue",
+    "SlangValidator",
+    "_SLANG_RESERVED",
+    "inject_and_validate",
+    "validate_slang_source",
+]
+
 
 # ── Device limits (conservative) ──────────────────────────────────────────
 
@@ -27,38 +53,6 @@ _DEFAULT_MAX_GROUPSHARED_BYTES = 32768
 
 # Vulkan spec minimum for maxComputeWorkGroupInvocations is 1024.
 _DEFAULT_MAX_INVOCATIONS = 1024
-
-
-@dataclasses.dataclass
-class SlangValidationIssue:
-    """A single validation issue found in Slang source."""
-
-    category: (
-        str  # "brace", "binding", "identifier", "groupshared", "numthreads", "syntax"
-    )
-    message: str
-    line: int | None = None
-    context: str | None = None  # relevant source snippet
-
-    def __str__(self) -> str:
-        parts = [f"[{self.category}] {self.message}"]
-        if self.line is not None:
-            parts.insert(1, f"line {self.line}")
-        if self.context:
-            parts.append(f"  context: {self.context}")
-        return " ".join(parts)
-
-    def __contains__(self, substring: object) -> bool:
-        # Lets legacy callers use ``"unclosed" in issue`` and ``"gap" in
-        # issue.lower()`` against an issue object the same way they used to
-        # against a plain error string. The shim path (slang_validator.py)
-        # imports SlangValidationIssue and re-exports validate_slang_source
-        # without any string conversion, so older tests keep working.
-        return isinstance(substring, str) and substring in str(self)
-
-    def lower(self) -> str:
-        # Older tests do ``e.lower()`` on each error.  Mirror str semantics.
-        return str(self).lower()
 
 
 class SlangValidationError(Exception):
@@ -74,225 +68,10 @@ class SlangValidationError(Exception):
 # ── Regex patterns ────────────────────────────────────────────────────────
 
 _BINDING_RE = re.compile(r"\[\[vk::binding\((\d+)(?:\s*,\s*\d+)?\)\]\]")
-_GROUPSHARED_RE = re.compile(
-    r"groupshared\s+(\w+(?:\s*<[^>]+>)?)\s+(\w+)\s*\[([^\]]+)\]\s*;"
-)
-_NUMTHREADS_RE = re.compile(r"\[numthreads\((\d+),\s*(\d+),\s*(\d+)\)\]")
 _STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _BLOCK_COMMENT_START_RE = re.compile(r"/\*")
 _BLOCK_COMMENT_END_RE = re.compile(r"\*/")
 _LINE_COMMENT_RE = re.compile(r"//.*$", re.MULTILINE)
-_IDENTIFIER_RE = re.compile(r"\b([a-zA-Z_]\w*)\b")
-
-
-# Slang keywords and built-in identifiers that are always "defined"
-_SLANG_RESERVED = frozenset(
-    {
-        # Slang keywords
-        "if",
-        "else",
-        "for",
-        "while",
-        "do",
-        "switch",
-        "case",
-        "default",
-        "break",
-        "continue",
-        "return",
-        "struct",
-        "class",
-        "interface",
-        "void",
-        "bool",
-        "int",
-        "uint",
-        "float",
-        "double",
-        "half",
-        "int8_t",
-        "int16_t",
-        "int64_t",
-        "uint8_t",
-        "uint16_t",
-        "uint64_t",
-        "float16_t",
-        "float32_t",
-        "float64_t",
-        "bfloat16",
-        "true",
-        "false",
-        "null",
-        "this",
-        "const",
-        "static",
-        "inline",
-        "public",
-        "private",
-        "protected",
-        "virtual",
-        "override",
-        "abstract",
-        "typedef",
-        "using",
-        "namespace",
-        "import",
-        "export",
-        "module",
-        "enum",
-        "union",
-        "operator",
-        "explicit",
-        "noexcept",
-        "__import",
-        "__generic",
-        "__generic_type",
-        "__extension",
-        "extension",
-        "as",
-        "is",
-        "sizeof",
-        "in",
-        "out",
-        "inout",
-        "ref",
-        "property",
-        "get",
-        "set",
-        "where",
-        "associatedtype",
-        "capability",
-        # Slang attributes
-        "vk",
-        "binding",
-        "push_constant",
-        "location",
-        "descriptorset",
-        "shader",
-        "compute",
-        "ForceInline",
-        "unroll",
-        "StructuredBuffer",
-        "RWStructuredBuffer",
-        "ByteAddressBuffer",
-        "RWByteAddressBuffer",
-        "Texture2D",
-        "RWTexture2D",
-        "ConstantBuffer",
-        "groupshared",
-        # SPIR-V / HLSL built-ins
-        "numthreads",
-        "SV_DispatchThreadID",
-        "SV_GroupThreadID",
-        "SV_GroupID",
-        "SV_GroupIndex",
-        # Slang built-in functions (subset)
-        "abs",
-        "max",
-        "min",
-        "clamp",
-        "sqrt",
-        "rsqrt",
-        "exp",
-        "log",
-        "sin",
-        "cos",
-        "tan",
-        "asin",
-        "acos",
-        "atan",
-        "atan2",
-        "sinh",
-        "cosh",
-        "tanh",
-        "floor",
-        "ceil",
-        "round",
-        "trunc",
-        "frac",
-        "sign",
-        "copysign",
-        "fmod",
-        "lerp",
-        "step",
-        "smoothstep",
-        "pow",
-        "mod",
-        "fma",
-        "fwidth",
-        "ddx",
-        "ddy",
-        "dot",
-        "cross",
-        "normalize",
-        "length",
-        "distance",
-        "reflect",
-        "refract",
-        "transpose",
-        "determinant",
-        "asfloat",
-        "asint",
-        "asuint",
-        "asdouble",
-        "countbits",
-        "firstbithigh",
-        "firstbitlow",
-        "reversebits",
-        "GroupMemoryBarrierWithGroupSync",
-        "GroupMemoryBarrier",
-        "InterlockedAdd",
-        "InterlockedExchange",
-        "InterlockedCompareExchange",
-        "InterlockedMin",
-        "InterlockedMax",
-        "InterlockedAnd",
-        "InterlockedOr",
-        "InterlockedXor",
-        "WaveGetLaneIndex",
-        "WaveReadLaneFirst",
-        "WaveReadLaneAt",
-        "WaveActiveSum",
-        "WaveActiveProduct",
-        "WaveActiveMax",
-        "WaveActiveMin",
-        "WaveActiveAllEqual",
-        "WaveActiveBitAnd",
-        "WaveActiveBitOr",
-        "WaveActiveBitXor",
-        "WavePrefixSum",
-        "WavePrefixProduct",
-        "WaveIsFirstLane",
-        "WaveBroadcastLaneAt",
-        "tex2D",
-        "tex2Dlod",
-        "sampler",
-        "float2",
-        "float3",
-        "float4",
-        "float2x2",
-        "float3x3",
-        "float4x4",
-        "int2",
-        "int3",
-        "int4",
-        "uint2",
-        "uint3",
-        "uint4",
-        "bool2",
-        "bool3",
-        "bool4",
-        "double2",
-        "double3",
-        "double4",
-        "matrix",
-        # GPU coordinate builtins (SV_ prefix is in reserved set above)
-        "gtid",
-        "lid",
-        "gid",
-        "tid",
-    }
-)
 
 
 class SlangValidator:
@@ -494,199 +273,19 @@ class SlangValidator:
 
     def _check_groupshared_budget(self, src: str) -> list[SlangValidationIssue]:
         """Sum groupshared array sizes and compare against device limit."""
-        issues: list[SlangValidationIssue] = []
-        total_bytes = 0
-        for m in _GROUPSHARED_RE.finditer(src):
-            type_str = m.group(1).strip()
-            # name = m.group(2)
-            size_expr = m.group(3)
-            # Determine element size in bytes
-            elem_bytes = _type_size_bytes(type_str)
-            # Try to evaluate the size expression (simple integer check)
-            try:
-                num_elems = int(size_expr)
-            except ValueError:
-                # Could be an expression with template variables like {{ BQ }} * {{ head_dim }}
-                # Try evaluating the Jinja-rendered form
-                try:
-                    num_elems = eval(size_expr, {"__builtins__": {}}, {})
-                except Exception:
-                    # Can't evaluate — just note it for manual review
-                    continue
-            total_bytes += elem_bytes * num_elems
-
-        if total_bytes > self._max_groupshared_bytes:
-            issues.append(
-                SlangValidationIssue(
-                    category="groupshared",
-                    message=(
-                        f"groupshared budget exceeded: {total_bytes} bytes "
-                        f"(limit: {self._max_groupshared_bytes} bytes)"
-                    ),
-                )
-            )
-        return issues
+        return check_groupshared_budget(src, self._max_groupshared_bytes)
 
     def _check_numthreads_product(self, src: str) -> list[SlangValidationIssue]:
         """Check that numthreads.x * y * z ≤ device max invocations."""
-        issues: list[SlangValidationIssue] = []
-        for m in _NUMTHREADS_RE.finditer(src):
-            x, y, z = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            product = x * y * z
-            if product > self._max_invocations:
-                issues.append(
-                    SlangValidationIssue(
-                        category="numthreads",
-                        message=(
-                            f"numthreads product ({x}×{y}×{z} = {product}) "
-                            f"exceeds max invocations ({self._max_invocations})"
-                        ),
-                    )
-                )
-            if (
-                x > self._max_invocations
-                or y > self._max_invocations
-                or z > self._max_invocations
-            ):
-                issues.append(
-                    SlangValidationIssue(
-                        category="numthreads",
-                        message=(
-                            f"numthreads dimension ({x},{y},{z}) exceeds "
-                            f"max invocations per dimension ({self._max_invocations})"
-                        ),
-                    )
-                )
-        return issues
+        return check_numthreads_product(src, self._max_invocations)
 
     @staticmethod
     def _check_undefined_identifiers(src: str) -> list[SlangValidationIssue]:
-        """Detect identifiers that appear exactly once — likely typos.
-
-        An identifier used **exactly once** in the whole shader source is
-        suspicious: either it's a function/variable that's never used (dead
-        code), or a typo (e.g., ``s27`` misspelled as ``s28`` in one place).
-        We flag these but filter out common single-use patterns like:
-
-        - Entry-point name (``computeMain``)
-        - Struct/parameter names in declarations
-        - Slang reserved words
-        - Common singleton patterns (``PC``, ``pc``)
-        """
-        issues: list[SlangValidationIssue] = []
-        # Strip strings and comments
-        cleaned = _strip_strings_and_comments(src)
-        # Find all identifiers
-        identifiers: dict[str, list[tuple[int, int]]] = {}
-        for m in _IDENTIFIER_RE.finditer(cleaned):
-            ident = m.group(1)
-            if ident in _SLANG_RESERVED:
-                continue
-            if ident.startswith("_"):
-                # Allow single-use underscore-prefixed identifiers
-                # (they're often intentionally generated)
-                continue
-            if len(ident) <= 1:
-                continue
-            identifiers.setdefault(ident, []).append((m.start(), m.end()))
-
-        # Find identifiers used exactly once
-        single_use: dict[str, tuple[int, int]] = {
-            k: v[0] for k, v in identifiers.items() if len(v) == 1
-        }
-
-        # Filter known-good single-use patterns
-        _known_single_use = {
-            "computeMain",  # entry point
-            "PC",
-            "pc",  # push-constant struct and var (may appear once per shader)
-            "main",
-        }
-        suspicious = {
-            k: pos for k, pos in single_use.items() if k not in _known_single_use
-        }
-
-        # Don't flag identifiers that look like type names (capitalized,
-        # used before struct/class declarations)
-        suspicious_filtered = {}
-        for k, pos in suspicious.items():
-            if k[0].isupper() and len(k) > 1:
-                # Capitalized identifiers may be type names used once
-                # Check context: if it appears near "struct" or "class", skip
-                ctx_start = max(0, pos[0] - 20)
-                ctx_end = min(len(cleaned), pos[1] + 20)
-                ctx = cleaned[ctx_start:ctx_end].lower()
-                if "struct" in ctx or "class" in ctx:
-                    continue
-            suspicious_filtered[k] = pos
-
-        if suspicious_filtered:
-            # Get line numbers for the suspicious identifiers
-            line_map = _build_line_map(src)
-            details = []
-            for ident, (start_pos, _) in sorted(
-                suspicious_filtered.items(), key=lambda x: x[1][0]
-            ):
-                line_no = _pos_to_line(line_map, start_pos)
-                details.append(f"`{ident}` at line {line_no}")
-            issues.append(
-                SlangValidationIssue(
-                    category="identifier",
-                    message=(
-                        f"Single-use identifiers (possible typos): "
-                        f"{', '.join(details[:8])}"  # cap at 8 to avoid flooding
-                    ),
-                )
-            )
-        return issues
+        """Detect identifiers that appear exactly once — likely typos."""
+        return check_undefined_identifiers(src)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────
-
-
-def _type_size_bytes(type_str: str) -> int:
-    """Return size in bytes for a Slang type string."""
-    type_str = type_str.strip()
-    # Exact matches
-    exact = {
-        "float": 4,
-        "int": 4,
-        "uint": 4,
-        "float32_t": 4,
-        "int32_t": 4,
-        "uint32_t": 4,
-        "half": 2,
-        "float16_t": 2,
-        "int16_t": 2,
-        "uint16_t": 2,
-        "double": 8,
-        "float64_t": 8,
-        "int64_t": 8,
-        "uint64_t": 8,
-        "int8_t": 1,
-        "uint8_t": 1,
-        "bool": 1,
-        "bfloat16": 2,
-    }
-    if type_str in exact:
-        return exact[type_str]
-    # Vector types: float2, float3, float4, int2, etc.
-    vec_match = re.match(r"^(float|int|uint|half|double|bool)(\d)$", type_str)
-    if vec_match:
-        base = vec_match.group(1)
-        count = int(vec_match.group(2))
-        base_size = exact.get(base, 4)
-        return base_size * count
-    # Matrix types: float2x2, float3x3, float4x4, etc.
-    mat_match = re.match(r"^(float|half|double)(\d)x(\d)$", type_str)
-    if mat_match:
-        base = mat_match.group(1)
-        rows = int(mat_match.group(2))
-        cols = int(mat_match.group(3))
-        base_size = exact.get(base, 4)
-        return base_size * rows * cols
-    # Default: assume 4 bytes (float)
-    return 4
 
 
 def _strip_strings_and_comments(src: str) -> str:
@@ -699,22 +298,6 @@ def _strip_strings_and_comments(src: str) -> str:
     # Remove line comments
     cleaned = _LINE_COMMENT_RE.sub(" ", cleaned)
     return cleaned
-
-
-def _build_line_map(src: str) -> list[int]:
-    """Build a list where index i is the start position of line i (0-based)."""
-    line_map = [0]
-    for i, ch in enumerate(src):
-        if ch == "\n":
-            line_map.append(i + 1)
-    return line_map
-
-
-def _pos_to_line(line_map: list[int], pos: int) -> int:
-    """Convert a character position to a 1-based line number."""
-    import bisect
-
-    return bisect.bisect_right(line_map, pos)
 
 
 # ── Public API ────────────────────────────────────────────────────────────

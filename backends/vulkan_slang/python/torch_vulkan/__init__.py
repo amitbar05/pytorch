@@ -679,6 +679,74 @@ def memory_cached() -> int:
     return _c_ext._memory_cached()
 
 
+def profile_and_warmup(
+    level: str = "deep",
+    *,
+    force: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Profile the Vulkan device and warm up shader / autotune caches.
+
+    Recommended one-shot call before a long training run to avoid paying
+    slangc cold-compile + autotune latency on the first ``torch.compile``
+    dispatch.
+
+    Args:
+        level: one of ``"quick"`` (~5 s — microbench only), ``"medium"``
+            (~30 s warm / minutes cold — adds shader-lib + matmul-template
+            SPIR-V prewarm), or ``"deep"`` (~3 min warm / up to ~15 min
+            cold — adds an autotune sweep over canonical mm and conv2d
+            shapes).  Default ``"deep"`` because if the caller asked for
+            ``profile_and_warmup`` they want the full set.
+        force: re-run even if a cached status marker says the requested
+            level is already complete.  Useful after a driver or slangc
+            upgrade.
+        verbose: print per-stage progress (default ``True`` since this
+            is a user-invoked operation).
+
+    Returns:
+        Dict with ``"level"``, ``"cached"``, per-stage timings, and the
+        underlying probe result.  Mirrors
+        :func:`torch_vulkan.inductor.hardware_probe.profile_device`.
+
+    Example::
+
+        import torch_vulkan
+        torch_vulkan.profile_and_warmup()           # one-time on cold cache
+        # … model + opt setup …
+        for batch in train_loader:
+            train_step(batch)
+    """
+    from torch_vulkan.inductor.hardware_probe import (
+        LEVEL_DEEP,
+        LEVEL_MEDIUM,
+        LEVEL_QUICK,
+        profile_device,
+    )
+
+    _level_map = {
+        "quick": LEVEL_QUICK,
+        "medium": LEVEL_MEDIUM,
+        "deep": LEVEL_DEEP,
+        # Numeric aliases mirror the env-var resolver.
+        "0": LEVEL_QUICK,
+        "1": LEVEL_MEDIUM,
+        "2": LEVEL_DEEP,
+    }
+    if isinstance(level, int):
+        lvl = level
+    else:
+        lvl_key = str(level).lower()
+        if lvl_key not in _level_map:
+            raise ValueError(
+                f"profile_and_warmup level must be one of "
+                f"{sorted(_level_map.keys())} or 0/1/2 (got {level!r})"
+            )
+        lvl = _level_map[lvl_key]
+
+    return profile_device(level=lvl, force=force, verbose=verbose)
+
+
 def _empty_strided_vulkan(size, stride, dtype, lifetime_class: str = "transient"):
     """Allocate a Vulkan tensor with the given size/stride/dtype.
 

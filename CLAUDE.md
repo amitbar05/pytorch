@@ -111,12 +111,24 @@ Only use lint commands provided by `spin`.
 
 ---
 
-# Commit messages
+# Commit policy
 
-Don't commit unless explicitly asked. Keep messages concise: describe
-**why**, not a bullet list of what. Disclose Claude authorship via
-`Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer.
-Preserve `ghstack-source-id` and `Pull-Request` trailers when amending.
+**Test and validate before committing.** Once the relevant tests are green
+(unit + targeted regression — and a smoke run when the change touches
+runtime / GPU code), commit the work as a single logical unit. You do
+not need to wait for a separate "please commit" instruction; the green
+test run is the authorisation.
+
+Skip commits only when: (a) tests are still failing, (b) the change is
+purely exploratory / scratch (`agent_space/`), or (c) the user said "don't
+commit yet" for the specific item.
+
+When you do commit:
+
+* Keep messages concise: describe **why**, not a bullet list of what.
+* Disclose Claude authorship via
+  `Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer.
+* Preserve `ghstack-source-id` and `Pull-Request` trailers when amending.
 
 ---
 

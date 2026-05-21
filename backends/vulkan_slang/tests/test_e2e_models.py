@@ -2429,8 +2429,12 @@ class TestUNetBlock:
         assert torch.isfinite(out.cpu()).all()
 
 
-class TestSmallCNNTrain:
-    """v5 North Star: SmallCNN trains end-to-end."""
+class TestSmallCNNTrainSequential:
+    """Older MNIST-style SmallCNN gate (1-channel, nn.Sequential).
+
+    Renamed 2026-05-20 to avoid shadowing the canonical 8-test
+    [TestSmallCNNTrain](#L1172).
+    """
 
     def test_small_cnn_forward_compiles(self):
         """SmallCNN forward compiles and matches CPU."""

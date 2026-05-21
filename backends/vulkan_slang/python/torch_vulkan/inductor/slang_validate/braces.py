@@ -88,4 +88,14 @@ def _check_brace_balance(src: str) -> list[str]:
             f"L{lineno}: unclosed bracket {opener!r} (missing {pairs[opener]!r})"
         )
 
+    # Unterminated string / block comment carried past end-of-input.  These
+    # are reported under the "brace" category because they imply a
+    # downstream bracket-mismatch the user can't see — and the regression
+    # tests (TestSlangSourceValidator::test_unclosed_{string,comment}_caught)
+    # match on ``category=="brace"`` + ``"string"|"comment"`` in the message.
+    if in_string:
+        errors.append("EOF: unclosed string literal")
+    if in_block_comment:
+        errors.append("EOF: unclosed block comment")
+
     return errors

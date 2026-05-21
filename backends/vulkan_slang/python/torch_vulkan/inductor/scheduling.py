@@ -734,6 +734,57 @@ class VulkanScheduling(SIMDScheduling):
             node_schedule, numel, reduction_numel, coalesce_analysis
         )
 
+    def create_kernel_choices(
+        self, kernel_features, kernel_args, kernel_kwargs
+    ):
+        """M19.2 — wire ``VulkanKernel._enable_persistent_mode()``.
+
+        The grid-stride-loop wrapper in ``kernel/pointwise.py`` was dead
+        code (defined, gated by ``config.persistent_pointwise()``, but
+        never invoked anywhere in the backend).  Activate it here, right
+        after the kernel is instantiated by the base SIMDScheduling, so
+        the body emitter in ``kernel/header.py`` (which checks
+        ``self._persistent_mode`` after the loads/compute/stores splice)
+        actually sees the flag set when ``codegen_kernel()`` runs.
+
+        Activation conditions:
+          * ``config.persistent_pointwise()`` is the user gate (default
+            on via ``TORCH_VULKAN_PERSISTENT_POINTWISE=1``).
+          * Pointwise only — ``reduction_numel == 1``.  The persistent
+            loop substitutes ``gtid.x`` and is incompatible with the
+            two-tree reduction layout.
+          * Small kernels — ``numel <= 4096``.  Below this point the
+            per-dispatch overhead (~30-60 us on RDNA1) dominates the
+            kernel runtime and the grid-stride loop amortises launches
+            across the chain.  Above 4096 elements the dispatch is
+            already large enough that the existing single-launch
+            path is fine; the persistent path would just add a
+            modulo-stride load per element.
+        """
+        from . import config
+
+        kernels = super().create_kernel_choices(
+            kernel_features, kernel_args, kernel_kwargs
+        )
+
+        if not config.persistent_pointwise():
+            return kernels
+        if kernel_features.is_reduction():
+            return kernels
+
+        numel = kernel_features.numel
+        if not isinstance(numel, sympy.Integer):
+            return kernels
+        if int(numel) > 4096:
+            return kernels
+
+        for kernel in kernels:
+            enable = getattr(kernel, "_enable_persistent_mode", None)
+            if callable(enable):
+                enable()
+
+        return kernels
+
 
 _BENCHMARKER = None
 

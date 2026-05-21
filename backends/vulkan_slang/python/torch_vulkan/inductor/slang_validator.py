@@ -8,3 +8,4 @@ continues to work exactly as before; the per-pass logic now lives in the
 from __future__ import annotations
 
 from torch_vulkan.inductor.slang_validate import validate_slang_source  # noqa: F401
+from torch_vulkan.inductor.validate import inject_and_validate  # noqa: F401

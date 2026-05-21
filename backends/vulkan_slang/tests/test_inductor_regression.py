@@ -51765,3 +51765,495 @@ class TestMNew5ColdImportOptimization:
             f"`_prewarm_filtered_sources` is being called from the "
             f"prewarm-active path."
         )
+
+
+class TestBlockerGSlangMmPcLayout:
+    """Blocker G (2026-05-21) — slang_mm / slang_addmm dispatches must
+    write to ``out``. Two distinct bugs caused the kernel to silently no-op:
+
+    1. The DR.7 ``_pick_numthreads_from_reflection`` flatten — collapsed
+       2D workgroups to ``(base, 1, 1)``, killing every thread with
+       ``lid.y > 0``. Locked by
+       ``TestDR7ReflectionRouting::test_dr7_preserves_2d_workgroups``.
+
+    2. Stale ``templates/slang_mm.slang`` / ``slang_mm_bwd.slang`` files
+       declared a CONDITIONAL PC struct (15 uints = 60 B when
+       ``has_bias=True, has_batch=False``), while Python ``_pack_mm_pc``
+       packs a MONOLITHIC 24-field layout (96 B per ``"19I5f"``).
+       ``_load_slang_template`` (``vulkan_template.py:68``) prefers
+       ``.slang`` over ``.py.jinja``, so the broken stale ``.slang`` won.
+       Bytes meant for ``stride_a_b=0`` landed at the shader's ``tile_m``
+       field → divide-by-zero in ``pc.tile_m / pc.m_per_thread`` → every
+       thread early-exited → no store ever fired.
+
+    Fix: deleted both stale ``.slang`` files; loader falls back to the
+    monolithic ``.py.jinja``. This test locks the fix by asserting the
+    files stay deleted and the rendered ``.py.jinja`` source contains
+    the monolithic-layout invariants.
+    """
+
+    def test_slang_mm_template_resolves_to_py_jinja(self):
+        """The stale ``slang_mm.slang`` / ``slang_mm_bwd.slang`` files
+        must NOT be re-introduced. The loader (`vulkan_template.py:68`)
+        prefers ``.slang`` over ``.py.jinja``; the deleted ``.slang``
+        files had a CONDITIONAL 60 B PC struct while Python packs 96 B
+        monolithic.
+        """
+        import os
+
+        from torch_vulkan.inductor import vulkan_template
+
+        templates_dir = os.path.join(
+            os.path.dirname(vulkan_template.__file__), "templates"
+        )
+        slang_path = os.path.join(templates_dir, "slang_mm.slang")
+        bwd_slang_path = os.path.join(templates_dir, "slang_mm_bwd.slang")
+        assert not os.path.exists(slang_path), (
+            f"slang_mm.slang re-appeared at {slang_path}. The stale fork "
+            "had a CONDITIONAL 60 B PC struct while Python packs 96 B "
+            "monolithic — divide-by-zero in pc.tile_m/pc.m_per_thread "
+            "and every thread early-exits. Delete it and use "
+            "slang_mm.py.jinja (loader falls back automatically)."
+        )
+        assert not os.path.exists(bwd_slang_path), (
+            f"slang_mm_bwd.slang re-appeared at {bwd_slang_path}. Same "
+            "class of layout mismatch as the forward — delete it."
+        )
+
+    def test_slang_mm_rendered_pc_is_monolithic(self):
+        """Rendered ``slang_mm`` source must contain the monolithic-layout
+        markers (every field unconditional, runtime-gated via ``pc.flags``).
+
+        The conditional ``/*{%*/ if has_alpha /*%}*/`` Jinja guards in the
+        stale ``.slang`` left some fields out of the SPIR-V struct, so
+        Python's ``struct.pack`` offsets didn't line up.
+        """
+        from torch_vulkan.inductor.vulkan_template_caller import _render_mm_slang
+
+        src = _render_mm_slang(
+            tile_m=8, tile_n=8, tile_k=8,
+            dtype_a="float", dtype_b="float", dtype_c="float",
+            dtype_acc="float", dtype_bias="float",
+            num_stages=1, has_bias=True,
+            m_per_thread=1, n_per_thread=1,
+        )
+
+        for marker in (
+            "MM_FLAG_BIAS",       # flag constant always present
+            "pc.flags",           # runtime gate
+            "stride_a_b",         # batch stride field, ALWAYS present
+            "stride_bias_n",      # bias stride field, ALWAYS present
+            "alpha",
+            "beta",
+            "scale",
+            "clamp_min",
+            "clamp_max",
+        ):
+            assert marker in src, (
+                f"Rendered slang_mm source is missing monolithic-PC "
+                f"marker {marker!r}. The .slang file may have been "
+                f"re-introduced or the .py.jinja was reverted to a "
+                f"conditional layout. Python _pack_mm_pc expects 24 "
+                f"fields (96 B). See roadmap Blocker G."
+            )
+
+
+class TestM192PersistentPointwise:
+    """M19.2 — persistent pointwise kernel wiring.
+
+    ``VulkanKernel._enable_persistent_mode()`` is defined in
+    ``kernel/pointwise.py`` (on the ``PointwiseMixin`` mixin) and gated
+    correctly on ``config.persistent_pointwise()`` plus ``not
+    self.inside_reduction``, but until M19.2 nothing in the backend
+    ever invoked it — the grid-stride-loop wrapper at
+    ``kernel/header.py:148`` was therefore dead code.
+
+    The wiring lives in ``VulkanScheduling.create_kernel_choices`` and
+    fires only for small pointwise kernels (``numel <= 4096``) where the
+    per-dispatch overhead matters most.  When active, the body emitter
+    rewrites the kernel body into a ``for (uint _pi = gtid.x; ...)``
+    grid-stride loop (see ``_emit_persistent_grid_stride_loop`` at
+    ``kernel/pointwise.py:518``).
+
+    These tests directly exercise the scheduler hook
+    (``create_kernel_choices``) rather than the full compile pipeline —
+    the cold-compile cost of every Slang lib module makes a real
+    ``torch.compile`` run too slow under concurrent agent pressure.
+    The wiring contract is purely "does ``_enable_persistent_mode()``
+    fire under the right conditions and produce the right body marker?"
+    and that's all this class checks.
+    """
+
+    def _make_fake_kernel(self):
+        class _FakeKernel:
+            def __init__(self):
+                self._persistent_mode = False
+
+            def _enable_persistent_mode(self):
+                self._persistent_mode = True
+
+        return _FakeKernel()
+
+    def _make_fake_features(self, numel, reduction_numel=1):
+        import sympy
+
+        class _FakeFeatures:
+            def __init__(self, n, rn):
+                self.numel = sympy.Integer(n)
+                self.reduction_numel = sympy.Integer(rn)
+
+            def is_reduction(self):
+                return self.reduction_numel != 1
+
+        return _FakeFeatures(numel, reduction_numel)
+
+    def _make_scheduling(self):
+        from torch_vulkan.inductor.scheduling import VulkanScheduling
+
+        # Bypass __init__ — we only need the method object, not a
+        # bound ``Scheduler``.
+        return VulkanScheduling.__new__(VulkanScheduling)
+
+    def test_enable_fires_for_small_pointwise(self):
+        """Small pointwise (numel=1024, no reduction) hits the gate."""
+        from unittest import mock
+
+        os.environ["TORCH_VULKAN_PERSISTENT_POINTWISE"] = "1"
+
+        sch = self._make_scheduling()
+        fake_kernels = [self._make_fake_kernel()]
+        features = self._make_fake_features(numel=1024)
+
+        with mock.patch(
+            "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
+            return_value=fake_kernels,
+        ):
+            result = sch.create_kernel_choices(features, [], {})
+
+        assert result is fake_kernels
+        assert fake_kernels[0]._persistent_mode is True, (
+            "M19.2 wiring failed: _enable_persistent_mode() never fired "
+            "for a small (numel=1024) non-reduction kernel under "
+            "TORCH_VULKAN_PERSISTENT_POINTWISE=1"
+        )
+
+    def test_enable_skipped_for_reduction(self):
+        """Reduction kernels must NOT be wrapped — the persistent loop
+        substitutes ``gtid.x`` and is incompatible with the two-tree
+        reduction layout."""
+        from unittest import mock
+
+        os.environ["TORCH_VULKAN_PERSISTENT_POINTWISE"] = "1"
+
+        sch = self._make_scheduling()
+        fake_kernels = [self._make_fake_kernel()]
+        features = self._make_fake_features(numel=1024, reduction_numel=64)
+
+        with mock.patch(
+            "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
+            return_value=fake_kernels,
+        ):
+            sch.create_kernel_choices(features, [], {})
+
+        assert fake_kernels[0]._persistent_mode is False, (
+            "M19.2 regression: _enable_persistent_mode() fired on a "
+            "reduction kernel — must be skipped per the inside_reduction "
+            "gate"
+        )
+
+    def test_enable_skipped_for_large_numel(self):
+        """Large pointwise (numel > 4096) is left alone — the
+        per-dispatch overhead the persistent loop amortises is already
+        negligible relative to the kernel runtime above the threshold."""
+        from unittest import mock
+
+        os.environ["TORCH_VULKAN_PERSISTENT_POINTWISE"] = "1"
+
+        sch = self._make_scheduling()
+        fake_kernels = [self._make_fake_kernel()]
+        features = self._make_fake_features(numel=8192)
+
+        with mock.patch(
+            "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
+            return_value=fake_kernels,
+        ):
+            sch.create_kernel_choices(features, [], {})
+
+        assert fake_kernels[0]._persistent_mode is False, (
+            "M19.2 regression: _enable_persistent_mode() fired on a "
+            "numel=8192 kernel — must be skipped above the 4096-element "
+            "threshold"
+        )
+
+    def test_enable_skipped_when_gate_disabled(self):
+        """``TORCH_VULKAN_PERSISTENT_POINTWISE=0`` must short-circuit."""
+        from unittest import mock
+
+        sch = self._make_scheduling()
+        fake_kernels = [self._make_fake_kernel()]
+        features = self._make_fake_features(numel=1024)
+
+        with mock.patch(
+            "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
+            return_value=fake_kernels,
+        ), mock.patch(
+            "torch_vulkan.inductor.config.persistent_pointwise",
+            return_value=False,
+        ):
+            sch.create_kernel_choices(features, [], {})
+
+        assert fake_kernels[0]._persistent_mode is False, (
+            "M19.2 regression: _enable_persistent_mode() fired even "
+            "though config.persistent_pointwise() returned False"
+        )
+
+    def test_persistent_body_emitter_produces_loop_marker(self):
+        """Once ``_persistent_mode`` is set, the body emitter
+        (``_emit_persistent_grid_stride_loop`` at
+        ``kernel/pointwise.py:518``) wraps the body in
+        ``for (uint _pi = gtid.x; ...)`` — verify the marker shape
+        directly so the M19.2 wiring is end-to-end checked without a
+        full torch.compile run.
+        """
+        from torch_vulkan.inductor.kernel.pointwise import PointwiseMixin
+
+        kernel = PointwiseMixin.__new__(PointwiseMixin)
+        kernel._persistent_mode = True
+        kernel.inside_reduction = False
+        kernel.numels = {"x": 1024}
+        kernel.max_threadgroup_size = 256
+        kernel.simd_group_size = 64
+
+        class _StubBody:
+            def __init__(self, txt):
+                self._txt = txt
+
+            def getvalue(self):
+                return self._txt
+
+        kernel.body = _StubBody(
+            "uint xindex = gtid.x;\n"
+            "float a = inp[xindex];\n"
+            "out[xindex] = a * 2.0 + 1.0;\n"
+        )
+
+        wrapped = kernel._emit_persistent_grid_stride_loop()
+        assert wrapped is not None, (
+            "M19.2 regression: _emit_persistent_grid_stride_loop "
+            "returned None for a valid pointwise body"
+        )
+        assert "for (uint _pi = gtid.x;" in wrapped, (
+            "M19.2 regression: persistent-mode body emitter did not "
+            "produce the `for (uint _pi = gtid.x;` loop marker.  Got:\n"
+            + wrapped
+        )
+        # ``gtid.x`` survives in the outer loop header (the
+        # ``for (uint _pi = gtid.x; …)`` initialiser) but inside the
+        # body the substitution must have rewritten the original
+        # ``gtid.x`` reference to ``_pi``: ``uint xindex = gtid.x;``
+        # becomes ``uint xindex = _pi;``.
+        assert "= _pi;" in wrapped, (
+            "M19.2 regression: gtid.x->_pi substitution missing — "
+            "expected the body's ``uint xindex = gtid.x;`` line to be "
+            "rewritten to ``uint xindex = _pi;``.  Got:\n"
+            + wrapped
+        )
+
+
+class TestM211cHardwareProbe:
+    """M21.1.c — hardware-probe orchestrator + ``profile_and_warmup`` API.
+
+    The probe layers are themselves expensive (level 1 = synchronous
+    matmul + shader-lib SPIR-V compile, ~30 s warm; level 2 adds an
+    autotune sweep, ~3 min warm).  These tests use ``mock.patch`` on the
+    per-level worker functions so the contract is verified without
+    paying the wall-clock cost.
+    """
+
+    def test_resolve_auto_level_defaults_to_quick(self):
+        """Env-var unset / "auto" maps to level 0, not level 2.
+
+        Previously the default fell through to ``LEVEL_DEEP`` which would
+        burn ~3 min (warm) / ~15 min (cold) on every fresh install — too
+        aggressive for a silent import-time hook.  M21.1.c flips the
+        default to level 0 (microbench only, ~5 s) and exposes the full
+        warm-up via the explicit :func:`torch_vulkan.profile_and_warmup`
+        entry point.
+        """
+        from torch_vulkan.inductor.hardware_probe import (
+            LEVEL_QUICK,
+            _resolve_auto_level,
+        )
+
+        assert _resolve_auto_level("auto") == LEVEL_QUICK
+        assert _resolve_auto_level("") == LEVEL_QUICK
+        assert _resolve_auto_level("yes") == LEVEL_QUICK
+        # Explicit values still resolve correctly.
+        assert _resolve_auto_level("off") is None
+        assert _resolve_auto_level("medium") is not None
+        assert _resolve_auto_level("medium") != LEVEL_QUICK
+        assert _resolve_auto_level("deep") != LEVEL_QUICK
+
+    def test_profile_device_rejects_invalid_level(self):
+        from torch_vulkan.inductor.hardware_probe import profile_device
+
+        try:
+            profile_device(level=7)
+        except ValueError as e:
+            assert "level" in str(e).lower()
+            return
+        raise AssertionError("profile_device(level=7) should ValueError")
+
+    def test_profile_device_level_0_only_runs_level_0(self, tmp_path):
+        """At level=0 only the microbench worker fires."""
+        from unittest import mock
+
+        from torch_vulkan.inductor import hardware_probe as hp
+
+        os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
+        hp.reset_for_test()
+        try:
+            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
+                 mock.patch.object(hp, "_run_level_1_sync") as m1, \
+                 mock.patch.object(hp, "_run_level_2_autotune") as m2:
+                result = hp.profile_device(level=hp.LEVEL_QUICK, force=True)
+        finally:
+            os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
+
+        assert m0.called, "level 0 worker should fire"
+        assert not m1.called, "level 1 worker must NOT fire at level=0"
+        assert not m2.called, "level 2 worker must NOT fire at level=0"
+        assert result["level"] == hp.LEVEL_QUICK
+        assert result["cached"] is False
+
+    def test_profile_device_level_2_runs_all_three(self, tmp_path):
+        """At level=2 (deep) all three workers fire in order."""
+        from unittest import mock
+
+        from torch_vulkan.inductor import hardware_probe as hp
+
+        os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
+        hp.reset_for_test()
+        try:
+            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
+                 mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1, \
+                 mock.patch.object(
+                     hp,
+                     "_run_level_2_autotune",
+                     return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
+                 ) as m2:
+                result = hp.profile_device(level=hp.LEVEL_DEEP, force=True)
+        finally:
+            os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
+
+        assert m0.called, "level 0 worker should fire at level=deep"
+        assert m1.called, "level 1 worker should fire at level=deep"
+        assert m2.called, "level 2 worker should fire at level=deep"
+        assert result["level"] == hp.LEVEL_DEEP
+
+    def test_profile_and_warmup_top_level_re_export(self, tmp_path):
+        """``torch_vulkan.profile_and_warmup`` calls the inductor probe."""
+        from unittest import mock
+
+        import torch_vulkan
+        from torch_vulkan.inductor import hardware_probe as hp
+
+        os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
+        hp.reset_for_test()
+        try:
+            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
+                 mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1, \
+                 mock.patch.object(
+                     hp,
+                     "_run_level_2_autotune",
+                     return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
+                 ) as m2:
+                result = torch_vulkan.profile_and_warmup(level="quick", verbose=False)
+
+        finally:
+            os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
+
+        assert m0.called, "quick path must reach _run_level_0"
+        assert not m1.called, "quick must NOT reach _run_level_1_sync"
+        assert not m2.called, "quick must NOT reach _run_level_2_autotune"
+        assert result["level"] == hp.LEVEL_QUICK
+
+    def test_profile_and_warmup_rejects_bad_level_string(self):
+        import torch_vulkan
+
+        try:
+            torch_vulkan.profile_and_warmup(level="extreme", verbose=False)
+        except ValueError as e:
+            assert "level" in str(e).lower()
+            return
+        raise AssertionError("profile_and_warmup level='extreme' should ValueError")
+
+
+class TestM221OrphanIntegration:
+    """M22.1.f/g — orphan mixin integration.
+
+    ``ThreadgroupSizingMixin`` (`kernel/threadgroup_sizing.py`, M22.1.f)
+    and ``CallKernelMixin`` (`kernel/dispatch_call.py`, M22.1.g) were
+    created as M22 file-size-cap split helpers but never wired into the
+    base class.  These tests lock the wiring so the duplicates can't drift
+    back into ``main.py`` / ``header.py``.
+    """
+
+    def test_vulkan_kernel_inherits_threadgroup_sizing(self):
+        from torch_vulkan.inductor.kernel.main import VulkanKernel
+        from torch_vulkan.inductor.kernel.threadgroup_sizing import (
+            ThreadgroupSizingMixin,
+        )
+
+        assert issubclass(VulkanKernel, ThreadgroupSizingMixin), (
+            "VulkanKernel must inherit ThreadgroupSizingMixin so the "
+            "threadgroup-size heuristics live in a single place "
+            "(see anti-goal #7 / M22.1.f)."
+        )
+
+    def test_vulkan_kernel_inherits_call_kernel(self):
+        from torch_vulkan.inductor.kernel.dispatch_call import CallKernelMixin
+        from torch_vulkan.inductor.kernel.main import VulkanKernel
+
+        assert issubclass(VulkanKernel, CallKernelMixin), (
+            "VulkanKernel must inherit CallKernelMixin so the wrapper-"
+            "side dispatch-call codegen lives in a single place "
+            "(see anti-goal #7 / M22.1.g)."
+        )
+
+    def test_main_py_no_duplicate_threadgroup_size_methods(self):
+        """``main.py`` must not redefine the methods provided by the
+        mixin — otherwise edits drift between the two copies."""
+        import os
+
+        import torch_vulkan.inductor.kernel.main as main_mod
+
+        with open(main_mod.__file__) as f:
+            src = f.read()
+
+        # The mixin owns these.  ``main.py`` should reference them via
+        # ``self.``, not redefine them.
+        for forbidden in (
+            "    def _pick_threadgroup_size(self)",
+            "    def _pick_threadgroup_size_pointwise(self)",
+            "    def _pick_threadgroup_size_reduction(self)",
+            "    def _round_wg_to_wave(",
+            "    def _classify_vgpr_pressure(",
+        ):
+            assert forbidden not in src, (
+                f"main.py contains a duplicate {forbidden!r} — "
+                f"ThreadgroupSizingMixin already provides it. Remove "
+                f"the duplicate to keep main.py under the 800-line cap."
+            )
+
+    def test_header_py_no_duplicate_call_kernel(self):
+        import torch_vulkan.inductor.kernel.header as header_mod
+
+        with open(header_mod.__file__) as f:
+            src = f.read()
+
+        assert "    def call_kernel(" not in src, (
+            "header.py contains a duplicate `call_kernel` — "
+            "CallKernelMixin already provides it. Remove the duplicate "
+            "to keep header.py under the 800-line cap."
+        )

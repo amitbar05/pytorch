@@ -617,16 +617,29 @@ def _legacy_register() -> None:
     except Exception:
         pass
 
-    # M21.1: profile the device on first import (microbench launch latency,
-    # mem BW, LDS BW, atomics). Cached at
-    # ``~/.cache/torch_vulkan/device_profile_<id>.json`` so subsequent imports
-    # pay only a JSON read. Heuristic consumers will pull from this via
-    # ``device_profile.current()`` once M20.5 rewires them. Gated via
-    # ``TORCH_VULKAN_PROFILE_DEVICE={auto,force,off}`` (default ``auto``).
+    # M21.1 / M21.1.c: hardware probe on first import.
+    #
+    # ``TORCH_VULKAN_PROFILE_DEVICE`` (default ``auto`` → level 0):
+    #   * ``off``    — skip entirely.
+    #   * ``quick`` / unset — level 0 only (~5 s microbench: launch latency,
+    #                         mem BW, LDS BW, atomics).
+    #   * ``medium`` — level 0 + shader-lib + matmul-template SPIR-V prewarm
+    #                  (synchronous; ~30 s warm / minutes on cold slangc).
+    #   * ``deep``   — level 0 + 1 + autotune sweep over canonical mm and
+    #                  conv2d shapes (~3 min warm / up to ~15 min cold).
+    #   * ``force``  — re-run ``deep`` even when the status marker is current.
+    #
+    # Results land in ``~/.cache/torch_vulkan/`` and are keyed by device id
+    # (see ``device_profile.compute_device_id``).  The probe writes a
+    # ``probe_status_<id>.json`` marker so subsequent imports short-circuit.
+    #
+    # Users who want the full warm-up pass before training should call
+    # :func:`torch_vulkan.profile_and_warmup` directly — that's the
+    # public entry point and it bypasses the cached marker on request.
     try:
-        from . import device_profile as _dp
+        from . import hardware_probe as _hp
 
-        _dp.load_or_profile()
+        _hp.auto_probe_on_import()
     except Exception:
         # Profiling is best-effort — never let it block backend registration.
         pass

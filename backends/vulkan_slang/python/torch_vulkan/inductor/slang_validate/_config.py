@@ -18,6 +18,18 @@ class ValidationIssue:
     def __str__(self) -> str:
         return f"[{self.category}] {self.message}"
 
+    def __contains__(self, substring: object) -> bool:
+        # Lets older tests use ``"unclosed" in issue`` (and ``"gap" in
+        # issue.lower()``) against an issue object the same way they
+        # used to against a plain error string.  Without this, the
+        # dataclass falls back to default __contains__ which raises
+        # ``TypeError: argument of type 'ValidationIssue' is not iterable``.
+        return isinstance(substring, str) and substring in str(self)
+
+    def lower(self) -> str:
+        # Older tests do ``e.lower()`` on each error.  Mirror str semantics.
+        return str(self).lower()
+
 
 # ── Configurable limits ────────────────────────────────────────────────────
 _MAX_GROUPSHARED = int(os.environ.get("TORCH_VULKAN_MAX_GROUPSHARED_BYTES", "65536"))
