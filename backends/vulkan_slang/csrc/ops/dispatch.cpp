@@ -111,6 +111,7 @@ void end_batch_dispatch() {
         rt.stream->flush_async();
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on batch end
     }
 }
@@ -236,6 +237,7 @@ void dispatch_shader(
         rt.stream->flush_async();
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
@@ -355,6 +357,24 @@ void dispatch_shader(
         cmd.push_constants(pipeline->layout(), push_constants_size, push_constants);
     }
 
+    // HOST→COMPUTE barrier: if any input buffer was written by the CPU host
+    // (via VulkanBuffer::write / vkMapMemory+memcpy), emit a HOST→COMPUTE
+    // pipeline barrier before the dispatch. This makes host writes visible
+    // to the GPU compute stage (Vulkan spec §7.1.2 requires this even on
+    // HOST_COHERENT memory — coherency only waives vkFlushMappedMemoryRanges,
+    // not the pipeline barrier for visibility into the GPU domain).
+    bool needs_host_barrier = false;
+    for (uint32_t i = 0; i < n && !needs_host_barrier; ++i) {
+        if (rt.host_written_buffers.count(vk_buffers_arr[i])) {
+            needs_host_barrier = true;
+        }
+    }
+    if (needs_host_barrier) {
+        cmd.host_to_compute_barrier();
+        rt.host_written_buffers.clear();
+        g_barrier_count++;
+    }
+
     // Smart barrier: only emit if this dispatch reads a buffer written by a previous dispatch.
     // Check if any current tensor overlaps with the dirty set from prior dispatches.
     bool needs_barrier = false;
@@ -459,6 +479,7 @@ void dispatch_shader_indexed(
         // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
@@ -528,6 +549,19 @@ void dispatch_shader_indexed(
                            push_constants_size, push_constants);
     }
 
+    // HOST→COMPUTE barrier for host-written buffers (same logic as dispatch_shader).
+    bool needs_host_barrier_indexed = false;
+    for (uint32_t i = 0; i < n && !needs_host_barrier_indexed; ++i) {
+        if (rt.host_written_buffers.count(vk_buffers_arr[i])) {
+            needs_host_barrier_indexed = true;
+        }
+    }
+    if (needs_host_barrier_indexed) {
+        cmd.host_to_compute_barrier();
+        rt.host_written_buffers.clear();
+        g_barrier_count++;
+    }
+
     bool needs_barrier = false;
     for (uint32_t i = 0; i < n && !needs_barrier; ++i) {
         if (rt.dirty_buffers.count(vk_buffers_arr[i])) {
@@ -556,6 +590,16 @@ void dispatch_shader_indexed(
     g_dispatch_count++;
 }
 
+// ── Host-write notification ─────────────────────────────────────
+// Called from Registration.cpp / vulkan_copy_() after VulkanBuffer::write().
+// Records that the GPU buffer was just filled from the CPU so that the next
+// dispatch_shader reads it with a HOST→COMPUTE barrier in place.
+void notify_host_write(VkBuffer buf) {
+    auto& ctx = vulkan::Context::instance();
+    auto& rt = get_runtime(ctx.current_device());
+    rt.host_written_buffers.insert(buf);
+}
+
 // ── Flush all pending GPU work ──────────────────────────────────
 void flush_stream() {
     std::lock_guard<std::recursive_mutex> lock(g_runtime_mutex);
@@ -572,6 +616,7 @@ void flush_stream() {
             rt.desc_pool->reset();
         }
         rt.dirty_buffers.clear();
+        rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset (flush)
     }
     // Drain quarantined buffers back into the reuse pool now that
@@ -642,11 +687,30 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
         // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
 
     auto& cmd = rt.stream->deferred_cmd();
     VkCommandBuffer raw_cmd = cmd.handle();
+
+    // HOST→TRANSFER barrier: if src or dst was host-written, make host writes
+    // visible to the transfer stage (vkCmdCopyBuffer is TRANSFER, not COMPUTE).
+    bool needs_host_barrier_copy =
+        rt.host_written_buffers.count(src_info.buffer) ||
+        rt.host_written_buffers.count(dst_info.buffer);
+    if (needs_host_barrier_copy) {
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(raw_cmd,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &mb, 0, nullptr, 0, nullptr);
+        rt.host_written_buffers.clear();
+        g_barrier_count++;
+    }
 
     // Pre-barrier: if src or dst was written by a prior compute dispatch,
     // synchronize the prior shader-write with this copy's transfer-read/write.

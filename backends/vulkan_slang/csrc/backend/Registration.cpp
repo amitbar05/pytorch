@@ -25,6 +25,13 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
         TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
         buf->write(src_contig.data_ptr(),
                    static_cast<VkDeviceSize>(src_contig.nbytes()));
+        // Notify the dispatch layer that this buffer was host-written.
+        // The next dispatch_shader that reads it will emit a HOST→COMPUTE
+        // pipeline barrier (Vulkan spec §7.1.2: host writes require an
+        // explicit barrier to become visible in the GPU compute domain,
+        // even on HOST_COHERENT memory where vkFlushMappedMemoryRanges
+        // is not needed).
+        ops::notify_host_write(buf->buffer());
         return self;
     }
 

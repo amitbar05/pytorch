@@ -54,8 +54,15 @@ public:
                         VkAccessFlags src_access = VK_ACCESS_SHADER_WRITE_BIT,
                         VkAccessFlags dst_access = VK_ACCESS_SHADER_READ_BIT);
 
-    // Memory barrier
+    // Memory barrier (COMPUTE → COMPUTE stage)
     void memory_barrier(VkAccessFlags src_access, VkAccessFlags dst_access);
+
+    // Host-write visibility barrier: makes CPU writes visible to subsequent
+    // GPU compute shaders. Needed before the first dispatch that reads a
+    // buffer filled by vkMapMemory/memcpy on the host (no command-buffer
+    // involvement in the write path → dirty_buffers won't cover it).
+    // src stage = HOST, dst stage = COMPUTE_SHADER.
+    void host_to_compute_barrier();
 
     VkCommandBuffer handle() const { return cmd_; }
 

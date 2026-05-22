@@ -25,6 +25,14 @@ struct DeviceRuntime {
     // Used for smart barrier insertion: barrier only emitted when a read depends on a prior write.
     std::unordered_set<VkBuffer> dirty_buffers;
 
+    // Tracks VkBuffers written by the CPU host (via vkMapMemory/memcpy in
+    // VulkanBuffer::write) since the last flush. A dispatch that reads any
+    // of these buffers must first emit a HOST → COMPUTE pipeline barrier so
+    // the GPU sees the latest host data. This is separate from dirty_buffers
+    // (which covers GPU-written buffers) because the required barrier stages
+    // differ: HOST→COMPUTE vs COMPUTE→COMPUTE.
+    std::unordered_set<VkBuffer> host_written_buffers;
+
     // M17.5: batch mode suppresses auto-flush until end_batch_dispatch().
     // When true, dispatch_shader/dispatch_shader_indexed will NOT auto-flush
     // even when MAX_DISPATCHES_PER_CMD is exceeded.
@@ -159,6 +167,12 @@ void dispatch_copy_buffer(const at::Tensor& src, const at::Tensor& dst);
 // Copy strided src to contiguous dst via GPU shader (avoids CPU roundtrip).
 // Supports up to 5 dimensions.
 void dispatch_strided_copy(const at::Tensor& src, const at::Tensor& dst);
+
+// Notify the dispatch layer that a buffer has been written by the CPU host
+// (via vkMapMemory / memcpy, i.e. VulkanBuffer::write). The next dispatch_shader
+// call that reads this buffer will emit a HOST → COMPUTE pipeline barrier
+// to make the host write visible to the GPU compute stage.
+void notify_host_write(VkBuffer buf);
 
 // Flush all pending GPU dispatches (submit deferred command buffer + wait).
 // Must be called before any host readback of GPU data.

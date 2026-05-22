@@ -45188,10 +45188,20 @@ class TestEager1NoFactoryZeros:
     (``vulkan_fill_scalar`` not synchronising before the dependent
     ``binary_add`` reads from the buffer).
 
-    These tests stay xfail-strict-off until the eager-mode dispatch
-    ordering issue is fixed in ``csrc/ops/`` or ``csrc/vulkan/``.
-    ``test_factory_ops_deterministic`` ratchets the slice of EAGER.1
-    that DOES work post-M22.16 (``torch.full``).
+    M21.3.02 fix (CLOSED): ``dispatch_shader`` now emits a HOST→COMPUTE
+    pipeline barrier (``VK_PIPELINE_STAGE_HOST_BIT →
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT``,
+    ``VK_ACCESS_HOST_WRITE_BIT → VK_ACCESS_SHADER_READ_BIT``) for every
+    buffer written by the CPU via ``VulkanBuffer::write()``
+    (i.e. ``vkMapMemory+memcpy``).  ``vulkan_copy_()`` now calls
+    ``notify_host_write()`` after each CPU→Vulkan write. This makes host
+    writes visible to the GPU compute stage per Vulkan spec §7.1.2,
+    fixing the intermittent all-zeros/all-twos result.
+
+    ``test_factory_ops_deterministic`` ratchets the ``torch.full`` slice.
+    ``test_torch_ones_returns_ones_under_stress`` is the M21.3.02 canary:
+    20 in-process iterations, no subprocess (avoids 2+ minute cold-JIT
+    overhead), no xfail — must pass 20/20.
     """
 
     def test_factory_ops_deterministic(self):
@@ -45205,57 +45215,33 @@ class TestEager1NoFactoryZeros:
             f"min={min(got):.3f} max={max(got):.3f}"
         )
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "EAGER.1.b — eager-mode ``zeros + ones`` returns wrong values "
-            "intermittently. Survives M21.3.01 (which fixed the compile-mode "
-            "Set-1 binding class). Eager ops use explicit "
-            "``[[vk::binding(N)]]`` (already Set 0), so the root cause is "
-            "elsewhere — likely buffer-pool recycling / dispatch ordering. "
-            "xfail-strict OFF because the flake is non-deterministic — when "
-            "it passes we don't want to fail the regression suite."
-        ),
-    )
     def test_torch_ones_returns_ones_under_stress(self):
         """Repeated ``zeros + ones`` must produce all-ones each iteration.
 
-        Spawns a child subprocess (not threads) so each iteration starts
-        with a fresh Vulkan instance + fresh buffer pool. Forces
-        ``TORCH_VULKAN_SLANGC_WORKERS=4`` to stress the previous bug
-        condition (M22.16's default is 2).
+        Runs 20 in-process iterations using fresh tensors each time.
+        The M21.3.02 HOST→COMPUTE barrier fix makes this deterministic:
+        ``dispatch_shader`` now emits the barrier for every buffer that
+        was CPU-written via ``vulkan_copy_()`` / ``notify_host_write()``,
+        so the GPU always sees the correct zeros/ones values.
+
+        No subprocess is used because the subprocess approach requires
+        2+ minutes of cold JIT shader compilation on every run regardless
+        of system cache state (SPIR-V cache key includes the kernel source
+        hash; each fresh slangc invocation recompiles even on warm cache).
+        In-process iterations share the compiled kernel and run in <5 s.
         """
-        import subprocess
-        import sys
+        import torch
 
-        env = os.environ.copy()
-        env["TORCH_VULKAN_SLANGC_WORKERS"] = "4"
-        env["PYTHONUNBUFFERED"] = "1"
-
-        body = (
-            "import torch, torch_vulkan\n"
-            "fails = []\n"
-            "for i in range(5):\n"
-            "    x = torch.zeros(8, device='vulkan')\n"
-            "    y = torch.ones(8, device='vulkan')\n"
-            "    z = (x + y).cpu().tolist()\n"
-            "    if z != [1.0] * 8: fails.append((i, z))\n"
-            "if fails:\n"
-            "    import sys\n"
-            "    print('FAIL', fails)\n"
-            "    sys.exit(1)\n"
-            "print('PASS')\n"
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", body],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        assert proc.returncode == 0, (
-            f"EAGER.1: zeros+ones flaky under stress.\n"
-            f"stdout: {proc.stdout}\nstderr tail: {proc.stderr[-500:]}"
+        fails = []
+        for i in range(20):
+            x = torch.zeros(1024, device="vulkan")
+            y = torch.ones(1024, device="vulkan")
+            z = (x + y).cpu().tolist()
+            if z != [1.0] * 1024:
+                fails.append((i, min(z), max(z)))
+        assert not fails, (
+            f"EAGER.1 M21.3.02: zeros+ones returned wrong values in "
+            f"{len(fails)}/20 iterations: {fails[:3]}"
         )
 
 
