@@ -54690,3 +54690,89 @@ class TestM234ComboChainRenameResolver:
         from torch_vulkan.inductor.kernel.dispatch_call import resolve_alias_chain as dc_fn
         from torch_vulkan.inductor.vulkan_combo_kernel import resolve_alias_chain as vck_fn
         assert dc_fn is vck_fn, "Both modules must use the same resolve_alias_chain"
+
+
+class TestM235ForeachOutsideCompileRatchet:
+    """M23.5 — foreach ops registered in Registration.cpp dispatch to Vulkan
+    when called outside torch.compile (eager mode).
+
+    Each test calls a registered ``_foreach_*`` op on Vulkan tensors and
+    verifies:
+    1. The result stays on Vulkan (no silent CPU fallback).
+    2. The result matches CPU ground truth.
+
+    This is a dispatch-ratchet: any op that silently falls back to CPU will
+    produce a CPUTensor result and fail the device assertion.  The set of ops
+    mirrors the registrations in ``csrc/backend/Registration.cpp``.
+    """
+
+    _BUG_ROOT_COMPONENT = "lowering"
+    _DEV = "vulkan:0"
+    _RTOL = 1e-4
+    _ATOL = 1e-4
+
+    def _make(self, *shapes, dtype=torch.float32):
+        return [torch.randn(*s, dtype=dtype).to(self._DEV) for s in shapes]
+
+    def _cpu(self, tensors):
+        return [t.cpu() for t in tensors]
+
+    def test_foreach_add_scalar_stays_vulkan(self):
+        """_foreach_add_.Scalar keeps tensors on Vulkan."""
+        ts = self._make((4, 8), (16,))
+        refs = [t.cpu().clone() for t in ts]
+        torch._foreach_add_(ts, 2.0)
+        for t, ref in zip(ts, refs):
+            assert t.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(
+                t.cpu(), ref + 2.0, rtol=self._RTOL, atol=self._ATOL
+            )
+
+    def test_foreach_add_list_stays_vulkan(self):
+        """_foreach_add_.List keeps tensors on Vulkan."""
+        ts = self._make((4, 8), (16,))
+        others = self._make((4, 8), (16,))
+        refs = [t.cpu().clone() for t in ts]
+        ref_others = [o.cpu() for o in others]
+        torch._foreach_add_(ts, others)
+        for t, ref, ro in zip(ts, refs, ref_others):
+            assert t.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(t.cpu(), ref + ro, rtol=self._RTOL, atol=self._ATOL)
+
+    def test_foreach_mul_scalar_stays_vulkan(self):
+        """_foreach_mul_.Scalar keeps tensors on Vulkan."""
+        ts = self._make((4, 8), (16,))
+        refs = [t.cpu().clone() for t in ts]
+        torch._foreach_mul_(ts, 0.5)
+        for t, ref in zip(ts, refs):
+            assert t.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(t.cpu(), ref * 0.5, rtol=self._RTOL, atol=self._ATOL)
+
+    def test_foreach_div_scalar_stays_vulkan(self):
+        """_foreach_div_.Scalar keeps tensors on Vulkan."""
+        ts = self._make((4, 8), (16,))
+        refs = [t.cpu().clone() for t in ts]
+        torch._foreach_div_(ts, 3.0)
+        for t, ref in zip(ts, refs):
+            assert t.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(t.cpu(), ref / 3.0, rtol=self._RTOL, atol=self._ATOL)
+
+    def test_foreach_sqrt_stays_vulkan(self):
+        """_foreach_sqrt returns Vulkan tensors."""
+        ts = self._make((4, 8), (16,))
+        # Ensure non-negative for sqrt.
+        ts = [t.abs() for t in ts]
+        refs = [t.cpu() for t in ts]
+        result = torch._foreach_sqrt(ts)
+        for r, ref in zip(result, refs):
+            assert r.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(r.cpu(), ref.sqrt(), rtol=1e-3, atol=1e-3)
+
+    def test_foreach_neg_stays_vulkan(self):
+        """_foreach_neg returns Vulkan tensors."""
+        ts = self._make((4, 8), (16,))
+        refs = [t.cpu() for t in ts]
+        result = torch._foreach_neg(ts)
+        for r, ref in zip(result, refs):
+            assert r.device.type == "vulkan", "result moved to CPU"
+            torch.testing.assert_close(r.cpu(), -ref, rtol=self._RTOL, atol=self._ATOL)

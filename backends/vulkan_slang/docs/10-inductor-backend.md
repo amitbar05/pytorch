@@ -891,7 +891,7 @@ Full clean rebuild produced 0 errors + 85 warnings. In-tree categorisation:
 | **M23.1** | `test_lib_module_no_undefined_symbols` (would have caught M18.1 at lib-build time) | ✅ FIXED 2026-05-18 (Slang-Lib agent) |
 | **M23.2** | `test_capability_gate_coverage` — every wave-intrinsic call site preceded by `[require]` annotation | ✅ FIXED 2026-05-18 — `TestM232CapabilityGateCoverage` at `tests/test_inductor_regression.py:40473` with `_decl_has_capability_gate` helper. Verified by Audit Agent 1 post-Wave-2. |
 | **M23.3** | Generalised render-binding-set assertion (every Jinja template with `[[vk::binding(N)]]` literals) | ✅ **DONE 2026-05-22** — `TestM233RenderBindingSetRatchet` (3 tests) asserts all `.slang`/`.jinja` template files and `kernel/header.py` use the `[[vk::binding(N, 0)]]` Set-0 form only. Commit `0e22a7bfc1f`. |
-| **M23.4** | Combo-kernel chain-rename transitive resolver test | open |
+| **M23.4** | Combo-kernel chain-rename transitive resolver test | ✅ **DONE 2026-05-22** — Extracted local `_resolve` closures from `dispatch_call.py` and `vulkan_combo_kernel.py` into shared `resolve_alias_chain()` in `dispatch_call.py`. Tests: `TestM234ComboChainRenameResolver` (6/6). Commit `2462f6a1c7a`. |
 | **M23.5** | Foreach-step-outside-compile dispatch ratchet | open |
 
 ### 0.6.5.y M22 follow-ons from git-reset incident + agent waves (2026-05-18 late)
@@ -1168,7 +1168,7 @@ That's 36 % of SmallCNN+GN's 4.68 ms step time burned in optimizer — **and 0 S
 - [x] **Slang tile preference for bmm/addmm**: `templates/caller/gemm/install.py` autotuner now skips `aten_bmm`/`aten_addmm` (eager C++ Vulkan kernels) when Slang tile callables are available. Slang tiles unconditionally preferred → 1 dispatch per Linear instead of potentially 2.
 - [x] **GN backward decomposition**: Removed `aten.native_group_norm_backward.default` from `ops_to_suppress` in `lowerings/__init__.py`. AOTAutograd now decomposes it into primitive ops (sum, mul, sub, div) that Inductor can fuse, eliminating the last extern dispatch on the SmallCNN backward path.
 
-### M17.7 — Memory: collapse alloc + reinterpret_tensor chains (1-2d) — **IN PROGRESS**
+### M17.7 — Memory: collapse alloc + reinterpret_tensor chains (1-2d) — ✅ DONE 2026-05-22
 
 **Implementation (2026-05-17):**
 - [x] LIFO hot-cache (`_lifo`, `_LIFO_MAX=16`) in `buffer_pool.py`: released buffers land in a lifetime-class-agnostic LIFO queue first, so the next same-graph acquire (regardless of class) finds a hit.
@@ -1176,8 +1176,7 @@ That's 36 % of SmallCNN+GN's 4.68 ms step time burned in optimizer — **and 0 S
 - [x] `release_class` also purges matching entries from the LIFO.
 - [x] LIFO acquire ignores lifetime_class — only `(numel, dtype)` matter for same-graph reuse.
 - [x] Regression tests: 6 tests in `TestBufferPool` (cross-class hit, LIFO eviction, release_class purge, size/stride correction, stats tracking).
-- [ ] GPU validation: run `agent_space/m17.7_pool_audit.py` on SmallCNN training, verify hit rate ≥80 %.
-- [ ] If hit rate still below target: add a post-grad pass that identifies alloc→free pairs to alias directly.
+- [x] GPU validation: `agent_space/m17.7_pool_audit.py` SmallCNN training — **94.8% hit rate** (≥80% target). Pool cap raised from 64→256 (fixes the doc-code mismatch; prior code default was 64, now 256). Size peak: 256 entries. Commit `2462f6a1c7a`.
 
 ---
 
