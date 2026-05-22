@@ -355,6 +355,134 @@ Regression gate:
 ``relu+linear+sum`` repro that forces the partitioner to save a
 bool mask as a backward graph input).
 
+**M-NEW.14 📋 OPEN 2026-05-22** — `TestSmallCNNTrain::test_grad_parity`
+/ `test_10step_no_nan` / `test_forward_backward` still fail with
+`Non-finite grad for conv1.weight`.  M-NEW.13's bool-buffer fix is
+NECESSARY but not SUFFICIENT — the SmallCNN two-block backward path
+still produces NaN/Inf gradients in isolation, both in the `pytest`
+harness AND when run as `python agent_space/probe_nan_stage6.py`
+(no test-pollution).  The earlier closeout's "Stage 6 ✅ ALL grads
+finite" claim could not be reproduced; the regression test
+`TestM_NEW_13_NoNaNBackward` itself fails on a clean re-run.
+
+**Bisection** (`agent_space/probe_nan_backward.py`):
+
+| Stage | Model | ALL_FINITE |
+|-------|-------|-----------|
+| 1 | Linear only | ✅ |
+| 2 | ReLU + Linear | ✅ |
+| 3 | MaxPool + Flatten + Linear | ✅ |
+| 4 | GN + ReLU + Pool + Linear | ✅ |
+| 5 | Conv + GN + ReLU + Pool + Linear (single block) | ✅ |
+| 6 | Conv + GN + ReLU + Pool + Conv + GN + ReLU + Pool + Linear (full SmallCNN) | ❌ |
+
+The failure surfaces ONLY with **two stacked Conv+GN+ReLU blocks**.
+Single-block (Stage 5) passes; two-block (Stage 6) fails.
+
+**Fingerprint on Stage 6**:
+
+| Parameter | Pattern | Interpretation |
+|-----------|---------|----------------|
+| `conv1.weight.grad` | ALL NaN | gradient input from upstream is NaN/Inf |
+| `conv1.bias.grad` | ALL NaN | computed as `sum(reshape_15, [0,2,3])` over the NaN chain |
+| `gn1.weight.grad` | finite, [1.6, 1490] | rstd-scaled chain ~100× CPU magnitude → reads correct stats but grad_output is huge |
+| `gn1.bias.grad` | finite, small | sum over the propagated-from-upstream `mul_17` which sees the relu mask |
+| `conv2.weight.grad` | finite, [-7.7e3, 9.1e3] | gradient ~100× CPU baseline (Stage 5 sees [-41, 40]) |
+| `conv2.bias.grad` | finite, [-5.6e3, 6.7e3] | same magnitude inflation |
+| **`gn2.weight.grad`** | **EXACTLY 0.0** | suspicious — matches `output_mask[1]=False` zero-buffer fingerprint |
+| **`gn2.bias.grad`** | **EXACTLY 0.0** | suspicious — matches `output_mask[2]=False` zero-buffer fingerprint |
+| `fc.weight.grad`, `fc.bias.grad` | finite | downstream of the chain corruption |
+
+**Backward graph analysis** (`/tmp/fx_dump/graph_0002_post.txt`):
+
+The forward fuses both `Conv → GN → ReLU` blocks into
+`torch_vulkan::conv2d_gn_relu_fused` custom ops via
+`fx_passes/post_grad.py::_fuse_conv_patched_gn_relu`.  AOTAutograd's
+joint trace inlines the registered backward
+(`fx_passes/eager/conv.py:776 _conv2d_gn_relu_backward`) and then
+**decomposes `aten.native_group_norm_backward` away** during
+partitioning — there is no `aten.native_group_norm_backward` node
+in the post-grad backward graph at all.  The gradient flow lives
+as primitive sums / muls / unsqueezes.
+
+The gn2-weight zero pattern thus is NOT the
+`_register_group_norm_backward` lowering's `output_mask` branch
+(that lowering never runs).  Instead `gn2.weight.grad` is computed
+as the inlined chain `reshape_9 = reshape(sum_6, [32])` where
+`sum_6 = sum(mul_16, [0])` and `mul_16 = sub_2 * unsqueeze_2`.
+`unsqueeze_2 = unsqueeze(getitem_6 [=rstd2], -1)`.  For `mul_16` to
+collapse to all-zeros, either every `sub_2` entry is zero OR every
+`rstd_2` entry is zero — implausible for a well-conditioned
+recomputation.
+
+The huge-magnitude gn1 values + exact-zero gn2 values strongly
+suggest the **recomputed forward chain inside the backward graph
+produces wrong intermediates** for the second block.  Candidate
+culprits:
+
+1. Inductor wrapper emits `extern_kernels.convolution(..., bias=None)`
+   for both `convolution` (block 2 conv recompute) and
+   `convolution_1` (block 1 conv recompute), with the real
+   `primals_7` / `primals_2` bias added by a separate fused
+   pointwise kernel further down.  GN is shift-invariant so the
+   no-bias conv output normalised is mathematically identical, but
+   a buffer-lifetime / race issue between the queued bias-add
+   kernel and the GN-normalisation read could leave bias-stale
+   data at the moment GN reads its input.
+2. The two stacked recomputations of `conv → GN` share
+   buffer-pool slots (`buf4`, `buf5`, `buf6`, `buf21`, `buf22`,
+   `buf23`) that get aliased or freed across the multi-kernel
+   sequence.  Trace at lines 873–910 of the generated wrapper:
+   `vulkan_kernel_1` writes mean/rstd into `buf5`/`buf6`,
+   `vulkan_kernel_2` consumes them, then `buf5`/`buf6` are
+   **reused via `reinterpret_tensor`** for block-1 buffers
+   (`buf31 = reinterpret_tensor(buf6, ...)`, `buf32 =
+   reinterpret_tensor(buf5, ...)`).  This is the canonical buffer-
+   aliasing fingerprint and is a high-probability culprit.
+3. The `vulkan_convolution_backward_overrideable_adapter` CPU
+   fallback (`csrc/backend/Registration.cpp:430`) is invoked
+   directly via `torch.ops.aten.convolution_backward.default` (line
+   911 of generated wrapper).  Its inputs go through `.cpu()`
+   copy which auto-flushes pending GPU work via the read
+   callback, but the **fallback runs on CPU and copies the result
+   back via `.to(dev)`**.  If the round-trip mis-handles
+   non-contiguous strides on the result side, the gradient flowing
+   into block 1 would be corrupted in exactly the observed way.
+
+**Out of immediate scope** because the fix requires either:
+
+* a partitioner-level rewrite to STOP decomposing
+  `native_group_norm_backward` (kept as opaque so the
+  `_register_group_norm_backward` lowering fires — Group B),
+* a buffer-pool aliasing audit (`buffer_pool.py` + scheduler
+  liveness — Group E + F), or
+* a CPU-fallback round-trip stride audit
+  (`vulkan_convolution_backward_overrideable_adapter` — Group A).
+
+None of these are 30-minute fixes; all three require careful
+investigation in their respective lanes.  Filing as OPEN with the
+diagnosis above; the smoking gun is the
+**buffer-aliasing reinterpret_tensor pattern at lines 930–931 of
+the generated wrapper** (`buf31 = reinterpret_tensor(buf6, ...)`;
+`buf32 = reinterpret_tensor(buf5, ...)`), where block-2 GN
+intermediate buffers are recycled as block-1 GN gradient outputs.
+
+**Repro**:
+```bash
+cd backends/vulkan_slang
+rm -rf ~/.cache/torch_vulkan/spirv ~/.cache/torch_vulkan/slang-modules /tmp/torchinductor_$(whoami)
+TORCH_VULKAN_NO_PREWARM=1 .venv/bin/python agent_space/probe_nan_backward.py
+# Stages 1-5 pass; stage 6 (full SmallCNN) hits the NaN/zero pattern.
+# Or:
+TORCH_VULKAN_NO_PREWARM=1 .venv/bin/python agent_space/probe_nan_stage6.py
+```
+
+**Reverting the kernel/* M19.4 changes** (`pointwise.py`,
+`pointwise_vec4_mixin.py`) to HEAD does NOT fix the issue —
+confirmed the M19.4 work is unrelated.  Disabling the dispatch
+batcher (`TORCH_VULKAN_BATCH_DISPATCH=0`) also does NOT help —
+the issue is not the M-NEW.12 race class.
+
 ---
 
 ## 0.0.6 CONV-TRAINING CRITICAL PATH (2026-05-19, user-directed focus)

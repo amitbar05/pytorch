@@ -53376,3 +53376,181 @@ class TestM_NEW_13_NoNaNBackward:
             assert torch.isfinite(t.grad.cpu()).all().item(), (
                 f"M-NEW.13: non-finite grad on {tag}"
             )
+
+
+class TestM_NEW_14_TwoBlockSmallCNNBackward:
+    """Diagnostic gate for the **two-block CNN backward** NaN bug.
+
+    OPEN as of 2026-05-22.  Locks in the bisect result that single-block
+    SmallCNN (Stage 5 of ``agent_space/probe_nan_backward.py`` — one
+    ``Conv2d → GroupNorm → ReLU → MaxPool → Linear`` block) produces
+    finite gradients under ``torch.compile``, while the two-block
+    full SmallCNN (Stage 6 — two stacked Conv+GN+ReLU blocks with a
+    pool between them) produces ``conv1.weight.grad = NaN`` AND
+    ``gn2.weight.grad = exactly 0`` AND ``gn1.weight.grad`` blown up
+    to ~100× the CPU-baseline magnitude.
+
+    The single-block test is the *positive* gate (must stay green).
+    The two-block test is the *xfail-strict* gate — flip the
+    ``xfail`` to a passing assertion once M-NEW.14 lands.  Diagnosis
+    is in ``docs/10-inductor-backend.md`` § 0.0.5 (the M-NEW.14
+    OPEN block); the smoking gun is the
+    ``reinterpret_tensor`` aliasing of block-2 GN scratch buffers
+    (``buf5`` / ``buf6``) into block-1 GN gradient outputs
+    (``buf31`` / ``buf32``) in the compile-mode generated wrapper —
+    see ``agent_space/m_new_14_compiled_wrapper.py`` lines 930-931.
+    """
+
+    @staticmethod
+    def _make_small_cnn():
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        class SmallCNN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+                self.gn2 = nn.GroupNorm(8, 32)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.flatten = nn.Flatten()
+                self.fc = nn.Linear(32 * 8 * 8, 10)
+
+            def forward(self, x):
+                x = F.relu(self.gn1(self.conv1(x)))
+                x = self.pool(x)
+                x = F.relu(self.gn2(self.conv2(x)))
+                x = self.pool(x)
+                x = self.flatten(x)
+                return self.fc(x)
+
+        return SmallCNN
+
+    @pytest.mark.slow_compile(seconds=180)
+    def test_single_block_compile_backward_finite(self):
+        """POSITIVE gate — Stage 5 of the bisect probe (single
+        Conv+GN+ReLU+Pool+Linear block) backward MUST produce finite
+        grads.  Locks the floor below which a regression would mean
+        even the single-block case is broken.
+        """
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        try:
+            torch.empty(1, device="vulkan:0")
+        except Exception:
+            import pytest
+
+            pytest.skip("Vulkan GPU not available")
+
+        torch.manual_seed(42)
+
+        class _Stage5(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 32, 3, padding=1)
+                self.gn = nn.GroupNorm(8, 32)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.flatten = nn.Flatten()
+                self.fc = nn.Linear(32 * 16 * 16, 10)
+
+            def forward(self, x):
+                x = F.relu(self.gn(self.conv(x)))
+                x = self.pool(x)
+                x = self.flatten(x)
+                return self.fc(x)
+
+        model = _Stage5().to("vulkan")
+        compiled = torch.compile(model, backend="inductor")
+        x = torch.randn(2, 3, 32, 32, device="vulkan")
+        targets = torch.randint(0, 10, (2,), device="vulkan")
+        logits = compiled(x)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"no grad for {name}"
+            ok = torch.isfinite(p.grad.cpu()).all().item()
+            assert ok, (
+                f"M-NEW.14 single-block floor: non-finite grad for {name}. "
+                f"Stage-5 of the bisect probe must stay green; if this fails, "
+                f"the regression is deeper than the two-block bug."
+            )
+
+    @pytest.mark.slow_compile(seconds=180)
+    @pytest.mark.xfail(
+        strict=True,
+        reason="M-NEW.14 OPEN (2026-05-22) — two-block SmallCNN "
+        "backward produces NaN on conv1.weight, exactly zero on "
+        "gn2.weight/gn2.bias, and ~100x-magnitude on gn1.weight. "
+        "Stage 5 (single block) passes; Stage 6 (two blocks) fails. "
+        "See docs/10-inductor-backend.md § 0.0.5 (M-NEW.14) for the "
+        "smoking-gun analysis (reinterpret_tensor buffer aliasing of "
+        "block-2 GN scratch into block-1 GN gradient outputs at "
+        "lines 930-931 of the generated wrapper, snapshotted in "
+        "agent_space/m_new_14_compiled_wrapper.py). When the fix "
+        "lands, this XPASSes and CI flips the marker.",
+    )
+    def test_two_block_compile_backward_finite(self):
+        """OPEN GATE (M-NEW.14) — Stage 6 of the bisect probe (full
+        SmallCNN, two stacked Conv+GN+ReLU blocks) backward.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        try:
+            torch.empty(1, device="vulkan:0")
+        except Exception:
+            import pytest
+
+            pytest.skip("Vulkan GPU not available")
+
+        # Pre-check stage — everything before the assertion must
+        # succeed or pytest.skip per
+        # feedback_xfail_empirical_verification +
+        # feedback_floor_xfail_scoping memories.  A compile-time
+        # failure here would otherwise produce a false-XFAIL that
+        # masks the regression we're tracking.
+        torch.manual_seed(42)
+        SmallCNN = self._make_small_cnn()
+        model = SmallCNN().to("vulkan")
+        compiled = torch.compile(model, backend="inductor")
+        x = torch.randn(2, 3, 32, 32, device="vulkan")
+        targets = torch.randint(0, 10, (2,), device="vulkan")
+        logits = compiled(x)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+
+        # Pre-check: every parameter has a grad attribute (otherwise
+        # the failure is unrelated to NaN — e.g. autograd didn't run).
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                import pytest
+
+                pytest.skip(
+                    f"Pre-check skip: no grad attached to {name}; "
+                    "unrelated to M-NEW.14."
+                )
+
+        # SCOPED assertion — this is what's under xfail-strict.
+        # When M-NEW.14 is fixed every grad will be finite; this
+        # assertion will pass, the test XPASSes, and CI fails until
+        # the marker is removed.
+        for name, p in model.named_parameters():
+            ok = torch.isfinite(p.grad.cpu()).all().item()
+            assert ok, f"M-NEW.14: non-finite grad for {name}"
+
+    # NOTE: the gn2.weight.grad=0 fingerprint is the canonical
+    # signature in the standalone-probe run (see
+    # ``agent_space/probe_nan_stage6.py``) but does NOT reliably
+    # reproduce inside the pytest harness — the conftest autouse
+    # ``torch._dynamo.reset()`` + per-test cache-reset combination
+    # nudges the compile through a different code path under
+    # successive tests, so the in-pytest grad is sometimes finite
+    # and non-zero on the 3rd-in-a-class invocation.  We DELIBERATELY
+    # don't gate on the zero fingerprint here to avoid a flaky
+    # xfail-strict.  The standalone-probe assertion lives in
+    # ``agent_space/probe_nan_stage6.py``; the in-pytest gate is
+    # only the finite-grads assertion above.
