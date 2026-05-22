@@ -41,8 +41,6 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
     # Suppress type-checker complaints about attributes defined in other
     # mixins or the base SIMDKernel — all resolved via self at runtime.
 
-    # ── CG.M8: Inline bwd_diff emission ─────────────────────────────
-
     def register_inline_unary_bwd(
         self,
         aten_op: str,
@@ -151,7 +149,7 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         self._bwd_diff_unary_ops.clear()
         self._bwd_diff_binary_ops.clear()
 
-    # ── M23: Variable dependency tracking for vec4 eligibility ──────
+    # Variable dependency tracking for vec4 eligibility:
     # The body is a mix of plain strings and DeferredLine objects in
     # IndentedBuffer._lines.  We parse simple assignment patterns to
     # build a dependency graph, then check whether any buffer index
@@ -164,8 +162,7 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         r"^\s*(?:float|int|int64_t|uint|bool|half)\s+(\w+)\s*=\s*(.+);\s*$"
     )
 
-    # ── M22: Dead code elimination (DCE) ───────────────────────────
-    # After body codegen, scan the generated Slang source for CSE
+    # Dead code elimination (DCE): after body codegen, scan the generated Slang for CSE
     # variable declarations.  Build a use-def chain, mark variables
     # transitively reachable from output stores as "live", and strip
     # assignments whose LHS is dead.  This eliminates unused loads and
@@ -396,8 +393,6 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
                 return True
         return False
 
-    # ── M11.3: Register-tile pointwise ────────────────────────────
-
     def _can_register_tile(self, tile_size: int) -> bool:
         """Check whether register tiling is applicable to this kernel.
 
@@ -500,8 +495,6 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         new_buf.writeline("}")
 
         return new_buf.getvalue()
-
-    # ── GPU.5: Persistent pointwise micro-batching ─────────────────
 
     def _enable_persistent_mode(self) -> None:
         """Enable grid-stride-loop wrapping for this kernel.
