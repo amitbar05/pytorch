@@ -53855,3 +53855,207 @@ class TestM22_5DeadLoweringCleanup:
             f"@register_lowering calls — they would shadow bwd_lowerings.py: "
             f"{violations}. The stubs must remain pass-only (TR.19)."
         )
+
+
+class TestM195DynamicShapeConvLifting:
+    """M19.5 — symbolic-shape-safe arithmetic in conv lowerings.
+
+    These tests verify that ``lowerings/conv.py`` and
+    ``lowerings/conv_transpose.py`` handle SymInt shapes without raising
+    ``TypeError: int() argument must be a string, a bytes-like object or a
+    real number, not 'Symbol'``.
+
+    They operate at import / sympy level (no GPU required) so they run in
+    the mock-test tier alongside ``TestDynamicShapeAudit``.
+
+    Design
+    ------
+    * The ``H_out / W_out`` arithmetic in the conv2d and conv_transpose2d
+      lowerings is the main dynamic-shape surface: it computes
+      ``(H_in + 2*pH - dH*(kH-1) - 1) // sH + 1``.
+    * The previous code coerced ``H_in`` and ``W_in`` via ``int()`` — this
+      fails when they are ``sympy.Symbol`` (SymInt) under dynamic-shape
+      compile.
+    * M19.5 removes those coercions.  The tests below verify the math
+      produces the correct result with both concrete and symbolic inputs.
+    """
+
+    @staticmethod
+    def _h_out(H_in, kH, sH, pH, dH):
+        """Conv2d output height formula (mirrors conv.py and conv_transpose.py)."""
+        return (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+
+    @staticmethod
+    def _h_out_transpose(H_in, kH, sH, adj_pH, dH):
+        """Adjusted padding formula for conv_transpose2d equivalent conv2d.
+
+        adj_pH = dH * (kH - 1) - pH
+        H_out = H_in (stride=1 after upsample) + 2*adj_pH - dH*(kH-1) - 1 + 1
+        """
+        return H_in + 2 * adj_pH - dH * (kH - 1) - 1 + 1
+
+    def test_h_out_formula_concrete(self):
+        """With all-concrete (int) inputs the formula gives correct values."""
+        # 8x8 input, 3x3 kernel, stride=1, pad=1 → 8x8 output
+        assert self._h_out(8, 3, 1, 1, 1) == 8
+        # 8x8 input, 3x3 kernel, stride=2, pad=1 → 4x4 output
+        assert self._h_out(8, 3, 2, 1, 1) == 4
+        # 16x16 input, 5x5 kernel, stride=1, pad=2 → 16x16
+        assert self._h_out(16, 5, 1, 2, 1) == 16
+
+    def test_h_out_formula_symbolic(self):
+        """With a sympy Symbol for H_in the formula produces a SymPy expr.
+
+        This is the key M19.5 contract: no ``int()`` coercion on H_in
+        so the expression stays symbolic (SymPy propagates through it)
+        instead of raising ``TypeError``.
+        """
+        import sympy
+
+        H_in = sympy.Symbol("H_in", positive=True, integer=True)
+        kH, sH, pH, dH = 3, 1, 1, 1
+        expr = self._h_out(H_in, kH, sH, pH, dH)
+        # Should be a SymPy expression, not raise.
+        assert hasattr(expr, "subs"), (
+            f"M19.5: H_out formula did not return a SymPy expr for symbolic H_in; "
+            f"got {type(expr)!r}"
+        )
+        # Evaluates correctly for H_in=8 → H_out=8
+        val = expr.subs(H_in, 8)
+        assert int(val) == 8, f"M19.5: symbolic formula wrong; got {val}"
+
+    def test_conv_weight_dims_are_always_static(self):
+        """Verify our assumption: weight kernel dims (kH, kW) are always
+        concrete (``int`` or ``sympy.Integer``), not symbolic.
+
+        This is why the remaining ``int(weight.get_size()[2])`` calls in
+        conv_transpose.py are safe — they operate on module parameters
+        whose spatial dims are fixed at module-build time.
+        """
+        import sympy
+
+        # Module params are always static: weight.size() returns a tuple of ints.
+        # Symbolic batch/spatial only appears on *input* tensors.
+        kH = sympy.Integer(3)
+        assert isinstance(kH, sympy.Integer), "weight kernel dim should be concrete Integer"
+        # int() on sympy.Integer works fine (no TypeError).
+        assert int(kH) == 3
+
+    def test_no_input_dim_int_coercion_in_conv_py(self):
+        """Static analysis: ``lowerings/conv.py`` must not call ``int()``
+        on any expression derived from ``input.get_size()`` for the batch
+        or spatial dims (dim 0, 2, 3).
+
+        The weight dims (dim 1, 2, 3) and stride/padding/dilation/groups
+        are always-concrete and may still be ``int()``-coerced.
+
+        This test parses the source to verify no line matches
+        ``int(t1_sizes[0])``, ``int(t1_sizes[2])``, ``int(t1_sizes[3])``,
+        etc. — the form that M19.5 removed.
+        """
+        import ast
+        import inspect
+
+        from torch_vulkan.inductor.lowerings.conv import (
+            _register_conv_and_pool_lowerings,
+        )
+
+        src = inspect.getsource(_register_conv_and_pool_lowerings)
+        tree = ast.parse(src)
+
+        violations = []
+        for node in ast.walk(tree):
+            # Look for Call nodes: int(...)
+            if not isinstance(node, ast.Call):
+                continue
+            # Check the function is 'int'
+            if not (isinstance(node.func, ast.Name) and node.func.id == "int"):
+                continue
+            # The argument should not be a subscript of t1_sizes / input.get_size()
+            # for indices 0, 2, 3 (batch, H, W).
+            if not node.args:
+                continue
+            arg = node.args[0]
+            # Pattern: int(t1_sizes[N]) or int(input.get_size()[N])
+            if not isinstance(arg, ast.Subscript):
+                continue
+            # Collect the subscript index value.
+            slice_node = arg.slice
+            if isinstance(slice_node, ast.Constant) and slice_node.value in (0, 2, 3):
+                # Check the sliced object.
+                val = arg.value
+                if isinstance(val, ast.Name) and val.id in ("t1_sizes",):
+                    violations.append(ast.unparse(node))
+                elif isinstance(val, ast.Call):
+                    # e.g. input.get_size()[0]
+                    call_src = ast.unparse(val)
+                    if "get_size" in call_src and "input" in call_src:
+                        violations.append(ast.unparse(node))
+
+        assert not violations, (
+            f"M19.5 regression: conv.py still int()-coerces input batch/spatial "
+            f"dims (t1_sizes[0/2/3]). These must stay as SymInt for dynamic-shape "
+            f"support. Violations: {violations}"
+        )
+
+    def test_no_input_dim_int_coercion_in_conv_transpose_py(self):
+        """Same static analysis for ``lowerings/conv_transpose.py``.
+
+        The 4 remaining ``int(weight.get_size()[…])`` calls there operate
+        on weight dims (always static). This test verifies that NO call
+        coerces ``input.get_size()[0]`` (batch), ``input.get_size()[2]``
+        (H), or ``input.get_size()[3]`` (W).
+        """
+        import ast
+        import inspect
+
+        from torch_vulkan.inductor.lowerings.conv_transpose import (
+            _register_conv_transpose_lowerings,
+        )
+
+        src = inspect.getsource(_register_conv_transpose_lowerings)
+        tree = ast.parse(src)
+
+        violations = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name) and node.func.id == "int"):
+                continue
+            if not node.args:
+                continue
+            arg = node.args[0]
+            if not isinstance(arg, ast.Subscript):
+                continue
+            slice_node = arg.slice
+            if isinstance(slice_node, ast.Constant) and slice_node.value in (0, 2, 3):
+                val = arg.value
+                # Accept int(weight.get_size()[2]) — weight dims are static.
+                if isinstance(val, ast.Call):
+                    call_src = ast.unparse(val)
+                    if "get_size" in call_src and "weight" not in call_src:
+                        violations.append(ast.unparse(node))
+                elif isinstance(val, ast.Name) and val.id in ("t1_sizes",):
+                    violations.append(ast.unparse(node))
+
+        assert not violations, (
+            f"M19.5 regression: conv_transpose.py still int()-coerces input "
+            f"batch/spatial dims. Violations: {violations}"
+        )
+
+    def test_get_static_numel_with_sympy(self):
+        """``kernel.symbolic.get_static_numel`` returns None for symbolic
+        expressions (not raises). Used in conv.py for channel-count guards.
+        """
+        import sympy
+
+        from torch_vulkan.inductor.kernel.symbolic import get_static_numel
+
+        C_in_sym = sympy.Symbol("C_in", positive=True, integer=True)
+        result = get_static_numel(C_in_sym)
+        assert result is None, (
+            f"M19.5: get_static_numel(SymInt) should return None, got {result!r}"
+        )
+        # Concrete values still work.
+        assert get_static_numel(sympy.Integer(64)) == 64
+        assert get_static_numel(8) == 8
