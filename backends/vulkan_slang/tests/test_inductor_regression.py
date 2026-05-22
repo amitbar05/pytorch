@@ -53611,19 +53611,6 @@ class TestM_NEW_14_TwoBlockSmallCNNBackward:
             )
 
     @pytest.mark.slow_compile(seconds=180)
-    @pytest.mark.xfail(
-        strict=True,
-        reason="M-NEW.14 OPEN (2026-05-22) — two-block SmallCNN "
-        "backward produces NaN on conv1.weight, exactly zero on "
-        "gn2.weight/gn2.bias, and ~100x-magnitude on gn1.weight. "
-        "Stage 5 (single block) passes; Stage 6 (two blocks) fails. "
-        "See docs/10-inductor-backend.md § 0.0.5 (M-NEW.14) for the "
-        "smoking-gun analysis (reinterpret_tensor buffer aliasing of "
-        "block-2 GN scratch into block-1 GN gradient outputs at "
-        "lines 930-931 of the generated wrapper, snapshotted in "
-        "agent_space/m_new_14_compiled_wrapper.py). When the fix "
-        "lands, this XPASSes and CI flips the marker.",
-    )
     def test_two_block_compile_backward_finite(self):
         """OPEN GATE (M-NEW.14) — Stage 6 of the bisect probe (full
         SmallCNN, two stacked Conv+GN+ReLU blocks) backward.

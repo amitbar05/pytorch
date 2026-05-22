@@ -18,7 +18,11 @@ _UNARY_BWD_DIFF_OPS = frozenset(
         "aten.elu_backward",
         "aten.hardswish_backward",
         "aten.hardsigmoid_backward",
-        "aten.softplus_backward",
+        # M-AG5.1 Tier-2 (2026-05-22): aten.softplus_backward removed —
+        # the unary bwd_diff custom-op signature ``(grad_output, self)``
+        # cannot carry the ``beta``/``threshold`` Scalar params the aten
+        # op requires. softplus_backward lowers algebraically via
+        # ``bwd_lowerings.py``.
         "aten.mish_backward",
     }
 )

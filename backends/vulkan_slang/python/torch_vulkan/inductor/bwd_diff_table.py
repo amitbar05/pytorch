@@ -68,7 +68,19 @@ BWD_DIFF_TABLE: dict[str, BwdDiffEntry] = {
     "aten.elu_backward": BwdDiffEntry("elu_fwd", "pointwise", 1),
     "aten.hardswish_backward": BwdDiffEntry("hardswish_fwd", "pointwise", 1),
     "aten.hardsigmoid_backward": BwdDiffEntry("hardsigmoid_fwd", "pointwise", 1),
-    "aten.softplus_backward": BwdDiffEntry("softplus_fwd", "pointwise", 1),
+    # M-AG5.1 Tier-2 (2026-05-22): ``aten.softplus_backward`` removed from
+    # the autodiff route. The aten signature carries ``beta`` and
+    # ``threshold`` Scalar params, but ``softplus_fwd`` in
+    # ``shaders/lib/pointwise.slang`` is the ``beta=1, threshold=20`` form
+    # ``log(1 + exp(x))`` with neither param materialised — wiring
+    # ``no_diff_params=("beta", "threshold")`` here would emit a
+    # ``bwd_diff(softplus_fwd)(dp, beta, threshold, dOut)`` call against a
+    # shader that does not declare those parameters and slangc would
+    # reject it. Until ``softplus_fwd`` grows the two ``no_diff float``
+    # params (Group G work), softplus_backward routes via the algebraic
+    # lowering in ``bwd_lowerings.py::_register_algebraic_backward_lowerings``
+    # — the leaky_relu pattern — and ``softplus_fwd`` is listed in
+    # ``EXCLUDED_DIFFERENTIABLE_FWDS`` below.
     "aten.mish_backward": BwdDiffEntry("mish_fwd", "pointwise", 1),
     # ── CG.M1: basic trig ─────────────────────────────────────────────
     "aten.sin_backward": BwdDiffEntry("sin_fwd", "pointwise", 1),
@@ -165,6 +177,19 @@ EXCLUDED_DIFFERENTIABLE_FWDS: dict[str, str] = {
     "ln_no_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_no_affine_elem": "norm: Welford reduction not autodiff-safe (P2.3)",
+    # M-AG5.1 Tier-2 (2026-05-22): ``softplus_fwd`` keeps its
+    # ``[Differentiable]`` annotation (the autograd-eligible math is well
+    # defined for ``beta=1`` / threshold disabled), but the aten op
+    # ``softplus_backward(grad_output, self, beta, threshold)`` cannot be
+    # routed through this table because the shader signature
+    # ``softplus_fwd(float x)`` does not carry the two ``no_diff`` scalars.
+    # softplus_backward is lowered algebraically in ``bwd_lowerings.py``;
+    # see the M-AG5.1 entry there.
+    "softplus_fwd": (
+        "M-AG5.1 Tier-2: aten signature carries beta/threshold "
+        "scalars that softplus_fwd does not declare; backward "
+        "lowered algebraically in bwd_lowerings.py"
+    ),
 }
 
 

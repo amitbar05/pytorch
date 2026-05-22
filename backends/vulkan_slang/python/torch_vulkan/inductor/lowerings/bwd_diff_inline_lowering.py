@@ -172,7 +172,10 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
         "aten.elu_backward",
         "aten.hardswish_backward",
         "aten.hardsigmoid_backward",
-        "aten.softplus_backward",
+        # M-AG5.1 Tier-2 (2026-05-22): aten.softplus_backward removed.
+        # The inline emitter's lowering signature is ``(grad_output, self)``,
+        # incompatible with the aten op's ``(grad_output, self, beta,
+        # threshold)``. Algebraic lowering in bwd_lowerings.py.
         "aten.mish_backward",
         "aten.sigmoid_backward",
         "aten.tanh_backward",

@@ -52,13 +52,20 @@ def _suppress_upstream_decomps() -> None:
     aten = torch.ops.aten
     ops_to_suppress = [
         aten.native_layer_norm_backward.default,
-        # PT.21: native_group_norm_backward is intentionally NOT suppressed.
-        # Removing it from the suppress list lets AOTAutograd / Inductor
-        # decompose it into primitive ops (sum, mul, div, sub, rsqrt, etc.)
-        # which all have existing Vulkan Slang lowerings.  The decomposition
-        # turns 1 extern dispatch into several fused Slang dispatches — better
-        # perf and eliminates the last remaining extern on the SmallCNN
-        # critical path.
+        # M-NEW.14 (2026-05-22): native_group_norm_backward MUST be suppressed.
+        # The previous "PT.21 keep decomposed" rationale (M17.6 closeout) is
+        # WRONG — the upstream decomp introduces a buffer-pool aliasing hazard
+        # in two-stacked-block SmallCNN.  The compiled wrapper recycles
+        # block-2 GN scratch buffers (buf5/buf6) into block-1 GN gradient
+        # outputs (buf31/buf32) via `reinterpret_tensor`, producing the
+        # exact-zero-grad fingerprint on `gn2.weight.grad` / `gn2.bias.grad`
+        # and propagating NaN into `conv1.weight.grad`.  See
+        # `agent_space/m_new_14_compiled_wrapper.py` lines 930-931 for the
+        # smoking gun.  Suppressing the decomp lets the dedicated Vulkan
+        # lowering at `bwd_lowerings.py::_register_group_norm_backward` fire
+        # instead — it builds the same primitive chain but as a single IR
+        # tree the scheduler can buffer-plan correctly.
+        aten.native_group_norm_backward.default,
         aten.native_batch_norm_backward.default,
         aten.native_batch_norm.default,
         # DR.1+: Suppress native_group_norm and native_layer_norm decompositions
@@ -139,6 +146,11 @@ def _suppress_upstream_decomps() -> None:
     _aot_decomps.pop(aten.lerp.Tensor, None)
     # M17.3: also pop adaptive_avg_pool2d from AOT decomp table.
     _aot_decomps.pop(aten._adaptive_avg_pool2d.default, None)
+    # M-NEW.14: also pop native_group_norm_backward from the AOT decomp
+    # table so AOTAutograd / partitioner do not decompose it before
+    # Inductor's lowering layer sees the op (see `ops_to_suppress`
+    # comment above for the buffer-aliasing rationale).
+    _aot_decomps.pop(aten.native_group_norm_backward.default, None)
 
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.

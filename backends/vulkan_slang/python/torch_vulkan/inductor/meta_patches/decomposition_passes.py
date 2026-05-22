@@ -15,13 +15,20 @@ def _patch_decompositions() -> None:
 
     M-AG5.1 Tier-0/Tier-1 closeout (2026-05-21): nine activation backward
     decomp entries were removed (anti-goal #5 cleanup) — they competed with
-    the autodiff path in ``bwd_diff_table.py``. The remaining four entries
-    each have a documented blocker:
+    the autodiff path in ``bwd_diff_table.py``.
+
+    M-AG5.1 Tier-2 closeout (2026-05-22): ``softplus_backward`` decomp
+    removed. The op now lowers algebraically through
+    ``bwd_lowerings.py::_register_algebraic_backward_lowerings`` (the
+    leaky_relu pattern). The full autodiff route is blocked on a Group G
+    shader extension (``softplus_fwd`` needs ``no_diff beta`` / ``no_diff
+    threshold`` params); see ``EXCLUDED_DIFFERENTIABLE_FWDS`` in
+    ``bwd_diff_table.py``.
+
+    The remaining decomp entries each have a documented blocker:
 
     * ``aten.hardtanh_backward`` — Tier-3: no ``hardtanh_fwd`` in
       ``bwd_diff_table`` yet.
-    * ``aten.softplus_backward`` — Tier-2: unary emitter does not yet
-      support ``no_diff_params`` for ``beta``/``threshold``.
     * ``aten.relu.default`` — forward decomposition retained as a
       ``ReluBackward0`` safety net so the joint trace never sees it.
     * ``aten.gelu_backward`` — Tier-4: string ``approximate=`` arg
@@ -42,10 +49,6 @@ def _patch_decompositions() -> None:
     def _hardtanh_bwd(grad_output, self, min_val, max_val):
         mask = (self > min_val) & (self < max_val)
         return grad_output * mask
-
-    def _softplus_bwd(grad_output, self, beta, threshold):
-        bx = beta * self
-        return torch.where(bx > threshold, grad_output, grad_output * torch.sigmoid(bx))
 
     # C1: Provide REAL decompositions, not shape-only proxies.
     # The previous approach (torch.empty_like for all backwards) caused
@@ -141,25 +144,10 @@ def _patch_decompositions() -> None:
         )
         return gi, gw, gb
 
-    def _group_norm_bwd(
-        grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
-    ):
-        gi = (
-            input.new_empty(input.shape)
-            if output_mask[0]
-            else input.new_empty((0,))
-        )
-        gw = (
-            grad_out.new_empty((int(C),))
-            if output_mask[1]
-            else grad_out.new_empty((0,))
-        )
-        gb = (
-            grad_out.new_empty((int(C),))
-            if output_mask[2]
-            else grad_out.new_empty((0,))
-        )
-        return gi, gw, gb
+    # M-NEW.14 (2026-05-22): `_group_norm_bwd` shape-only proxy removed.
+    # See the comment on `aten.native_group_norm_backward.default` below
+    # for the rationale (buffer-aliasing fix routes the op through the
+    # native Vulkan lowering in `bwd_lowerings.py`).
 
     def _batch_norm_bwd(
         grad_out,
@@ -202,20 +190,19 @@ def _patch_decompositions() -> None:
     # Deleted: ``hardswish_backward``, ``hardsigmoid_backward``,
     # ``mish_backward``, ``threshold_backward``, ``silu_backward``,
     # ``leaky_relu_backward``, ``elu_backward``, ``sigmoid_backward``,
-    # ``tanh_backward``.
+    # ``tanh_backward`` (Tier-0/Tier-1 ✅ landed 2026-05-21);
+    # ``softplus_backward`` (Tier-2 ✅ landed 2026-05-22 — algebraic
+    # lowering in ``bwd_lowerings.py``).
     #
     # Kept (separate handling reasons documented above each helper):
     #   * ``aten.hardtanh_backward`` — no fwd in ``bwd_diff_table`` yet
     #     (Tier-3 plan; needs a new ``[Differentiable]`` ``hardtanh_fwd``).
-    #   * ``aten.softplus_backward`` — needs the ``no_diff_params`` extension
-    #     of the unary emitter (Tier-2 plan).
     #   * ``aten.relu.default`` — forward C1 safety net so
     #     ``ReluBackward0`` never enters the joint trace.
     #   * ``aten.gelu_backward`` — ``approximate=`` string param not
     #     supported in ``bwd_diff`` codegen yet (Tier-4 plan).
     replacements = {
         aten.hardtanh_backward.default: _hardtanh_bwd,
-        aten.softplus_backward.default: _softplus_bwd,
         aten.relu.default: _relu_fwd_decomp,
         aten.gelu_backward.default: _gelu_bwd,
         aten._softmax_backward_data.default: _softmax_bwd,
@@ -224,7 +211,15 @@ def _patch_decompositions() -> None:
         aten.max_pool2d_with_indices_backward.default: _max_pool_bwd,
         aten.linear_backward.default: _linear_bwd,
         aten.native_layer_norm_backward.default: _layer_norm_bwd,
-        aten.native_group_norm_backward.default: _group_norm_bwd,
+        # M-NEW.14 (2026-05-22): native_group_norm_backward is no longer in
+        # this proxy table.  The previous shape-only ``_group_norm_bwd``
+        # entry competed with the AOT decomp and (post M-NEW.14 suppression)
+        # would re-inject a decomp into the AOT table that the
+        # ``_suppress_upstream_decomps`` pop in ``lowerings/__init__.py``
+        # then removes — but the partitioner had already snapshotted it.
+        # Letting Inductor's native lowering at
+        # ``bwd_lowerings.py::_register_group_norm_backward`` fire instead
+        # eliminates the buffer-aliasing hazard described in that file.
         aten.native_batch_norm_backward.default: _batch_norm_bwd,
     }
     decomposition_table.update(replacements)

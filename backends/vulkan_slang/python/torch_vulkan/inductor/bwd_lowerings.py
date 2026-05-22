@@ -59,13 +59,20 @@ _UNARY_BWD_DIFF_LOWERING_OPS: set[str] = {
     "aten.elu_backward",
     "aten.hardswish_backward",
     "aten.hardsigmoid_backward",
-    "aten.softplus_backward",
     "aten.mish_backward",
 }
 # NOTE: aten.gelu_backward is NOT in the auto-generated set because
 # gelu_fwd in pointwise.slang uses the tanh approximation, while
 # PyTorch's default approximate="none" uses the exact erf formula.
 # gelu_backward is handled in _register_algebraic_backward_lowerings().
+#
+# NOTE: aten.softplus_backward is also NOT in the auto-generated set
+# (M-AG5.1 Tier-2, 2026-05-22). The aten signature carries
+# ``beta``/``threshold`` Scalar params, but the unary bwd_diff lowering
+# template ``_lowering(grad_output, self)`` has no slots for them, and
+# the ``softplus_fwd`` shader does not declare matching ``no_diff``
+# scalars. softplus_backward is lowered algebraically (leaky_relu
+# pattern) in ``_register_algebraic_backward_lowerings``.
 
 _BINARY_BWD_DIFF_LOWERING_OPS: set[str] = {
     "aten.mse_loss_backward",
@@ -298,6 +305,37 @@ def _register_algebraic_backward_lowerings() -> None:
         scaled = L.lowerings[aten.mul.Scalar](grad_output, negative_slope)
         return L.lowerings[aten.where.self](gt0, grad_output, scaled)
 
+    # ── softplus_backward ──────────────────────────────────────────
+    # M-AG5.1 Tier-2 (2026-05-22). CANNOT use bwd_diff:
+    # ``softplus_backward(grad_output, self, beta, threshold)`` carries
+    # two Scalar args that ``softplus_fwd`` in
+    # ``shaders/lib/pointwise.slang`` does not declare (the shader is the
+    # ``beta=1`` form ``log(1 + exp(x))``). Wiring those through
+    # ``no_diff_params`` would mismatch the shader signature and slangc
+    # would reject the emitted ``bwd_diff(softplus_fwd)(dp, beta,
+    # threshold, dOut)`` call.
+    #
+    # Math (matches the deleted symptom-fix in
+    # ``meta_patches/decomposition_passes.py::_softplus_bwd``):
+    #
+    #     bx = beta * self
+    #     dy/dx = 1                       if bx > threshold
+    #           = sigmoid(bx)             otherwise
+    #     grad_input = grad_output * dy/dx
+    #
+    # PyTorch's softplus default is ``beta=1, threshold=20``; we honour
+    # whatever AOTAutograd hands us so the lowering stays correct for
+    # ``nn.Softplus(beta=…, threshold=…)`` configurations.
+    @register_lowering(aten.softplus_backward, type_promotion_kind=None)
+    def _vulkan_softplus_backward(grad_output, self, beta, threshold):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+        bx = L.lowerings[aten.mul.Scalar](self, beta)
+        sig_bx = L.lowerings[aten.sigmoid.default](bx)
+        gt_thr = L.lowerings[aten.gt.Scalar](bx, threshold)
+        sig_branch = L.lowerings[aten.mul.Tensor](grad_output, sig_bx)
+        return L.lowerings[aten.where.self](gt_thr, grad_output, sig_branch)
+
     # ── native_dropout_backward ────────────────────────────────────
     # Not autodiff-eligible — simple mask * scale * grad.
     @register_lowering(aten.native_dropout_backward, type_promotion_kind=None)
@@ -429,18 +467,32 @@ def _register_group_norm_backward() -> None:
         if N <= 0 or C <= 0 or HxW <= 0 or group <= 0 or C % group != 0:
             return NotImplemented
         cpg = C // group
-        s = 1.0 / float(HxW * cpg)
+        s = 1.0 / float(cpg * HxW)
 
-        go_3d = L.lowerings[aten.view.default](grad_output, [N, C, HxW])
-        in_3d = L.lowerings[aten.view.default](inp, [N, C, HxW])
+        # Work in 4D [N, group, cpg, HxW] throughout so mean/rstd broadcast
+        # cleanly over (cpg, HxW) and reductions land on the right dims.
+        in_4d = L.lowerings[aten.view.default](inp, [N, group, cpg, HxW])
+        go_4d = L.lowerings[aten.view.default](grad_output, [N, group, cpg, HxW])
+        mean_4d = L.lowerings[aten.view.default](mean, [N, group, 1, 1])
+        rstd_4d = L.lowerings[aten.view.default](rstd, [N, group, 1, 1])
 
-        ds = L.lowerings[aten.sum.dim_IntList](
-            L.lowerings[aten.mul.Tensor](go_3d, in_3d), [2], keepdims=False
+        # xhat = (x - mean) * rstd  — the per-group normalised input
+        xhat_4d = L.lowerings[aten.mul.Tensor](
+            L.lowerings[aten.sub.Tensor](in_4d, mean_4d), rstd_4d
         )
-        db = L.lowerings[aten.sum.dim_IntList](go_3d, [2], keepdims=False)
 
-        ds_g = L.lowerings[aten.view.default](ds, [N, group, cpg])
-        db_g = L.lowerings[aten.view.default](db, [N, group, cpg])
+        # PyTorch GroupNorm backward: gamma is applied OUTSIDE the reductions.
+        # ds_g[n,g] = sum_{c,h}(dy * xhat),  db_g[n,g] = sum_{c,h}(dy)
+        # Chain two single-dim reductions: HxW (dim 3) then cpg (dim 2).
+        dy_xhat = L.lowerings[aten.mul.Tensor](go_4d, xhat_4d)
+        ds_g = L.lowerings[aten.sum.dim_IntList](
+            L.lowerings[aten.sum.dim_IntList](dy_xhat, [3], keepdims=False),
+            [2], keepdims=False,
+        )  # [N, group]
+        db_g = L.lowerings[aten.sum.dim_IntList](
+            L.lowerings[aten.sum.dim_IntList](go_4d, [3], keepdims=False),
+            [2], keepdims=False,
+        )  # [N, group]
 
         def _zero_like_shape(shape):
             return L.lowerings[aten.full.default](
@@ -458,66 +510,35 @@ def _register_group_norm_backward() -> None:
         ]
 
         if output_mask[0]:
+            # d_input = (gamma * rstd) * (dy - s*db_g - xhat * s*ds_g)
+            ds_g_4d = L.lowerings[aten.view.default](ds_g, [N, group, 1, 1])
+            db_g_4d = L.lowerings[aten.view.default](db_g, [N, group, 1, 1])
             if gamma is not None:
-                gamma_3d = L.lowerings[aten.view.default](gamma, [1, group, cpg])
-                ds_val = L.lowerings[aten.sum.dim_IntList](
-                    L.lowerings[aten.mul.Tensor](ds_g, gamma_3d), [2], keepdims=False
-                )
-                db_val = L.lowerings[aten.sum.dim_IntList](
-                    L.lowerings[aten.mul.Tensor](db_g, gamma_3d), [2], keepdims=False
-                )
+                gamma_4d = L.lowerings[aten.view.default](gamma, [1, group, cpg, 1])
+                c1_4d = L.lowerings[aten.mul.Tensor](rstd_4d, gamma_4d)
             else:
-                ds_val = L.lowerings[aten.sum.dim_IntList](ds_g, [2], keepdims=False)
-                db_val = L.lowerings[aten.sum.dim_IntList](db_g, [2], keepdims=False)
-
-            t = L.lowerings[aten.mul.Tensor](db_val, mean)
-            t = L.lowerings[aten.sub.Tensor](t, ds_val)
-            rstd_sq = L.lowerings[aten.mul.Tensor](rstd, rstd)
-            rstd_cu = L.lowerings[aten.mul.Tensor](rstd_sq, rstd)
-            c2 = L.lowerings[aten.mul.Tensor](t, rstd_cu)
-            c2 = L.lowerings[aten.mul.Scalar](c2, s)
-            neg_c2_mean = L.lowerings[aten.neg.default](
-                L.lowerings[aten.mul.Tensor](c2, mean)
+                c1_4d = rstd_4d
+            db_term = L.lowerings[aten.mul.Scalar](db_g_4d, s)
+            ds_term = L.lowerings[aten.mul.Scalar](ds_g_4d, s)
+            xhat_ds = L.lowerings[aten.mul.Tensor](xhat_4d, ds_term)
+            correction = L.lowerings[aten.sub.Tensor](go_4d, db_term)
+            correction = L.lowerings[aten.sub.Tensor](correction, xhat_ds)
+            d_input_4d = L.lowerings[aten.mul.Tensor](c1_4d, correction)
+            outputs[0] = L.lowerings[aten.view.default](
+                d_input_4d, list(inp.get_size())
             )
-            db_rstd = L.lowerings[aten.mul.Tensor](db_val, rstd)
-            db_rstd_s = L.lowerings[aten.mul.Scalar](db_rstd, s)
-            c3 = L.lowerings[aten.sub.Tensor](neg_c2_mean, db_rstd_s)
-
-            rstd_3d = L.lowerings[aten.view.default](rstd, [N, group, 1])
-            if gamma is not None:
-                gamma_3d_b = L.lowerings[aten.view.default](gamma, [1, group, cpg])
-                c1 = L.lowerings[aten.mul.Tensor](rstd_3d, gamma_3d_b)
-                c1_4d = L.lowerings[aten.view.default](c1, [N, group, cpg, 1])
-            else:
-                c1_4d = L.lowerings[aten.view.default](rstd_3d, [N, group, 1, 1])
-
-            c2_4d = L.lowerings[aten.view.default](c2, [N, group, 1, 1])
-            c3_4d = L.lowerings[aten.view.default](c3, [N, group, 1, 1])
-
-            go_4d = L.lowerings[aten.view.default](grad_output, [N, group, cpg, HxW])
-            in_4d = L.lowerings[aten.view.default](inp, [N, group, cpg, HxW])
-
-            term1 = L.lowerings[aten.mul.Tensor](go_4d, c1_4d)
-            term2 = L.lowerings[aten.mul.Tensor](in_4d, c2_4d)
-            d_input = L.lowerings[aten.add.Tensor](term1, term2)
-            d_input = L.lowerings[aten.add.Tensor](d_input, c3_4d)
-            d_input = L.lowerings[aten.view.default](d_input, list(inp.get_size()))
-            outputs[0] = d_input
 
         if output_mask[1]:
-            mean_3d = L.lowerings[aten.view.default](mean, [N, group, 1])
-            rstd_3d2 = L.lowerings[aten.view.default](rstd, [N, group, 1])
-            inner = L.lowerings[aten.sub.Tensor](
-                ds_g, L.lowerings[aten.mul.Tensor](db_g, mean_3d)
-            )
-            scaled = L.lowerings[aten.mul.Tensor](inner, rstd_3d2)
-            d_gamma = L.lowerings[aten.sum.dim_IntList](scaled, [0], keepdims=False)
-            d_gamma = L.lowerings[aten.view.default](d_gamma, [C])
-            outputs[1] = d_gamma
+            # d_gamma_c = sum_{N,H}(dy_c * xhat_c)
+            tmp = L.lowerings[aten.sum.dim_IntList](dy_xhat, [3], keepdims=False)
+            tmp = L.lowerings[aten.sum.dim_IntList](tmp, [0], keepdims=False)
+            outputs[1] = L.lowerings[aten.view.default](tmp, [C])
 
         if output_mask[2]:
-            d_bias = L.lowerings[aten.sum.dim_IntList](db, [0], keepdims=False)
-            outputs[2] = d_bias
+            # d_bias_c = sum_{N,H}(dy_c)
+            tmp = L.lowerings[aten.sum.dim_IntList](go_4d, [3], keepdims=False)
+            tmp = L.lowerings[aten.sum.dim_IntList](tmp, [0], keepdims=False)
+            outputs[2] = L.lowerings[aten.view.default](tmp, [C])
 
         return outputs
 
