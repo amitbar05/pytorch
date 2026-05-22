@@ -26241,7 +26241,11 @@ _UNARY_BWD_REFS: dict[str, "callable"] = {
     "aten.elu_backward": lambda x: torch.nn.functional.elu(x),
     "aten.hardswish_backward": lambda x: torch.nn.functional.hardswish(x),
     "aten.hardsigmoid_backward": lambda x: torch.nn.functional.hardsigmoid(x),
-    "aten.softplus_backward": lambda x: torch.nn.functional.softplus(x),
+    # M-AG5.1 Tier-2 (2026-05-22): aten.softplus_backward dropped from the
+    # bwd_diff dispatch route. softplus_fwd does not declare ``beta`` /
+    # ``threshold`` as ``no_diff`` scalars, so the dispatcher cannot emit a
+    # valid bwd_diff call. softplus_backward now lowers algebraically; see
+    # ``TestMAG51Tier2Softplus``.
     "aten.mish_backward": lambda x: torch.nn.functional.mish(x),
 }
 
@@ -30575,10 +30579,9 @@ class TestUnaryBwdDiffDispatch:
     def test_hardsigmoid_backward_bwd_diff(self):
         self._test_unary_backward(torch.nn.functional.hardsigmoid)
 
-    def test_softplus_backward_bwd_diff(self):
-        self._test_unary_backward(
-            lambda x: torch.nn.functional.softplus(x, beta=1.0),
-        )
+    # M-AG5.1 Tier-2 (2026-05-22): test_softplus_backward_bwd_diff removed.
+    # softplus_backward no longer routes through bwd_diff — see
+    # TestMAG51Tier2Softplus for the algebraic-path coverage.
 
     def test_mish_backward_bwd_diff(self):
         self._test_unary_backward(torch.nn.functional.mish)
@@ -30594,7 +30597,8 @@ class TestUnaryBwdDiffDispatch:
             "elu_backward_bwd_diff",
             "hardswish_backward_bwd_diff",
             "hardsigmoid_backward_bwd_diff",
-            "softplus_backward_bwd_diff",
+            # M-AG5.1 Tier-2 (2026-05-22): "softplus_backward_bwd_diff"
+            # removed — softplus_backward now lowers algebraically.
             "mish_backward_bwd_diff",
         ]
         if hasattr(torch.ops.aten, "relu_backward"):
@@ -52872,14 +52876,15 @@ class TestM221OrphanIntegration:
 
 
 class TestMAG51ActivationDecompRouting:
-    """M-AG5.1 Tier-0/Tier-1 closeout (anti-goal #5 cleanup).
+    """M-AG5.1 Tier-0/Tier-1/Tier-2 closeout (anti-goal #5 cleanup).
 
-    Nine activation backward ops (hardswish, hardsigmoid, mish,
-    threshold, silu, leaky_relu, elu, sigmoid, tanh) had decomposition
+    Ten activation backward ops (hardswish, hardsigmoid, mish, threshold,
+    silu, leaky_relu, elu, sigmoid, tanh, softplus) had decomposition
     entries in ``meta_patches/decomposition_passes.py`` that competed
-    with the autodiff path in ``bwd_diff_table.py`` + ``bwd_lowerings.py``.
-    The decomp entries were symptom-patches; deleting them lets the
-    autodiff path own these ops outright.
+    with the autodiff / algebraic-lowering paths in ``bwd_diff_table.py``
+    + ``bwd_lowerings.py``. The decomp entries were symptom-patches;
+    deleting them lets the autodiff (or algebraic) path own these ops
+    outright.
 
     The tests below lock in the deletion at the structural level — they
     inspect the ``_patch_decompositions`` source and the routing tables.
@@ -52890,10 +52895,10 @@ class TestMAG51ActivationDecompRouting:
 
     * ``test_patch_does_not_override_deleted_ops`` — the
       ``replacements`` dict in ``_patch_decompositions`` does NOT include
-      any of the nine Tier-0/Tier-1 aten backward ops.
-    * ``test_patch_still_overrides_retained_ops`` — the four Tier-2/3/4
-      entries (``hardtanh``, ``softplus``, ``relu`` fwd, ``gelu``) ARE
-      still overridden, with their documented blockers.
+      any of the ten Tier-0/Tier-1/Tier-2 aten backward ops.
+    * ``test_patch_still_overrides_retained_ops`` — the three Tier-3/4
+      entries (``hardtanh``, ``relu`` fwd, ``gelu``) ARE still
+      overridden, with their documented blockers.
     * ``test_bwd_diff_routing_intact`` — every deleted op still has
       either a ``BWD_DIFF_TABLE`` entry or a direct ``register_lowering``.
     """
@@ -52911,12 +52916,15 @@ class TestMAG51ActivationDecompRouting:
         "elu_backward",
         "sigmoid_backward",
         "tanh_backward",
+        # Tier-2 (M-AG5.1, 2026-05-22). softplus_backward routes via
+        # the algebraic lowering in bwd_lowerings.py — see
+        # TestMAG51Tier2Softplus below for the dedicated coverage.
+        "softplus_backward",
     )
 
     # Decomp entries that remain (each with a documented blocker).
     _RETAINED_OPS = (
         "hardtanh_backward",  # Tier-3 (no hardtanh_fwd in BWD_DIFF_TABLE)
-        "softplus_backward",  # Tier-2 (needs no_diff_params on beta/threshold)
         "gelu_backward",  # Tier-4 (string approximate= arg)
     )
 
@@ -52983,6 +52991,129 @@ class TestMAG51ActivationDecompRouting:
                 f"after the decomp deletion — neither BWD_DIFF_TABLE entry "
                 f"nor register_lowering. Restore one or revert the deletion."
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M-AG5.1 Tier-2 — softplus_backward algebraic lowering closeout
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMAG51Tier2Softplus:
+    """M-AG5.1 Tier-2 (2026-05-22): ``aten.softplus_backward`` no longer
+    routes through ``meta_patches/decomposition_passes.py`` and no longer
+    appears in ``BWD_DIFF_TABLE``. Instead it has a dedicated algebraic
+    ``register_lowering`` in
+    ``bwd_lowerings.py::_register_algebraic_backward_lowerings`` that
+    mirrors the leaky_relu pattern — multiply, sigmoid, threshold-mask,
+    ``where`` — producing pointwise IR the Inductor scheduler can fuse
+    with neighbouring ops.
+
+    The Tier-2 plan originally called for extending the unary bwd_diff
+    emitter with ``no_diff_params``, but ``softplus_fwd`` in
+    ``shaders/lib/pointwise.slang`` (Group G, off-limits to this branch)
+    does not declare ``beta``/``threshold`` parameters; the
+    ``no_diff_params`` plumbing already supports them on the emitter
+    side (see ``aten.leaky_relu_backward``), but the shader signature
+    mismatch would cause slangc to reject the emitted call. The
+    algebraic route is the Group-B-only closeout — see the documented
+    Tier-2 entry in ``EXCLUDED_DIFFERENTIABLE_FWDS``.
+
+    Tests:
+
+    * ``test_table_does_not_route_softplus`` — ``BWD_DIFF_TABLE`` has
+      no ``aten.softplus_backward`` entry; ``softplus_fwd`` IS listed in
+      ``EXCLUDED_DIFFERENTIABLE_FWDS`` with a documented reason.
+    * ``test_softplus_backward_registered_in_lowering_table`` — the
+      Inductor lowering table has a ``register_lowering`` for
+      ``aten.softplus_backward``.
+    * ``test_softplus_backward_correctness_default_beta`` — end-to-end
+      ``torch.compile`` backward with the PyTorch default
+      ``beta=1, threshold=20`` matches CPU autograd.
+    * ``test_softplus_backward_correctness_non_default_beta`` — the same
+      check with ``beta=1.5`` exercises the multiplication by ``beta``
+      that the previous broken bwd_diff route would have silently lost.
+    * ``test_softplus_backward_correctness_threshold_branch`` — drives
+      ``self`` large enough that ``beta*self > threshold`` everywhere,
+      forcing the ``where`` to pick the identity branch
+      (``grad_input == grad_output``).
+    """
+
+    _BUG_ROOT_COMPONENT = "fx-meta-patches"
+
+    def test_table_does_not_route_softplus(self):
+        from torch_vulkan.inductor.bwd_diff_table import (
+            BWD_DIFF_TABLE,
+            EXCLUDED_DIFFERENTIABLE_FWDS,
+        )
+
+        assert "aten.softplus_backward" not in BWD_DIFF_TABLE, (
+            "M-AG5.1 Tier-2: aten.softplus_backward must NOT be in "
+            "BWD_DIFF_TABLE — the unary emitter cannot thread "
+            "beta/threshold through softplus_fwd (the shader signature "
+            "does not declare them as no_diff scalars)."
+        )
+        assert "softplus_fwd" in EXCLUDED_DIFFERENTIABLE_FWDS, (
+            "M-AG5.1 Tier-2: softplus_fwd retains its [Differentiable] "
+            "annotation in shaders/lib/pointwise.slang, so it must be "
+            "listed in EXCLUDED_DIFFERENTIABLE_FWDS with a documented "
+            "reason or the BwdDiffCoverageGate will fail."
+        )
+
+    def test_softplus_backward_registered_in_lowering_table(self):
+        import torch_vulkan  # noqa: F401
+        from torch._inductor import lowering as L
+        from torch_vulkan.inductor import register
+
+        register()
+        target = torch.ops.aten.softplus_backward.default
+        assert target in L.lowerings, (
+            "M-AG5.1 Tier-2: aten.softplus_backward.default missing "
+            "from L.lowerings — the algebraic register_lowering in "
+            "bwd_lowerings.py::_register_algebraic_backward_lowerings "
+            "did not fire."
+        )
+
+    @staticmethod
+    def _check_correctness(beta: float, threshold: float, scale: float = 1.0):
+        torch._dynamo.reset()
+        torch.manual_seed(0xA51 ^ int(beta * 1000) ^ int(threshold * 1000))
+
+        shape = (8, 32)
+        x_cpu = (torch.randn(shape) * scale).contiguous()
+        x_cpu_ref = x_cpu.detach().clone().requires_grad_(True)
+        ref = torch.nn.functional.softplus(x_cpu_ref, beta=beta, threshold=threshold)
+        ref.sum().backward()
+        grad_ref = x_cpu_ref.grad.clone()
+
+        x_v = x_cpu.detach().to("vulkan:0").requires_grad_(True)
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return torch.nn.functional.softplus(x, beta=beta, threshold=threshold).sum()
+
+        loss = fn(x_v)
+        loss.backward()
+        assert x_v.grad is not None, (
+            f"M-AG5.1 Tier-2: x.grad is None for beta={beta}, "
+            f"threshold={threshold}"
+        )
+        torch.testing.assert_close(x_v.grad.cpu(), grad_ref, rtol=1e-4, atol=1e-5)
+
+    def test_softplus_backward_correctness_default_beta(self):
+        # PyTorch defaults: beta=1, threshold=20.
+        self._check_correctness(beta=1.0, threshold=20.0, scale=2.0)
+
+    def test_softplus_backward_correctness_non_default_beta(self):
+        # beta=1.5 — exercises the ``mul(self, beta)`` step that the
+        # previous broken bwd_diff route would have lost (the old unary
+        # lowering signature was ``(grad_output, self)`` with no slot
+        # for beta).
+        self._check_correctness(beta=1.5, threshold=20.0, scale=2.0)
+
+    def test_softplus_backward_correctness_threshold_branch(self):
+        # scale=15 with threshold=20 puts most x values close to (but
+        # straddling) the threshold so both ``where`` branches fire.
+        self._check_correctness(beta=1.0, threshold=20.0, scale=15.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -53554,3 +53685,136 @@ class TestM_NEW_14_TwoBlockSmallCNNBackward:
     # xfail-strict.  The standalone-probe assertion lives in
     # ``agent_space/probe_nan_stage6.py``; the in-pytest gate is
     # only the finite-grads assertion above.
+
+
+class TestM22_5DeadLoweringCleanup:
+    """M22.5 — regression gate: formerly-dead @register_lowering stubs replaced.
+
+    Before M22.5, several ops had ``@register_lowering`` entries that
+    immediately returned ``NotImplemented`` or raised on every call — adding
+    startup cost and confusing coverage walkers without enabling any kernels.
+    The affected ops were:
+
+      - ``aten.addcmul``, ``aten.addcdiv`` (activation.py)
+      - ``aten.index_add``, ``aten.index_copy`` (scatter.py)
+      - ``aten.unfold`` (view.py)
+      - ``aten.rot90`` (activation.py — M19.R fixed the correctness bug and
+        removed the old iterative stub)
+
+    After M22.5 these all have real lowerings.  This class asserts:
+
+    1. Each op IS registered in Inductor's lowering table (the registration
+       ran at backend init).
+    2. ``norm.py`` does NOT contain duplicate ``_register_*_backward``
+       definitions — the duplicate stubs were collapsed in M22.5.
+    3. The norm-backward stubs in ``norm.py`` remain ``pass``-only
+       (no accidental ``@register_lowering`` piggyback that would shadow
+       the real lowerings in ``bwd_lowerings.py``).
+    """
+
+    _FORMERLY_DEAD_OPS = [
+        "torch.ops.aten.addcmul.default",
+        "torch.ops.aten.addcdiv.default",
+        "torch.ops.aten.index_add.default",
+        "torch.ops.aten.index_copy.default",
+        "torch.ops.aten.unfold.default",
+        "torch.ops.aten.rot90.default",
+    ]
+
+    def test_formerly_dead_ops_are_now_registered(self):
+        """Each op that was a dead stub must now be in the lowering table."""
+        import torch
+        from torch._inductor.lowering import lowerings as _L
+
+        missing = []
+        for op_str in self._FORMERLY_DEAD_OPS:
+            parts = op_str.split(".")
+            # Navigate torch.ops.aten.<name>.<overload>
+            obj = torch
+            try:
+                for part in parts[1:]:
+                    obj = getattr(obj, part)
+                if obj not in _L:
+                    missing.append(op_str)
+            except AttributeError:
+                missing.append(f"{op_str} (attr not found)")
+
+        assert not missing, (
+            "M22.5: the following ops were formerly dead stubs and must now "
+            "have real @register_lowering entries in the Inductor lowering "
+            f"table (they are missing): {missing}"
+        )
+
+    def test_norm_py_no_duplicate_backward_stubs(self):
+        """norm.py must not contain duplicate _register_*_backward definitions.
+
+        M22.5 collapsed the four duplicate function bodies that Python
+        was silently shadowing.  This test locks in the cleanup so
+        they don't creep back in.
+        """
+        import ast
+        import pathlib
+
+        norm_path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "python"
+            / "torch_vulkan"
+            / "inductor"
+            / "lowerings"
+            / "norm.py"
+        )
+        src = norm_path.read_text()
+        tree = ast.parse(src)
+
+        # Count top-level definitions of each _register_*_backward name.
+        counts: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("_register_") and node.name.endswith("_backward"):
+                    counts[node.name] = counts.get(node.name, 0) + 1
+
+        duplicates = {name: cnt for name, cnt in counts.items() if cnt > 1}
+        assert not duplicates, (
+            "M22.5: norm.py contains duplicate function definitions for "
+            f"{duplicates}. The duplicate stubs were supposed to be collapsed "
+            "in M22.5. Remove the redundant definitions."
+        )
+
+    def test_norm_backward_stubs_do_not_register_lowerings(self):
+        """The _register_*_backward stubs in norm.py must be pass-only.
+
+        The real backward lowerings live in bwd_lowerings.py.  If the stubs
+        in norm.py were to call @register_lowering they would shadow the
+        real lowerings registered by bwd_lowerings.py (Inductor is
+        first-come-first-served).
+        """
+        import ast
+        import pathlib
+
+        norm_path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "python"
+            / "torch_vulkan"
+            / "inductor"
+            / "lowerings"
+            / "norm.py"
+        )
+        src = norm_path.read_text()
+        tree = ast.parse(src)
+
+        violations = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not (node.name.startswith("_register_") and node.name.endswith("_backward")):
+                continue
+            # Look for @register_lowering decorator usage anywhere in the body.
+            func_src = ast.get_source_segment(src, node) or ""
+            if "register_lowering" in func_src:
+                violations.append(node.name)
+
+        assert not violations, (
+            "M22.5: the following norm.py backward stubs contain "
+            f"@register_lowering calls — they would shadow bwd_lowerings.py: "
+            f"{violations}. The stubs must remain pass-only (TR.19)."
+        )

@@ -253,7 +253,7 @@ def _register_batch_norm_forward() -> None:
 # Backward lowerings for layer_norm, group_norm, and batch_norm have
 # been consolidated into ``bwd_lowerings.py`` (TR.19).  The no-op
 # stubs below preserve the import contract for callers that still
-# reference them.
+# reference them (M22.5 — duplicate definitions collapsed).
 
 
 def _register_layer_norm_backward() -> None:
@@ -266,23 +266,3 @@ def _register_group_norm_backward() -> None:
 
 def _register_batch_norm_backward() -> None:
     pass  # TR.19 — moved to bwd_lowerings.py
-
-
-def _register_batch_norm_backward() -> None:
-    """Register batch_norm backward lowerings (stub — TR.19).
-
-    The full batch_norm backward lowering has been moved to
-    ``bwd_lowerings.py`` (TR.19 backward consolidation).  This stub
-    keeps the import contract in ``lowerings/__init__.py`` working
-    until the consolidation is complete.
-    """
-
-
-def _register_group_norm_backward() -> None:
-    """Register group_norm backward lowerings (stub — TR.19).
-
-    The full group_norm backward lowering has been moved to
-    ``bwd_lowerings.py`` (TR.19 backward consolidation).  This stub
-    keeps the import contract in ``lowerings/__init__.py`` working
-    until the consolidation is complete.
-    """
