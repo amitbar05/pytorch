@@ -23,6 +23,26 @@ import torch
 from torch._inductor.codegen.common import InplacedBuffer
 from torch._inductor.virtualized import V
 
+
+def resolve_alias_chain(
+    name: str,
+    freed: "set[str]",
+    old_to_new: "dict[str, str]",
+) -> str:
+    """Walk the buffer alias chain until a live name is reached.
+
+    The Inductor memory planner may chain reuses: buf9 → buf10 → buf11 (buf10
+    is itself reused into buf11).  A naive one-step substitution leaves buf10
+    in the arg list, which references a deleted variable at runtime
+    (UnboundLocalError).  This function walks transitively, guarding against
+    cycles.
+    """
+    seen: set[str] = set()
+    while name in old_to_new and name in freed and name not in seen:
+        seen.add(name)
+        name = old_to_new[name]
+    return name
+
 from .. import config
 
 
@@ -79,16 +99,9 @@ class CallKernelMixin:
             old_to_new = {}
             for new_name, old_name in reuses.items():
                 old_to_new[old_name] = new_name
-
-            def _resolve(name):
-                # Walk the alias chain, guarding against cycles.
-                seen = set()
-                while name in old_to_new and name in freed and name not in seen:
-                    seen.add(name)
-                    name = old_to_new[name]
-                return name
-
-            ordered_args = [_resolve(a) for a in ordered_args]
+            ordered_args = [
+                resolve_alias_chain(a, freed, old_to_new) for a in ordered_args
+            ]
 
         # N+1.7: For fully-static kernels, sizevars are emitted as
         # ``static const uint`` module-scope declarations — no push

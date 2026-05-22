@@ -951,6 +951,14 @@ public:
     static at::Tensor forward(torch::autograd::AutogradContext* ctx,
                                const at::Tensor& weight, const at::Tensor& indices,
                                int64_t padding_idx, bool scale_grad_by_freq, bool sparse) {
+        // M22.7: guard unsupported flags before saving context so callers get
+        // a clear error instead of silently returning a dense gradient when
+        // sparse=True was requested.
+        TORCH_CHECK(!sparse,
+                    "Vulkan embedding: sparse gradient not supported (sparse=True). "
+                    "Use sparse=False.");
+        TORCH_CHECK(!scale_grad_by_freq,
+                    "Vulkan embedding: scale_grad_by_freq=True not supported.");
         ctx->save_for_backward({indices});
         ctx->saved_data["num_embeddings"] = weight.size(0);
         ctx->saved_data["embedding_dim"] = weight.size(1);

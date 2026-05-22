@@ -31,6 +31,7 @@ from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.virtualized import V
 
 from .combo_kernel.binding_map import build_global_binding_map
+from .kernel.dispatch_call import resolve_alias_chain
 from .combo_kernel.body_rewriter import (
     _KEYWORDS,
     _NEVER_RENAME,
@@ -555,15 +556,9 @@ class VulkanComboKernel:
             old_to_new: dict[str, str] = {}
             for new_name, old_name in reuses.items():
                 old_to_new[old_name] = new_name
-
-            def _resolve(name: str) -> str:
-                seen: set[str] = set()
-                while name in old_to_new and name in freed and name not in seen:
-                    seen.add(name)
-                    name = old_to_new[name]
-                return name
-
-            all_args = [_resolve(a) for a in all_args]
+            all_args = [
+                resolve_alias_chain(a, freed, old_to_new) for a in all_args
+            ]
 
         for v in self.subkernels[0][0].args.sizevars:
             all_args.append(str(v))

@@ -12,6 +12,13 @@ namespace torch_vulkan { namespace ops {
 // ── Embedding ───────────────────────────────────────────────────
 at::Tensor vulkan_embedding(const at::Tensor& weight, const at::Tensor& indices,
                             int64_t padding_idx, bool scale_grad_by_freq, bool sparse) {
+    // M22.7: guard unsupported flags so callers get a clear error instead of
+    // silently wrong results.
+    TORCH_CHECK(!sparse,
+                "Vulkan embedding: sparse gradient not supported (sparse=True). "
+                "Use sparse=False.");
+    TORCH_CHECK(!scale_grad_by_freq,
+                "Vulkan embedding: scale_grad_by_freq=True not supported.");
     auto weight_c = weight.contiguous();
     check_supported_float(weight_c, "embedding");
     auto orig_dtype = weight_c.scalar_type();

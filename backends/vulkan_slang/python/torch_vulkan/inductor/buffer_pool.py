@@ -79,7 +79,7 @@ _SCRATCH_LIFETIME = "scratch"
 
 _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
 _PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
-_GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
+_GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "256"))
 # M-PERF.1: snapshot the env-override flag at module load so the hot-path
 # cap lookup (``_per_key_cap_for``) can be ``@lru_cache``-d on the class
 # name alone.  ``_reset_disabled_cache`` (test hook) re-reads the env and
@@ -782,6 +782,6 @@ def _reset_disabled_cache() -> None:
     global _POOL_DISABLED, _PER_KEY_CAP_DEFAULT, _GLOBAL_CAP, _PER_KEY_ENV_OVERRIDE
     _POOL_DISABLED = os.environ.get("TORCH_VULKAN_BUFFER_POOL", "1") == "0"
     _PER_KEY_CAP_DEFAULT = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_PER_KEY", "4"))
-    _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "64"))
+    _GLOBAL_CAP = int(os.environ.get("TORCH_VULKAN_BUFFER_POOL_SIZE", "256"))
     _PER_KEY_ENV_OVERRIDE = "TORCH_VULKAN_BUFFER_POOL_PER_KEY" in os.environ
     _per_key_cap_for.cache_clear()
