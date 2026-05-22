@@ -863,7 +863,7 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M22.3** | Pre-grad pattern firing-rate instrumentation | open |
 | **M22.4** | Delete dead `_replace_sdpa_with_custom_op` (160 L) | ✅ **DONE 2026-05-18** | Function deleted from `fx_passes/post_grad.py`; comment at deletion site records M22.4. |
 | **M22.5** | Suppress 9 dead-code lowerings (addcmul, addcdiv, index_add, index_copy, norm.ScalarOpt_dim, permute, pow.Scalar, rot90, unfold) | ✅ **VERIFIED 2026-05-22 — no suppression needed** | All 9 ops audited and confirmed live: addcmul/addcdiv (optimizer + lerp), index_add/index_copy (scatter family, guarded by _is_vulkan), norm.ScalarOpt_dim (proxies linalg_vector_norm, _is_vulkan guard), permute (conv_transpose, SDPA, einsum), pow.Scalar (RoPE), rot90 (M19.R correctness fix), unfold (OP.3 view). Roadmap description was inaccurate when filed. |
-| **M22.6** | Split `bwd_lowerings.py` (805 L) | (= M22.1.e) |
+| **M22.6** | Split `bwd_lowerings.py` (835 L) | ✅ **DONE 2026-05-22** | Layer-norm / group-norm / batch-norm backward extracted to `bwd_lowerings_norm.py` (336 L). `bwd_lowerings.py` now 523 L; `register()` calls `register_norm_backward_lowerings()`. Tests: `TestM226BwdLoweringsNormSplit` (4 tests). |
 | **M22.7** | Sparse-tensor stub `TORCH_CHECK(false)` upgrade | open |
 
 ### 0.6.5.x M22.8–11 — Rebuild diagnostics (2026-05-18)

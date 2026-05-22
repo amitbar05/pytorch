@@ -52875,6 +52875,56 @@ class TestM221OrphanIntegration:
         )
 
 
+class TestM226BwdLoweringsNormSplit:
+    """M22.6 — bwd_lowerings.py split (norm backward extracted).
+
+    bwd_lowerings.py was 835 L — over the 800-line anti-goal #7 cap.
+    Layer-norm / group-norm / batch-norm backward now live in
+    ``bwd_lowerings_norm.py``; ``register()`` calls
+    ``register_norm_backward_lowerings()`` from there.
+    """
+
+    def test_bwd_lowerings_under_800_lines(self):
+        import torch_vulkan.inductor.bwd_lowerings as mod
+
+        with open(mod.__file__) as f:
+            n = sum(1 for _ in f)
+        assert n <= 800, (
+            f"bwd_lowerings.py is {n} lines — exceeds anti-goal #7 cap of 800. "
+            "Extract more content to bwd_lowerings_norm.py."
+        )
+
+    def test_bwd_lowerings_norm_under_800_lines(self):
+        import torch_vulkan.inductor.bwd_lowerings_norm as mod
+
+        with open(mod.__file__) as f:
+            n = sum(1 for _ in f)
+        assert n <= 800, (
+            f"bwd_lowerings_norm.py is {n} lines — exceeds anti-goal #7 cap of 800."
+        )
+
+    def test_norm_functions_in_norm_module_not_bwd_lowerings(self):
+        """bwd_lowerings.py must NOT define the norm backward functions directly."""
+        import torch_vulkan.inductor.bwd_lowerings as main_mod
+
+        with open(main_mod.__file__) as f:
+            src = f.read()
+
+        for forbidden in (
+            "def _register_layer_norm_backward(",
+            "def _register_group_norm_backward(",
+            "def _register_batch_norm_backward(",
+        ):
+            assert forbidden not in src, (
+                f"bwd_lowerings.py still defines {forbidden!r}. "
+                "Move norm backward lowerings to bwd_lowerings_norm.py."
+            )
+
+    def test_register_norm_lowerings_importable(self):
+        """register_norm_backward_lowerings must be importable from bwd_lowerings."""
+        from torch_vulkan.inductor.bwd_lowerings import register_norm_backward_lowerings  # noqa: F401
+
+
 class TestMAG51ActivationDecompRouting:
     """M-AG5.1 Tier-0/Tier-1/Tier-2 closeout (anti-goal #5 cleanup).
 
