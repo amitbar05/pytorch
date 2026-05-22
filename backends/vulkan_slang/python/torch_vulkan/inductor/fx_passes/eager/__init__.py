@@ -13,11 +13,11 @@ from .addmm import (
 )
 from .conv import (
     _ensure_conv1d_with_optional_bias_op_registered,
-    _ensure_conv2d_backward_op_registered,
-    _ensure_conv2d_gn_relu_fused_op_registered,
-    _ensure_conv2d_relu_fused_op_registered,
     _ensure_conv2d_with_optional_bias_op_registered,
 )
+from .conv_backward import _ensure_conv2d_backward_op_registered
+from .conv_gn_relu import _ensure_conv2d_gn_relu_fused_op_registered
+from .conv_relu import _ensure_conv2d_relu_fused_op_registered
 from .optimizer import (
     _ensure_foreach_adamw_step_op_registered,
     _ensure_foreach_lion_step_op_registered,

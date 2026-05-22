@@ -608,7 +608,7 @@ file diff lands in `git status` before declaring done.
 | `worktree-agent-a58e1face111590ac` | M22j `shape_ops.py` split (753→629 + 3 new files) | refactor |
 | `worktree-agent-a843fd91d51dd477a` | M22g `wrapper.py` split (825→460 + new `wrapper_buffer_pool.py` 385L) | refactor |
 | `worktree-agent-ac56abf2c6b5daf03` | G.1 delete 15 dead `_OP_IMPLS` entries (-216 LoC); patch at `agent_space/g1_dead_fake_impl_deletions/g1_dead_fake_impl_deletions.patch` | deletion |
-| `worktree-agent-a5cf1eab7761f5816` | M22b conv split (final report truncated; needs verification) | refactor |
+| `worktree-agent-a5cf1eab7761f5816` | M22b conv split (final report truncated; needs verification) | ✅ DONE 2026-05-22 (main branch) |
 | `worktree-agent-a503af5f1b7879f89` | M22a Stage 1 `slangc.py` → `common.py` extraction (slangc.py 2264→2035, common.py 336L new) | refactor |
 | `worktree-agent-a43be97e9acbc6296` | M22e `kernel/main.py` 1009→802 + new `threadgroup_sizing.py` 233L | refactor |
 | `worktree-agent-a5c1934d15f18510b` | M22d `templates/caller/rnn.py` 1053 → 5 files all ≤598L | refactor |
@@ -664,7 +664,7 @@ Listed for visibility so the next session doesn't double-dispatch.
 | **K.2** | 9 missing types in combo_kernel `_TYPE_KEYWORDS` | Worktree fix in flight (+12 types covering u8/i8/i16/u16/u32/u64/f16/bf16/c64). |
 | **M22a** | 7-way split plan for `runtime/slangc.py` (2348 L → ≤500 L each) | Stage 1 worktree (common.py extraction) in flight. Tracks anti-goal #7 file-size cap. |
 | **M22d** | Per-cell-type split plan for `templates/caller/rnn.py` (1053 L) | Stage 1 worktree in flight. |
-| **M22b** | Per-rank split plan for `fx_passes/eager/conv.py` (1147 L) | Worktree in flight. |
+| **M22b** | Per-rank split plan for `fx_passes/eager/conv.py` (1147 L) | ✅ **DONE 2026-05-22**. Split into 4 files all ≤800 L: `conv.py` (376 L — conv2d fwd+autograd + conv1d), `conv_relu.py` (242 L — Conv2d+ReLU M17.2), `conv_gn_relu.py` (449 L — GN helper + Conv2d+GN+ReLU M17.2 Phase 3), `conv_backward.py` (121 L — opaque conv2d_backward M17.8.d.2). Re-exports in `conv.py` + updated `__init__.py` preserve the public API unchanged. Tests: `TestM22bConvSplit` (10 import-level tests in `tests/test_inductor_regression.py`). |
 | **M22.13 Stage 2-3** | Retirement plan for `matmul_ops.cpp` workarounds | Gated on Stage 1 tripwires (now landed — see § 0.0.8) confirming the shader-side fix holds under the test suite. Stage 2 = delete the tripwire branches; Stage 3 = delete the contiguous-rewrite scaffolding. |
 | **M-CV.2** | 30 zero-coverage backward ops identified | Phase 1 (8 high-priority tests) implementation in flight. |
 | **M-CV.3** | 5-test plan for dynamic-batch coverage | Implementation in flight. |
@@ -855,7 +855,7 @@ in-tree blockers (M22.8–11). Agent owners:
 
 | # | Title | Status |
 |---|-------|--------|
-| **M22.1.a-g** | Split 7 file-size violators (`pointwise.py` 761, `pointwise_vec4_mixin.py` 755, `header.py` 794, `kernel/main.py` 928, `bwd_lowerings.py` 805, `fx_passes/eager/conv.py` 1063, `templates/caller/rnn.py` 1053) | partial |
+| **M22.1.a-g** | Split 7 file-size violators (`pointwise.py` 761, `pointwise_vec4_mixin.py` 755, `header.py` 794, `kernel/main.py` 928, `bwd_lowerings.py` 805, `fx_passes/eager/conv.py` 1063 ✅, `templates/caller/rnn.py` 1053) | partial — conv.py ✅ M22b (see above) |
 | **M22.1.f** | `kernel/main.py` 1009 L → 495 L via `ThreadgroupSizingMixin` extraction | ✅ **DONE 2026-05-21**. `VulkanKernel` now inherits `ThreadgroupSizingMixin` (`kernel/threadgroup_sizing.py`, 546 L); the 13 threadgroup-size heuristics live in a single place. Tests: `TestM221OrphanIntegration::test_vulkan_kernel_inherits_threadgroup_sizing` + `test_main_py_no_duplicate_threadgroup_size_methods`. |
 | **M22.1.g** | `kernel/header.py` 867 L → 725 L via `CallKernelMixin` extraction | ✅ **DONE 2026-05-21**. `HeaderMixin` now inherits `CallKernelMixin` (`kernel/dispatch_call.py`, 178 L); the wrapper-side dispatch-grid emission lives in a single place. Tests: `TestM221OrphanIntegration::test_vulkan_kernel_inherits_call_kernel` + `test_header_py_no_duplicate_call_kernel`. |
 | **M22.1.i** | Split `validate.py` 813 L → ≤500 L per module | ✅ **DONE 2026-05-21** (working tree). `validate.py` now 396 L, split into 3 sibling modules: `validate_types.py` (43 L — `SlangValidationIssue` dataclass; landing site to break import cycles), `validate_resource_limits.py` (141 L — `check_groupshared_budget` + `check_numthreads_product`), `validate_identifiers.py` (344 L — `check_undefined_identifiers` + `_SLANG_RESERVED`). Public API unchanged (`validate_slang_source`, `SlangValidator`, `_SLANG_RESERVED`, `SlangValidationIssue` re-exported from `validate.py`'s `__all__`). |
