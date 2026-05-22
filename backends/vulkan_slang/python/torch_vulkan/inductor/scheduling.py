@@ -760,6 +760,17 @@ class VulkanScheduling(SIMDScheduling):
             kernel_features, kernel_args, kernel_kwargs
         )
 
+        if not kernels:
+            import warnings
+
+            warnings.warn(
+                "[M19.8] VulkanScheduling.create_kernel_choices returned no candidates "
+                "for this node; Inductor will likely fall back to an extern kernel. "
+                "Check TORCH_VULKAN_NO_WG_TUNE / occupancy settings.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         if not config.persistent_pointwise():
             return kernels
         if kernel_features.is_reduction():

@@ -126,6 +126,19 @@ def benchmark_wg_sizes(
     Returns:
         The fastest workgroup size.
     """
+    if not wg_sizes:
+        import warnings
+
+        warnings.warn(
+            f"[M19.8] Slang autotune got empty wg_sizes for kernel {kernel_hash[:16]!r}; "
+            "falling back to WG=256. This usually means all candidate sizes were "
+            "filtered by the occupancy / VGPR cap. Set TORCH_VULKAN_NO_WG_TUNE=1 "
+            "to bypass the filter.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 256
+
     cached = lookup_cached_wg_size(kernel_hash, device_name)
     if cached is not None and cached in wg_sizes:
         return cached

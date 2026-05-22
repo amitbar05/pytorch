@@ -54383,3 +54383,162 @@ class TestM22dRNNSplit:
         )
         assert callable(install_external_rnn)
         assert callable(_dispatch_rnn_cell)
+
+
+class TestM198AutotuneEmptyChoices:
+    """M19.8 — Autotune empty-choices warning guard.
+
+    Adds a RuntimeWarning when ``benchmark_wg_sizes`` receives an empty
+    ``wg_sizes`` list (all candidates filtered by occupancy/VGPR caps)
+    instead of crashing with IndexError. Falls back to WG=256.
+
+    Also guards ``VulkanScheduling.create_kernel_choices`` for the case
+    where upstream returns no kernel candidates.
+
+    No GPU required — purely logic tests.
+    """
+
+    def test_benchmark_wg_sizes_empty_warns(self):
+        """benchmark_wg_sizes with empty wg_sizes must warn and return 256."""
+        import warnings
+
+        from torch_vulkan.inductor.autotune import benchmark_wg_sizes
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = benchmark_wg_sizes(
+                call_fn=lambda: None,
+                wg_sizes=[],
+                kernel_hash="deadbeef",
+                device_name="test_device",
+            )
+
+        assert result == 256, f"M19.8: expected fallback 256, got {result}"
+        assert any("M19.8" in str(w.message) for w in caught), (
+            "M19.8: expected RuntimeWarning about empty wg_sizes"
+        )
+
+    def test_benchmark_wg_sizes_empty_is_runtime_warning(self):
+        """The empty-wg_sizes warning must be a RuntimeWarning."""
+        import warnings
+
+        from torch_vulkan.inductor.autotune import benchmark_wg_sizes
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            benchmark_wg_sizes(
+                call_fn=lambda: None,
+                wg_sizes=[],
+                kernel_hash="cafe1234",
+                device_name="test",
+            )
+        runtime_warns = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert runtime_warns, "M19.8: expected at least one RuntimeWarning"
+
+    def test_benchmark_wg_sizes_nonempty_no_warn(self):
+        """Non-empty wg_sizes must NOT trigger the M19.8 warning."""
+        import time
+        import warnings
+
+        from torch_vulkan.inductor.autotune import benchmark_wg_sizes
+
+        calls = [0]
+
+        def fast_call():
+            calls[0] += 1
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = benchmark_wg_sizes(
+                call_fn=fast_call,
+                wg_sizes=[256],
+                kernel_hash="no_warn_test_" + str(int(time.time())),
+                device_name="test_device",
+                warmup=1,
+                rep_ms=5.0,
+            )
+
+        m198_warns = [w for w in caught if "M19.8" in str(w.message)]
+        assert not m198_warns, f"M19.8: unexpected warning for non-empty wg_sizes: {m198_warns}"
+        assert result == 256
+
+
+class TestM233RenderBindingSetRatchet:
+    """M23.3 — Safety net: every Slang template must use Set-0 binding annotations.
+
+    Background: slangc v2026.7.1 defaults bare ``[[vk::binding(N)]]``
+    (no set qualifier) to Descriptor Set 1.  Our VkPipelineLayout only
+    declares Set 0, so any bare binding causes a VUID-07988 validation
+    error and silent corruption on non-RADV drivers (RADV ignores the
+    wrong-set annotation; Nvidia/Intel/Apple/MoltenVK reject it).
+
+    Fix (M21.3.01): all templates now use ``[[vk::binding(N, 0)]]`` with
+    an explicit set-0 qualifier.  This test is the regression gate — it
+    will immediately catch any future template that forgets the ``, 0``.
+
+    No GPU required — purely file-based.
+    """
+
+    _TEMPLATES_DIR = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "python/torch_vulkan/inductor/templates"
+    )
+    _HEADER_DIR = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "python/torch_vulkan/inductor/kernel"
+    )
+
+    @staticmethod
+    def _find_bare_bindings(path) -> list[tuple[int, str]]:
+        """Return (lineno, line) pairs where a bare [[vk::binding(N)]] without
+        set-0 qualifier appears outside a Slang comment."""
+        import re
+
+        bare = re.compile(r"\[\[vk::binding\(\d+\)\]\]")
+        violations = []
+        for i, raw in enumerate(path.read_text().splitlines(), 1):
+            stripped = raw.lstrip()
+            if stripped.startswith("//") or stripped.startswith("*"):
+                continue
+            if bare.search(raw):
+                violations.append((i, raw.rstrip()))
+        return violations
+
+    def test_template_slang_files_use_set0_binding(self):
+        """All .slang template files must use [[vk::binding(N, 0)]] form."""
+        violations = []
+        for p in sorted(self._TEMPLATES_DIR.rglob("*.slang")):
+            for lineno, line in self._find_bare_bindings(p):
+                violations.append(f"{p.name}:{lineno}: {line!r}")
+        assert not violations, (
+            "M23.3: bare [[vk::binding(N)]] (no set-0) found in templates:\n"
+            + "\n".join(violations)
+        )
+
+    def test_template_jinja_files_use_set0_binding(self):
+        """All .py.jinja / .slang.jinja template files must use [[vk::binding(N, 0)]]."""
+        violations = []
+        for p in sorted(self._TEMPLATES_DIR.rglob("*.jinja")):
+            for lineno, line in self._find_bare_bindings(p):
+                violations.append(f"{p.name}:{lineno}: {line!r}")
+        assert not violations, (
+            "M23.3: bare [[vk::binding(N)]] (no set-0) found in Jinja templates:\n"
+            + "\n".join(violations)
+        )
+
+    def test_kernel_header_uses_set0_binding(self):
+        """The kernel codegen (header.py) must only emit [[vk::binding(N, 0)]] form."""
+        violations = []
+        header = self._HEADER_DIR / "header.py"
+        import re
+        bare = re.compile(r"\[\[vk::binding\(\d+\)\]\]")
+        for i, raw in enumerate(header.read_text().splitlines(), 1):
+            stripped = raw.lstrip()
+            if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'"):
+                continue
+            if "vk::binding" in raw and bare.search(raw):
+                violations.append(f"header.py:{i}: {raw.rstrip()!r}")
+        assert not violations, (
+            "M23.3: bare [[vk::binding(N)]] (no set-0) found in kernel/header.py:\n"
+            + "\n".join(violations)
+        )
