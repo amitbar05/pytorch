@@ -54238,3 +54238,78 @@ class TestM22bConvSplit:
             assert callable(getattr(pkg, name)), (
                 f"M22b: {name!r} is not callable"
             )
+
+
+class TestM22cSchedulingSplit:
+    """M22c — Anti-goal #7: scheduling.py split under 800-line cap.
+
+    The original ``scheduling.py`` was 901 lines.  M22c extracts
+    module-level helpers (``compute_combo_config_key``,
+    ``_wave64_persistent_ok``, benchmarker helpers) into a new
+    ``scheduling_helpers.py`` file, reducing ``scheduling.py`` to ~781
+    lines while keeping all public API and runtime behaviour identical.
+
+    All tests are import-level (no GPU required).
+    """
+
+    _INDUCTOR_DIR = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "python/torch_vulkan/inductor"
+    )
+
+    def test_scheduling_py_under_800_lines(self):
+        """scheduling.py must not exceed 800 lines after the M22c split."""
+        path = self._INDUCTOR_DIR / "scheduling.py"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22c: scheduling.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_scheduling_helpers_py_exists(self):
+        """scheduling_helpers.py must exist as the extracted module."""
+        path = self._INDUCTOR_DIR / "scheduling_helpers.py"
+        assert path.exists(), "M22c: scheduling_helpers.py was not created"
+
+    def test_scheduling_helpers_py_under_800_lines(self):
+        """scheduling_helpers.py must not exceed 800 lines."""
+        path = self._INDUCTOR_DIR / "scheduling_helpers.py"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22c: scheduling_helpers.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_helpers_imported_into_scheduling(self):
+        """scheduling.py must import the helpers from scheduling_helpers."""
+        path = self._INDUCTOR_DIR / "scheduling.py"
+        src = path.read_text()
+        assert "from .scheduling_helpers import" in src, (
+            "M22c: scheduling.py must import helpers from scheduling_helpers"
+        )
+
+    def test_helpers_not_defined_in_scheduling(self):
+        """compute_combo_config_key must not be defined inline in scheduling.py."""
+        path = self._INDUCTOR_DIR / "scheduling.py"
+        src = path.read_text()
+        assert "def compute_combo_config_key" not in src, (
+            "M22c: compute_combo_config_key must live in scheduling_helpers.py"
+        )
+        assert "def _wave64_persistent_ok" not in src, (
+            "M22c: _wave64_persistent_ok must live in scheduling_helpers.py"
+        )
+        assert "def _get_benchmarker" not in src, (
+            "M22c: _get_benchmarker must live in scheduling_helpers.py"
+        )
+
+    def test_compute_combo_config_key_correctness(self):
+        """compute_combo_config_key must produce stable, content-aware keys."""
+        from torch_vulkan.inductor.scheduling_helpers import compute_combo_config_key
+
+        k1 = compute_combo_config_key(["a", "b"])
+        k2 = compute_combo_config_key(["a", "b"])
+        k3 = compute_combo_config_key(["b", "a"])
+        k4 = compute_combo_config_key(["a"])
+        assert k1 == k2, "M22c: key must be deterministic"
+        assert k1 != k3, "M22c: key must be order-sensitive"
+        assert k1 != k4, "M22c: key must reflect combo size"
+        assert k1.startswith("combo2_n2_"), f"M22c: unexpected key format: {k1!r}"
+        assert k4.startswith("combo2_n1_"), f"M22c: unexpected key format: {k4!r}"
