@@ -202,33 +202,34 @@ class PointwiseLoadMixin:
                     dtype = torch.float32
             else:
                 _init_load_dispatch()
-                # OP.1.b — external bool inputs are byte-packed.  PyTorch eager
-                # allocates 1 byte per ``torch.bool`` element; the
-                # ``dispatch_copy_buffer`` upload path (4 B/element) packs four
-                # consecutive bool bytes into each uint32 slot of the SSBO.
-                # Reading the slot as a single uint (the compile-internal
-                # contract) returns 0x00010001 for ``[T,F,T,F]`` instead of the
-                # per-element value.  For graph-input bool buffers we unpack
-                # the byte at ``idx`` via ``_vk_unpack_u8`` (helpers.slang).
-                # Compile-internal bool buffers (produced by a prior pointwise
-                # STORE that writes 1 uint/element) keep the legacy
-                # 1-uint-per-element read.
-                if dtype == torch.bool and name in V.graph.graph_inputs:
-                    self._pw_uses_subbyte_packing = True
-                    self.headers.add("subdtype_unpack")
-                    line = f"_vk_unpack_u8({self._buf_path(var)}, {idx_str})"
+                # M-NEW.13 (2026-05-22): bool buffers (graph inputs OR
+                # compile-internal) are now bound as
+                # ``StructuredBuffer<uint8_t>`` (1 B/slot) per
+                # ``DTYPE_TO_SLANG[torch.bool] = "uint8_t"`` post-M18.4-followup-C,
+                # matching PyTorch's 1 B/element bool storage. The
+                # ``dispatch_copy_buffer`` byte-precision path
+                # (``dispatch.cpp::dispatch_copy_buffer_byte``) preserves the
+                # 1-byte-per-element layout on upload.  The prior
+                # ``_vk_unpack_u8`` branch for graph-input bools was a
+                # vestige of the 4 B/slot binding era — it expects
+                # ``StructuredBuffer<uint>`` and slang-compile-errors
+                # ``E30019: type mismatch`` against the current
+                # ``StructuredBuffer<uint8_t>`` binding (the backward
+                # graph's saved-mask reads tripped this on SmallCNN's
+                # GroupNorm + ReLU + MaxPool block).  All bool reads now
+                # route through the generic ``_LOAD_DISPATCH`` table,
+                # which emits ``((float)(v[i]))`` for the native
+                # ``uint8_t`` slot.
+                spec = _LOAD_DISPATCH.get(dtype)
+                if spec is not None:
+                    emit_fn, hdr = spec
+                    if hdr is not None:
+                        self._pw_uses_subbyte_packing = True
+                        self.headers.add(hdr)
+                    line = emit_fn(self._buf_path(var), idx_str)
                     dtype = torch.float32
                 else:
-                    spec = _LOAD_DISPATCH.get(dtype)
-                    if spec is not None:
-                        emit_fn, hdr = spec
-                        if hdr is not None:
-                            self._pw_uses_subbyte_packing = True
-                            self.headers.add(hdr)
-                        line = emit_fn(self._buf_path(var), idx_str)
-                        dtype = torch.float32
-                    else:
-                        line = f"{self._buf_path(var)}[{idx_str}]"
+                    line = f"{self._buf_path(var)}[{idx_str}]"
 
         from .. import config
 

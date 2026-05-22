@@ -409,6 +409,23 @@ def _patch_extern_convolution_out_kwarg() -> None:
         # Wrapper handles positional (input, weight, bias) and the kwarg
         # form Inductor emits.
         import torch
+        # M-NEW.13 (2026-05-22): the wrapper is invoked at runtime from the
+        # generated wrapper code as a direct Python call
+        # (``buf_N = extern_kernels.convolution(buf_A, primals_W)``).  If
+        # ``buf_A`` is the output of a still-queued ``_batcher.add(...)``
+        # dispatch (e.g. a pointwise reduction backward kernel that
+        # produces the grad_output for a backward conv recompute), the
+        # convolution reads zero-initialised data and the resulting grads
+        # cascade to NaN once divided by per-channel variance in the GN
+        # backward (mean(grad)=0 → div-by-zero in d_gamma).  Mirror the
+        # M-NEW.12 fix on ``_slang_tile_conv2d`` / ``_slang_tile_mm``:
+        # flush the active batcher before the direct dispatch.
+        try:
+            from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+
+            DispatchBatcher.flush_current_if_active()
+        except Exception:  # noqa: BLE001
+            pass
         if len(args) >= 2 and isinstance(args[0], torch.Tensor) and isinstance(args[1], torch.Tensor):
             input_t, weight_t = args[0], args[1]
             bias_t = args[2] if len(args) >= 3 else kwargs.pop("bias", None)

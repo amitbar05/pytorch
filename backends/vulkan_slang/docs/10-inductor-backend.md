@@ -291,6 +291,70 @@ all fail with `Non-finite grad for conv1.weight` (NaN gradients) —
 a SEPARATE backward-path issue.  Not in M-NEW.12 scope; tracked as
 M-NEW.13 follow-up.
 
+**M-NEW.13 ✅ CLOSED 2026-05-22** — stale ``_vk_unpack_u8`` load path
+for bool graph inputs in the backward shader.
+
+Root cause: ``kernel/pointwise_load_mixin.py::PointwiseLoadMixin.load``
+emitted ``_vk_unpack_u8(args.in_ptr_<mask>, idx)`` for ``torch.bool``
+buffers that lived in ``V.graph.graph_inputs`` (canonical case: a
+saved ReLU mask the partitioner threads from forward into the
+backward graph as a graph input).  The helper signature in
+``shaders/lib/dtype_pack.slang:132`` is::
+
+    public float _vk_unpack_u8(StructuredBuffer<uint> buf, uint idx)
+
+— it expects a 4 B/slot ``uint`` SSBO and unpacks the byte at
+``idx`` from the 32-bit slot.  Post-M18.4-followup-C
+(``overrides.py::DTYPE_TO_SLANG[torch.bool] = "uint8_t"``) all bool
+buffers — graph inputs OR compile-internal — bind as
+``StructuredBuffer<uint8_t>`` (1 B/slot) to match PyTorch's
+1 B/element bool storage (the ``dispatch_copy_buffer_byte`` path in
+``csrc/ops/dispatch.cpp`` preserves the layout on upload).  slangc
+errors out with::
+
+    error[E30019]: type mismatch — expected
+    StructuredBuffer<uint, DefaultDataLayout>, got
+    StructuredBuffer<uint8_t, DefaultDataLayout>
+
+and the whole backward graph fails to compile.  AOTAutograd's
+``CompiledFxGraph`` then propagates the partial / undefined buffer
+via a fallback, which downstream div-by-variance kernels (GN
+backward) turn into NaN gradients on ``conv1.weight``.
+
+Symptom on SmallCNN bisect (``probe_nan_backward.py``):
+* Stage 1-3 (Linear, ReLU+Linear, MaxPool+Linear) — all ✅.
+* Stage 4 (GN + ReLU + Pool + Linear) — pre-fix: slangc compile
+  error at the GN backward's ReLU-mask-load shader.  Post-fix: ✅.
+* Stage 5 (Conv + GN + ReLU + Pool + Linear, single block) — ✅.
+* Stage 6 (full 2-block SmallCNN) — ✅ ALL grads finite.
+
+Fix (Group C, ``kernel/pointwise_load_mixin.py:203-229``): drop the
+special branch that routed bool graph inputs through
+``_vk_unpack_u8``.  Bool buffers — whether graph inputs OR
+compile-internal — now read via the generic ``_LOAD_DISPATCH``
+table's ``((float)(v[i]))`` form, matching the ``uint8_t`` slot
+binding.  Comment on the bool store path in
+``kernel/pointwise.py:710-722`` refreshed in parallel (the
+implicit ``uint -> uint8_t`` narrowing cast was already
+spec-correct; only the comment had drifted).
+
+Defensive companion (Group F+B, ``inductor/__init__.py::
+_patch_extern_convolution_out_kwarg``): the patched runtime wrapper
+around ``extern_kernels.convolution`` now invokes
+``DispatchBatcher.flush_current_if_active()`` at entry, matching
+the M-NEW.12 fix on ``_slang_tile_conv2d`` / ``_slang_tile_mm`` —
+defense in depth against any future codegen path that emits an
+``extern_kernels.convolution(...)`` line without going through
+``generate_extern_kernel_alloc`` (which already emits the flush).
+
+Regression gate:
+``tests/test_inductor_regression.py::TestM_NEW_13_NoNaNBackward``
+(two tests: ``test_gn_relu_pool_linear_backward_compiles_and_no_nan``
+— stage-4 of the bisect probe; and
+``test_relu_compare_save_backward_no_compile_error`` — direct
+``relu+linear+sum`` repro that forces the partitioner to save a
+bool mask as a backward graph input).
+
 ---
 
 ## 0.0.6 CONV-TRAINING CRITICAL PATH (2026-05-19, user-directed focus)
@@ -625,7 +689,7 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M19.1** | Wire `_register_linear_backward_decomposition` (closes M17.1-gap remainder) | in-flight (Matmul-3D agent) |
 | **M19.2** | Persistent pointwise kernels wired (currently dead code in `kernel/pointwise.py`) | ✅ **DONE 2026-05-21** (working tree) — `VulkanScheduling.create_kernel_choices` override in `scheduling.py:737` activates `_enable_persistent_mode()` for pointwise kernels with static `numel <= 4096`. Reduction kernels and dynamic-shape kernels bail safely. Tests: `TestM192PersistentPointwise` (5 mock-based tests in `tests/test_inductor_regression.py:51861`) lock the wiring contract without a full compile, sidestepping the M22.16 slangc-threadpool deadlock that blocks live tests. |
 | **M19.3** | Reduction-boundary horizontal fusion (`vulkan_combo_kernel.py:194 _coalesce_orphan_pointwise` admits reductions) | 🟡 **partial 2026-05-22** — vertical-fusion helper extended (`scheduling.py::_all_consumers_are_fusible`, renamed from `_all_consumers_are_fusible_pointwise`, with backwards-compat alias preserved at the same line; the new logic admits reduction consumers whose `rnumel` fits the wave-budget cap, using the same 64 / 256 / 1024 policy as the M9.8 + M-PERF.6 relaxation). Tests: `TestM193ReductionBoundaryFusion` (5 tests in `tests/test_inductor_regression.py:38406`) — 3 mock-driven unit tests lock the helper contract; 2 live-compile floor tests are durable (skip rather than fail) until the wave3 ratchet lands. **Current floor**: GN+ReLU = 3 dispatches (target ≤ 2), GN+ReLU+GAP = 4 (target ≤ 3, long-term ≤ 1). Probe at `agent_space/probe_gn_relu_fusion.py`. The horizontal `_coalesce_orphan_pointwise` path remains dead code (still unwired); the M19.3 ratchet now lives in the active vertical path, which is the only one that actually emits kernels today. |
-| **M19.4** | Vec4 progressive fallback (60 %→≥80 % eligibility) | open |
+| **M19.4** | Vec4 progressive fallback (60 %→≥80 % eligibility) | 🟡 **audit complete 2026-05-22** — sweep (`agent_space/probe_vec4_coverage.py`) measures **10/15 = 67 %** baseline. Three real gates identified: (A) `n % (wg·4) != 0` divisibility in `pointwise_vec4_mixin.py:245` (rejects odd/non-pow2 numels — 2/15); (B) `all decls must be float` in `pointwise_vec4_mixin.py:254` (rejects mixed f16/f32 — 1/15); (C) `_pw_has_wave_ops=True` set unconditionally by the packed16 scalar-store path in `kernel/pointwise.py:694` then checked at `pointwise_vec4_mixin.py:265`, creating a self-inflicted circular rejection of the packed16 vec4 path (rejects f16 contiguous — 2/15). Scheduler (Group E) has zero leverage on any of these gates; the M9.8 xfail flip (below) was the only ratchet visible from this lane. Full breakdown + action items at `agent_space/m19_4_vec4_audit.md`. **Best ROI**: Gate C is a 1-line ordering fix that would lift coverage to ~80 %; deferred to a Group-C agent. |
 | **M19.5** | Dynamic-shape lifting in `lowerings/conv*.py` (39 `int(get_size()[i])` sites) | open |
 | **M19.6** | Foreach pointwise generic Slang template (covers 16 foreach ops) | open |
 | **M19.7** | Complex pointwise C++ bridge (closes OP.20) | in-flight (Dtype-Matrix agent) |
@@ -1042,7 +1106,7 @@ Closes the 96 % / 230× host/kernel gap. M9.1 (buffer pool) and M9.3
 - [x] **M9.5** ✅ GPU-validated 2026-05-13. Cached `_jit_dispatch_indexed`: codegen prefers indexed variant when any binding has count > 1. (1d) — C++ FFI bindings added (_jit_dispatch_indexed_cached{,_nopc}), Python FFI resolution updated, needs GPU validation
 - [x] **M9.6** Adaptive `_PER_KEY_CAP` in `buffer_pool.py` (scratch=8, transient=6, save_for_backward=4). (1d) ✅
 - [x] **M9.7** Pool non-extern Inductor outputs (currently only extern-kernel outputs are pooled). Closes the residual ~64 % miss rate. (1-2d) ✅
-- [x] **M9.8** Reduction-boundary fusion: GN + ReLU + GlobalAvg should fuse into 1 kernel, not 2. Relax `rnumel_fuse_cap` gate in `scheduling.py:248-261`, or change gate to predicate on consumer pattern rather than rnumel. (2-3d) — **FIX**: Added reduction-boundary fusion relaxation in `can_fuse_vertical`; rnumel cap check now overrides base tiling rejection. Tests in `TestM98ReductionBoundaryFusion`.
+- [x] **M9.8** Reduction-boundary fusion: GN + ReLU + GlobalAvg should fuse into 1 kernel, not 2. Relax `rnumel_fuse_cap` gate in `scheduling.py:248-261`, or change gate to predicate on consumer pattern rather than rnumel. (2-3d) — **FIX**: Added reduction-boundary fusion relaxation in `can_fuse_vertical`; rnumel cap check now overrides base tiling rejection. Tests in `TestM98ReductionBoundaryFusion`. **Correctness ratchet 2026-05-22**: `test_m98_groupnorm_relu_global_avg_correctness` was carrying `xfail(strict=True, reason="Pre-existing GN accuracy gap on Vulkan (not fusion)")`. After the M-NEW.10 welford fix, the test XPASSed; the xfail has been removed so the gate now hard-asserts numerical parity (1e-2 tolerance) and a future regression is caught immediately. Evidence: `tests/test_inductor_regression.py:38346` (xfail removed) + `agent_space/m19_4_vec4_audit.md`.
 - [x] **M9.9** Transformer combo-batcher `UnboundLocalError: buf10`. **Root cause located**: `vulkan_combo_kernel.py:987-1019` `_rewrite_body()` token-based renaming runs before the buffer-name map is fully seeded; if a buffer name isn't in `per_sub_maps[idx]`, the rewriter emits the original name and collides with a renamed local from a previous subkernel. Fix: pre-seed buffer names via `_build_global_binding_map()` (line 689-795) before the rewrite loop. (1-2d) — **FIX (2026-05-15 reopen)**: `_rewrite_body` per-subkernel suffix change wasn't enough; the runtime `UnboundLocalError` resurfaced on Transformer training. **Real root cause**: `kernel/header.py:call_kernel` and `vulkan_combo_kernel.py:call_kernel` substitute reused-buffer names one step but Inductor's memory planner can chain reuses (`buf9 → buf10 → buf11` — buf10 itself is reused into buf11). One-step substitution leaves the dead intermediate (buf10) in the kernel arg list. **Fix**: walk the alias chain transitively via `_resolve(name)` in both `call_kernel` sites. M9.9 regression test (`test_m99_combo_kernel_no_unbound_local`) now PASSES (was xfail). Transformer 3-step training works end-to-end through `torch.compile`.
 
 ---

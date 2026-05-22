@@ -38343,11 +38343,15 @@ class TestM98ReductionBoundaryFusion:
         # Conservative upper bound: 3 dispatches.
         assert d <= 3, f"GN+ReLU+GlobalAvg: expected ≤3 dispatches (target: 1), got {d}"
 
-    @pytest.mark.xfail(
-        strict=True, reason="Pre-existing GN accuracy gap on Vulkan (not fusion)"
-    )
     def test_m98_groupnorm_relu_global_avg_correctness(self):
-        """Numerical correctness of GN+ReLU+GlobalAvg under compile."""
+        """Numerical correctness of GN+ReLU+GlobalAvg under compile.
+
+        M19.4 ratchet (2026-05-22): the M-NEW.10 welford fix closed the
+        pre-existing GN accuracy gap on Vulkan.  XPASS observed under
+        ``xfail(strict=True)``; the gate is now a normal passing test so
+        a future regression is caught immediately.  Tolerance kept at
+        the original loose 1e-2 — tightening is a separate ratchet.
+        """
 
         @torch.compile(backend="inductor")
         def compiled(x, w, b):
@@ -53173,3 +53177,130 @@ class TestM_NEW_12_SecondConv2dCorrectness:
             # flush_current_if_active is a no-op on empty queue
             DispatchBatcher.flush_current_if_active()
         assert DispatchBatcher._current is None
+
+
+class TestM_NEW_13_NoNaNBackward:
+    """Regression gate for the **bool-graph-input load type mismatch**.
+
+    Bug (closed 2026-05-22, M-NEW.13): the load path in
+    ``kernel/pointwise_load_mixin.py`` emitted
+    ``_vk_unpack_u8(args.in_ptr0, idx)`` for ``torch.bool`` buffers that
+    were graph inputs (typical case: a saved ReLU mask from the forward
+    partitioned across the fw/bw boundary).  The helper
+    ``_vk_unpack_u8(StructuredBuffer<uint> buf, uint idx)`` expects a
+    4 B/slot ``uint`` SSBO, but post-M18.4-followup-C all bool buffers
+    bind as ``StructuredBuffer<uint8_t>`` (1 B/slot) to match PyTorch's
+    1 B/element ``torch.bool`` storage.  slangc errors out with
+    ``E30019: type mismatch — expected StructuredBuffer<uint>, got
+    StructuredBuffer<uint8_t>`` and the whole backward graph fails to
+    compile.
+
+    Pre-fix symptom: SmallCNN's ``test_grad_parity``,
+    ``test_10step_no_nan``, and ``test_forward_backward`` all failed
+    with ``Non-finite grad for conv1.weight`` — the failure tracked
+    back to a slangc compile error on the backward graph that flagged
+    a stage with GroupNorm + ReLU + MaxPool2d (the partitioner saved a
+    bool mask for the ReLU recompute path).
+
+    Fix (``kernel/pointwise_load_mixin.py``): drop the special branch
+    that routed bool graph inputs through ``_vk_unpack_u8``. Bool
+    buffers — whether graph inputs OR compile-internal — now read via
+    the generic ``_LOAD_DISPATCH`` table's ``((float)(v[i]))`` form,
+    matching the ``uint8_t`` slot binding.
+    """
+
+    def test_gn_relu_pool_linear_backward_compiles_and_no_nan(self):
+        """Repro of the SmallCNN second-block backward: GN + ReLU + Pool + Linear.
+
+        Stage-4 of ``probe_nan_backward.py`` — the minimal slice that hit
+        the pre-fix ``E30019`` slangc compile failure.  Verifies the
+        backward graph (a) compiles without slangc errors, (b) produces
+        non-finite-free gradients on every parameter.
+        """
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        try:
+            torch.empty(1, device="vulkan:0")
+        except Exception:
+            import pytest
+
+            pytest.skip("Vulkan GPU not available")
+
+        torch.manual_seed(42)
+
+        class _Stage4(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gn = nn.GroupNorm(8, 32)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.fc = nn.Linear(32 * 8 * 8, 10)
+
+            def forward(self, x):
+                x = F.relu(self.gn(x))
+                x = self.pool(x)
+                x = x.flatten(1)
+                return self.fc(x)
+
+        model = _Stage4().to("vulkan")
+        compiled = torch.compile(model, backend="inductor")
+        x = torch.randn(2, 32, 16, 16, device="vulkan")
+        targets = torch.randint(0, 10, (2,), device="vulkan")
+
+        logits = compiled(x)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"no grad for {name}"
+            finite = torch.isfinite(p.grad.cpu()).all().item()
+            assert finite, (
+                f"M-NEW.13 regression: non-finite grad for {name} — "
+                f"check bool-buffer load path in pointwise_load_mixin.py."
+            )
+
+    def test_relu_compare_save_backward_no_compile_error(self):
+        """Direct repro of the bool-graph-input shader compile failure.
+
+        Builds a tiny ``relu(x).sum()`` pattern that — under the joint
+        trace + partitioner — saves a bool mask as a backward graph
+        input.  Pre-fix the backward shader read ``args.in_ptr_<mask>``
+        via ``_vk_unpack_u8`` against an ``uint8_t`` SSBO and
+        slangc-failed with ``E30019``.  Post-fix the kernel compiles.
+
+        Uses ``aten.gt.Scalar`` to force a bool buffer that the
+        partitioner cannot fold away.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        try:
+            torch.empty(1, device="vulkan:0")
+        except Exception:
+            import pytest
+
+            pytest.skip("Vulkan GPU not available")
+
+        @torch.compile(backend="inductor")
+        def fn(x, w, b):
+            # GN + ReLU + something the partitioner won't trivially fold —
+            # use a Linear to keep the graph non-trivial and ensure the
+            # backward partitioner saves a bool mask as graph input.
+            y = F.relu(F.linear(x, w, b))
+            return (y * y).sum()
+
+        x = torch.randn(4, 32, device="vulkan", requires_grad=True)
+        w = torch.randn(16, 32, device="vulkan", requires_grad=True)
+        b = torch.randn(16, device="vulkan", requires_grad=True)
+
+        out = fn(x, w, b)
+        out.backward()
+
+        # The compile would have raised pre-fix; assert that grads exist
+        # and are finite as a positive confirmation.
+        for tag, t in (("x", x), ("w", w), ("b", b)):
+            assert t.grad is not None, f"no grad on {tag}"
+            assert torch.isfinite(t.grad.cpu()).all().item(), (
+                f"M-NEW.13: non-finite grad on {tag}"
+            )

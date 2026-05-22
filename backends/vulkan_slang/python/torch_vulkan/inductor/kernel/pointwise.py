@@ -709,9 +709,16 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
 
         dtype_str = self.dtype_to_str(out_dtype)
         if out_dtype == torch.bool:
-            # Comparison ops produce Slang bool expressions.  Bool output
-            # buffers are declared as StructuredBuffer<uint> (1-uint-per-element),
-            # so an explicit cast is always required.
+            # M-NEW.13 (2026-05-22) — comment refresh: bool output buffers
+            # are declared as ``RWStructuredBuffer<uint8_t>`` (1 B/slot)
+            # per ``DTYPE_TO_SLANG[torch.bool] = "uint8_t"`` (M18.4-followup-C),
+            # matching PyTorch's 1 B/element bool storage. Slang implicitly
+            # narrows the ``uint`` cast to ``uint8_t`` at store time, so
+            # the existing ``((uint)({value}))`` cast still writes the
+            # correct 0/1 byte. Refresh kept here to align with the load
+            # side (``pointwise_load_mixin.py``) which now routes all
+            # bool reads through the native ``((float)(v[i]))`` path
+            # against the ``uint8_t`` slot.
             cast_val = f"((uint)({value}))"
         elif out_dtype == torch.int64:
             cast_val = f"uint2(uint(int({value})), uint(int({value}) >> 31))"
