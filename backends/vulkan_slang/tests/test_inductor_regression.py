@@ -55180,3 +55180,122 @@ class TestM196ForeachPointwiseLowerings:
                 r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
                 msg="M19.6 foreach chain compile mismatch"
             )
+
+
+class TestM223PatternStats:
+    """M22.3 — FX pattern firing-rate instrumentation.
+
+    Verifies that:
+      1. Firing a pattern (relu_to_clamp_min) increments the per-name counter.
+      2. reset_pattern_stats() zeroes all counters.
+      3. dump_pattern_stats() is a no-op when TORCH_VULKAN_PATTERN_STATS=0.
+    """
+
+    def _make_aten_relu_graph(self):
+        """Return a GraphModule with one aten.relu.default node.
+
+        Constructs the graph via the FX Graph API so the node target is
+        exactly ``aten.relu.default`` — the form the pattern matcher expects.
+        ``symbolic_trace`` would emit ``torch.relu`` (a different target).
+        """
+        import torch
+
+        aten = torch.ops.aten
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        out = graph.call_function(aten.relu.default, (x,))
+        graph.output(out)
+        return torch.fx.GraphModule({}, graph)
+
+    def test_pattern_stats_counter_increments(self):
+        """After apply_all on a graph containing aten.relu.default, the
+        relu_to_clamp_min counter must be non-zero (stats gate on)."""
+        import torch_vulkan.inductor.config as _cfg
+        from torch_vulkan.inductor.fx_passes.post_grad import (
+            _PatternStats,
+            reset_pattern_stats,
+        )
+        from torch_vulkan.inductor.fx_passes.patterns.registry import FX_PATTERN_REGISTRY
+
+        # Temporarily enable stats by patching the module-level flag.
+        _orig = _cfg._PATTERN_STATS
+        _cfg._PATTERN_STATS = True
+        try:
+            reset_pattern_stats()
+            gm = self._make_aten_relu_graph()
+            FX_PATTERN_REGISTRY.apply_all(gm)
+            # relu_to_clamp_min should have fired since the graph had aten.relu.
+            assert "relu_to_clamp_min" in _PatternStats, (
+                "relu_to_clamp_min pattern did not appear in _PatternStats "
+                f"after apply_all on an aten.relu graph.  Stats: {dict(_PatternStats)}"
+            )
+            assert _PatternStats["relu_to_clamp_min"] >= 1, (
+                f"Expected ≥1 fires for relu_to_clamp_min, got "
+                f"{_PatternStats['relu_to_clamp_min']}"
+            )
+        finally:
+            _cfg._PATTERN_STATS = _orig
+            reset_pattern_stats()
+
+    def test_pattern_stats_reset(self):
+        """reset_pattern_stats() must zero all counters."""
+        import torch_vulkan.inductor.config as _cfg
+        from torch_vulkan.inductor.fx_passes.post_grad import (
+            _PatternStats,
+            record_pattern_fire,
+            reset_pattern_stats,
+        )
+
+        _orig = _cfg._PATTERN_STATS
+        _cfg._PATTERN_STATS = True
+        try:
+            reset_pattern_stats()
+            record_pattern_fire("test_pattern_a")
+            record_pattern_fire("test_pattern_b")
+            assert len(_PatternStats) == 2, (
+                f"Expected 2 entries after two record calls, got {len(_PatternStats)}"
+            )
+            reset_pattern_stats()
+            assert len(_PatternStats) == 0, (
+                f"reset_pattern_stats() should clear all entries, "
+                f"but {len(_PatternStats)} remain: {dict(_PatternStats)}"
+            )
+        finally:
+            _cfg._PATTERN_STATS = _orig
+            reset_pattern_stats()
+
+    def test_pattern_stats_env_gate(self):
+        """dump_pattern_stats() must produce no output when
+        TORCH_VULKAN_PATTERN_STATS=0 (the default)."""
+        import io
+
+        import torch_vulkan.inductor.config as _cfg
+        from torch_vulkan.inductor.fx_passes.post_grad import (
+            dump_pattern_stats,
+            record_pattern_fire,
+            reset_pattern_stats,
+        )
+
+        # Ensure the gate is off.
+        _orig = _cfg._PATTERN_STATS
+        _cfg._PATTERN_STATS = False
+        try:
+            reset_pattern_stats()
+            record_pattern_fire("some_pattern")
+            # Redirect stderr and verify dump_pattern_stats() writes nothing.
+            buf = io.StringIO()
+            import sys
+            _old_stderr = sys.stderr
+            sys.stderr = buf
+            try:
+                dump_pattern_stats()
+            finally:
+                sys.stderr = _old_stderr
+            output = buf.getvalue()
+            assert output == "", (
+                f"dump_pattern_stats() should be a no-op when "
+                f"TORCH_VULKAN_PATTERN_STATS=0, but wrote: {output!r}"
+            )
+        finally:
+            _cfg._PATTERN_STATS = _orig
+            reset_pattern_stats()

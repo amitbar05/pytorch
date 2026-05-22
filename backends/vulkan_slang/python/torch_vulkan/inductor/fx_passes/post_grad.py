@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -9,6 +11,39 @@ if TYPE_CHECKING:
 
 _DUMP_FX_DIR: str = ""
 _DUMP_FX_COUNTER: int = 0
+
+# M22.3 — per-pattern firing-rate counters.  Incremented by
+# FxPatternRegistry.apply_all when TORCH_VULKAN_PATTERN_STATS=1.
+# Module-level dict is sufficient; Inductor compiles are single-threaded
+# per graph.  Key: pattern name string.  Value: fire count.
+_PatternStats: dict[str, int] = defaultdict(int)
+
+
+def record_pattern_fire(name: str) -> None:
+    """Increment the counter for *name* (called by the pattern registry)."""
+    _PatternStats[name] += 1
+
+
+def dump_pattern_stats() -> None:
+    """Print a sorted firing-rate table to stderr when TORCH_VULKAN_PATTERN_STATS=1.
+
+    Emits nothing when the env-var is off (zero overhead in production).
+    """
+    from torch_vulkan.inductor.config import pattern_stats_enabled
+
+    if not pattern_stats_enabled():
+        return
+    if not _PatternStats:
+        print("[vulkan pattern_stats] (no patterns fired)", file=sys.stderr)
+        return
+    print("[vulkan pattern_stats]", file=sys.stderr)
+    for name, count in sorted(_PatternStats.items(), key=lambda kv: -kv[1]):
+        print(f"  {count:6d}  {name}", file=sys.stderr)
+
+
+def reset_pattern_stats() -> None:
+    """Zero all pattern counters.  Call between compile jobs for test isolation."""
+    _PatternStats.clear()
 
 
 _VULKAN_OP_PREWARM_REGISTRY: dict[str, tuple[str, str]] = {

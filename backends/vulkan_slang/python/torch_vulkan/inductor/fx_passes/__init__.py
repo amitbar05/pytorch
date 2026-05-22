@@ -39,9 +39,13 @@ from .functional import _fuse_optimizer_step_to_foreach, _fuse_qkv_linears
 from .joint_graph import _materialize_implicit_tangents  # noqa: F401
 from .patterns.registry import FX_PATTERN_REGISTRY
 from .post_grad import (  # noqa: F401 — re-export for tests
+    _PatternStats,
     _VULKAN_OP_PREWARM_REGISTRY,
     _aten_target_name,
+    dump_pattern_stats,
     prewarm_from_fx_graph,
+    record_pattern_fire,
+    reset_pattern_stats,
 )
 
 
@@ -155,7 +159,11 @@ def _make_vulkan_pass() -> object:
                 _fuse_optimizer_step_to_foreach,
             )
             from .joint_graph import _materialize_implicit_tangents
-            from .post_grad import _maybe_dump_fx, prewarm_from_fx_graph
+            from .post_grad import (
+                _maybe_dump_fx,
+                dump_pattern_stats,
+                prewarm_from_fx_graph,
+            )
 
             _maybe_dump_fx(gm, "pre")
             _materialize_implicit_tangents(gm)
@@ -171,6 +179,9 @@ def _make_vulkan_pass() -> object:
             except Exception:
                 pass
             _maybe_dump_fx(gm, "post")
+            # M22.3 — emit pattern firing-rate table when
+            # TORCH_VULKAN_PATTERN_STATS=1 (no-op otherwise).
+            dump_pattern_stats()
 
         def uuid(self) -> object:
             # M-pipeline-6: return the whole-fx_passes-subtree digest

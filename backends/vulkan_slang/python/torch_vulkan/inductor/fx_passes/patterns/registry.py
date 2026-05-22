@@ -52,14 +52,29 @@ class FxPatternEntry:
 
     def apply(self, gm: "GraphModule") -> "GraphModule":
         """Apply the pattern once: scan, match, rewrite if found.
-        
+
         Returns the (possibly modified) graph module.  If no match is found,
         returns the original graph unchanged.
+
+        When ``TORCH_VULKAN_PATTERN_STATS=1`` (M22.3), increments the
+        per-name counter on every successful match.
         """
         for root_node, context in self.match_fn(gm):
             gm = self.rewrite_fn(gm, root_node, context)
             gm.graph.lint()
             gm.recompile()
+            # M22.3 — count the match at the exact point it fires so we
+            # don't need a fragile proxy (node-count delta fails for 1→1
+            # rewrites like relu→clamp_min).
+            try:
+                from torch_vulkan.inductor.config import pattern_stats_enabled
+                from torch_vulkan.inductor.fx_passes.post_grad import (
+                    record_pattern_fire,
+                )
+                if pattern_stats_enabled():
+                    record_pattern_fire(self.name)
+            except ImportError:
+                pass
             return gm
         return gm
 
@@ -107,6 +122,9 @@ class FxPatternRegistry:
 
         Patterns are applied in priority order.  After each pattern exhausts
         its matches, the next pattern runs on the rewritten graph.
+
+        Firing-rate counters (M22.3) are incremented inside
+        ``FxPatternEntry.apply`` — no extra bookkeeping needed here.
         """
         for entry in self._entries:
             gm = entry.apply_exhaustive(gm)

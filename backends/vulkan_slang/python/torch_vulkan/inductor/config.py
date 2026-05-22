@@ -555,3 +555,22 @@ def max_storage_bufs_override() -> Optional[int]:
         return int(env_val)
     except ValueError:
         return None
+
+
+# M22.3 — FX pattern firing-rate instrumentation.
+# When enabled, each FX pattern match increments a per-name counter so
+# users can see which rewrites actually fire and how often.  Zero overhead
+# in production (default off).
+# Set ``TORCH_VULKAN_PATTERN_STATS=1`` to enable.
+_PATTERN_STATS = os.environ.get("TORCH_VULKAN_PATTERN_STATS", "0") == "1"
+
+
+def pattern_stats_enabled() -> bool:
+    """Whether FX pattern firing-rate counters are active (M22.3).
+
+    When True, each pattern match via ``FxPatternRegistry.apply_all``
+    increments a per-name counter.  Call ``dump_pattern_stats()`` from
+    ``fx_passes/post_grad.py`` to emit a sorted table to stderr.
+    Set ``TORCH_VULKAN_PATTERN_STATS=1`` to enable.
+    """
+    return _PATTERN_STATS
