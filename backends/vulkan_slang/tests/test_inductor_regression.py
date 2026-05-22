@@ -52925,6 +52925,69 @@ class TestM226BwdLoweringsNormSplit:
         from torch_vulkan.inductor.bwd_lowerings import register_norm_backward_lowerings  # noqa: F401
 
 
+class TestM22WrapperHelpersSplit:
+    """M22.1 — wrapper.py split via wrapper_helpers.py.
+
+    wrapper.py was 881 L — over the 800-line anti-goal #7 cap.
+    Module-level helpers and monkey-patches extracted to wrapper_helpers.py;
+    wrapper.py now contains only VulkanPythonWrapperCodegen.
+    """
+
+    def test_wrapper_py_under_800_lines(self):
+        import torch_vulkan.inductor.wrapper as mod
+
+        with open(mod.__file__) as f:
+            n = sum(1 for _ in f)
+        assert n <= 800, (
+            f"wrapper.py is {n} lines — exceeds anti-goal #7 cap of 800. "
+            "Extract more content to wrapper_helpers.py."
+        )
+
+    def test_wrapper_helpers_under_800_lines(self):
+        import torch_vulkan.inductor.wrapper_helpers as mod
+
+        with open(mod.__file__) as f:
+            n = sum(1 for _ in f)
+        assert n <= 800, (
+            f"wrapper_helpers.py is {n} lines — exceeds anti-goal #7 cap of 800."
+        )
+
+    def test_helpers_imported_into_wrapper(self):
+        """wrapper.py must import key helpers from wrapper_helpers."""
+        import torch_vulkan.inductor.wrapper as mod
+
+        with open(mod.__file__) as f:
+            src = f.read()
+        assert "from .wrapper_helpers import" in src, (
+            "wrapper.py must import from wrapper_helpers"
+        )
+        for name in ("_batch_dispatch_enabled", "_lifetime_class_for_name",
+                     "_normalize_strides_to_row_major"):
+            assert name in src, f"wrapper.py must import {name} from wrapper_helpers"
+
+    def test_helpers_not_defined_in_wrapper(self):
+        """wrapper.py must NOT define the moved helpers inline."""
+        import torch_vulkan.inductor.wrapper as mod
+
+        with open(mod.__file__) as f:
+            src = f.read()
+        for fn in ("def _install_vulkan_skip_alignment_clone",
+                   "def _batch_dispatch_enabled",
+                   "def _lifetime_class_for_name"):
+            assert fn not in src, (
+                f"wrapper.py still defines {fn!r} — should be in wrapper_helpers.py"
+            )
+
+    def test_normalize_strides_correctness(self):
+        """_normalize_strides_to_row_major produces correct row-major strides."""
+        from torch_vulkan.inductor.wrapper_helpers import _normalize_strides_to_row_major
+
+        assert _normalize_strides_to_row_major([4], [1]) == [1]
+        assert _normalize_strides_to_row_major([3, 4], [4, 1]) == [4, 1]
+        assert _normalize_strides_to_row_major([2, 3, 4], [12, 4, 1]) == [12, 4, 1]
+        assert _normalize_strides_to_row_major([], []) == []
+
+
 class TestMAG51ActivationDecompRouting:
     """M-AG5.1 Tier-0/Tier-1/Tier-2 closeout (anti-goal #5 cleanup).
 
@@ -54059,3 +54122,119 @@ class TestM195DynamicShapeConvLifting:
         # Concrete values still work.
         assert get_static_numel(sympy.Integer(64)) == 64
         assert get_static_numel(8) == 8
+
+
+class TestM22bConvSplit:
+    """M22b — Anti-goal #7: fx_passes/eager/conv.py split under 800-line cap.
+
+    The original ``conv.py`` was 1147 lines, violating the 800-line cap
+    (anti-goal #7).  M22b splits it into four files:
+      - ``conv.py``          — conv2d forward + autograd + conv1d (≤800 L)
+      - ``conv_relu.py``     — Conv2d+ReLU fused op (M17.2)
+      - ``conv_gn_relu.py``  — Conv2d+GroupNorm+ReLU fused op (M17.2 Phase 3)
+      - ``conv_backward.py`` — Opaque non-autograd conv2d_backward (M17.8.d.2)
+
+    All tests are import-level (no GPU required).
+    """
+
+    _EAGER_DIR = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "python/torch_vulkan/inductor/fx_passes/eager"
+    )
+
+    def test_conv_py_under_800_lines(self):
+        """conv.py must not exceed 800 lines after the M22b split."""
+        path = self._EAGER_DIR / "conv.py"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22b: conv.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_conv_relu_py_under_800_lines(self):
+        """conv_relu.py must not exceed 800 lines."""
+        path = self._EAGER_DIR / "conv_relu.py"
+        assert path.exists(), "M22b: conv_relu.py was not created"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22b: conv_relu.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_conv_gn_relu_py_under_800_lines(self):
+        """conv_gn_relu.py must not exceed 800 lines."""
+        path = self._EAGER_DIR / "conv_gn_relu.py"
+        assert path.exists(), "M22b: conv_gn_relu.py was not created"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22b: conv_gn_relu.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_conv_backward_py_under_800_lines(self):
+        """conv_backward.py must not exceed 800 lines."""
+        path = self._EAGER_DIR / "conv_backward.py"
+        assert path.exists(), "M22b: conv_backward.py was not created"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22b: conv_backward.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_conv2d_importable_from_conv(self):
+        """Core conv2d ops must be importable directly from conv module."""
+        from torch_vulkan.inductor.fx_passes.eager.conv import (
+            _ensure_conv1d_with_optional_bias_op_registered,
+            _ensure_conv2d_with_optional_bias_op_registered,
+        )
+        assert callable(_ensure_conv2d_with_optional_bias_op_registered)
+        assert callable(_ensure_conv1d_with_optional_bias_op_registered)
+
+    def test_relu_importable_from_conv_relu(self):
+        """Conv+ReLU op must be importable from conv_relu submodule."""
+        from torch_vulkan.inductor.fx_passes.eager.conv_relu import (
+            _ensure_conv2d_relu_fused_op_registered,
+        )
+        assert callable(_ensure_conv2d_relu_fused_op_registered)
+
+    def test_gn_relu_importable_from_conv_gn_relu(self):
+        """Conv+GN+ReLU op must be importable from conv_gn_relu submodule."""
+        from torch_vulkan.inductor.fx_passes.eager.conv_gn_relu import (
+            _dispatch_group_norm_slang,
+            _ensure_conv2d_gn_relu_fused_op_registered,
+        )
+        assert callable(_ensure_conv2d_gn_relu_fused_op_registered)
+        assert callable(_dispatch_group_norm_slang)
+
+    def test_backward_importable_from_conv_backward(self):
+        """Opaque conv2d_backward op must be importable from conv_backward submodule."""
+        from torch_vulkan.inductor.fx_passes.eager.conv_backward import (
+            _ensure_conv2d_backward_op_registered,
+        )
+        assert callable(_ensure_conv2d_backward_op_registered)
+
+    def test_backward_compat_imports_from_conv(self):
+        """Re-exports in conv.py keep legacy ``from .conv import …`` working."""
+        from torch_vulkan.inductor.fx_passes.eager.conv import (
+            _ensure_conv2d_backward_op_registered,
+            _ensure_conv2d_gn_relu_fused_op_registered,
+            _ensure_conv2d_relu_fused_op_registered,
+        )
+        assert callable(_ensure_conv2d_relu_fused_op_registered)
+        assert callable(_ensure_conv2d_gn_relu_fused_op_registered)
+        assert callable(_ensure_conv2d_backward_op_registered)
+
+    def test_package_init_exports_all_conv_ops(self):
+        """The eager sub-package __init__ must export all five conv _ensure_* names."""
+        import torch_vulkan.inductor.fx_passes.eager as pkg
+
+        required = [
+            "_ensure_conv1d_with_optional_bias_op_registered",
+            "_ensure_conv2d_with_optional_bias_op_registered",
+            "_ensure_conv2d_relu_fused_op_registered",
+            "_ensure_conv2d_gn_relu_fused_op_registered",
+            "_ensure_conv2d_backward_op_registered",
+        ]
+        for name in required:
+            assert hasattr(pkg, name), (
+                f"M22b: eager __init__ missing export {name!r}"
+            )
+            assert callable(getattr(pkg, name)), (
+                f"M22b: {name!r} is not callable"
+            )
