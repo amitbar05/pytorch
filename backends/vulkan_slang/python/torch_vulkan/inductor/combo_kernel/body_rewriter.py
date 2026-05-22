@@ -382,8 +382,13 @@ def _rewrite_body(
     # fields are buffer references that still need binding-map renaming.
     # CG.M14: prev_significant_value tracks the last non-space/non-comment
     # token value, so we can detect ``args.`` and allow name_map lookup.
+    # member_object tracks the identifier token immediately before a ``.'',
+    # so that when processing "args.in_ptr0" the field handler can check
+    # whether the object was "args" even though prev_significant_value has
+    # already been updated to ".".
     prev_significant_type: int | None = None
     prev_significant_value: str = ""
+    member_object: str = ""  # identifier token before the most recent "."
 
     for tok in tokens:
         if tok.type in (_T_SPACE, _T_COMMENT):
@@ -420,6 +425,14 @@ def _rewrite_body(
                 # another declarator (e.g. ``float x, y, z;`` or
                 # ``for (int i = 0, j = 0; …)``).
                 saw_type = True
+            elif tok.value == ".":
+                # Record the current object identifier for use when the
+                # field token is processed (prev_significant_value will be
+                # "." by then, so we need a separate slot).
+                if prev_significant_type == _T_IDENT:
+                    member_object = prev_significant_value
+                else:
+                    member_object = ""
             # Other punctuation ``( ) [ ]`` does not affect decl tracking.
             # ``.`` is tracked via prev_significant_type below.
 
@@ -443,8 +456,10 @@ def _rewrite_body(
                 # or apply rename maps, UNLESS the object is ``args``
                 # (ParameterBlock<KernelArgs>), whose fields are buffer
                 # references that still need binding-map renaming (CG.M14).
+                # Use member_object (captured when "." was processed) because
+                # prev_significant_value is "." at this point, not "args".
                 if (
-                    prev_significant_value == "args"
+                    member_object == "args"
                     and name in name_map
                     and name_map[name] != name
                 ):

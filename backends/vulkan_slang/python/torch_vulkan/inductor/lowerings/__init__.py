@@ -422,3 +422,8 @@ def register() -> None:
     from .rnn_bwd import register as _register_rnn_bwd
 
     _register_rnn_bwd()
+    # M19.6: foreach pointwise lowering coverage — validates upstream lowerings
+    # for all 16 foreach element-wise ops and suppresses any stray AOT decomps.
+    from .foreach_pointwise import register_foreach_pointwise_lowerings
+
+    register_foreach_pointwise_lowerings()
