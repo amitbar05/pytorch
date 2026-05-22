@@ -45065,22 +45065,25 @@ class TestM2216SlangcConcurrency:
         file exists in the module cache directory.
         """
 
-        from torch_vulkan.inductor.runtime import slangc as _s
+        # M22a Stage 2: precompile_shader_libs and its helpers live in
+        # shader_lib.py. Patch that module so the stubs take effect
+        # inside the function that reads these module-level names.
+        import torch_vulkan.inductor.runtime.shader_lib as _slib
 
         # Point the module-cache dir at our tmp.
-        monkeypatch.setattr(_s, "_SHADER_LIB_MODULE_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(_slib, "_SHADER_LIB_MODULE_CACHE_DIR", str(tmp_path))
         # Stub a single source file so the loop has exactly one iteration.
         fake_src = tmp_path / "fake_lib.slang"
         fake_src.write_text("// empty\n")
-        monkeypatch.setattr(_s, "_shader_lib_sources", lambda: [str(fake_src)])
-        monkeypatch.setattr(_s, "_slangc_available", lambda: True)
-        monkeypatch.setattr(_s, "_get_slangc", lambda: "/bin/false")
-        monkeypatch.setattr(_s, "_slangc_fingerprint", lambda: "deadbeef")
+        monkeypatch.setattr(_slib, "_shader_lib_sources", lambda: [str(fake_src)])
+        monkeypatch.setattr(_slib, "_slangc_available", lambda: True)
+        monkeypatch.setattr(_slib, "_get_slangc", lambda: "/bin/false")
+        monkeypatch.setattr(_slib, "_slangc_fingerprint", lambda: "deadbeef")
 
         # Synthesise a slangc failure: a returncode-1 result with a tmp
         # path that does NOT get filled with content. ``subprocess.run``
         # is real here — ``/bin/false`` is a tiny CLI that always exits 1.
-        result = _s.precompile_shader_libs(lax=True, force=True)
+        result = _slib.precompile_shader_libs(lax=True, force=True)
 
         assert result["failed"], (
             f"expected slangc failure to populate 'failed', got {result!r}"
@@ -52116,18 +52119,48 @@ class TestMNew5ColdImportOptimization:
             "slangc.py",
         )
 
+    @staticmethod
+    def _shader_lib_module_path() -> str:
+        """M22a Stage 2: prewarm constants extracted to shader_lib.py."""
+        import os
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(
+            os.path.dirname(here),
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "runtime",
+            "shader_lib.py",
+        )
+
+    def _runtime_src(self) -> str:
+        """Combined source of slangc.py + shader_lib.py (if present).
+
+        M22a Stage 2 moved prewarm constants from slangc.py to shader_lib.py
+        while re-exporting them from slangc.py. Static source checks must
+        search both files so they keep passing after the split.
+        """
+        import os
+
+        src = open(self._slangc_module_path()).read()
+        slib = self._shader_lib_module_path()
+        if os.path.exists(slib):
+            src += "\n" + open(slib).read()
+        return src
+
     # ── Static guards ──────────────────────────────────────────────
 
     def test_core_prewarm_set_declared(self):
-        """The CORE prewarm set must be declared in
-        ``runtime/slangc.py`` as a module-level constant the test can
-        locate. Names check: must contain the canonical universal
-        modules every test run touches.
+        """The CORE prewarm set must be declared in the runtime source
+        (``runtime/slangc.py`` or ``runtime/shader_lib.py`` after the
+        M22a Stage 2 split) as a module-level constant. Names check:
+        must contain the canonical universal modules every test touches.
         """
-        src = open(self._slangc_module_path()).read()
+        src = self._runtime_src()
         assert "_PREWARM_CORE_MODULES" in src, (
             "M-NEW.5 regression: `_PREWARM_CORE_MODULES` constant "
-            "missing from `runtime/slangc.py`. The CORE set is the "
+            "missing from runtime source. The CORE set is the "
             "primary M-NEW.5 contract."
         )
         for required in (
@@ -52147,18 +52180,19 @@ class TestMNew5ColdImportOptimization:
 
     def test_prewarm_level_env_recognized(self):
         """The ``TORCH_VULKAN_PREWARM_LEVEL`` env knob must be read
-        somewhere in ``runtime/slangc.py``. Catches a future refactor
-        that drops the knob.
+        somewhere in the runtime source (slangc.py or shader_lib.py
+        after M22a Stage 2 split). Catches a future refactor that
+        drops the knob entirely.
         """
-        src = open(self._slangc_module_path()).read()
+        src = self._runtime_src()
         assert "TORCH_VULKAN_PREWARM_LEVEL" in src, (
             "M-NEW.5 regression: env knob `TORCH_VULKAN_PREWARM_LEVEL` "
-            "not referenced in `runtime/slangc.py`. The tiered-prewarm "
+            "not referenced in runtime source. The tiered-prewarm "
             "behaviour is unreachable without the knob."
         )
         assert "_prewarm_level(" in src, (
             "M-NEW.5 regression: `_prewarm_level` helper missing from "
-            "`runtime/slangc.py`. Without it the env knob isn't "
+            "runtime source. Without it the env knob isn't "
             "translated into a level integer."
         )
 
@@ -54810,3 +54844,339 @@ class TestM235ForeachOutsideCompileRatchet:
         for r, ref in zip(result, refs):
             assert r.device.type == "vulkan", "result moved to CPU"
             torch.testing.assert_close(r.cpu(), -ref, rtol=self._RTOL, atol=self._ATOL)
+
+
+class TestM196ForeachPointwiseLowerings:
+    """M19.6 — foreach pointwise ops under torch.compile(backend="inductor").
+
+    Verifies that all 16 target _foreach_* ops produce correct outputs when
+    compiled through the Vulkan Inductor backend.  Each test:
+      1. Compiles the target function with ``torch.compile(backend="inductor")``.
+      2. Runs it on Vulkan tensors.
+      3. Compares the result against a CPU reference.
+
+    The upstream Inductor already registers these via ``make_foreach_pointwise``
+    / ``register_foreach_pointwise``.  ``lowerings/foreach_pointwise.py``
+    validates the registration and suppresses any stray AOT decomps.
+
+    No GPU dispatch-count assertions — these tests are correctness-only.
+    Dispatch-count ratchets for foreach ops live in
+    ``TestM175DispatchOverhead``.
+    """
+
+    _DEV = "vulkan:0"
+    _RTOL = 1e-4
+    _ATOL = 1e-4
+
+    def _make(self, n, *shape, dtype=torch.float32):
+        """Return n Vulkan tensors of the given shape."""
+        return [torch.randn(*shape, dtype=dtype, device=self._DEV) for _ in range(n)]
+
+    def _cpu(self, tensors):
+        return [t.cpu() for t in tensors]
+
+    # ── Registration / smoke tests (no GPU required) ─────────────────────────
+
+    def test_foreach_pointwise_module_importable(self):
+        """foreach_pointwise.py is importable and exposes its entry point."""
+        from torch_vulkan.inductor.lowerings.foreach_pointwise import (
+            register_foreach_pointwise_lowerings,
+        )
+        assert callable(register_foreach_pointwise_lowerings)
+
+    def test_foreach_pointwise_all_ops_in_lowerings(self):
+        """All 16 M19.6 target ops are in Inductor's lowering table after register()."""
+        import torch_vulkan.inductor
+        torch_vulkan.inductor.register()
+
+        from torch._inductor.lowering import lowerings
+        aten = torch.ops.aten
+
+        required = [
+            aten._foreach_add.List,
+            aten._foreach_add.Scalar,
+            aten._foreach_sub.List,
+            aten._foreach_sub.Scalar,
+            aten._foreach_mul.List,
+            aten._foreach_mul.Scalar,
+            aten._foreach_div.List,
+            aten._foreach_div.Scalar,
+            aten._foreach_neg.default,
+            aten._foreach_abs.default,
+            aten._foreach_sqrt.default,
+            aten._foreach_reciprocal.default,
+            aten._foreach_add_.List,
+            aten._foreach_add_.Scalar,
+            aten._foreach_mul_.Scalar,
+        ]
+        missing = [str(op) for op in required if op not in lowerings]
+        assert not missing, f"M19.6: missing lowerings for: {missing}"
+
+    # ── Compile-mode correctness tests ───────────────────────────────────────
+
+    def test_foreach_add_list_compile(self):
+        """_foreach_add.List under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, others):
+            return torch._foreach_add(ts, others)
+
+        ts = self._make(2, 4, 8)
+        others = self._make(2, 4, 8)
+        ts_cpu = self._cpu(ts)
+        others_cpu = self._cpu(others)
+
+        with torch.no_grad():
+            result = fn(ts, others)
+            ref = torch._foreach_add(ts_cpu, others_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_add.List compile mismatch"
+            )
+
+    def test_foreach_add_scalar_compile(self):
+        """_foreach_add.Scalar under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, alpha):
+            return torch._foreach_add(ts, alpha)
+
+        ts = self._make(3, 16)
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts, 3.0)
+            ref = torch._foreach_add(ts_cpu, 3.0)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_add.Scalar compile mismatch"
+            )
+
+    def test_foreach_sub_list_compile(self):
+        """_foreach_sub.List under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, others):
+            return torch._foreach_sub(ts, others)
+
+        ts = self._make(2, 8, 4)
+        others = self._make(2, 8, 4)
+        ts_cpu = self._cpu(ts)
+        others_cpu = self._cpu(others)
+
+        with torch.no_grad():
+            result = fn(ts, others)
+            ref = torch._foreach_sub(ts_cpu, others_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_sub.List compile mismatch"
+            )
+
+    def test_foreach_mul_list_compile(self):
+        """_foreach_mul.List under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, others):
+            return torch._foreach_mul(ts, others)
+
+        ts = self._make(2, 8, 8)
+        others = self._make(2, 8, 8)
+        ts_cpu = self._cpu(ts)
+        others_cpu = self._cpu(others)
+
+        with torch.no_grad():
+            result = fn(ts, others)
+            ref = torch._foreach_mul(ts_cpu, others_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_mul.List compile mismatch"
+            )
+
+    def test_foreach_mul_scalar_compile(self):
+        """_foreach_mul.Scalar under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, scalar):
+            return torch._foreach_mul(ts, scalar)
+
+        ts = self._make(3, 4, 4)
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts, 2.0)
+            ref = torch._foreach_mul(ts_cpu, 2.0)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_mul.Scalar compile mismatch"
+            )
+
+    def test_foreach_div_scalar_compile(self):
+        """_foreach_div.Scalar under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts, scalar):
+            return torch._foreach_div(ts, scalar)
+
+        ts = self._make(2, 8, 8)
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts, 4.0)
+            ref = torch._foreach_div(ts_cpu, 4.0)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_div.Scalar compile mismatch"
+            )
+
+    def test_foreach_neg_compile(self):
+        """_foreach_neg.default under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts):
+            return torch._foreach_neg(ts)
+
+        ts = self._make(2, 8, 4)
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts)
+            ref = torch._foreach_neg(ts_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_neg compile mismatch"
+            )
+
+    def test_foreach_abs_compile(self):
+        """_foreach_abs.default under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts):
+            return torch._foreach_abs(ts)
+
+        ts = self._make(2, 4, 8)
+        # Use mixed-sign values to exercise abs properly.
+        ts = [t * 2 - 1 for t in ts]  # shift to [-1, 1]
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts)
+            ref = torch._foreach_abs(ts_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_abs compile mismatch"
+            )
+
+    def test_foreach_sqrt_compile(self):
+        """_foreach_sqrt.default under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts):
+            return torch._foreach_sqrt(ts)
+
+        # Use positive values only to avoid NaN from sqrt of negative.
+        ts = [t.abs() + 0.01 for t in self._make(2, 8, 4)]
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts)
+            ref = torch._foreach_sqrt(ts_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=1e-3, atol=1e-3,
+                msg="M19.6 _foreach_sqrt compile mismatch"
+            )
+
+    def test_foreach_reciprocal_compile(self):
+        """_foreach_reciprocal.default under torch.compile matches CPU reference."""
+        @torch.compile(backend="inductor")
+        def fn(ts):
+            return torch._foreach_reciprocal(ts)
+
+        # Use values bounded away from zero to avoid inf.
+        ts = [t.abs() + 1.0 for t in self._make(2, 8, 4)]
+        ts_cpu = self._cpu(ts)
+
+        with torch.no_grad():
+            result = fn(ts)
+            ref = torch._foreach_reciprocal(ts_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=1e-3, atol=1e-3,
+                msg="M19.6 _foreach_reciprocal compile mismatch"
+            )
+
+    def test_foreach_add_inplace_list_compile(self):
+        """_foreach_add_.List under torch.compile mutates correctly vs CPU."""
+        @torch.compile(backend="inductor")
+        def fn(ts, others):
+            torch._foreach_add_(ts, others)
+            return ts
+
+        ts = self._make(2, 4, 8)
+        others = self._make(2, 4, 8)
+        ts_cpu = [t.cpu().clone() for t in ts]
+        others_cpu = self._cpu(others)
+
+        with torch.no_grad():
+            result = fn(ts, others)
+            torch._foreach_add_(ts_cpu, others_cpu)
+
+        for r, r_cpu in zip(result, ts_cpu):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_add_.List compile mismatch"
+            )
+
+    def test_foreach_mul_inplace_scalar_compile(self):
+        """_foreach_mul_.Scalar under torch.compile mutates correctly vs CPU."""
+        @torch.compile(backend="inductor")
+        def fn(ts, scalar):
+            torch._foreach_mul_(ts, scalar)
+            return ts
+
+        ts = self._make(2, 4, 8)
+        ts_cpu = [t.cpu().clone() for t in ts]
+
+        with torch.no_grad():
+            result = fn(ts, 0.5)
+            torch._foreach_mul_(ts_cpu, 0.5)
+
+        for r, r_cpu in zip(result, ts_cpu):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 _foreach_mul_.Scalar compile mismatch"
+            )
+
+    def test_foreach_mixed_chain_compile(self):
+        """Chain of foreach ops (neg→mul→add) under compile matches CPU."""
+        @torch.compile(backend="inductor")
+        def fn(ts, others):
+            neg_ts = torch._foreach_neg(ts)
+            scaled = torch._foreach_mul(neg_ts, 2.0)
+            return torch._foreach_add(scaled, others)
+
+        ts = self._make(2, 8, 8)
+        others = self._make(2, 8, 8)
+        ts_cpu = self._cpu(ts)
+        others_cpu = self._cpu(others)
+
+        with torch.no_grad():
+            result = fn(ts, others)
+            neg = torch._foreach_neg(ts_cpu)
+            scaled = torch._foreach_mul(neg, 2.0)
+            ref = torch._foreach_add(scaled, others_cpu)
+
+        for r, r_cpu in zip(result, ref):
+            torch.testing.assert_close(
+                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
+                msg="M19.6 foreach chain compile mismatch"
+            )

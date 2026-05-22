@@ -205,9 +205,9 @@ def reset_per_test_caches() -> None:
     _SHADER_LIB_MODULE_STATS["compiles"] = 0
     _SHADER_LIB_MODULE_STATS["cache_hits"] = 0
     reset_compile_stats()
-    # Reset module-level globals in slangc
-    import torch_vulkan.inductor.runtime.slangc as _slangc_mod
+    # Reset module-level globals that now live in shader_lib (M22a Stage 2).
+    import torch_vulkan.inductor.runtime.shader_lib as _shader_lib_mod
 
-    _slangc_mod._slangc_available_cache = None
-    _slangc_mod._shader_lib_modules_ready = False
+    _shader_lib_mod._slangc_available_cache = None
+    _shader_lib_mod._shader_lib_modules_ready = False
     _DISPATCH_TIMES.clear()
