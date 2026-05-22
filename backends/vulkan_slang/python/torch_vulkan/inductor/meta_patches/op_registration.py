@@ -50,8 +50,9 @@ def _register_backward_meta_decomps() -> None:
             (aten.silu_backward.default, _bwd_meta_like_grad),
             (aten.leaky_relu_backward.default, _bwd_meta_like_grad),
             (aten.elu_backward.default, _bwd_meta_like_grad),
-            (aten.upsample_nearest2d_backward.vec, _bwd_meta_like_grad),
-            (aten.upsample_bilinear2d_backward.vec, _bwd_meta_like_grad),
+            # PyTorch 2.11 uses .default (not .vec which was an older overload name).
+            (aten.upsample_nearest2d_backward.default, _bwd_meta_like_grad),
+            (aten.upsample_bilinear2d_backward.default, _bwd_meta_like_grad),
         ]:
             try:
                 register_decomposition(op, type="meta")(fn)
