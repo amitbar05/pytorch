@@ -22,7 +22,7 @@ _RNN_BWD_CALLERS: dict[str, object] = {}
 
 def _get_rnn_bwd_caller(cell_type: str):
     """Return a cached _SlangTileRNNBackward for *cell_type*."""
-    from ...templates.caller.rnn import _SlangTileRNNBackward
+    from ...templates.caller.rnn_backward import _SlangTileRNNBackward
 
     caller = _RNN_BWD_CALLERS.get(cell_type)
     if caller is None:
@@ -47,7 +47,7 @@ _RNN_BWD_CALLERS: dict[str, object] = {}
 
 def _get_rnn_bwd_caller(cell_type: str):
     """Return a cached _SlangTileRNNBackward for *cell_type*."""
-    from ...templates.caller.rnn import _SlangTileRNNBackward
+    from ...templates.caller.rnn_backward import _SlangTileRNNBackward
 
     caller = _RNN_BWD_CALLERS.get(cell_type)
     if caller is None:

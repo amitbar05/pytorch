@@ -54313,3 +54313,73 @@ class TestM22cSchedulingSplit:
         assert k1 != k4, "M22c: key must reflect combo size"
         assert k1.startswith("combo2_n2_"), f"M22c: unexpected key format: {k1!r}"
         assert k4.startswith("combo2_n1_"), f"M22c: unexpected key format: {k4!r}"
+
+
+class TestM22dRNNSplit:
+    """M22d — Anti-goal #7: templates/caller/rnn.py split under 800-line cap.
+
+    The original ``rnn.py`` was 1053 lines.  M22d splits it into two files:
+      - ``rnn.py``          — forward + fused forward + install (~700 L)
+      - ``rnn_backward.py`` — backward render/dispatch/tile (~362 L)
+
+    All tests are import-level (no GPU required).
+    """
+
+    _CALLER_DIR = (
+        __import__("pathlib").Path(__file__).parent.parent
+        / "python/torch_vulkan/inductor/templates/caller"
+    )
+
+    def test_rnn_py_under_800_lines(self):
+        """rnn.py must not exceed 800 lines after the M22d split."""
+        path = self._CALLER_DIR / "rnn.py"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22d: rnn.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_rnn_backward_py_exists(self):
+        """rnn_backward.py must exist as the extracted backward module."""
+        path = self._CALLER_DIR / "rnn_backward.py"
+        assert path.exists(), "M22d: rnn_backward.py was not created"
+
+    def test_rnn_backward_py_under_800_lines(self):
+        """rnn_backward.py must not exceed 800 lines."""
+        path = self._CALLER_DIR / "rnn_backward.py"
+        lines = path.read_text().count("\n")
+        assert lines <= 800, (
+            f"M22d: rnn_backward.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_backward_not_defined_in_rnn(self):
+        """rnn.py must not define _render_rnn_cell_bwd inline after the split."""
+        path = self._CALLER_DIR / "rnn.py"
+        src = path.read_text()
+        assert "def _render_rnn_cell_bwd" not in src, (
+            "M22d: _render_rnn_cell_bwd must live in rnn_backward.py"
+        )
+        assert "class _SlangTileRNNBackward" not in src, (
+            "M22d: _SlangTileRNNBackward must live in rnn_backward.py"
+        )
+
+    def test_slang_tile_rnn_backward_importable(self):
+        """_SlangTileRNNBackward must be importable from rnn_backward."""
+        from torch_vulkan.inductor.templates.caller.rnn_backward import (
+            _SlangTileRNNBackward,
+        )
+        assert callable(_SlangTileRNNBackward)
+
+    def test_forward_symbols_still_in_rnn(self):
+        """Forward symbols must remain importable from rnn.py after the split."""
+        from torch_vulkan.inductor.templates.caller.rnn import (
+            _can_use_fused_rnn_template,
+            _dispatch_rnn_cell,
+            _dispatch_rnn_cell_fused,
+            _render_rnn_cell,
+            _render_rnn_cell_fused,
+            _SlangTileRNN,
+            _SlangTileRNNFused,
+            install_external_rnn,
+        )
+        assert callable(install_external_rnn)
+        assert callable(_dispatch_rnn_cell)
