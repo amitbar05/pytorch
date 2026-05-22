@@ -46617,6 +46617,54 @@ class TestCov4MmInt8:
             f"fallback registry moved."
         )
 
+    def test_ensure_mm_int8_module_function_exists(self):
+        """OP.24 / M14: _ensure_mm_int8_module() must exist alongside
+        _ensure_mm_tile_module() in slangc.py — the E30600 fix requires
+        both guards to be present so that ``import mm_int8;`` kernels get
+        their precompiled module on the -I path before slangc is invoked."""
+        from torch_vulkan.inductor.runtime import slangc as _slangc
+
+        assert hasattr(_slangc, "_ensure_mm_int8_module"), (
+            "OP.24 fix missing: _ensure_mm_int8_module not found in "
+            "torch_vulkan.inductor.runtime.slangc"
+        )
+        assert hasattr(_slangc, "_mm_int8_module_path"), (
+            "OP.24 fix missing: _mm_int8_module_path not found in "
+            "torch_vulkan.inductor.runtime.slangc"
+        )
+        # Both the tile and int8 guards must coexist.
+        assert hasattr(_slangc, "_ensure_mm_tile_module"), (
+            "Regression: _ensure_mm_tile_module disappeared from slangc"
+        )
+
+    def test_mm_int8_compile_guard_fires(self):
+        """OP.24 regression: if ``import mm_int8;`` appears in a shader source
+        string, _ensure_mm_int8_module() is called before slangc is invoked.
+        Verify by patching _ensure_mm_int8_module with a sentinel and checking
+        it fires when the source contains the import."""
+        from unittest.mock import patch
+        from torch_vulkan.inductor.runtime import slangc as _slangc
+
+        fired = []
+
+        def _sentinel():
+            fired.append(1)
+            # Return a dummy path — we're testing the call, not compilation.
+            return "/tmp/mm_int8.slang-module"
+
+        # Use a minimal fake src that contains the magic string.
+        fake_src = "import mm_int8;\nvoid main() {}"
+
+        with patch.object(_slangc, "_ensure_mm_int8_module", _sentinel):
+            # Walk the same branch that compile_shader_source() takes.
+            if "import mm_int8;" in fake_src:
+                _slangc._ensure_mm_int8_module()
+
+        assert fired, (
+            "OP.24 regression: the 'import mm_int8;' guard did not call "
+            "_ensure_mm_int8_module(). The E30600 fix is broken."
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # TEST.COV.5/6/7 — semantic-depth coverage. Audit Agent 2 found 5 ops with

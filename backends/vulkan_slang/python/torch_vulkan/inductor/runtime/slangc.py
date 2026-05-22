@@ -1045,6 +1045,31 @@ def _ensure_mm_tile_module() -> str:
     return mod_path
 
 
+def _mm_int8_module_path() -> str:
+    return os.path.join(_SHADER_LIB_MODULE_CACHE_DIR, "mm_int8.slang-module")
+
+
+def _ensure_mm_int8_module() -> str:
+    """Ensure mm_int8.slang-module is precompiled. Returns the module path.
+
+    OP.24 / M14: Mirrors ``_ensure_mm_tile_module``; the int8 kernel wrapper
+    uses ``import mm_int8;`` for link-time tile-size specialization, so the
+    precompiled module must be on the -I path before slangc is invoked.
+    Without this the import succeeds but slangc reports E30600 "not accessible"
+    because the module was compiled from a different directory context.
+    """
+    mod_path = _mm_int8_module_path()
+    if os.path.isfile(mod_path):
+        return mod_path
+    _ensure_shader_lib_modules()
+    if not os.path.isfile(mod_path):
+        raise RuntimeError(
+            "mm_int8.slang-module not found after precompilation. "
+            "Ensure shaders/lib/mm_int8.slang exists and slangc is available."
+        )
+    return mod_path
+
+
 def _extract_linktime_spec_constants(src: str) -> dict[str, int]:
     """Parse link-time specialization constants from a wrapper source.
 
@@ -1749,13 +1774,15 @@ def _compile_slang_to_spirv_inner(
         for ip in include_paths:
             cmd.extend(["-I", ip])
 
-        # P3.2 / M14: Ensure mm_tile module is precompiled for link-time
-        # specialization. The wrapper source already defines tile-size
-        # constants via "static const int" before "import mm_tile;", so
-        # Slang's linker resolves them without additional flags.
+        # P3.2 / M14: Ensure mm_tile / mm_int8 modules are precompiled for
+        # link-time specialization. The wrapper source already defines tile-size
+        # constants via "static const int" before the import, so Slang's linker
+        # resolves them without additional flags.
         # We just need the .slang-module to exist on the -I path.
         if "import mm_tile;" in src:
             _ensure_mm_tile_module()
+        if "import mm_int8;" in src:
+            _ensure_mm_int8_module()
 
         # DR.7: track whether precompiled modules were on the include path
         # so the optional re-compile pass mirrors the same include structure.
