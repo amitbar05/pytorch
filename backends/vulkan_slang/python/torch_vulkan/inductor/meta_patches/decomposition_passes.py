@@ -36,10 +36,13 @@ def _patch_decompositions() -> None:
 
     Shape-only backward decomps (``_softmax_bwd``, ``_log_softmax_bwd``,
     ``_avg_pool2d_bwd``, ``_max_pool_bwd``, ``_linear_bwd``,
-    ``_layer_norm_bwd``, ``_group_norm_bwd``, ``_batch_norm_bwd``) remain;
-    they hand out ``new_empty`` proxies so the partitioner sees a
-    storage-bound tensor (M18.3 — replaces the ``empty_like`` literal-zero
-    trap).
+    ``_layer_norm_bwd``) remain; they hand out ``new_empty`` proxies so the
+    partitioner sees a storage-bound tensor (M18.3 — replaces the
+    ``empty_like`` literal-zero trap).
+
+    ``_group_norm_bwd`` was removed in M-NEW.14 (2026-05-22).
+    ``_batch_norm_bwd`` was removed in M-NEW.15 (2026-05-22).
+    Both now route through dedicated Vulkan lowerings in ``bwd_lowerings.py``.
     """
     import torch
     from torch._decomp import decomposition_table
@@ -145,39 +148,8 @@ def _patch_decompositions() -> None:
         return gi, gw, gb
 
     # M-NEW.14 (2026-05-22): `_group_norm_bwd` shape-only proxy removed.
-    # See the comment on `aten.native_group_norm_backward.default` below
-    # for the rationale (buffer-aliasing fix routes the op through the
-    # native Vulkan lowering in `bwd_lowerings.py`).
-
-    def _batch_norm_bwd(
-        grad_out,
-        input,
-        weight,
-        running_mean,
-        running_var,
-        save_mean,
-        save_invstd,
-        train,
-        eps,
-        output_mask,
-    ):
-        C = input.shape[1]
-        gi = (
-            input.new_empty(input.shape)
-            if output_mask[0]
-            else input.new_empty((0,))
-        )
-        gw = (
-            grad_out.new_empty((C,))
-            if output_mask[1]
-            else grad_out.new_empty((0,))
-        )
-        gb = (
-            grad_out.new_empty((C,))
-            if output_mask[2]
-            else grad_out.new_empty((0,))
-        )
-        return gi, gw, gb
+    # M-NEW.15 (2026-05-22): `_batch_norm_bwd` shape-only proxy removed.
+    # Both ops now route through dedicated Vulkan lowerings in bwd_lowerings.py.
 
     # M-AG5.1 Tier-0/Tier-1 (2026-05-21): 9 activation-backward decomp
     # entries deleted (anti-goal #5). The decomp entries duplicated work
@@ -220,7 +192,11 @@ def _patch_decompositions() -> None:
         # Letting Inductor's native lowering at
         # ``bwd_lowerings.py::_register_group_norm_backward`` fire instead
         # eliminates the buffer-aliasing hazard described in that file.
-        aten.native_batch_norm_backward.default: _batch_norm_bwd,
+        # M-NEW.15 (2026-05-22): native_batch_norm_backward removed from the
+        # AOT decomp table (lowerings/__init__.py:_suppress_upstream_decomps
+        # now pops it explicitly). Keeping a shape-only proxy here competed
+        # with the dedicated Vulkan lowering in bwd_lowerings.py::
+        # _register_batch_norm_backward — same fix as M-NEW.14 for group_norm.
     }
     decomposition_table.update(replacements)
 

@@ -151,6 +151,11 @@ def _suppress_upstream_decomps() -> None:
     # Inductor's lowering layer sees the op (see `ops_to_suppress`
     # comment above for the buffer-aliasing rationale).
     _aot_decomps.pop(aten.native_group_norm_backward.default, None)
+    # M-NEW.15: same fix for native_batch_norm_backward — _patch_decompositions
+    # was adding a shape-only proxy (_batch_norm_bwd) to the AOT decomp table,
+    # causing AOTAutograd to decompose the op away before our Vulkan lowering
+    # in bwd_lowerings.py fires. Pop it here so Inductor sees the raw op.
+    _aot_decomps.pop(aten.native_batch_norm_backward.default, None)
 
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.
