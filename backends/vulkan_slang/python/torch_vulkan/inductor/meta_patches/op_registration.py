@@ -18,142 +18,40 @@ def _register_backward_meta_decomps() -> None:
     A meta decomposition fires first and just returns the correct shape,
     bypassing the device-mixing issue.
 
-    M15.2 audit (a): legitimate shape-inference patch. However, 10 of these
-    overlap with fake_impl entries in _OP_IMPLS (__init__.py). The fake_impl
-    is a dead fallback — if meta decomps are proven sufficient by test suite,
-    the overlapping fake_impl entries can be removed. See M15.2.a.
+    M18.7 (2026-05-22): Three-layer consolidation complete.
+    The 8 shape-only backward proxies that previously appeared here also had
+    entries in both _OP_IMPLS (fake_impl, __init__.py) and _patch_decompositions
+    (decomposition_table, decomposition_passes.py).  Per the M15.2 audit the
+    fake_impl entries in _OP_IMPLS fire first for FakeTensor shape inference,
+    making the meta decomps below redundant dead fallbacks for those ops.
+    The AOT-level shape proxies live solely in _patch_decompositions.
+
+    Removed (now covered by _OP_IMPLS fake_impl + _patch_decompositions):
+      _softmax_backward_data, _log_softmax_backward_data, avg_pool2d_backward,
+      max_pool2d_with_indices_backward, linear_backward,
+      native_layer_norm_backward, native_group_norm_backward,
+      native_batch_norm_backward.
+
+    Kept: ops where no _OP_IMPLS fake_impl entry exists and the meta decomp
+    is the only FakeTensor shape inference path:
+      gelu_backward, silu_backward, leaky_relu_backward, elu_backward,
+      upsample_nearest2d_backward, upsample_bilinear2d_backward.
     """
     try:
         from torch._decomp import register_decomposition
 
         aten = torch.ops.aten
 
-        # M18.3 (2026-05-18): torch.empty_like(t) → t.new_empty(t.shape).
-        # The proxy tracer (AOTAutograd joint trace) records ``empty_like(t)``
-        # as a shape-only op; the joint partitioner then drops the primal
-        # inputs and Inductor lowers the backward to ``alloc + zero-init``
-        # — literal-zero gradients at runtime. ``new_empty(shape)``
-        # materialises through the source tensor's factory, which the
-        # partitioner treats as storage-bound rather than shape-derived.
         def _bwd_meta_like_grad(grad_output, *_args, **_kwargs):
             return grad_output.new_empty(grad_output.shape)
-
-        def _bwd_meta_like_input(grad_output, input, *_args, **_kwargs):
-            return input.new_empty(input.shape)
-
-        def _layer_norm_bwd_meta(
-            grad_out,
-            input,
-            normalized_shape,
-            mean,
-            rstd,
-            weight=None,
-            bias=None,
-            output_mask=(True, True, True),
-        ):
-            gi = (
-                input.new_empty(input.shape)
-                if output_mask[0]
-                else input.new_empty((0,))
-            )
-            norm_size = 1
-            for s in normalized_shape:
-                norm_size *= s
-            gw = (
-                grad_out.new_empty((norm_size,))
-                if output_mask[1]
-                else grad_out.new_empty((0,))
-            )
-            gb = (
-                grad_out.new_empty((norm_size,))
-                if output_mask[2]
-                else grad_out.new_empty((0,))
-            )
-            return gi, gw, gb
-
-        def _group_norm_bwd_meta(
-            grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
-        ):
-            gi = (
-                input.new_empty(input.shape)
-                if output_mask[0]
-                else input.new_empty((0,))
-            )
-            gw = (
-                grad_out.new_empty((int(C),))
-                if output_mask[1]
-                else grad_out.new_empty((0,))
-            )
-            gb = (
-                grad_out.new_empty((int(C),))
-                if output_mask[2]
-                else grad_out.new_empty((0,))
-            )
-            return gi, gw, gb
-
-        def _batch_norm_bwd_meta(
-            grad_out,
-            input,
-            weight,
-            running_mean,
-            running_var,
-            save_mean,
-            save_invstd,
-            train,
-            eps,
-            output_mask,
-        ):
-            gi = (
-                input.new_empty(input.shape)
-                if output_mask[0]
-                else input.new_empty((0,))
-            )
-            C = input.shape[1]
-            gw = (
-                grad_out.new_empty((C,))
-                if output_mask[1]
-                else grad_out.new_empty((0,))
-            )
-            gb = (
-                grad_out.new_empty((C,))
-                if output_mask[2]
-                else grad_out.new_empty((0,))
-            )
-            return gi, gw, gb
-
-        def _linear_bwd_meta(input, grad_output, weight, output_mask):
-            gi = (
-                input.new_empty(input.shape)
-                if output_mask[0]
-                else input.new_empty((0,))
-            )
-            gw = (
-                weight.new_empty(weight.shape)
-                if output_mask[1]
-                else weight.new_empty((0,))
-            )
-            gb = (
-                grad_output.new_empty((weight.size(0),))
-                if output_mask[2]
-                else grad_output.new_empty((0,))
-            )
-            return gi, gw, gb
 
         for op, fn in [
             (aten.gelu_backward.default, _bwd_meta_like_grad),
             (aten.silu_backward.default, _bwd_meta_like_grad),
             (aten.leaky_relu_backward.default, _bwd_meta_like_grad),
             (aten.elu_backward.default, _bwd_meta_like_grad),
-            (aten._softmax_backward_data.default, _bwd_meta_like_grad),
-            (aten._log_softmax_backward_data.default, _bwd_meta_like_grad),
-            (aten.avg_pool2d_backward.default, _bwd_meta_like_input),
-            (aten.max_pool2d_with_indices_backward.default, _bwd_meta_like_input),
             (aten.upsample_nearest2d_backward.vec, _bwd_meta_like_grad),
             (aten.upsample_bilinear2d_backward.vec, _bwd_meta_like_grad),
-            (aten.native_layer_norm_backward.default, _layer_norm_bwd_meta),
-            (aten.native_group_norm_backward.default, _group_norm_bwd_meta),
-            (aten.native_batch_norm_backward.default, _batch_norm_bwd_meta),
-            (aten.linear_backward.default, _linear_bwd_meta),
         ]:
             try:
                 register_decomposition(op, type="meta")(fn)

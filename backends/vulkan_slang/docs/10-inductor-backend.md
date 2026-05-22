@@ -355,15 +355,17 @@ Regression gate:
 ``relu+linear+sum`` repro that forces the partitioner to save a
 bool mask as a backward graph input).
 
-**M-NEW.14 📋 OPEN 2026-05-22** — `TestSmallCNNTrain::test_grad_parity`
-/ `test_10step_no_nan` / `test_forward_backward` still fail with
-`Non-finite grad for conv1.weight`.  M-NEW.13's bool-buffer fix is
-NECESSARY but not SUFFICIENT — the SmallCNN two-block backward path
-still produces NaN/Inf gradients in isolation, both in the `pytest`
-harness AND when run as `python agent_space/probe_nan_stage6.py`
-(no test-pollution).  The earlier closeout's "Stage 6 ✅ ALL grads
-finite" claim could not be reproduced; the regression test
-`TestM_NEW_13_NoNaNBackward` itself fails on a clean re-run.
+**M-NEW.14 ✅ CLOSED 2026-05-22** — Two-block SmallCNN backward NaN
+fixed.  Root cause: `native_group_norm_backward` was being decomposed by
+AOTAutograd into primitives that shared buffer-pool storage (the
+`reinterpret_tensor` aliasing at wrapper lines 930-931).  Fix: suppress
+`aten.native_group_norm_backward.default` from BOTH the Inductor
+decomposition table AND `torch._decomp.decomposition_table` so it reaches
+the registered Vulkan lowering opaque.  Also completely rewrote
+`_vulkan_native_group_norm_backward` in `bwd_lowerings.py` to use the
+correct 4D formula (unweighted `ds_g`/`db_g` reductions, gamma applied
+outside).  Gates: `TestM_NEW_14_TwoBlockSmallCNNBackward` (2 tests, PASS).
+Commit: `a6b40f6c6b8`.
 
 **Bisection** (`agent_space/probe_nan_backward.py`):
 
@@ -804,11 +806,11 @@ in-tree blockers (M22.8–11). Agent owners:
 |---|-------|--------|----------|
 | **M18.1** | `vk_wg_reduce_{any,xor,xor_2d,argmax,argmin}` undefined → 5 ops fail compile | ✅ FIXED 2026-05-18 (Slang-Lib agent) | Defined in `shaders/lib/reduction.slang:488-693`; tests `TestM181WgReduceHelpers` (4 pass, 2 xfail on separate codegen guard at `kernel/reduction.py:69-75`); `TestM23LibModuleSanity::test_lib_module_no_undefined_symbols` (M23.1) compiles every lib standalone. |
 | **M18.2** | FunctionalTensor 3-copy drift in `fx_passes/eager/conv.py:528, 847` | in-flight (FX agent) | M17.8.d.2's helper extraction missed `_conv2d_relu_backward` and `_conv2d_gn_relu_backward`. Empirically Conv2d+ReLU `c.weight.grad` cpu_norm=30.59 vs vk_norm=12.67, L∞=9.78. Fix: extract `_has_real_vulkan_storage` to `fx_passes/eager/_common.py`; remove `@torch.compiler.disable`. |
-| **M18.3** | 8 backward decomps use `empty_like` → silent zero grads | in-flight (FX agent) | `meta_patches/decomposition_passes.py:88-209` for `_softmax_bwd`, `_log_softmax_bwd`, `_avg_pool2d_bwd`, `_max_pool_bwd`, `_linear_bwd`, `_layer_norm_bwd`, `_group_norm_bwd`, `_batch_norm_bwd`. Same M17.8.d.2 class. Fix: `t.new_empty(t.shape)`. |
+| **M18.3** | 8 backward decomps use `empty_like` → silent zero grads | ✅ **FIXED 2026-05-18** | All 8 `_*_bwd` shape proxies in `meta_patches/decomposition_passes.py` now use `new_empty(shape)` (see comment at line 71). M-NEW.14 further removed `_group_norm_bwd` from the AOT decomp table entirely (competing with Vulkan lowering); M-NEW.15 does the same for `_batch_norm_bwd`. |
 | **M18.4** | DTYPE_TO_SLANG element-size mismatch sweep | ✅ PARTIAL 2026-05-18 (Dtype-Matrix agent) | `overrides.py:51` audit found bool/int8/uint8/int16/bfloat16/complex32 all mis-sized; uint16/uint32/uint64 absent. **Landed**: uint16/32/64 mappings + 4-byte sign-extend bit-twiddles for narrow types as a stopgap. **Pending M18.4-followup-C**: enable `shaderInt8 + storageBuffer{8,16}BitAccess` in `csrc/vulkan/Context.cpp` and switch narrow Slang types to `uint8_t/int8_t/int16_t/uint16_t`. Tests: `TestDtypeMatrix` 7 pass + 3 xfail-strict (int8/uint8/int16). |
 | **M18.5** | Transformer 3D-matmul compile crash | ✅ FIXED 2026-05-18 (Matmul-3D agent) | `lowerings/matmul.py:274-317` — added `ndim1≥2 × ndim2==2` sympy-product fold mirroring upstream `should_fold`. Parity 3.815e-6 vs CPU. `TestM185Transformer3DMatmul` 4/4 pass. |
 | **M18.6** | DescriptorPool `FREE_DESCRIPTOR_SET_BIT` anti-pattern | ✅ FIXED 2026-05-18 (Validation agent) | `csrc/vulkan/DescriptorSet.cpp:21` — flag removed; matches CommandPool precedent. `TestM186DescriptorPool` added (validates via VUID absence assertion). |
-| **M18.7** | Three-layer shape-only proxy consolidation | open (deferred from FX agent) | `_OP_IMPLS` × `_register_backward_meta_decomps` × `_patch_decompositions` overlap for 8 backwards. Pick one, delete the others. |
+| **M18.7** | Three-layer shape-only proxy consolidation | ✅ **DONE 2026-05-22** | `_register_backward_meta_decomps` meta-decomp entries for 8 backward ops removed from `meta_patches/op_registration.py` (dead fallbacks per M15.2 audit — `_OP_IMPLS` fake_impl fires first for FakeTensor shape inference). AOT-level shape proxies remain in `_patch_decompositions`. Two layers remain (fake_impl + decomp_table) covering distinct concerns. |
 
 ### 0.6.2 M19 — Codegen completeness
 
@@ -859,8 +861,8 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M22.1.i** | Split `validate.py` 813 L → ≤500 L per module | ✅ **DONE 2026-05-21** (working tree). `validate.py` now 396 L, split into 3 sibling modules: `validate_types.py` (43 L — `SlangValidationIssue` dataclass; landing site to break import cycles), `validate_resource_limits.py` (141 L — `check_groupshared_budget` + `check_numthreads_product`), `validate_identifiers.py` (344 L — `check_undefined_identifiers` + `_SLANG_RESERVED`). Public API unchanged (`validate_slang_source`, `SlangValidator`, `_SLANG_RESERVED`, `SlangValidationIssue` re-exported from `validate.py`'s `__all__`). |
 | **M22.2** | `alloc_alias.py` IR-level migration (280 L regex post-processor) | open |
 | **M22.3** | Pre-grad pattern firing-rate instrumentation | open |
-| **M22.4** | Delete dead `_replace_sdpa_with_custom_op` (160 L) | open |
-| **M22.5** | Suppress 9 dead-code lowerings (addcmul, addcdiv, index_add, index_copy, norm.ScalarOpt_dim, permute, pow.Scalar, rot90, unfold) | open |
+| **M22.4** | Delete dead `_replace_sdpa_with_custom_op` (160 L) | ✅ **DONE 2026-05-18** | Function deleted from `fx_passes/post_grad.py`; comment at deletion site records M22.4. |
+| **M22.5** | Suppress 9 dead-code lowerings (addcmul, addcdiv, index_add, index_copy, norm.ScalarOpt_dim, permute, pow.Scalar, rot90, unfold) | ✅ **VERIFIED 2026-05-22 — no suppression needed** | All 9 ops audited and confirmed live: addcmul/addcdiv (optimizer + lerp), index_add/index_copy (scatter family, guarded by _is_vulkan), norm.ScalarOpt_dim (proxies linalg_vector_norm, _is_vulkan guard), permute (conv_transpose, SDPA, einsum), pow.Scalar (RoPE), rot90 (M19.R correctness fix), unfold (OP.3 view). Roadmap description was inaccurate when filed. |
 | **M22.6** | Split `bwd_lowerings.py` (805 L) | (= M22.1.e) |
 | **M22.7** | Sparse-tensor stub `TORCH_CHECK(false)` upgrade | open |
 
