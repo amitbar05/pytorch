@@ -49,11 +49,22 @@ class CallKernelMixin:
             if outer not in self.args.inplace_buffers
             and outer not in self.removed_buffers
         )
-        ordered_args.extend(
-            outer
-            for outer, inner in self.args.inplace_buffers.items()
-            if isinstance(inner, InplacedBuffer)
-        )
+        # Deduplicate by inner_name: when a buffer is aliased via
+        # reinterpret_tensor (e.g. buf2 → buf5), both the pre- and
+        # post-alias outer names appear as separate entries in
+        # inplace_buffers, all pointing to the same inner_name.  After
+        # alias resolution both collapse to the live name (buf5) and the
+        # duplicate gets the WRONG buffer into the next descriptor slot.
+        # Mirror header.py's seen_inout guard: pick the last other_name
+        # (the most-recent live outer name after aliasing) per inner.
+        _seen_inout: set[str] = set()
+        for outer, inner in self.args.inplace_buffers.items():
+            if not isinstance(inner, InplacedBuffer):
+                continue
+            if inner.inner_name in _seen_inout:
+                continue
+            _seen_inout.add(inner.inner_name)
+            ordered_args.append(inner.other_names[-1])
 
         # Substitute buffer aliases (the Inductor memory planner may alias
         # buffers via ``buf1 = reinterpret_tensor(div); del div`` before

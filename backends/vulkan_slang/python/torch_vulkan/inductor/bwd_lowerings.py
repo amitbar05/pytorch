@@ -481,18 +481,12 @@ def _register_group_norm_backward() -> None:
             L.lowerings[aten.sub.Tensor](in_4d, mean_4d), rstd_4d
         )
 
-        # PyTorch GroupNorm backward: gamma is applied OUTSIDE the reductions.
-        # ds_g[n,g] = sum_{c,h}(dy * xhat),  db_g[n,g] = sum_{c,h}(dy)
-        # Chain two single-dim reductions: HxW (dim 3) then cpg (dim 2).
-        dy_xhat = L.lowerings[aten.mul.Tensor](go_4d, xhat_4d)
-        ds_g = L.lowerings[aten.sum.dim_IntList](
-            L.lowerings[aten.sum.dim_IntList](dy_xhat, [3], keepdims=False),
-            [2], keepdims=False,
-        )  # [N, group]
-        db_g = L.lowerings[aten.sum.dim_IntList](
-            L.lowerings[aten.sum.dim_IntList](go_4d, [3], keepdims=False),
-            [2], keepdims=False,
-        )  # [N, group]
+        def _sum2(t, d0, d1):
+            """Reduce t over two dims sequentially (d0 first, then d1)."""
+            t = L.lowerings[aten.sum.dim_IntList](t, [d0], keepdims=False)
+            # Removing dim d0 shifts all dims > d0 down by 1.
+            adj = d1 - 1 if d1 > d0 else d1
+            return L.lowerings[aten.sum.dim_IntList](t, [adj], keepdims=False)
 
         def _zero_like_shape(shape):
             return L.lowerings[aten.full.default](
@@ -509,35 +503,50 @@ def _register_group_norm_backward() -> None:
             _zero_like_shape([C]),
         ]
 
+        # Correct PyTorch GroupNorm backward (matches ATen group_norm.cpp):
+        #   d_x_i = rstd * (gamma_i * dy_i
+        #             - (1/n) * sum_j(gamma_j * dy_j)
+        #             - xhat_i * (1/n) * sum_j(gamma_j * dy_j * xhat_j))
+        # where n = cpg * HxW.  gamma must be INSIDE the group-level sums;
+        # factoring it outside is only valid when cpg == 1.
+
+        # go_gamma = gamma * dy  (or just dy when gamma is None)
+        if gamma is not None:
+            gamma_4d = L.lowerings[aten.view.default](gamma, [1, group, cpg, 1])
+            go_gamma = L.lowerings[aten.mul.Tensor](go_4d, gamma_4d)
+        else:
+            go_gamma = go_4d
+
+        # dy * xhat — needed for d_gamma (no gamma factor)
+        dy_xhat = L.lowerings[aten.mul.Tensor](go_4d, xhat_4d)
+
         if output_mask[0]:
-            # d_input = (gamma * rstd) * (dy - s*db_g - xhat * s*ds_g)
+            # group sums with gamma inside
+            go_gamma_xhat = L.lowerings[aten.mul.Tensor](go_gamma, xhat_4d)
+            # ds_g[n,g] = sum_{cpg,HxW}(gamma * dy * xhat)
+            ds_g = _sum2(go_gamma_xhat, 3, 2)  # [N, group]
+            # db_g[n,g] = sum_{cpg,HxW}(gamma * dy)
+            db_g = _sum2(go_gamma, 3, 2)  # [N, group]
             ds_g_4d = L.lowerings[aten.view.default](ds_g, [N, group, 1, 1])
             db_g_4d = L.lowerings[aten.view.default](db_g, [N, group, 1, 1])
-            if gamma is not None:
-                gamma_4d = L.lowerings[aten.view.default](gamma, [1, group, cpg, 1])
-                c1_4d = L.lowerings[aten.mul.Tensor](rstd_4d, gamma_4d)
-            else:
-                c1_4d = rstd_4d
             db_term = L.lowerings[aten.mul.Scalar](db_g_4d, s)
             ds_term = L.lowerings[aten.mul.Scalar](ds_g_4d, s)
             xhat_ds = L.lowerings[aten.mul.Tensor](xhat_4d, ds_term)
-            correction = L.lowerings[aten.sub.Tensor](go_4d, db_term)
+            correction = L.lowerings[aten.sub.Tensor](go_gamma, db_term)
             correction = L.lowerings[aten.sub.Tensor](correction, xhat_ds)
-            d_input_4d = L.lowerings[aten.mul.Tensor](c1_4d, correction)
+            d_input_4d = L.lowerings[aten.mul.Tensor](rstd_4d, correction)
             outputs[0] = L.lowerings[aten.view.default](
                 d_input_4d, list(inp.get_size())
             )
 
         if output_mask[1]:
-            # d_gamma_c = sum_{N,H}(dy_c * xhat_c)
-            tmp = L.lowerings[aten.sum.dim_IntList](dy_xhat, [3], keepdims=False)
-            tmp = L.lowerings[aten.sum.dim_IntList](tmp, [0], keepdims=False)
+            # d_gamma_c = sum_{N,HxW}(dy_c * xhat_c)  — no gamma factor
+            tmp = _sum2(dy_xhat, 3, 0)  # sum HxW then N: [group, cpg]
             outputs[1] = L.lowerings[aten.view.default](tmp, [C])
 
         if output_mask[2]:
-            # d_bias_c = sum_{N,H}(dy_c)
-            tmp = L.lowerings[aten.sum.dim_IntList](go_4d, [3], keepdims=False)
-            tmp = L.lowerings[aten.sum.dim_IntList](tmp, [0], keepdims=False)
+            # d_bias_c = sum_{N,HxW}(dy_c)  — no gamma factor
+            tmp = _sum2(go_4d, 3, 0)  # sum HxW then N: [group, cpg]
             outputs[2] = L.lowerings[aten.view.default](tmp, [C])
 
         return outputs

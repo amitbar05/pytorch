@@ -765,7 +765,12 @@ def precompile_shader_libs(
             mod_path[: -len(".slang-module")]
             + f".tmp.{os.getpid()}.{threading.get_ident()}.slang-module"
         )
-        argv = [_get_slangc(), src_path, "-emit-ir", "-o", tmp_mod_path]
+        # M22.16-followup: slangc 2026.7.1 crashes in the thread-pool case
+        # when compiling helpers.slang (subgroup_ballot capability check).
+        # Apply -ignore-capabilities here too — the SPIR-V output is
+        # unaffected; we only suppress a static capability-availability
+        # check that the GPU satisfies at runtime anyway.
+        argv = [_get_slangc(), src_path, "-emit-ir", "-o", tmp_mod_path, "-ignore-capabilities"]
         try:
             proc = subprocess.run(
                 argv,
