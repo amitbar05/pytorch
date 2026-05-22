@@ -7,22 +7,20 @@ Load and vec4 logic extracted to ``pointwise_load_mixin`` / ``pointwise_vec4_mix
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 import sympy
 import torch
 
+
 logger = logging.getLogger(__name__)
-from torch._inductor.codegen.common import (
-    CSEVariable,
-    DeferredLine,
-    IndentedBuffer,
-)
+from torch._inductor.codegen.common import CSEVariable, DeferredLine, IndentedBuffer
 from torch._inductor.virtualized import V
 
 from .pointwise_load_mixin import PointwiseLoadMixin
 from .pointwise_vec4_mixin import PointwiseVec4Mixin
 from .symbolic import is_dynamic, is_dynamic_stride
+
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import StoreMode
@@ -411,7 +409,6 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         5. Not packed16 (packed16 has its own vectorization path).
         6. Not in persistent mode (persistent already does grid-stride).
         """
-        from .. import config
 
         if tile_size < 2 or tile_size > 4:
             return False
@@ -450,7 +447,7 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
 
         return True
 
-    def _apply_register_tile(self, body_str: str, tile_size: int) -> Optional[str]:
+    def _apply_register_tile(self, body_str: str, tile_size: int) -> str | None:
         """Rewrite the scalar pointwise body for register tiling.
 
         Wraps the body in ``[unroll] for (uint _rt = 0u; _rt < T; ++_rt)``
@@ -515,7 +512,7 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         """
         self._persistent_mode = True
 
-    def _emit_persistent_grid_stride_loop(self) -> Optional[str]:
+    def _emit_persistent_grid_stride_loop(self) -> str | None:
         """Emit a grid-stride loop wrapper for the pointwise body.
 
         When _persistent_mode is True, this wraps the compute body
@@ -691,7 +688,17 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
             and not self._packed16_load_only
         ):
             self._pw_uses_subbyte_packing = True
-            self._pw_has_wave_ops = True
+            # M19.4 (Gate C): only mark the kernel as wave-op-using when
+            # the packed16-vector-write rewrite is NOT going to elide
+            # this scalar-store path. When `_packed16_vw_active` is set,
+            # `_packed16_vw_rewrite` replaces the WaveReadLaneAt-based
+            # pack/unpack with a `_pvw_out_*[_k] = …` scratch store —
+            # so the wave-op never reaches the emitted shader.  Setting
+            # the flag unconditionally here used to cause circular
+            # rejection at `pointwise_vec4_mixin.py:199` (packed16 vec4
+            # path) for every f16 contiguous pointwise kernel.
+            if not getattr(self, "_packed16_vw_active", False):
+                self._pw_has_wave_ops = True
             self._packed16_bufs.add(var)
             suffix = "f16" if out_dtype == torch.float16 else "bf16"
             self.headers.add(f"packed16_{suffix}")

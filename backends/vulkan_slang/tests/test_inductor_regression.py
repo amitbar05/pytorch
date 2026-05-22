@@ -1380,8 +1380,8 @@ class TestM12ReductionBackward:
     def test_m12_registry_entries_present(self):
         """BWD_TEMPLATE_REGISTRY has CG.M3 reduction backward entries."""
         from torch_vulkan.inductor.bwd_template_registry import (
-            BWD_TEMPLATE_REGISTRY,
             BackwardKind,
+            BWD_TEMPLATE_REGISTRY,
         )
 
         expected = {
@@ -2603,9 +2603,9 @@ class TestCG12PointwiseGenericDispatch:
         """Unary generic source must declare a Slang generic, not a Jinja var."""
         from torch_vulkan.inductor.generic_dispatch_table import PointwiseEntry
         from torch_vulkan.inductor.generic_pointwise_dispatch import (
-            _UNARY_GENERIC_SRC,
             _entry_name,
             _generic_src,
+            _UNARY_GENERIC_SRC,
         )
 
         # The source must declare a Slang generic entry point.
@@ -3035,7 +3035,6 @@ class TestBlockerDBoolOrderingCompare:
 
     def _bool_expr(self, name: str):
         import torch as _torch
-
         from torch_vulkan.inductor.overrides import _SlangExpr
 
         return _SlangExpr(name, dtype=_torch.bool)
@@ -3075,7 +3074,6 @@ class TestBlockerDBoolOrderingCompare:
         """Float / int comparisons must NOT get a spurious uint cast —
         that would corrupt signed/float ordering."""
         import torch as _torch
-
         from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
 
         a = _SlangExpr("tmp3", dtype=_torch.float32)
@@ -3100,18 +3098,13 @@ class TestBlockerDBoolOrderingCompare:
 
     def test_mixed_bool_and_float_casts_only_bool(self):
         import torch as _torch
-
         from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
 
         a = self._bool_expr("flag")
         b = _SlangExpr("val", dtype=_torch.float32)
         out = VulkanOverrides.gt(a, b)
-        assert "(uint)(flag)" in out, (
-            f"bool side must be cast, got: {out!r}"
-        )
-        assert "(uint)(val)" not in out, (
-            f"float side must NOT be cast, got: {out!r}"
-        )
+        assert "(uint)(flag)" in out, f"bool side must be cast, got: {out!r}"
+        assert "(uint)(val)" not in out, f"float side must NOT be cast, got: {out!r}"
 
 
 class TestBlockerEPipelineLayoutSet0:
@@ -3136,9 +3129,7 @@ class TestBlockerEPipelineLayoutSet0:
         """
         import re
 
-        from torch_vulkan.inductor.templates.caller.gemm.render import (
-            _render_mm_slang,
-        )
+        from torch_vulkan.inductor.templates.caller.gemm.render import _render_mm_slang
 
         src = _render_mm_slang(
             tile_m=64,
@@ -3236,9 +3227,7 @@ class TestBlockerEPipelineLayoutSet0:
             / "header.py"
         )
         text = header_py.read_text()
-        assert (
-            '[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;' in text
-        ), (
+        assert "[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;" in text, (
             "kernel/header.py must emit `[[vk::binding(0, 0)]] "
             "ParameterBlock<KernelArgs> args;` — Blocker E pin."
         )
@@ -3249,9 +3238,7 @@ class TestBlockerEPipelineLayoutSet0:
         # Find every `[[vk::binding({slot}...)]]` literal in the source
         # (these are the codegen emit f-strings).  Each must include
         # `, 0` somewhere before the closing paren.
-        emit_calls = re.findall(
-            r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text
-        )
+        emit_calls = re.findall(r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text)
         bad = [c for c in emit_calls if ", 0)" not in c]
         assert not bad, (
             f"kernel/header.py legacy-branch binding emits missing `, 0` "
@@ -3270,17 +3257,13 @@ class TestBlockerEPipelineLayoutSet0:
             / "vulkan_combo_kernel.py"
         )
         text = ck_py.read_text()
-        assert (
-            '[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;' in text
-        ), (
+        assert "[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;" in text, (
             "vulkan_combo_kernel.py must emit "
             "`[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;`."
         )
         import re
 
-        emit_calls = re.findall(
-            r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text
-        )
+        emit_calls = re.findall(r'f"\[\[vk::binding\(\{slot[^"]*?\)\]\][^"]*"', text)
         bad = [c for c in emit_calls if ", 0)" not in c]
         assert not bad, (
             f"vulkan_combo_kernel.py legacy-branch binding emits missing "
@@ -3297,9 +3280,7 @@ class TestBlockerEPipelineLayoutSet0:
         from pathlib import Path
 
         templates_dir = (
-            Path(__import__("torch_vulkan").__file__).parent
-            / "inductor"
-            / "templates"
+            Path(__import__("torch_vulkan").__file__).parent / "inductor" / "templates"
         )
         for name in ("slang_mm.py.jinja", "slang_mm_bwd.py.jinja"):
             path = templates_dir / name
@@ -3361,12 +3342,9 @@ class TestBlockerFDescriptorPoolReset:
         ``flush_async() → reset_async(fence)`` path fires repeatedly —
         which is exactly where the race lived.
         """
-        import torch_vulkan
         from torch_vulkan import _C as _C_ext
 
-        if not hasattr(
-            _C_ext, "_descriptor_pool_reset_validation_errors"
-        ):
+        if not hasattr(_C_ext, "_descriptor_pool_reset_validation_errors"):
             pytest.skip(
                 "C++ pybind ``_descriptor_pool_reset_validation_errors"
                 "`` missing — backend has not been rebuilt with the "
@@ -3408,7 +3386,6 @@ class TestBlockerFDescriptorPoolReset:
         unbounded amount the queue is growing without bound — a
         latent correctness risk even when VUID-00313 isn't tripped.
         """
-        import torch_vulkan
         from torch_vulkan import _C as _C_ext
 
         if not hasattr(_C_ext, "_descriptor_pool_async_reset_requests"):
@@ -7203,8 +7180,8 @@ class TestT55TokenRenaming:
         ``VulkanComboKernel`` produces the same result as ``_rewrite_body``
         with an empty name map."""
         from torch_vulkan.inductor.vulkan_combo_kernel import (
-            VulkanComboKernel,
             _rewrite_body,
+            VulkanComboKernel,
         )
 
         combo = VulkanComboKernel()
@@ -7259,9 +7236,7 @@ class TestK2TypeKeywords:
         future desync when a new dtype is added to one map but forgotten in
         the rewriter.
         """
-        from torch_vulkan.inductor.combo_kernel.body_rewriter import (
-            _TYPE_KEYWORDS,
-        )
+        from torch_vulkan.inductor.combo_kernel.body_rewriter import _TYPE_KEYWORDS
 
         # Pull the canonical set of dtype-emitted Slang scalar / vector type
         # names.  We import lazily so the test still runs if either symbol
@@ -7336,9 +7311,7 @@ class TestK2TypeKeywords:
 
         # And the dynamic discovery, when available, must also be covered.
         # Filter to scalar identifiers (no templates / spaces).
-        dyn_expected = {
-            name for name in expected if name.isidentifier()
-        }
+        dyn_expected = {name for name in expected if name.isidentifier()}
         missing_dyn = dyn_expected - _TYPE_KEYWORDS
         assert not missing_dyn, (
             f"_TYPE_KEYWORDS desynced from DTYPE_TO_SLANG/_SLANG_RESERVED. "
@@ -11071,9 +11044,9 @@ class TestBufferPool:
         """M17.7: when LIFO reaches _LIFO_MAX, the oldest entry evicts to
         its per-class bucket."""
         from torch_vulkan.inductor.buffer_pool import (
-            _LIFO_MAX,
             _buckets,
             _lifo,
+            _LIFO_MAX,
             reset_pool,
             vulkan_pool_release,
         )
@@ -11928,6 +11901,131 @@ class TestVec4PointwiseF32:
                 assert "StructuredBuffer<float4> in_ptr1" not in s, (
                     "TRAIN.5 regression: broadcast buffer declared as float4\n" + s
                 )
+
+
+class TestM194Vec4WaveOpsOrdering:
+    """M19.4 — vec4 progressive-fallback ordering of `_pw_has_wave_ops`.
+
+    Before the fix, ``kernel/pointwise.py`` set ``self._pw_has_wave_ops =
+    True`` unconditionally inside the packed16 scalar-store path.  That
+    flag was later checked at ``kernel/pointwise_vec4_mixin.py`` and
+    rejected the packed16 vec4 rewrite, even though the vec4 rewrite
+    would have replaced the wave-op load/store with vector scratch
+    arrays — so the wave-op would never reach the emitted shader.
+    The audit (`agent_space/m19_4_vec4_audit.md`) called this a
+    self-inflicted circular rejection that knocked f16 contiguous
+    pointwise kernels out of the vec4 path.
+
+    After the fix the assignment is gated on ``_packed16_vw_active``;
+    when the packed16 vec4 path is going to fire, the wave-op flag is
+    not set, so the gate at ``pointwise_vec4_mixin.py:199`` admits the
+    rewrite.  These tests lock that ordering and verify both:
+
+    1. The packed16 vec4 codegen actually fires (``_pvw_in_*`` /
+       ``_pvw_out_*`` scratch arrays appear in the source).
+    2. The vectorized kernel produces results matching CPU.
+    """
+
+    @staticmethod
+    def _gather_slang_sources(fn, *args) -> list[str]:
+        """Compile ``fn(*args)`` on Vulkan and return every Slang source the
+        wrapper module embeds.
+
+        Uses ``run_and_get_code`` (the same approach as
+        ``agent_space/probe_vec4_coverage.py``) and scrapes Slang sources
+        out of the ``<name>_slang = '''<src>'''`` blocks Inductor emits
+        in the generated wrapper module.  More robust than the
+        ``compile_slang_to_spirv`` spy used elsewhere in this file: that
+        helper races with the on-disk SPIR-V cache under xdist
+        parallelism (the spy only fires on cold compiles).
+        """
+        from torch._inductor.utils import run_and_get_code
+
+        torch._dynamo.reset()
+        # Reset Inductor's compile cache so the wrapper code is regenerated.
+        rm_path = "/tmp/torchinductor_" + os.environ.get("USER", "amit")
+        os.system(f"rm -rf {rm_path} 2>/dev/null")
+
+        _, code_list = run_and_get_code(fn, *args)
+        sources: list[str] = []
+        for wrapper_src in code_list:
+            for m in re.finditer(r"_slang\s*=\s*'''(.*?)'''", wrapper_src, re.DOTALL):
+                sources.append(m.group(1))
+        return sources
+
+    def test_f16_add_emits_packed16_vec4(self):
+        """An f16 contiguous add with `numel % (wg*4) == 0` must emit
+        ``_pvw_in_*`` / ``_pvw_out_*`` scratch arrays — the marker of the
+        packed16 vec4 rewrite at ``pointwise_vec4_mixin.py:_packed16_vw_rewrite``.
+        """
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(a, b):
+            return a + b
+
+        # numel = 16384 → divisible by max_threadgroup_size * 4 on RDNA1.
+        a = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        b = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        sources = self._gather_slang_sources(fn, a, b)
+        assert any("_pvw_in_" in s and "_pvw_out_" in s for s in sources), (
+            "M19.4: packed16 vec4 rewrite did not fire on a 16384-elem f16 add. "
+            "Before the Gate-C ordering fix, the `_pw_has_wave_ops=True` flag "
+            "set in kernel/pointwise.py:694 would have caused a circular "
+            "rejection at pointwise_vec4_mixin.py:199.\nsources=\n"
+            + "\n---\n".join(sources)
+        )
+
+    def test_f16_relu_emits_packed16_vec4(self):
+        """Same gate, single-input unary op."""
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(a):
+            return torch.relu(a)
+
+        a = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        sources = self._gather_slang_sources(fn, a)
+        assert any("_pvw_in_" in s and "_pvw_out_" in s for s in sources), (
+            "M19.4: packed16 vec4 rewrite did not fire on a 16384-elem f16 relu.\n"
+            "sources=\n" + "\n---\n".join(sources)
+        )
+
+    def test_f16_add_correctness(self):
+        """The packed16 vec4 rewrite must produce results matching CPU.
+
+        Half-precision is lossy, so we use loose tolerances — the bug we
+        want to catch is a wrong-element / wrong-pack-order rewrite, not
+        f16 rounding noise.
+        """
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(a, b):
+            return a + b
+
+        a = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        b = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        out = fn(a, b)
+        torch.testing.assert_close(
+            out.cpu().float(),
+            (a.cpu().float() + b.cpu().float()),
+            rtol=5e-3,
+            atol=5e-3,
+        )
+
+    def test_f16_relu_correctness(self):
+        """Same correctness gate, unary op."""
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(a):
+            return torch.relu(a)
+
+        a = torch.randn(16384, device="vulkan:0", dtype=torch.float16)
+        out = fn(a)
+        torch.testing.assert_close(
+            out.cpu().float(),
+            torch.relu(a.cpu().float()),
+            rtol=5e-3,
+            atol=5e-3,
+        )
 
 
 class TestCumScanOps:
@@ -17773,9 +17871,9 @@ class TestCodegenEmitsImport:
             precompile_shader_libs,
         )
         from torch_vulkan.inductor.slang_helpers import (
-            HELPERS_MODULE_HEADERS,
             _reset_emit_helpers_cache,
             emit_helpers,
+            HELPERS_MODULE_HEADERS,
         )
 
         assert "digamma" in HELPERS_MODULE_HEADERS
@@ -19554,8 +19652,8 @@ class TestCodegenSmellRatchet:
 
     def test_locked_ceilings_match_measured_state(self):
         from torch_vulkan.inductor.codegen_audit import (
-            LOCKED_CEILINGS,
             codegen_smell_counts,
+            LOCKED_CEILINGS,
         )
 
         actual = codegen_smell_counts()
@@ -19641,8 +19739,8 @@ class TestComboKernelViaModuleImport:
 
     def test_combo_string_concat_under_locked_ceiling(self):
         from torch_vulkan.inductor.codegen_audit import (
-            LOCKED_CEILINGS,
             codegen_smell_counts,
+            LOCKED_CEILINGS,
         )
 
         actual = codegen_smell_counts()["combo_string_concat"]
@@ -20844,10 +20942,10 @@ class TestColdCompileTimeBudget:
             sys.path.insert(0, bench_dir)
         import inductor_train as it
         from torch_vulkan.inductor.runtime import (
-            _COMPILE_STATS,
-            _DISK_CACHE_DIR,
             _cache_by_hash,
             _cache_by_key,
+            _COMPILE_STATS,
+            _DISK_CACHE_DIR,
             precompile_shader_libs,
             reset_compile_stats,
         )
@@ -21659,10 +21757,10 @@ class TestCompileTimeNoColdOutlier:
             sys.path.insert(0, bench_dir)
         import inductor_train as it
         from torch_vulkan.inductor.runtime import (
-            _COMPILE_STATS,
-            _DISK_CACHE_DIR,
             _cache_by_hash,
             _cache_by_key,
+            _COMPILE_STATS,
+            _DISK_CACHE_DIR,
             precompile_shader_libs,
             reset_compile_stats,
         )
@@ -22278,7 +22376,7 @@ class TestFxTimePrewarmPass:
         # Build a small FX graph with two known ops; assert the
         # registry walk finds both and ``prewarm_submits`` increases.
         from torch_vulkan.inductor.fx_passes import prewarm_from_fx_graph
-        from torch_vulkan.inductor.runtime import _COMPILE_STATS, _cache_by_key
+        from torch_vulkan.inductor.runtime import _cache_by_key, _COMPILE_STATS
 
         # Drop any existing cached entries for the prewarm keys so the
         # submit count is deterministic.
@@ -24467,8 +24565,7 @@ class TestPermuteZeroCopyLowering:
         # permuted size + stride. We bypass the full FX → Inductor
         # pipeline so this test runs without a Slang cold compile.
         import torch_vulkan  # noqa: F401
-        from torch._inductor import ir
-        from torch._inductor import lowering as L
+        from torch._inductor import ir, lowering as L
         from torch._inductor.graph import GraphLowering
         from torch._inductor.ir import FixedLayout, TensorBox
         from torch._inductor.virtualized import V
@@ -24514,8 +24611,7 @@ class TestPermuteZeroCopyLowering:
         # Non-Vulkan tensors must keep the upstream ``PermuteView`` path
         # — our override should be device-gated.
         import torch_vulkan  # noqa: F401
-        from torch._inductor import ir
-        from torch._inductor import lowering as L
+        from torch._inductor import ir, lowering as L
         from torch._inductor.graph import GraphLowering
         from torch._inductor.ir import FixedLayout, TensorBox
         from torch._inductor.virtualized import V
@@ -27229,7 +27325,7 @@ class TestDR8CppWrapper:
             collect_aoti_spv_bundle,
             emit_aoti_spv_header,
         )
-        from torch_vulkan.inductor.runtime import _KERNEL_SPIRV_HASH, _disk_cache_write
+        from torch_vulkan.inductor.runtime import _disk_cache_write, _KERNEL_SPIRV_HASH
 
         # Seed the cache with a minimal test entry
         test_key = "_test_dr8_spv_bundle"
@@ -27292,8 +27388,8 @@ class TestCP12AOTITrainingStep:
         """Verify C++ wrapper + SPIR-V bundle infrastructure."""
         from torch._inductor.codegen.common import device_codegens
         from torch_vulkan.inductor.cpp_wrapper_gpu import (
-            VulkanCppWrapperGpu,
             collect_aoti_spv_bundle,
+            VulkanCppWrapperGpu,
         )
 
         dcg = device_codegens.get("vulkan")
@@ -28648,8 +28744,8 @@ class TestStepEndReleaseHook:
         containing a ``zero_.default`` op tagged as gradient lifetime."""
         import torch.fx as fx
         from torch_vulkan.inductor.lifetime import (
-            _LIFETIME_KEY,
             _install_zero_grad_release_hook,
+            _LIFETIME_KEY,
         )
 
         graph = fx.Graph()
@@ -30610,9 +30706,7 @@ class TestB5CLeakyReluBwdDiff:
                     f"upstream (Group G); slangc reported: {msg[:200]}"
                 )
             raise
-        torch.testing.assert_close(
-            grad_in.cpu(), ref_grad, rtol=1e-4, atol=1e-5
-        )
+        torch.testing.assert_close(grad_in.cpu(), ref_grad, rtol=1e-4, atol=1e-5)
 
     def test_dispatch_rejects_missing_negative_slope(self):
         from torch_vulkan.inductor.bwd_diff_dispatch import dispatch_unary_bwd
@@ -35810,8 +35904,8 @@ class TestCGM5MatmulBackward:
     def test_cgm5_bwd_template_registry_entries(self):
         """BWD_TEMPLATE_REGISTRY has CG.M5 entries for mm/bmm/addmm."""
         from torch_vulkan.inductor.bwd_template_registry import (
-            BWD_TEMPLATE_REGISTRY,
             BackwardKind,
+            BWD_TEMPLATE_REGISTRY,
         )
 
         for key in ("mm_default", "bmm_default", "addmm_default"):
@@ -35971,8 +36065,8 @@ class TestCGM5MatmulBackward:
 
     def test_cgm5_bwd_template_registry_entries(self):
         from torch_vulkan.inductor.bwd_template_registry import (
-            BWD_TEMPLATE_REGISTRY,
             BackwardKind,
+            BWD_TEMPLATE_REGISTRY,
         )
 
         for key in ("mm_default", "bmm_default", "addmm_default"):
@@ -38557,7 +38651,6 @@ class TestM193ReductionBoundaryFusion:
         from unittest.mock import MagicMock
 
         import sympy
-
         from torch_vulkan.inductor.scheduling import VulkanScheduling
 
         # ``node1`` produces a buffer ``buf0`` that has two consumers:
@@ -38614,7 +38707,6 @@ class TestM193ReductionBoundaryFusion:
         from unittest.mock import MagicMock
 
         import sympy
-
         from torch_vulkan.inductor.scheduling import VulkanScheduling
 
         node1 = MagicMock()
@@ -40116,8 +40208,8 @@ class TestMPipeline1ConvLoweringReachable:
         ``_REGISTER_DONE`` guard short-circuits the work and the op
         identity in ``torch.ops.torch_vulkan`` stays stable.
         """
-        from torch_vulkan.inductor.fx_passes import eager as _eager
         from torch_vulkan.inductor.fx_passes import (
+            eager as _eager,
             register_eager_patch_custom_ops,
         )
 
@@ -40258,11 +40350,11 @@ class TestMPipeline1FollowupConvPackInt:
             f"expected 31 uint fields, got {len(common_fields)}"
         )
 
-        pc = struct.pack("31IfII", *common_fields, float(1e-5), int(1), 0)
+        pc = struct.pack("31IfII", *common_fields, 1e-5, 1, 0)
         assert len(pc) == 31 * 4 + 4 + 4 + 4, f"expected 136 bytes, got {len(pc)}"
 
         # No-bias variant uses the same format with stride_bias=0.
-        pc_no_bias = struct.pack("31IfII", *common_fields, float(1e-5), 0, 0)
+        pc_no_bias = struct.pack("31IfII", *common_fields, 1e-5, 0, 0)
         assert len(pc_no_bias) == 136
 
         # Round-trip the float eps to confirm it isn't truncated.
@@ -40532,9 +40624,7 @@ class TestM188bDynamoSubgraphSplit:
         # no-op during the Dynamo trace below.  Registering a custom_op
         # inside a Dynamo-traced frame is unsupported and causes a
         # graph break / "Unsupported" error.
-        from torch_vulkan.inductor.fx_passes import (
-            register_eager_patch_custom_ops,
-        )
+        from torch_vulkan.inductor.fx_passes import register_eager_patch_custom_ops
 
         register_eager_patch_custom_ops()
 
@@ -41528,8 +41618,8 @@ class TestM23LibModuleSanity:
         import subprocess
 
         from torch_vulkan.inductor.runtime.slangc import (
-            _SHADERS_LIB_DIR,
             _get_slangc,
+            _SHADERS_LIB_DIR,
             _slangc_available,
         )
 
@@ -42097,10 +42187,7 @@ class TestM204WaveIntrinsicCoverage:
 
     @staticmethod
     def _resolve_slangc() -> str:
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -42277,10 +42364,7 @@ class TestM203SpecConstCompilation:
 
     @staticmethod
     def _resolve_slangc() -> str:
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -42766,10 +42850,7 @@ class TestM201RNNCellAutodiff:
 
     @staticmethod
     def _resolve_slangc() -> str:
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -43047,9 +43128,7 @@ class TestM201RNNCellAutodiff:
         _rnn_caller._rnn_cell_bwd_cache.clear()
         torch._dynamo.reset()
 
-        from torch_vulkan.inductor.templates.caller.rnn import (
-            _SlangTileRNNBackward,
-        )
+        from torch_vulkan.inductor.templates.caller.rnn import _SlangTileRNNBackward
 
         is_lstm = cell_type == "lstm"
         # hidden_size must be a multiple of the wave size (64) — the
@@ -43268,9 +43347,7 @@ class TestM201CBatchSafeRNNBackward:
         _rnn_caller._rnn_cell_bwd_cache.clear()
         torch._dynamo.reset()
 
-        from torch_vulkan.inductor.templates.caller.rnn import (
-            _SlangTileRNNBackward,
-        )
+        from torch_vulkan.inductor.templates.caller.rnn import _SlangTileRNNBackward
 
         is_lstm = cell_type == "lstm"
         hidden_size = 64
@@ -43800,10 +43877,7 @@ class TestM2213MmTransposeA:
         import subprocess
         import tempfile
 
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -43936,10 +44010,7 @@ class TestM2213MmTransposeA:
         import subprocess
         import tempfile
 
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -44225,7 +44296,7 @@ class TestM195DynamicShapeConv:
         except (
             torch._inductor.exc.InductorError,
             AssertionError,
-        ) as e:
+        ):
             tb = traceback.format_exc()
             if "significant_strides_equal" in tb or "require_exact_strides" in tb:
                 pytest.skip(
@@ -44268,7 +44339,7 @@ class TestM195DynamicShapeConv:
         except (
             torch._inductor.exc.InductorError,
             AssertionError,
-        ) as e:
+        ):
             tb = traceback.format_exc()
             if "significant_strides_equal" in tb or "require_exact_strides" in tb:
                 pytest.skip(
@@ -44395,10 +44466,7 @@ class TestM202MmParameterBlockRestore:
 
     @staticmethod
     def _resolve_slangc() -> str:
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -44734,10 +44802,7 @@ class TestM206SubgroupSizeSpecConst:
         import subprocess
         import tempfile
 
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -44776,10 +44841,7 @@ class TestM206SubgroupSizeSpecConst:
         import subprocess
         import tempfile
 
-        from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
-            _slangc_available,
-        )
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
 
         if not _slangc_available():
             pytest.skip("slangc not available")
@@ -44998,7 +45060,6 @@ class TestM2216SlangcConcurrency:
         synthesised slangc-failure, no half-written ``.slang-module``
         file exists in the module cache directory.
         """
-        import subprocess
 
         from torch_vulkan.inductor.runtime import slangc as _s
 
@@ -45212,7 +45273,6 @@ class TestM213PostM22_16Sweep:
     @pytest.mark.timeout(180)
     def test_canary_zero_vuids_post_m22_16(self):
         from torch_vulkan.inductor.runtime.validation_codegen import (
-            VUID_RE,
             find_icd_filename,
             layer_installed,
             run_with_validation,
@@ -45426,9 +45486,7 @@ class TestM2130_1PipelineLayoutSet0:
 
         import jinja2
         from torch_vulkan.inductor.runtime.slangc import _get_slangc
-        from torch_vulkan.inductor.vulkan_template import (
-            _load_slang_template,
-        )
+        from torch_vulkan.inductor.vulkan_template import _load_slang_template
 
         slangc = _get_slangc()
         if slangc == "slangc":
@@ -45845,9 +45903,7 @@ class TestMNew3RegisterTileWaveAlignment:
             _get_device_subgroup_size,
             _pick_register_tile_configs,
         )
-        from torch_vulkan.inductor.vulkan_template import (
-            _MM_REGISTER_TILE_CONFIGS,
-        )
+        from torch_vulkan.inductor.vulkan_template import _MM_REGISTER_TILE_CONFIGS
 
         sgs = _get_device_subgroup_size()
         if sgs != 64:
@@ -46005,8 +46061,8 @@ class TestMNew3bInt8WaveAlignment:
             _get_device_subgroup_size,
         )
         from torch_vulkan.inductor.templates.caller.gemm.install import (
-            _INT8_TILE_CONFIGS,
             _int8_config_wg_threads,
+            _INT8_TILE_CONFIGS,
         )
 
         sgs = _get_device_subgroup_size()
@@ -46090,9 +46146,9 @@ class TestMNew3bInt8WaveAlignment:
             _get_device_subgroup_size,
         )
         from torch_vulkan.inductor.templates.caller.gemm.install import (
-            _INT8_TILE_CONFIGS,
             _filter_int8_configs_wave_aligned,
             _int8_config_wg_threads,
+            _INT8_TILE_CONFIGS,
         )
 
         sgs = _get_device_subgroup_size()
@@ -46492,7 +46548,6 @@ class TestCov4MmInt8:
         sister test below is the structural-invariant guarantee.
         """
         import os
-        import signal
 
         import torch
 
@@ -47206,8 +47261,7 @@ class TestCoverageStructuralInvariant:
         """Normalize ``torch.ops.aten.foo`` / ``torch.ops.torch_vulkan.foo``
         to ``aten.foo`` / ``torch_vulkan.foo``."""
         s = s.strip()
-        if s.startswith("torch.ops."):
-            s = s[len("torch.ops.") :]
+        s = s.removeprefix("torch.ops.")
         return s
 
     @classmethod
@@ -48350,9 +48404,9 @@ class TestM22_8MetaKernelsCleanup:
             f"strides — repeat the M22.8 cleanup audit."
         )
         assert not y.is_contiguous(), (
-            f"M22.8 regression: transpose meta output reports contiguous, "
-            f"which is the exact bug the deleted ``meta_transpose`` stub "
-            f"would have introduced."
+            "M22.8 regression: transpose meta output reports contiguous, "
+            "which is the exact bug the deleted ``meta_transpose`` stub "
+            "would have introduced."
         )
 
     def test_upstream_native_layer_norm_meta_returns_three_tuple(self):
@@ -49128,7 +49182,7 @@ class TestMCppNew6EagerReluChain:
         x_vk = x_cpu.to("vulkan:0")
         x_vk.relu_()
         assert torch.equal(x_vk.cpu(), expected), (
-            f"in-place relu_() single-call regression"
+            "in-place relu_() single-call regression"
         )
 
         # In-place twice.
@@ -49136,9 +49190,9 @@ class TestMCppNew6EagerReluChain:
         x_vk.relu_()
         x_vk.relu_()
         assert torch.equal(x_vk.cpu(), expected), (
-            f"in-place relu_() x2 regression — likely the "
-            f"`dispatch_copy_buffer` write inside `vulkan_relu_` is "
-            f"hitting the same descriptor-set-cache hazard."
+            "in-place relu_() x2 regression — likely the "
+            "`dispatch_copy_buffer` write inside `vulkan_relu_` is "
+            "hitting the same descriptor-set-cache hazard."
         )
 
     def test_eager_relu_then_other_op_chain(self):
@@ -49553,9 +49607,9 @@ class TestMPipeline3ConfigKeyComplete:
             inplace_buffers={"buf_inplace": object()},
         )
         assert self._config_key(k_oop) != self._config_key(k_ip), (
-            f"M-pipeline-3 regression: in-place vs out-of-place "
-            f"kernels share a config_key. The `ip:<count>` field "
-            f"must differ."
+            "M-pipeline-3 regression: in-place vs out-of-place "
+            "kernels share a config_key. The `ip:<count>` field "
+            "must differ."
         )
 
     def test_config_key_differs_for_parameter_block_flag(self):
@@ -49567,9 +49621,9 @@ class TestMPipeline3ConfigKeyComplete:
         k_flat = _MPipeline3MockKernel(use_parameter_block=False)
         k_pb = _MPipeline3MockKernel(use_parameter_block=True)
         assert self._config_key(k_flat) != self._config_key(k_pb), (
-            f"M-pipeline-3 regression: parameter_block ON vs OFF "
-            f"share a config_key. The `pb:0` vs `pb:1` field must "
-            f"differ."
+            "M-pipeline-3 regression: parameter_block ON vs OFF "
+            "share a config_key. The `pb:0` vs `pb:1` field must "
+            "differ."
         )
 
     def test_config_key_stable_for_same_kernel(self):
@@ -49699,9 +49753,9 @@ class TestMPipeline7ComboCacheKey:
         key_c = self._key(("cfg2_aaa", "cfg2_bbb"))
         key_d = self._key(("cfg2_aaa", "cfg2_xxx"))
         assert key_c != key_d, (
-            f"M-pipeline-7 regression: combos with partial sub-kernel "
-            f"overlap still mapped to the same cache slot. The hash "
-            f"must be sensitive to ALL sub-keys, not just the first."
+            "M-pipeline-7 regression: combos with partial sub-kernel "
+            "overlap still mapped to the same cache slot. The hash "
+            "must be sensitive to ALL sub-keys, not just the first."
         )
 
     def test_combo_config_key_same_for_same_subkernel_set(self):
@@ -49875,9 +49929,7 @@ class TestMPipeline2OpOverloadIdentitySafe:
         Python identity, so registering under one OpOverload-like
         object and looking up by a string-equivalent finds the entry.
         """
-        from torch_vulkan.inductor.lowerings._conv_common import (
-            get_lowering_by_name,
-        )
+        from torch_vulkan.inductor.lowerings._conv_common import get_lowering_by_name
 
         class _FakeOp:
             """Stand-in for ``OpOverload`` — only the ``__str__`` is
@@ -49905,9 +49957,7 @@ class TestMPipeline2OpOverloadIdentitySafe:
     def test_get_lowering_by_name_returns_none_for_missing(self):
         """Non-existent target → ``None`` (caller falls through to
         ``NotImplemented``)."""
-        from torch_vulkan.inductor.lowerings._conv_common import (
-            get_lowering_by_name,
-        )
+        from torch_vulkan.inductor.lowerings._conv_common import get_lowering_by_name
 
         assert get_lowering_by_name({}, "aten.missing.default") is None, (
             "missing target should return None, not raise KeyError"
@@ -49933,9 +49983,7 @@ class TestMPipeline2OpOverloadIdentitySafe:
         Simulates the
         ``register_eager_patch_custom_ops()``-re-binding scenario.
         """
-        from torch_vulkan.inductor.lowerings._conv_common import (
-            get_lowering_by_name,
-        )
+        from torch_vulkan.inductor.lowerings._conv_common import get_lowering_by_name
 
         class _FakeOp:
             def __init__(self, s):
@@ -50443,10 +50491,10 @@ class TestMPipeline5MaxBindingsPerCall:
                 offenders.append((label, line_no, src[m.start() : m.end()]))
 
         assert not offenders, (
-            f"M-pipeline-5 regression: `static const` capture-at-first-"
-            f"use in `dispatch.cpp`. Use a per-call `const` instead "
-            f"(see the M-pipeline-5 explainer at the kUseDescCache "
-            f"declaration). Offenders:\n"
+            "M-pipeline-5 regression: `static const` capture-at-first-"
+            "use in `dispatch.cpp`. Use a per-call `const` instead "
+            "(see the M-pipeline-5 explainer at the kUseDescCache "
+            "declaration). Offenders:\n"
             + "\n".join(f"  L{ln}: {label}: {body}" for label, ln, body in offenders)
         )
 
@@ -50468,11 +50516,11 @@ class TestMPipeline5MaxBindingsPerCall:
             src,
         )
         assert len(matches) >= 1, (
-            f"M-pipeline-5 regression: no `constexpr uint32_t "
-            f"MAX_BINDINGS_CAP = 256;` declaration found in "
-            f"dispatch.cpp. Either the constant was renamed (update "
-            f"this test) or downgraded to `const` (re-introduces the "
-            f"VLA-style GCC extension dependence)."
+            "M-pipeline-5 regression: no `constexpr uint32_t "
+            "MAX_BINDINGS_CAP = 256;` declaration found in "
+            "dispatch.cpp. Either the constant was renamed (update "
+            "this test) or downgraded to `const` (re-introduces the "
+            "VLA-style GCC extension dependence)."
         )
 
     def test_dispatch_cpp_documents_m_pipeline_5_rationale(self):
@@ -51434,7 +51482,6 @@ class TestM229FollowupAllocatorMultiDevice:
         Catches a regression where someone reverts to the base
         ``allocate(nbytes)`` call.
         """
-        import re
 
         _, _, reg_path = self._paths()
         src = open(reg_path).read()
@@ -52383,18 +52430,25 @@ class TestBlockerGSlangMmPcLayout:
         from torch_vulkan.inductor.vulkan_template_caller import _render_mm_slang
 
         src = _render_mm_slang(
-            tile_m=8, tile_n=8, tile_k=8,
-            dtype_a="float", dtype_b="float", dtype_c="float",
-            dtype_acc="float", dtype_bias="float",
-            num_stages=1, has_bias=True,
-            m_per_thread=1, n_per_thread=1,
+            tile_m=8,
+            tile_n=8,
+            tile_k=8,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_acc="float",
+            dtype_bias="float",
+            num_stages=1,
+            has_bias=True,
+            m_per_thread=1,
+            n_per_thread=1,
         )
 
         for marker in (
-            "MM_FLAG_BIAS",       # flag constant always present
-            "pc.flags",           # runtime gate
-            "stride_a_b",         # batch stride field, ALWAYS present
-            "stride_bias_n",      # bias stride field, ALWAYS present
+            "MM_FLAG_BIAS",  # flag constant always present
+            "pc.flags",  # runtime gate
+            "stride_a_b",  # batch stride field, ALWAYS present
+            "stride_bias_n",  # bias stride field, ALWAYS present
             "alpha",
             "beta",
             "scale",
@@ -52545,12 +52599,15 @@ class TestM192PersistentPointwise:
         fake_kernels = [self._make_fake_kernel()]
         features = self._make_fake_features(numel=1024)
 
-        with mock.patch(
-            "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
-            return_value=fake_kernels,
-        ), mock.patch(
-            "torch_vulkan.inductor.config.persistent_pointwise",
-            return_value=False,
+        with (
+            mock.patch(
+                "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
+                return_value=fake_kernels,
+            ),
+            mock.patch(
+                "torch_vulkan.inductor.config.persistent_pointwise",
+                return_value=False,
+            ),
         ):
             sch.create_kernel_choices(features, [], {})
 
@@ -52596,8 +52653,7 @@ class TestM192PersistentPointwise:
         )
         assert "for (uint _pi = gtid.x;" in wrapped, (
             "M19.2 regression: persistent-mode body emitter did not "
-            "produce the `for (uint _pi = gtid.x;` loop marker.  Got:\n"
-            + wrapped
+            "produce the `for (uint _pi = gtid.x;` loop marker.  Got:\n" + wrapped
         )
         # ``gtid.x`` survives in the outer loop header (the
         # ``for (uint _pi = gtid.x; …)`` initialiser) but inside the
@@ -52607,8 +52663,7 @@ class TestM192PersistentPointwise:
         assert "= _pi;" in wrapped, (
             "M19.2 regression: gtid.x->_pi substitution missing — "
             "expected the body's ``uint xindex = gtid.x;`` line to be "
-            "rewritten to ``uint xindex = _pi;``.  Got:\n"
-            + wrapped
+            "rewritten to ``uint xindex = _pi;``.  Got:\n" + wrapped
         )
 
 
@@ -52633,8 +52688,8 @@ class TestM211cHardwareProbe:
         entry point.
         """
         from torch_vulkan.inductor.hardware_probe import (
-            LEVEL_QUICK,
             _resolve_auto_level,
+            LEVEL_QUICK,
         )
 
         assert _resolve_auto_level("auto") == LEVEL_QUICK
@@ -52665,9 +52720,11 @@ class TestM211cHardwareProbe:
         os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
         hp.reset_for_test()
         try:
-            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
-                 mock.patch.object(hp, "_run_level_1_sync") as m1, \
-                 mock.patch.object(hp, "_run_level_2_autotune") as m2:
+            with (
+                mock.patch.object(hp, "_run_level_0", return_value={}) as m0,
+                mock.patch.object(hp, "_run_level_1_sync") as m1,
+                mock.patch.object(hp, "_run_level_2_autotune") as m2,
+            ):
                 result = hp.profile_device(level=hp.LEVEL_QUICK, force=True)
         finally:
             os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
@@ -52687,13 +52744,15 @@ class TestM211cHardwareProbe:
         os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
         hp.reset_for_test()
         try:
-            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
-                 mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1, \
-                 mock.patch.object(
-                     hp,
-                     "_run_level_2_autotune",
-                     return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
-                 ) as m2:
+            with (
+                mock.patch.object(hp, "_run_level_0", return_value={}) as m0,
+                mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1,
+                mock.patch.object(
+                    hp,
+                    "_run_level_2_autotune",
+                    return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
+                ) as m2,
+            ):
                 result = hp.profile_device(level=hp.LEVEL_DEEP, force=True)
         finally:
             os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
@@ -52713,13 +52772,15 @@ class TestM211cHardwareProbe:
         os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
         hp.reset_for_test()
         try:
-            with mock.patch.object(hp, "_run_level_0", return_value={}) as m0, \
-                 mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1, \
-                 mock.patch.object(
-                     hp,
-                     "_run_level_2_autotune",
-                     return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
-                 ) as m2:
+            with (
+                mock.patch.object(hp, "_run_level_0", return_value={}) as m0,
+                mock.patch.object(hp, "_run_level_1_sync", return_value={}) as m1,
+                mock.patch.object(
+                    hp,
+                    "_run_level_2_autotune",
+                    return_value={"mm_shapes_probed": 0, "conv_shapes_probed": 0},
+                ) as m2,
+            ):
                 result = torch_vulkan.profile_and_warmup(level="quick", verbose=False)
 
         finally:
@@ -52776,7 +52837,6 @@ class TestM221OrphanIntegration:
     def test_main_py_no_duplicate_threadgroup_size_methods(self):
         """``main.py`` must not redefine the methods provided by the
         mixin — otherwise edits drift between the two copies."""
-        import os
 
         import torch_vulkan.inductor.kernel.main as main_mod
 
@@ -52956,9 +53016,7 @@ class TestMNew11ConvGnReluFusedCorrectness:
     def _run_case(N, C_in, C_out, H, W, num_groups, *, with_bias=True):
         import torch
         import torch.nn.functional as F
-
         import torch_vulkan  # noqa: F401
-
         from torch_vulkan.inductor.templates.caller.conv import (
             _slang_tile_conv2d_gn_relu,
         )
@@ -52978,22 +53036,35 @@ class TestMNew11ConvGnReluFusedCorrectness:
 
         out_vk = torch.empty(N, C_out, H, W, device="vulkan")
         _slang_tile_conv2d_gn_relu(
-            x_vk, w_vk, b_vk, gw_vk, gb_vk, out_vk,
-            stride=(1, 1), padding=(1, 1), dilation=(1, 1),
-            num_groups=num_groups, eps=1e-5,
+            x_vk,
+            w_vk,
+            b_vk,
+            gw_vk,
+            gb_vk,
+            out_vk,
+            stride=(1, 1),
+            padding=(1, 1),
+            dilation=(1, 1),
+            num_groups=num_groups,
+            eps=1e-5,
         )
 
         out_cpu = F.relu(
             F.group_norm(
                 F.conv2d(x_cpu, w_cpu, b_cpu, stride=1, padding=1),
-                num_groups, gw_cpu, gb_cpu, eps=1e-5,
+                num_groups,
+                gw_cpu,
+                gb_cpu,
+                eps=1e-5,
             )
         )
         return out_vk.cpu(), out_cpu
 
     def test_smallcnn_first_block(self):
         """SmallCNN's first conv_gn_relu block (3→16 chans, 32×32, G=4)."""
-        out_vk, out_cpu = self._run_case(N=2, C_in=3, C_out=16, H=32, W=32, num_groups=4)
+        out_vk, out_cpu = self._run_case(
+            N=2, C_in=3, C_out=16, H=32, W=32, num_groups=4
+        )
         err = (out_vk - out_cpu).abs().max().item()
         assert err < 1e-3, f"max_err={err:.6e}"
         # No negatives — ReLU is the outermost op.
@@ -53001,7 +53072,9 @@ class TestMNew11ConvGnReluFusedCorrectness:
 
     def test_smallcnn_second_block(self):
         """SmallCNN's second conv_gn_relu block (16→32 chans, 16×16, G=8)."""
-        out_vk, out_cpu = self._run_case(N=2, C_in=16, C_out=32, H=16, W=16, num_groups=8)
+        out_vk, out_cpu = self._run_case(
+            N=2, C_in=16, C_out=32, H=16, W=16, num_groups=8
+        )
         err = (out_vk - out_cpu).abs().max().item()
         assert err < 1e-3, f"max_err={err:.6e}"
         assert (out_vk >= 0).all()
@@ -53010,7 +53083,6 @@ class TestMNew11ConvGnReluFusedCorrectness:
         """Tiny case (1→4 chans, 8×8, G=2) — reproduces the slangc Wave-1
         store-drop signature: half the channels would be left at the
         pre-fill value before the Group-D fallback landed."""
-        import torch
 
         out_vk, out_cpu = self._run_case(N=1, C_in=1, C_out=4, H=8, W=8, num_groups=2)
         err = (out_vk - out_cpu).abs().max().item()

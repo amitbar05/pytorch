@@ -5,13 +5,14 @@ Extracted from ``PointwiseMixin`` (M15.1.d — Track 1 anti-goal #7 split).
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import sympy
 import torch
 from torch._inductor.codegen.block_analysis import BlockPatternMatcher
 from torch._inductor.codegen.common import IndentedBuffer
 from torch._inductor.virtualized import V
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class PointwiseVec4Mixin:
         rt: Any,
         all_inners: list[str],
         out_inners: set[str],
-    ) -> Optional[bool]:
+    ) -> bool | None:
         """Use BlockPatternMatcher to determine vec4 eligibility structurally.
 
         Analyzes collected sympy index expressions from ``_pw_index_records``
@@ -340,9 +341,7 @@ class PointwiseVec4Mixin:
             return False
         return True
 
-    def _classify_pw_buffers_by_axis(
-        self, rt: Any
-    ) -> Optional[tuple[set[str], set[str]]]:
+    def _classify_pw_buffers_by_axis(self, rt: Any) -> tuple[set[str], set[str]] | None:
         """Classify each I/O buffer as vec4-coalesced or broadcast w.r.t. *rt*.
 
         Returns ``(vec4_bufs, broadcast_bufs)`` on success, or ``None`` if any
@@ -361,7 +360,7 @@ class PointwiseVec4Mixin:
             idx_syms = index_expr.free_symbols
 
             seen_trees: set[int] = set()  # use id() — IterationRangesRoot unhashable
-            rt_sym_in_idx: Optional[sympy.Symbol] = None
+            rt_sym_in_idx: sympy.Symbol | None = None
             for s in idx_syms:
                 tree = sym_to_tree.get(s)
                 if tree is not None:
@@ -415,7 +414,7 @@ class PointwiseVec4Mixin:
         in_decls: list[tuple[str, str]],
         out_decls: list[tuple[str, str]],
         inout_decls: list[tuple[str, str]],
-    ) -> Optional[IndentedBuffer]:
+    ) -> IndentedBuffer | None:
         """Rewrite a scalar pointwise body into vec4 form.
 
         Pre-conditions: `_vec4_pw_eligible` returned True.
@@ -626,7 +625,7 @@ class PointwiseVec4Mixin:
         in_decls: list[tuple[str, str]],
         out_decls: list[tuple[str, str]],
         inout_decls: list[tuple[str, str]],
-    ) -> Optional[IndentedBuffer]:
+    ) -> IndentedBuffer | None:
         """Rewrite a scalar packed16 pointwise body into vectorized form.
 
         Each thread processes 4 consecutive half-precision elements
@@ -709,14 +708,15 @@ class PointwiseVec4Mixin:
         with new_buf.indent():
             for ln in head_lines:
                 new_buf.writeline(ln)
-            new_buf.writeline(f"uint xbase = gtid.x * 4u;")
+            new_buf.writeline("uint xbase = gtid.x * 4u;")
 
             for buf_inner in sorted(in_bufs):
+                buf_path = self._buf_path(buf_inner)
                 new_buf.writeline(f"float _pvw_in_{buf_inner}[4];")
                 new_buf.writeline("{")
                 with new_buf.indent():
-                    new_buf.writeline(f"uint _pvw_w0 = {buf_inner}[gtid.x * 2u];")
-                    new_buf.writeline(f"uint _pvw_w1 = {buf_inner}[gtid.x * 2u + 1u];")
+                    new_buf.writeline(f"uint _pvw_w0 = {buf_path}[gtid.x * 2u];")
+                    new_buf.writeline(f"uint _pvw_w1 = {buf_path}[gtid.x * 2u + 1u];")
                     new_buf.writeline(
                         f"_pvw_in_{buf_inner}[0] = _vk_unpack_{pfx}(_pvw_w0, 0u);"
                     )
@@ -743,12 +743,13 @@ class PointwiseVec4Mixin:
             new_buf.writeline("}")
 
             for buf_inner in sorted(out_bufs):
+                buf_path = self._buf_path(buf_inner)
                 new_buf.writeline(
-                    f"{buf_inner}[gtid.x * 2u] = "
+                    f"{buf_path}[gtid.x * 2u] = "
                     f"_vk_pack_{pfx}(_pvw_out_{buf_inner}[0], _pvw_out_{buf_inner}[1]);"
                 )
                 new_buf.writeline(
-                    f"{buf_inner}[gtid.x * 2u + 1u] = "
+                    f"{buf_path}[gtid.x * 2u + 1u] = "
                     f"_vk_pack_{pfx}(_pvw_out_{buf_inner}[2], _pvw_out_{buf_inner}[3]);"
                 )
 
