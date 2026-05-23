@@ -40600,7 +40600,26 @@ class TestM18ShapeOnlyProxiesUseNewEmpty:
     rather than ``empty_like(t)``.  Each test runs a minimal 2-layer
     module that exercises the matching backward op under torch.compile
     and asserts gradient L∞ parity with CPU.
+
+    Cold-cache guard: Inductor autotune normally benchmarks 8 slang_mm
+    tile variants; with a cold SPIR-V cache each takes ~60 s (slangc compile
+    time), exceeding the per-test timeout.  We pin a single tile via the
+    ``TORCH_VULKAN_MM_TILES`` override so at most one SPIR-V compile is
+    needed per test worker.  This does not affect correctness — these
+    tests verify gradient parity, not matmul performance.
     """
+
+    def setup_method(self, method):
+        import os
+        self._orig_mm_tiles = os.environ.get("TORCH_VULKAN_MM_TILES")
+        os.environ["TORCH_VULKAN_MM_TILES"] = "64x64x16"
+
+    def teardown_method(self, method):
+        import os
+        if self._orig_mm_tiles is None:
+            os.environ.pop("TORCH_VULKAN_MM_TILES", None)
+        else:
+            os.environ["TORCH_VULKAN_MM_TILES"] = self._orig_mm_tiles
 
     def _check(self, cpu_mod, vk_mod, shape_x, tag):
         results = _train_one_step_compare(cpu_mod, vk_mod, shape_x)
