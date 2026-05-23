@@ -49531,7 +49531,7 @@ class TestMCppNew6EagerReluChain:
         """
         x_cpu = self._make_input()
         x_vk = x_cpu.to("vulkan:0")
-        for op_name in ("relu", "abs", "neg", "gelu", "tanh", "sigmoid"):
+        for op_name in ("relu", "abs", "neg", "tanh", "sigmoid"):  # torch.gelu N/A in 2.11
             f = getattr(torch, op_name)
             y_cpu = f(f(x_cpu))
             y_vk = f(f(x_vk))
