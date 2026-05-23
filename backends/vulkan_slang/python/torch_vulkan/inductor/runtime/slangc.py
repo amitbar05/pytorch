@@ -605,9 +605,14 @@ def batch_compile_slang_to_spirv(
             errors.append(e)
             return None
 
+    # PF.14 extension: workers in this local pool call compile_slang_to_spirv,
+    # which re-submits to _ASYNC_POOL when _is_in_pool_worker() is False.
+    # Wrap with _wrap_pool_worker so the flag is set and the re-submission
+    # (which would deadlock if both pools share all workers) is bypassed.
     with ThreadPoolExecutor(max_workers=workers) as pool:
+        wrapped_compile = _wrap_pool_worker(_compile_one)
         futures = {
-            pool.submit(_compile_one, src, entry, ck, ip): ck
+            pool.submit(wrapped_compile, src, entry, ck, ip): ck
             for src, entry, ck, ip in pending
         }
         for fut in futures:

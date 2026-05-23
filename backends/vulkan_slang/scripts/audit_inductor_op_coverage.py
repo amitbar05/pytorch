@@ -654,9 +654,12 @@ _SLANGC_SMOKE_SNIPPETS: dict[str, str] = {
         "}\n"
     ),
     # Module import + helpers symbol. Locks that `import helpers;` +
-    # `c10_vulkan_erf` resolves. The exact snippet that failed slangc
-    # during the in-flight PF.5 (the helper was looked up against a
-    # stale `helpers.slang-module`).
+    # the special_math `.erf()` extension method resolves. The exact
+    # snippet that failed slangc during the in-flight PF.5 (the helper
+    # was looked up against a stale `helpers.slang-module`).
+    # NOTE: erf is exposed as a float extension method `(x).erf()` via
+    # special_math.slang, re-exported by helpers.slang. There is no
+    # standalone `c10_vulkan_erf()` free function.
     "smoke_pointwise_gelu_import_helpers": (
         "[[vk::binding(0)]] StructuredBuffer<float4> in_x;\n"
         "[[vk::binding(1)]] RWStructuredBuffer<float4> out_y;\n"
@@ -667,8 +670,7 @@ _SLANGC_SMOKE_SNIPPETS: dict[str, str] = {
         "    float4 r;\n"
         "    [unroll] for (uint k = 0u; k < 4u; ++k) {\n"
         "        float x = v[k];\n"
-        "        r[k] = 0.5f * x * (1.0f + c10_vulkan_erf("
-        "x * 0.7071067811865476f));\n"
+        "        r[k] = 0.5f * x * (1.0f + (x * 0.7071067811865476f).erf());\n"
         "    }\n"
         "    out_y[gtid.x] = r;\n"
         "}\n"
@@ -689,8 +691,7 @@ _SLANGC_SMOKE_SNIPPETS: dict[str, str] = {
         "    if (tid.x >= pc.M * pc.N) return;\n"
         "    uint col = tid.x % pc.N;\n"
         "    float v = in_a[tid.x] + bias[col * pc.stride_bias_n];\n"
-        "    out_c[tid.x] = 0.5f * v * (1.0f + c10_vulkan_erf("
-        "v * 0.7071067811865476f));\n"
+        "    out_c[tid.x] = 0.5f * v * (1.0f + (v * 0.7071067811865476f).erf());\n"
         "}\n"
     ),
 }

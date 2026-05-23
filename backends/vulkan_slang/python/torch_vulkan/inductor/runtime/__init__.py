@@ -60,6 +60,7 @@ from .slangc import (  # noqa: F401
     _ensure_shader_lib_modules,
     _extract_linktime_spec_constants,
     _get_async_pool,
+    _resolve_slangc,
     _get_device_subgroup_size_tag,
     _harvest_reflection_metrics,
     _in_flight,
@@ -83,7 +84,6 @@ from .slangc import (  # noqa: F401
     _rewrite_numthreads_in_source,
     _save_spv_baselines,
     _shader_lib_modules_lock,
-    _shader_lib_modules_ready,
     _shader_lib_sources,
     _slangc_available,
     _slangc_available_cache,
@@ -193,8 +193,6 @@ def reset_per_test_caches() -> None:
         _cache_by_hash,
         _cache_by_key,
         _reflection_cache,
-        _shader_lib_modules_ready,
-        _slangc_available_cache,
         reset_compile_stats,
     )
 
@@ -205,9 +203,25 @@ def reset_per_test_caches() -> None:
     _SHADER_LIB_MODULE_STATS["compiles"] = 0
     _SHADER_LIB_MODULE_STATS["cache_hits"] = 0
     reset_compile_stats()
-    # Reset module-level globals that now live in shader_lib (M22a Stage 2).
-    import torch_vulkan.inductor.runtime.shader_lib as _shader_lib_mod
-
-    _shader_lib_mod._slangc_available_cache = None
-    _shader_lib_mod._shader_lib_modules_ready = False
+    # _shader_lib_modules_ready is NOT reset here — the shader-lib .slang-module
+    # files are on disk and persist across tests.  Tests that need a clean
+    # shader-lib state call _reset_shader_lib_modules_ready() explicitly.
+    # (M22a Stage 2 previously reset it here, which forced a full 16-module
+    # recompile before every test that calls slangc, causing test timeouts.)
     _DISPATCH_TIMES.clear()
+
+
+def __getattr__(name: str):
+    """Dynamic lookup for mutable state that lives in submodules (M22a).
+
+    `_shader_lib_modules_ready` is a bool in shader_lib that changes at
+    runtime; a static `from .slangc import ...` binding would freeze the
+    value at import time.  Python module `__getattr__` (PEP 562) intercepts
+    attribute misses on the module object so tests that read
+    `rt._shader_lib_modules_ready` see the live value.
+    """
+    if name == "_shader_lib_modules_ready":
+        import torch_vulkan.inductor.runtime.shader_lib as _sl
+
+        return _sl._shader_lib_modules_ready
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

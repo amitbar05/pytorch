@@ -89,17 +89,20 @@ def _resolve_slangc(raw: str) -> str:
         os.path.join(repo_root, "third_party", "slang", "build"),
         os.path.join(backend_root, "third_party", "slang", "build"),
     ]
-    seen: list[str] = []
-    for tpr in third_party_roots:
-        if not os.path.isdir(tpr):
-            continue
-        for entry in os.listdir(tpr):
-            candidate = os.path.join(tpr, entry, "bin", "slangc")
-            if os.path.isfile(candidate):
-                seen.append(candidate)
-    if seen:
-        seen.sort(key=_ver_key, reverse=True)
-        candidates.append(seen[0])
+    # Auto-detect from third_party only when the caller wants the generic
+    # "slangc" binary — not when they named a specific (non-existent) binary.
+    if raw == "slangc":
+        seen: list[str] = []
+        for tpr in third_party_roots:
+            if not os.path.isdir(tpr):
+                continue
+            for entry in os.listdir(tpr):
+                candidate = os.path.join(tpr, entry, "bin", "slangc")
+                if os.path.isfile(candidate):
+                    seen.append(candidate)
+        if seen:
+            seen.sort(key=_ver_key, reverse=True)
+            candidates.append(seen[0])
     for c in candidates:
         if os.path.exists(c):
             return os.path.abspath(c)

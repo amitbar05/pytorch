@@ -385,6 +385,7 @@ def install_external_rng() -> None:
         # offset to the Slang Philox template.
         import torch.utils._pytree as pytree
         from torch._inductor import ir
+        from torch._inductor.ir import TensorBox
 
         return pytree.tree_map(
             TensorBox.create,
@@ -450,6 +451,7 @@ def install_external_rng() -> None:
         # CP.9 / TRAIN.12: Defer to FallbackKernel (see _vulkan_rand).
         import torch.utils._pytree as pytree
         from torch._inductor import ir
+        from torch._inductor.ir import TensorBox
 
         return pytree.tree_map(
             TensorBox.create,
@@ -493,6 +495,7 @@ def install_external_rng() -> None:
         # copy-back via the PrivateUse1 dispatch which calls self.copy_.
         import torch.utils._pytree as pytree
         from torch._inductor import ir
+        from torch._inductor.ir import TensorBox
 
         return pytree.tree_map(
             TensorBox.create,
