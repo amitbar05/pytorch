@@ -41119,6 +41119,7 @@ class TestM197ComplexPointwise:
         expected = fn(*cpu_args)
         torch.testing.assert_close(got, expected, atol=atol, rtol=rtol)
 
+    @pytest.mark.timeout(300)
     def test_complex64_add_compile_parity(self):
         """Complex64 add under torch.compile matches CPU at every index.
 
@@ -41126,6 +41127,10 @@ class TestM197ComplexPointwise:
         routes through our decomp instead of the upstream
         ``x + 0``-materializing decomp (which throws on Vulkan because
         ``aten.add.Scalar`` for complex isn't C++-implemented).
+
+        timeout=300: first cold compile in a fresh worker includes Slang
+        module cache warm-up (~30 s extra) on top of prewarm; override
+        the default --timeout=30 single-test command that the agent uses.
         """
         torch.manual_seed(0)
         a = torch.randn(4, 8, dtype=torch.cfloat)

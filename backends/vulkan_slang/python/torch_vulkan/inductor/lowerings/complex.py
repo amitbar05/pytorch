@@ -37,6 +37,14 @@ from __future__ import annotations
 
 import torch
 
+# Static lookup avoids tracing x.real (which generates dead view_as_real
+# + select nodes in the FX graph during make_fx tracing).
+_COMPLEX_TO_REAL_DTYPE: dict[torch.dtype, torch.dtype] = {
+    torch.complex32: torch.float16,
+    torch.complex64: torch.float32,
+    torch.complex128: torch.float64,
+}
+
 
 def _reshape_complex_as_pairs(x: torch.Tensor) -> torch.Tensor:
     """Reshape ``x`` from complex ``[..., last]`` to real
@@ -47,9 +55,13 @@ def _reshape_complex_as_pairs(x: torch.Tensor) -> torch.Tensor:
     contiguous in the last dim by construction).
     """
     *initial_dims, last_dim = x.shape
+    # Use a static dtype table instead of x.real.dtype to avoid tracing
+    # aten.real.default (which decomposes to view_as_real+select and creates
+    # dead nodes in the Inductor FX graph).
+    real_dtype = _COMPLEX_TO_REAL_DTYPE[x.dtype]
     # x.view(real) doubles the last dim. Re-grouping (n, 2) gives us
     # (real, imag) pairs at the innermost level.
-    real_view = x.view(x.real.dtype)
+    real_view = x.view(real_dtype)
     return real_view.view(*initial_dims, last_dim, 2)
 
 
