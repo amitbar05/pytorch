@@ -699,7 +699,7 @@ Listed for visibility so the next session doesn't double-dispatch.
 | **M21** | **Hardware-profiling + validation infrastructure (NEW, user-requested)** | Device-profile-on-import phase (M21.1 in flight); validation-as-codegen-check during autotune; best-practices VUID sweep (M21.3 + M21.3.a debug-utils messenger ✅); per-kernel lifecycle stress tests. See § 0.6.4. | 1-2w |
 | **M9** | **Host-overhead reduction** | ✅ M9.1–M9.9 all closed (M-docs-9 reconciled 2026-05-18). New host-overhead targets file as M-cpp-new-2 (M-cpp-new-2 ✅ (DescriptorPool async-reset path + fence-per-submit + pre_sync_callback drain)). | active perf-track (sub-followups) |
 | **M11** | **Occupancy-aware codegen** | M11.1–M11.2, M11.9 closed; refined by M20 (reflection 100 %→40 %). | 1-2w |
-| **M12** | **Reduction backward via autodiff** | 6/8 reduction ops `[Differentiable]`. Audit confirms argmax/argmin SHOULDN'T be differentiable (positions, not values). | 1w |
+| **M12** | **Reduction backward via autodiff** | ✅ **DONE 2026-05-23** — 6/8 reduction ops `[Differentiable]` (sum/mean/var/prod + fold paths). Argmax/argmin correctly excluded (positional outputs — not differentiable values). M12.1 ✅ annotations, M12.2 ✅ bwd-lowerings routing, M12.3 ✅ no legacy shaders. See § 3 M12. | ✅ |
 | **M13** | **Slang feature saturation** | Superseded/expanded by **M20**. | merged into M20 |
 | **M14** | **Op coverage gaps** | Complex-dtype binary (→ M19.7), foreach element-wise (→ M19.6), dynamic-shape reduction (→ M19.5), RNN backward (→ M20.1). Residual: sparse + quantized int8. | 2w |
 | **M15** | **Anti-goal #5/#7 cleanup** | M15.1.a–j closed / in-flight. Expanded by **M22** (5 new file-size violators + M22.8–11 rebuild blockers). | 1-2w |
