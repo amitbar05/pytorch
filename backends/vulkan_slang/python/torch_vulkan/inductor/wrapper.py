@@ -22,9 +22,9 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.virtualized import V
 
+from .fx_passes.alloc_alias_ir import apply_vulkan_ir_alias_pass
 from .wrapper_helpers import (
     _batch_dispatch_enabled,
-    _get_alloc_alias_fn,
     _lifetime_class_for_name,
     _normalize_strides_to_row_major,
     _profile_dispatches_enabled,
@@ -114,6 +114,23 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             self.writeline("_batcher.__exit__(None, None, None)")
         super().generate_end_graph()
 
+    def run_wrapper_ir_passes(self, is_inference: bool) -> None:
+        """M22.2: extend the upstream memory-planning pass with a Vulkan-specific
+        IR-level alloc-alias pass.
+
+        Upstream's ``memory_plan_reuse()`` already converts adjacent same-size
+        pairs into ``ReuseLine``.  After that runs, ``apply_vulkan_ir_alias_pass``
+        scans the remaining ``AllocateLine`` / ``FreeIfNotReusedLine`` entries and
+        aliases pairs with matching Vulkan alloc keys that have non-overlapping
+        lifetimes (the old buffer freed before the new one is allocated).
+        """
+        super().run_wrapper_ir_passes(is_inference)
+        try:
+            apply_vulkan_ir_alias_pass(self)
+        except Exception:
+            # Never let a cosmetic optimization break compilation.
+            pass
+
     def generate_return(self, output_refs):
         # GPU.1: Flush batcher before return so kernels execute.
         if _batch_dispatch_enabled():
@@ -131,27 +148,12 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             )
         super().generate_return(output_refs)
 
-    # M17.7 — override generate() to post-process the assembled wrapper
-    # source and elide redundant empty_strided_vulkan calls via aliasing.
+    # M22.2: The regex post-processor (M17.7) is superseded by the IR-level
+    # alias pass in ``run_wrapper_ir_passes``.  ``generate()`` no longer needs
+    # to touch the assembled source string.  The override is kept as a no-op
+    # pass-through so the call chain is explicit.
     def generate(self, is_inference):
-        result_vlm, kernel_decls_vlm = super().generate(is_inference)
-        try:
-            alias_fn = _get_alloc_alias_fn()
-            new_value = alias_fn(result_vlm.value)
-        except Exception:
-            # Never let a cosmetic optimization break compilation.
-            # Fall through with the un-modified source.
-            return result_vlm, kernel_decls_vlm
-        # Construct a new ValueWithLineMap preserving the original
-        # line_map — the line numbers will be slightly off for elided
-        # lines but the rest of the mapping stays valid.
-        from torch._inductor.utils import ValueWithLineMap
-
-        new_result = ValueWithLineMap(
-            value=new_value,
-            line_map=result_vlm.line_map,
-        )
-        return new_result, kernel_decls_vlm
+        return super().generate(is_inference)
 
     def codegen_input_size_asserts(self) -> None:
         # P5.11.a.1: under default-ON, skip collecting per-input asserts

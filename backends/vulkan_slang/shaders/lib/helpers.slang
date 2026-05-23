@@ -71,6 +71,28 @@ public float2 welford_finalize(Welford w) {
     return float2(w.mean, v);
 }
 
+// ── M20.7 Welford streaming (single-element) update ──────────────────
+// Knuth / Welford online algorithm: accumulate one element x into the
+// running (mean, M2, n) without materialising intermediate sums.
+// Use this inside a per-thread loop before feeding the result into the
+// workgroup-level `wg_welford` from `reduction.slang`.
+//
+// Typical usage pattern:
+//   Welford wf = { 0.0f, 0.0f, 0.0f };
+//   for (uint d = tid; d < S; d += TG_SIZE) {
+//       welford_update(wf, buf[d]);
+//   }
+//   WelfordResult<float> stats = wg_welford(...);
+//
+// Algorithm: delta = x - mean; n++; mean += delta/n; M2 += delta*(x-mean)
+// (the second delta uses the UPDATED mean — Welford's two-delta form.)
+public void welford_update(inout Welford w, float x) {
+    w.n += 1.0f;
+    float delta = x - w.mean;
+    w.mean += delta / w.n;
+    w.m2   += delta * (x - w.mean);
+}
+
 // ── Wave intrinsic wrappers ───────────────────────────────────────────
 // Generic `T : __BuiltinFloatingPointType` wrappers around the SPIR-V
 // `WaveActive*` / `WavePrefix*` intrinsics. Keeping them in `helpers`

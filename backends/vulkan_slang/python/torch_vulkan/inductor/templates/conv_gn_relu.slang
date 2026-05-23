@@ -127,9 +127,13 @@ void computeMain(
     // because PyTorch composes as ``relu(gn(conv(x)))`` — GN must see
     // the raw conv+bias values.
     // ═══════════════════════════════════════════════════════════════
-    float local_mean = 0.0f;
-    float local_m2   = 0.0f;
-    float local_n    = 0.0f;
+    // M20.7: replaced inline (local_mean, local_m2, local_n) triple
+    // with `Welford` struct + `welford_update()` from helpers.slang
+    // (re-exported by reduction.slang).  The accumulator is
+    // zero-initialised and welford_update() maintains the invariant
+    // that (mean, M2, n) satisfy Welford's online algorithm after each
+    // element.
+    Welford local_wf = { 0.0f, 0.0f, 0.0f };
 
     for (uint d = tid; d < S; d += 256) {
         // Decode (co, oh, ow) from flat index within the group row
@@ -170,23 +174,19 @@ void computeMain(
         sum += args.bias[co];
         /*{%*/ endif /*%}*/
 
-        // ── Online Welford (single-pass mean + M2) over conv+bias ──
+        // ── Online Welford via shared helper ──
         // Pre-norm value; the fix vs the old shader is that we do NOT
         // pre-clamp at ReLU before accumulating.
-        float pre_norm = sum;
-        float delta = pre_norm - local_mean;
-        local_n += 1.0f;
-        local_mean += delta / local_n;
-        local_m2   += delta * (pre_norm - local_mean);
+        welford_update(local_wf, sum);
     }
 
     // ═══════════════════════════════════════════════════════════════
     // Pass 2: workgroup-level Welford reduction → mean, var, rstd
     // ═══════════════════════════════════════════════════════════════
     WelfordResult<float> wf;
-    wf.mean = (local_n > 0.0f) ? local_mean : 0.0f;
-    wf.m2   = (local_n > 0.0f) ? local_m2   : 0.0f;
-    wf.n    = local_n;
+    wf.mean = local_wf.mean;
+    wf.m2   = local_wf.m2;
+    wf.n    = local_wf.n;
     WelfordResult<float> stats = wg_welford(wf, tid, 256u, VK_SUBGROUP_SIZE);
 
     float mean = stats.mean;

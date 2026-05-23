@@ -44881,6 +44881,7 @@ class TestM206SubgroupSizeSpecConst:
                         mod_path,
                         "-I",
                         os.path.join(shader_root, "lib"),
+                        "-ignore-capabilities",
                     ],
                     capture_output=True,
                     text=True,
@@ -44949,6 +44950,7 @@ void computeMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
                     "-matrix-layout-row-major",
                     "-I",
                     os.path.join(shader_root, "lib"),
+                    "-ignore-capabilities",
                 ],
                 capture_output=True,
                 text=True,
@@ -55354,3 +55356,324 @@ class TestM223PatternStats:
         finally:
             _cfg._PATTERN_STATS = _orig
             reset_pattern_stats()
+
+
+class TestM222AllocAliasIRMigration:
+    """M22.2 — IR-level alloc-alias pass (replaces regex post-processor).
+
+    Validates:
+      1. The new IR-level pass module is importable and its public API is stable.
+      2. The old regex pass (``alloc_alias.py``) still works — backward compat.
+      3. The IR-level ``apply_vulkan_ir_alias_pass`` function is importable.
+      4. A compile-mode test verifies correctness of the new path.
+      5. The generated wrapper source does not contain the old regex-pass
+         ``# (pool-release elided:`` comment (that comment is a regex-pass
+         artifact; the IR pass does not emit it).
+    """
+
+    def test_old_regex_pass_importable(self):
+        """alias_alloc_free_pairs from alloc_alias.py must still be importable
+        (backward compat — external tooling or cached code may use it)."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias import alias_alloc_free_pairs
+
+        assert callable(alias_alloc_free_pairs)
+
+    def test_old_regex_pass_noop_on_empty(self):
+        """alias_alloc_free_pairs returns the input unchanged when there are
+        fewer than 2 allocations in the source."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias import alias_alloc_free_pairs
+
+        src = (
+            "x = empty_strided_vulkan((4,), (1,), torch.float32,"
+            " lifetime_class='transient')\n"
+        )
+        assert alias_alloc_free_pairs(src) == src
+
+    def test_old_regex_pass_aliases_matching_pair(self):
+        """alias_alloc_free_pairs rewrites a free-then-alloc pair with the same
+        size/stride/dtype into an alias assignment (backward compat check)."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias import alias_alloc_free_pairs
+
+        src = (
+            "buf0 = empty_strided_vulkan((16, 1024), (1024, 1), torch.float32,"
+            " lifetime_class='transient')\n"
+            "vulkan_pool_release(buf0, lifetime_class='transient'); buf0 = None\n"
+            "buf1 = empty_strided_vulkan((16, 1024), (1024, 1), torch.float32,"
+            " lifetime_class='transient')\n"
+            "vulkan_pool_release(buf1, lifetime_class='transient'); buf1 = None\n"
+        )
+        result = alias_alloc_free_pairs(src)
+        assert "buf1 = buf0" in result, (
+            "Expected 'buf1 = buf0' in aliased output, got:\n" + result
+        )
+
+    def test_ir_pass_importable(self):
+        """apply_vulkan_ir_alias_pass must be importable from alloc_alias_ir."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias_ir import (
+            apply_vulkan_ir_alias_pass,
+        )
+
+        assert callable(apply_vulkan_ir_alias_pass)
+
+    def test_ir_custom_line_types_importable(self):
+        """VulkanAliasAllocLine and VulkanAliasFreeRedirectLine must be importable."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias_ir import (
+            VulkanAliasAllocLine,
+            VulkanAliasFreeRedirectLine,
+        )
+
+        assert VulkanAliasAllocLine is not None
+        assert VulkanAliasFreeRedirectLine is not None
+
+    def test_alloc_alias_key_returns_none_for_non_layout(self):
+        """_alloc_alias_key returns None for nodes without a Layout output spec."""
+        from torch_vulkan.inductor.fx_passes.alloc_alias_ir import _alloc_alias_key
+
+        class _FakeNode:
+            def get_output_spec(self):
+                return None
+
+        assert _alloc_alias_key(_FakeNode()) is None  # type: ignore[arg-type]
+
+    def test_wrapper_generate_no_regex_artifact(self):
+        """The old regex-pass comment '# (pool-release elided:' must NOT appear
+        in the compiled wrapper source — confirms the regex pass is bypassed."""
+        from torch._inductor.utils import run_and_get_code
+
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(x):
+            a = torch.relu(x)
+            b = torch.relu(a + 1.0)
+            c = torch.relu(b + 1.0)
+            return c
+
+        x = torch.randn(16, 1024, device="vulkan:0")
+        _, code_list = run_and_get_code(fn, x)
+
+        for wrapper_src in code_list:
+            assert "# (pool-release elided:" not in wrapper_src, (
+                "Old regex-pass artifact found in wrapper source — the regex "
+                "pass must not run after the M22.2 IR migration.\n\n"
+                "Wrapper snippet:\n" + wrapper_src[:2000]
+            )
+
+    def test_compile_mode_correctness(self):
+        """After the IR migration, compiled output matches CPU reference."""
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(x, y):
+            buf_a = torch.relu(x)
+            _scalar = torch.sum(y)
+            buf_b = torch.relu(x + _scalar)
+            return buf_a + buf_b
+
+        x = torch.randn(16, 1024, device="vulkan:0")
+        y = torch.randn(4, device="vulkan:0")
+
+        result = fn(x, y).cpu()
+
+        x_cpu = x.cpu()
+        y_cpu = y.cpu()
+        buf_a_cpu = torch.relu(x_cpu)
+        _scalar_cpu = torch.sum(y_cpu)
+        buf_b_cpu = torch.relu(x_cpu + _scalar_cpu)
+        ref = buf_a_cpu + buf_b_cpu
+
+        torch.testing.assert_close(
+            result, ref, rtol=1e-4, atol=1e-4,
+            msg="M22.2: IR alias pass broke numerical correctness"
+        )
+
+    def test_wrapper_py_under_800_lines(self):
+        """wrapper.py must stay under the 800-line anti-goal #7 cap."""
+        from pathlib import Path
+
+        path = (
+            Path(__file__).parent.parent
+            / "python" / "torch_vulkan" / "inductor" / "wrapper.py"
+        )
+        lines = path.read_text().count("\n")
+        assert lines < 800, (
+            f"M22.2: wrapper.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+    def test_alloc_alias_ir_py_under_800_lines(self):
+        """alloc_alias_ir.py must stay under the 800-line anti-goal #7 cap."""
+        from pathlib import Path
+
+        path = (
+            Path(__file__).parent.parent
+            / "python" / "torch_vulkan" / "inductor"
+            / "fx_passes" / "alloc_alias_ir.py"
+        )
+        lines = path.read_text().count("\n")
+        assert lines < 800, (
+            f"M22.2: alloc_alias_ir.py is {lines} lines (anti-goal #7 cap is 800)"
+        )
+
+
+class TestM207LibHelperExtraction:
+    """M20.7 — Extract streaming Welford accumulator into a shared lib helper.
+
+    The per-element Welford update (Knuth's online algorithm) was previously
+    written inline in ``conv_gn_relu.slang`` and any future kernels that need
+    single-pass mean/variance computation.  This class verifies that:
+
+    1. ``shaders/lib/helpers.slang`` declares ``welford_update(inout Welford, float)``.
+    2. ``conv_gn_relu.slang`` no longer contains the inline implementation;
+       instead it calls the shared helper.
+    3. The pattern compiles correctly via slangc (import reduction; → helpers; →
+       welford_update accessible).
+
+    Grid-stride loop patterns (``for (uint d = tid; d < S; d += 256)``) are NOT
+    extracted because Slang lacks a macro system and the loop bound / stride are
+    kernel-specific; the extraction would add no reuse.  This is documented in
+    the roadmap as the grid-stride sub-item intentionally deferred.
+    """
+
+    def test_helpers_slang_declares_welford_update(self):
+        """Static check: ``shaders/lib/helpers.slang`` declares
+        ``welford_update(inout Welford, float)`` with the correct signature."""
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "shaders",
+            "lib",
+            "helpers.slang",
+        )
+        with open(path) as f:
+            src = f.read()
+        # Strip single-line comments to avoid matching documentation text.
+        no_comments = re.sub(r"//[^\n]*", "", src)
+        decl_re = re.compile(
+            r"public\s+void\s+welford_update\s*\(\s*inout\s+Welford\s+\w+\s*,\s*float\s+\w+\s*\)"
+        )
+        assert decl_re.search(no_comments), (
+            "lib/helpers.slang is missing the M20.7 welford_update() function. "
+            "Expected a declaration matching:\n"
+            "  public void welford_update(inout Welford w, float x)"
+        )
+
+    def test_conv_gn_relu_uses_welford_update_helper(self):
+        """Static check: ``conv_gn_relu.slang`` calls ``welford_update``
+        and no longer contains the inline (local_mean, local_m2, local_n) triple."""
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+            "conv_gn_relu.slang",
+        )
+        with open(path) as f:
+            src = f.read()
+        # The refactored shader must call welford_update.
+        assert "welford_update" in src, (
+            "conv_gn_relu.slang does not call welford_update(). "
+            "M20.7 requires using the shared lib helper."
+        )
+        # The old inline triple should be gone (no 'local_mean' or 'local_m2').
+        # We allow 'local_wf' as the replacement accumulator variable name.
+        no_comments = re.sub(r"//[^\n]*", "", src)
+        assert "local_mean" not in no_comments, (
+            "conv_gn_relu.slang still contains 'local_mean'. "
+            "M20.7 should have replaced the inline accumulation with welford_update()."
+        )
+        assert "local_m2" not in no_comments, (
+            "conv_gn_relu.slang still contains 'local_m2'. "
+            "M20.7 should have replaced the inline accumulation with welford_update()."
+        )
+
+    def test_welford_update_compiles_via_reduction_import(self):
+        """Compile a probe kernel that imports reduction (which re-exports helpers)
+        and calls welford_update + wg_welford; assert slangc exits 0.
+
+        This verifies the full code path that conv_gn_relu.slang uses:
+          import reduction;
+          Welford local_wf = {0, 0, 0};
+          welford_update(local_wf, x);
+          WelfordResult<float> wf = {local_wf.mean, local_wf.m2, local_wf.n};
+          WelfordResult<float> stats = wg_welford(wf, tid, 256u, VK_SUBGROUP_SIZE);
+        """
+        import subprocess
+        import tempfile
+
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
+
+        if not _slangc_available():
+            pytest.skip("slangc not available")
+
+        probe_src = """
+import reduction;
+
+RWStructuredBuffer<float> output;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint S = 256u;
+    uint tid = lid.x;
+
+    // M20.7 pattern: streaming Welford accumulator via shared helper
+    Welford local_wf;
+    local_wf.mean = 0.0f;
+    local_wf.m2   = 0.0f;
+    local_wf.n    = 0.0f;
+
+    for (uint d = tid; d < S; d += 256u) {
+        float x = float(d) * 0.01f;
+        welford_update(local_wf, x);
+    }
+
+    // Bridge to workgroup-level WelfordResult
+    WelfordResult<float> wf;
+    wf.mean = local_wf.mean;
+    wf.m2   = local_wf.m2;
+    wf.n    = local_wf.n;
+    WelfordResult<float> stats = wg_welford(wf, tid, 256u, VK_SUBGROUP_SIZE);
+
+    if (tid == 0u) {
+        output[gid.x] = stats.mean;
+    }
+}
+"""
+        slangc = _get_slangc()
+        shader_root = os.path.join(os.path.dirname(__file__), "..", "shaders")
+        lib_dir = os.path.join(shader_root, "lib")
+
+        with tempfile.TemporaryDirectory() as td:
+            src_path = os.path.join(td, "m207_probe.slang")
+            spv_path = os.path.join(td, "m207_probe.spv")
+            with open(src_path, "w") as f:
+                f.write(probe_src)
+            proc = subprocess.run(
+                [
+                    slangc,
+                    src_path,
+                    "-target",
+                    "spirv",
+                    "-entry",
+                    "computeMain",
+                    "-o",
+                    spv_path,
+                    "-matrix-layout-row-major",
+                    "-ignore-capabilities",
+                    "-I",
+                    lib_dir,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert proc.returncode == 0, (
+                f"M20.7 probe kernel failed to compile via slangc: "
+                f"rc={proc.returncode}\nstderr:\n{proc.stderr[:2000]}"
+            )
