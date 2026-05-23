@@ -43907,6 +43907,44 @@ class TestM212ValidationAsCodegenCheck:
         assert result.returncode == 0
         assert result.vuids == []
 
+    def test_validate_winner_forwards_to_validate_codegen_dispatch(self, monkeypatch):
+        """``validate_winner`` calls ``validate_codegen_dispatch`` when mode != off.
+
+        This is the autotune-commit-path wiring test: verifies that the
+        chain autotune.benchmark_wg_sizes → autotune.validate_winner →
+        validation_codegen.validate_codegen_dispatch is fully connected.
+        Prior tests mock at the ``validate_winner`` boundary; this one
+        mocks at ``validate_codegen_dispatch`` to confirm the interior of
+        ``validate_winner`` is wired correctly.
+        """
+        from torch_vulkan.inductor import autotune
+        from torch_vulkan.inductor.runtime import validation_codegen as vc
+
+        os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"] = "warn"
+        # Pretend the validation layer is installed so mode resolves to "warn".
+        monkeypatch.setattr(vc, "layer_installed", lambda: True)
+
+        captured: list[tuple[str, str]] = []
+
+        def _fake_dispatch(body, *, kernel_name="<unknown>", env_extra=None, timeout_s=60):
+            captured.append((kernel_name, body))
+            return vc.ValidationResult(returncode=0, stdout="", stderr="", vuids=[])
+
+        monkeypatch.setattr(vc, "validate_codegen_dispatch", _fake_dispatch)
+
+        autotune.validate_winner(
+            "print('dispatch_probe')",
+            kernel_name="autotune_winner",
+            wg=128,
+        )
+        assert len(captured) == 1, (
+            "validate_winner must call validate_codegen_dispatch exactly once "
+            "when mode != off"
+        )
+        assert "autotune_winner@wg=128" in captured[0][0], (
+            "kernel_name annotation must include the wg suffix"
+        )
+
 
 class TestM2213MmTransposeA:
     """M22.13 — mm with a transposed-view operand.
