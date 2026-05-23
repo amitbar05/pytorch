@@ -7,6 +7,61 @@ module atomics;
 // PF.21 hoists it here so future atomic-scatter lowerings (PF.22 /
 // PF.25) compose without re-deriving the pattern.
 
+// ─── M20.8: IScatter — Anti-goal #6 generic interface ─────────────────────
+//
+// Replaces the Jinja `{% if operation == "scatter_add" %}...{% elif %}...`
+// chain in `templates/scatter_atomic.py.jinja` with a Slang generic
+// `<S : IScatter>` parameterisation.  The Jinja `operation` string is now
+// only used to select the concrete struct name (scatter_struct), not to
+// branch inside the shader body.
+//
+// Interface contract: `combine` writes one value into a uint-view SSBO.
+// All scatter atomic operations share the same buffer type
+// (RWStructuredBuffer<uint> — the CAS trick that reinterprets float bits
+// as uint for InterlockedCompareExchange) so the interface is uniform.
+// The `scatter_reduce_mean` count-increment remains Jinja-gated (is_mean)
+// because it binds a *second* buffer — a structural difference, not an
+// operational one.
+public interface IScatter {
+    static void combine(RWStructuredBuffer<uint> out, uint idx, float val);
+};
+
+// scatter_add / index_put_accumulate — atomic float-add
+public struct ScatterAdd : IScatter {
+    public static void combine(RWStructuredBuffer<uint> out, uint idx, float val) {
+        vk_atomic_add(out, idx, val);
+    }
+};
+
+// scatter_reduce(reduce='amax') — atomic float max
+public struct ScatterMax : IScatter {
+    public static void combine(RWStructuredBuffer<uint> out, uint idx, float val) {
+        atomic_max_f32(out, idx, val);
+    }
+};
+
+// scatter_reduce(reduce='amin') — atomic float min
+public struct ScatterMin : IScatter {
+    public static void combine(RWStructuredBuffer<uint> out, uint idx, float val) {
+        atomic_min_f32(out, idx, val);
+    }
+};
+
+// scatter_reduce(reduce='prod') — atomic float multiply
+public struct ScatterProd : IScatter {
+    public static void combine(RWStructuredBuffer<uint> out, uint idx, float val) {
+        atomic_mul_f32(out, idx, val);
+    }
+};
+
+// scatter_reduce(reduce='mean') — same as ScatterAdd for the value slot;
+// the count-buffer increment is handled separately (is_mean Jinja gate).
+public struct ScatterMean : IScatter {
+    public static void combine(RWStructuredBuffer<uint> out, uint idx, float val) {
+        vk_atomic_add(out, idx, val);
+    }
+};
+
 // Inductor codegen emits atomic-scatter stores into a
 // `RWStructuredBuffer<uint>` (the dest tensor reinterpreted as raw u32).
 // PF.21.b retires `slang_helpers._emit_helpers_impl`'s inline copy of

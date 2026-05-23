@@ -14,6 +14,16 @@
 //                           (T4.11, atomic_add_f32 + InterlockedAdd; post-pass
 //                            divides on the host side / second kernel).
 //
+// M20.8 — Anti-goal #6 sweep:
+//   Atomic operations (scatter_add, index_put_accumulate, scatter_reduce_*)
+//   are now dispatched via the Slang generic `<S : IScatter>` interface
+//   declared in `shaders/lib/atomics.slang`.  The Jinja `operation` string
+//   selects the concrete struct name (scatter_struct) at render time, but
+//   there is no per-operation if/elif chain inside the shader body for
+//   atomic ops — only `ScatterXxx::combine(args.out, idx, val)`.
+//   Structural differences (gather vs scatter buffer layout, mean's count
+//   buffer) remain Jinja-gated because they affect the struct layout.
+//
 // Buffer layout (canonical struct field order, matching dispatch caller):
 //   args.src     — source / values (StructuredBuffer<dtype>)
 //   args.indices — indices (StructuredBuffer<index_dtype>)
@@ -50,6 +60,17 @@
     "scatter_reduce_prod",
     "scatter_reduce_mean",
 )) /*%}*/
+/*# M20.8: Map operation name to the concrete IScatter struct.            #*/
+/*# Non-atomic operations (gather, scatter, index_put) leave this unused. #*/
+/*{%*/ set _scatter_struct_map = {
+    "scatter_add":           "ScatterAdd",
+    "index_put_accumulate":  "ScatterAdd",
+    "scatter_reduce_amax":   "ScatterMax",
+    "scatter_reduce_amin":   "ScatterMin",
+    "scatter_reduce_prod":   "ScatterProd",
+    "scatter_reduce_mean":   "ScatterMean",
+} /*%}*/
+/*{%*/ set scatter_struct = _scatter_struct_map.get(operation, "ScatterAdd") /*%}*/
 /*# The Vulkan backend stores int64 tensors as uint2 (vec2 of uint32) #*/
 /*# because many Vulkan devices do not support the shaderInt64 capability. #*/
 /*# StructuredBuffer<int64_t> would fail to create a pipeline on those #*/
@@ -92,9 +113,10 @@ struct KernelArgs {
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 /*{%*/ if is_atomic /*%}*/
-// ── Import the canonical atomic-add implementation from lib/atomics.slang
+// ── Import the canonical atomic helpers from lib/atomics.slang (M20.8).
 // PF.21.b: the precompiled module carries the correct SPIR-V decorations
 // (Coherent) for InterlockedCompareExchange to work on Vulkan drivers.
+// M20.8: also declares IScatter + ScatterAdd/Max/Min/Prod/Mean structs.
 import atomics;
 /*{%*/ endif /*%}*/
 
@@ -130,44 +152,24 @@ void computeMain(uint3 tid : SV_DispatchThreadID) {
     // The index refers to the output buffer; guard with out_numel.
     if (idx < 0 || uint(idx) >= pc.out_numel) return;
     args.out[uint(idx)] = asuint(args.src[i]);
-/*{%*/ elif operation == "scatter_add" /*%}*/
-    // scatter_add: out[indices[i]] += src[i]  (atomic)
-    if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    c10_vulkan_atomic_add(args.out, uint(idx), (float)args.src[i]);
 /*{%*/ elif operation == "index_put" /*%}*/
     // index_put: out[indices[i]] = values[i]  (last-write-wins)
     if (idx < 0 || uint(idx) >= pc.out_numel) return;
     args.out[uint(idx)] = asuint(args.src[i]);
-/*{%*/ elif operation == "index_put_accumulate" /*%}*/
-    // index_put(accumulate=True): out[indices[i]] += values[i]  (atomic)
+/*{%*/ elif is_atomic /*%}*/
+    // M20.8 — Anti-goal #6: dispatch via IScatter generic instead of
+    // per-operation if/elif chain.  The concrete struct (/*{{*/ scatter_struct /*}}ScatterAdd*/)
+    // is substituted at Jinja render time; the shader body is operation-agnostic.
     if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    c10_vulkan_atomic_add(args.out, uint(idx), (float)args.src[i]);
-/*{%*/ elif operation == "scatter_reduce_amax" /*%}*/
-    // scatter_reduce(reduce='amax'): out[indices[i]] = max(out[indices[i]], src[i])
-    // T4.11 — float atomic max via CAS loop in lib/atomics.slang.
-    if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    atomic_max_f32(args.out, uint(idx), (float)args.src[i]);
-/*{%*/ elif operation == "scatter_reduce_amin" /*%}*/
-    // scatter_reduce(reduce='amin'): out[indices[i]] = min(out[indices[i]], src[i])
-    // T4.11 — float atomic min via CAS loop in lib/atomics.slang.
-    if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    atomic_min_f32(args.out, uint(idx), (float)args.src[i]);
-/*{%*/ elif operation == "scatter_reduce_prod" /*%}*/
-    // scatter_reduce(reduce='prod'): out[indices[i]] *= src[i]
-    // T4.11 — float atomic multiply via CAS loop in lib/atomics.slang.
-    if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    atomic_mul_f32(args.out, uint(idx), (float)args.src[i]);
-/*{%*/ elif operation == "scatter_reduce_mean" /*%}*/
-    // scatter_reduce(reduce='mean'): same atomic-add as sum-mode plus a
-    // companion uint-counter SSBO that increments once per src element.
-    // The host (or a follow-on divide kernel) computes
-    //   out[k] = (include_self ? out[k] + sum(src[..])  : sum(src[..])) /
-    //            (include_self ? count[k] + 1           : count[k])
-    // Per-thread we just emit the atomic add + atomic increment; the
-    // post-pass is the caller's responsibility (see _dispatch_scatter_atomic).
-    if (idx < 0 || uint(idx) >= pc.out_numel) return;
-    c10_vulkan_atomic_add(args.out, uint(idx), (float)args.src[i]);
+    /*{{*/ scatter_struct /*}}ScatterAdd*/::combine(args.out, uint(idx), (float)args.src[i]);
+/*{%*/ if is_mean /*%}*/
+    // scatter_reduce(reduce='mean'): companion uint-counter SSBO gets one
+    // atomic increment per landed element.  The host post-pass divides
+    //   out[k] / count[k] to compute the mean.  This increment is
+    // Jinja-gated (is_mean) because it requires the extra `count` buffer
+    // declared in KernelArgs — a structural difference, not an op difference.
     uint _orig_count;
     InterlockedAdd(args.count[uint(idx)], 1u, _orig_count);
+/*{%*/ endif /*%}*/
 /*{%*/ endif /*%}*/
 }

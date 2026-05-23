@@ -56438,3 +56438,165 @@ class TestM209CooperativeReductionReflectionAware:
             "M20.9: combined SGPR×0.5 + I/O×2.0 = net×1.0; "
             "rnumel=4097 > 4096 → non-cooperative"
         )
+
+
+class TestM208ScatterIScatterGenerics:
+    """M20.8 — Anti-goal #6 sweep for scatter_atomic template.
+
+    Verifies that the scatter_atomic template uses the Slang ``IScatter``
+    generic interface (declared in ``shaders/lib/atomics.slang``) for all
+    atomic operations instead of the old Jinja ``{% if operation == ... %}``
+    chain inside the shader body.
+
+    These are static-analysis tests (grep / Jinja render) — no GPU required.
+    """
+
+    def _atomics_src(self) -> str:
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "shaders",
+            "lib",
+            "atomics.slang",
+        )
+        with open(os.path.normpath(path)) as f:
+            return f.read()
+
+    def _jinja_src(self) -> str:
+        path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+            "scatter_atomic.py.jinja",
+        )
+        with open(os.path.normpath(path)) as f:
+            return f.read()
+
+    def _render(self, operation: str) -> str:
+        from jinja2 import Environment
+
+        env = Environment()
+        tmpl = env.from_string(self._jinja_src())
+        return tmpl.render(operation=operation, dtype="float", index_dtype="int")
+
+    def test_scatter_atomic_slang_uses_iscatter_interface(self):
+        """IScatter interface is declared in shaders/lib/atomics.slang."""
+        src = self._atomics_src()
+        assert "public interface IScatter" in src, (
+            "M20.8: `public interface IScatter` must be declared in "
+            "shaders/lib/atomics.slang (anti-goal #6 — generics, not strings)."
+        )
+        # combine method must be part of the interface
+        assert "static void combine(RWStructuredBuffer<uint> out, uint idx, float val)" in src, (
+            "M20.8: IScatter interface must declare "
+            "`static void combine(RWStructuredBuffer<uint> out, uint idx, float val)`."
+        )
+
+    def test_scatter_structs_implement_iscatter(self):
+        """All five concrete IScatter structs exist in atomics.slang."""
+        src = self._atomics_src()
+        expected_structs = [
+            "ScatterAdd",
+            "ScatterMax",
+            "ScatterMin",
+            "ScatterProd",
+            "ScatterMean",
+        ]
+        for struct in expected_structs:
+            assert f"public struct {struct} : IScatter" in src, (
+                f"M20.8: `public struct {struct} : IScatter` not found in "
+                "shaders/lib/atomics.slang."
+            )
+
+    def test_scatter_slang_no_operation_if_elif_for_atomics(self):
+        """scatter_atomic.py.jinja must not have per-op if/elif for atomic ops.
+
+        The old anti-goal #6 violation was branching on the operation name
+        inside the shader body (e.g. ``{% if operation == 'scatter_add' %}``).
+        After M20.8, atomic operations are dispatched via ``IScatter`` generics
+        — the Jinja template may still use ``operation`` to set Jinja variables
+        (scatter_struct, is_atomic, etc.), but must not branch on it inside the
+        rendered Slang shader body for the atomic dispatch itself.
+        """
+        src = self._jinja_src()
+        # These patterns are the old per-op branches in the shader body.
+        # They must no longer appear.
+        forbidden = [
+            '{% elif operation == "scatter_add" %}',
+            "{% elif operation == 'scatter_add' %}",
+            '{% elif operation == "index_put_accumulate" %}',
+            "{% elif operation == 'index_put_accumulate' %}",
+            '{% elif operation == "scatter_reduce_amax" %}',
+            "{% elif operation == 'scatter_reduce_amax' %}",
+            '{% elif operation == "scatter_reduce_amin" %}',
+            "{% elif operation == 'scatter_reduce_amin' %}",
+            '{% elif operation == "scatter_reduce_prod" %}',
+            "{% elif operation == 'scatter_reduce_prod' %}",
+            '{% elif operation == "scatter_reduce_mean" %}',
+            "{% elif operation == 'scatter_reduce_mean' %}",
+        ]
+        for pattern in forbidden:
+            assert pattern not in src, (
+                f"M20.8: found forbidden per-op Jinja branch `{pattern}` in "
+                "scatter_atomic.py.jinja — anti-goal #6 violation. "
+                "Atomic operations must use IScatter::combine generics."
+            )
+
+    def test_scatter_add_renders_scatteradd_struct(self):
+        """scatter_add renders ScatterAdd::combine, not c10_vulkan_atomic_add."""
+        rendered = self._render("scatter_add")
+        assert "ScatterAdd::combine(args.out" in rendered, (
+            "M20.8: scatter_add must render `ScatterAdd::combine(args.out, ...)` "
+            "in the shader body."
+        )
+        # Old direct call must be gone from the rendered body
+        assert "c10_vulkan_atomic_add" not in rendered, (
+            "M20.8: scatter_add must not emit raw `c10_vulkan_atomic_add` — "
+            "use IScatter::combine instead."
+        )
+
+    def test_scatter_reduce_ops_render_correct_structs(self):
+        """Each scatter_reduce variant renders the correct IScatter struct."""
+        op_to_struct = {
+            "index_put_accumulate": "ScatterAdd",
+            "scatter_reduce_amax": "ScatterMax",
+            "scatter_reduce_amin": "ScatterMin",
+            "scatter_reduce_prod": "ScatterProd",
+            "scatter_reduce_mean": "ScatterMean",
+        }
+        for op, struct in op_to_struct.items():
+            rendered = self._render(op)
+            assert f"{struct}::combine(args.out" in rendered, (
+                f"M20.8: operation `{op}` must render `{struct}::combine(args.out, ...)`. "
+                "Got:\n" + rendered
+            )
+
+    def test_scatter_reduce_mean_still_has_count_increment(self):
+        """scatter_reduce_mean still emits InterlockedAdd for the count buffer."""
+        rendered = self._render("scatter_reduce_mean")
+        assert "InterlockedAdd(args.count[uint(idx)], 1u" in rendered, (
+            "M20.8: scatter_reduce_mean must still emit "
+            "`InterlockedAdd(args.count[...], 1u, ...)` for the count buffer. "
+            "This is a structural gate (is_mean), not an atomic-op gate."
+        )
+
+    def test_non_atomic_ops_unchanged(self):
+        """Non-atomic ops (gather, scatter, index_put) are structurally unchanged."""
+        # gather: reads from src[idx] into out[i]
+        rendered_gather = self._render("gather")
+        assert "args.out[i] = args.src[uint(idx)]" in rendered_gather, (
+            "M20.8: gather path must still write `args.out[i] = args.src[uint(idx)]`."
+        )
+        # scatter: non-atomic write to out[idx]
+        rendered_scatter = self._render("scatter")
+        assert "args.out[uint(idx)] = asuint(args.src[i])" in rendered_scatter, (
+            "M20.8: scatter path must still write `args.out[uint(idx)] = asuint(args.src[i])`."
+        )
+        # index_put: non-atomic write to out[idx]
+        rendered_ip = self._render("index_put")
+        assert "args.out[uint(idx)] = asuint(args.src[i])" in rendered_ip, (
+            "M20.8: index_put path must still write `args.out[uint(idx)] = asuint(args.src[i])`."
+        )
