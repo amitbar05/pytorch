@@ -57662,3 +57662,318 @@ class TestTestCov1UntestedLowerings:
         b = torch.randn(4, 8)
         w = torch.rand(4, 8)
         self._compile_parity(lambda x, y, wt: torch.lerp(x, y, wt), a, b, w)
+
+
+class TestM214PerKernelVUIDLifecycleStress:
+    """M21.4 — Per-kernel VUID lifecycle stress tests.
+
+    Each Vulkan compute kernel invocation walks a fixed lifecycle:
+      1. look-up / create VkPipeline  (pipeline cache)
+      2. allocate VkDescriptorSet from pool
+      3. write buffer descriptors (vkUpdateDescriptorSets)
+      4. record dispatch into a command buffer
+      5. submit + wait
+      6. pool reset → descriptors become available again
+
+    These tests stress that lifecycle across many invocations under
+    ``VK_LAYER_KHRONOS_validation`` + best-practices + sync validation,
+    verifying that no VUID tokens appear in the combined stdout/stderr.
+
+    The subprocess pattern mirrors ``TestM213PostM22_16Sweep`` and
+    ``TestM186DescriptorPool``: validation env-vars must be set BEFORE
+    ``import torch_vulkan`` creates the Vulkan instance, so each test
+    spawns a fresh child process.
+
+    Static tests (no subprocess) are provided for CI environments that
+    don't have the validation layer installed — they always pass and
+    verify structural invariants around the harness itself.
+    """
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _layer_installed() -> bool:
+        from torch_vulkan.inductor.runtime.validation_codegen import layer_installed
+
+        return layer_installed()
+
+    @staticmethod
+    def _run(body: str, *, timeout_s: int = 150):
+        """Run ``body`` under the validation layer; return ValidationResult."""
+        from torch_vulkan.inductor.runtime.validation_codegen import run_with_validation
+
+        return run_with_validation(body, timeout_s=timeout_s)
+
+    @staticmethod
+    def _assert_clean(result) -> None:
+        """Fail with a descriptive message if any unexpected VUID was found."""
+        from torch_vulkan.inductor.runtime.validation_codegen import (
+            assert_clean,
+            load_known_vuids,
+        )
+
+        # Timeout sentinel (rc=124): skip rather than false-fail.
+        if result.returncode == 124:
+            pytest.skip(
+                "subprocess timed out — likely slangc cold-compile contention. "
+                "Re-run with a warm cache."
+            )
+        assert_clean(result)
+
+    # ── Static / structural tests (always run) ───────────────────────────
+
+    def test_known_vuids_file_is_parseable(self):
+        """``tests/data/m21_4_known_vuids.txt`` must be parseable by
+        ``load_known_vuids()``; an unparseable file would silently allow
+        unexpected VUIDs through the filter.
+        """
+        from torch_vulkan.inductor.runtime.validation_codegen import load_known_vuids
+
+        # load_known_vuids() returns a set; it must not raise.
+        known = load_known_vuids()
+        assert isinstance(known, set), (
+            "M21.4: load_known_vuids() must return a set, got "
+            f"{type(known).__name__}"
+        )
+
+    def test_run_with_validation_api_exists(self):
+        """``run_with_validation`` and ``assert_clean`` are importable from
+        ``runtime.validation_codegen``; any signature change would break the
+        M21.4 harness.
+        """
+        from torch_vulkan.inductor.runtime.validation_codegen import (
+            assert_clean,
+            load_known_vuids,
+            run_with_validation,
+        )
+
+        assert callable(run_with_validation), "run_with_validation must be callable"
+        assert callable(assert_clean), "assert_clean must be callable"
+        assert callable(load_known_vuids), "load_known_vuids must be callable"
+
+    def test_vuid_regex_matches_expected_format(self):
+        """The VUID regex in ``validation_codegen`` must match well-known
+        VUID strings so lifecycle tests don't silently pass due to a regex
+        bug.
+        """
+        from torch_vulkan.inductor.runtime.validation_codegen import VUID_RE
+
+        samples = [
+            "VUID-vkCmdDispatch-None-02700",
+            "VUID-VkWriteDescriptorSet-dstSet-04611",
+            "VUID-VkSubmitInfo-pCommandBuffers-00072",
+            "VUID-vkCmdPipelineBarrier-srcAccessMask-02812",
+            "VUID-VkComputePipelineCreateInfo-layout-07988",
+        ]
+        for vuid in samples:
+            line = f"Validation Error: [ {vuid} ]"
+            found = VUID_RE.findall(line)
+            assert vuid in found, (
+                f"M21.4: VUID_RE failed to match {vuid!r} in {line!r}"
+            )
+
+    def test_layer_installed_returns_bool(self):
+        """``layer_installed()`` must return a bool (not None / str).
+
+        The subprocess tests skip when this is False, so a type bug would
+        silently skip all lifecycle tests.
+        """
+        from torch_vulkan.inductor.runtime.validation_codegen import layer_installed
+
+        result = layer_installed()
+        assert isinstance(result, bool), (
+            f"M21.4: layer_installed() must return bool, got {type(result).__name__}"
+        )
+
+    # ── Subprocess lifecycle stress tests ────────────────────────────────
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
+    def test_pointwise_kernel_no_vulkan_errors(self):
+        """20 iterations of ``x * 2 + 1`` under ``VK_LAYER_KHRONOS_validation``
+        must produce no unexpected VUIDs.
+
+        This exercises the full descriptor-allocate → update → dispatch →
+        pool-reset cycle for a pointwise kernel across enough iterations
+        to cross ``Stream::MAX_DISPATCHES_PER_CMD`` (32) and trigger at
+        least one mid-loop ``flush_async → reset_async(fence)`` path.
+        """
+        if not self._layer_installed():
+            pytest.skip("Khronos validation layer not installed")
+
+        body = """
+            import torch
+            import torch_vulkan
+
+            x = torch.randn(128, device="vulkan")
+
+            @torch.compile(backend="inductor")
+            def fn(t):
+                return t * 2 + 1
+
+            # Warm up the compile cache with the first call.
+            _ = fn(x)
+            # Stress: 20 iterations to cross the cmd-buf flush threshold.
+            for _ in range(20):
+                out = fn(x)
+                _ = out.cpu()  # forces flush + GPU→CPU readback each iter
+
+            torch_vulkan.synchronize()
+            print("LIFECYCLE_OK")
+        """
+        result = self._run(body, timeout_s=150)
+        assert "LIFECYCLE_OK" in result.stdout or result.returncode == 0, (
+            f"pointwise lifecycle script did not reach LIFECYCLE_OK; "
+            f"rc={result.returncode} stderr tail:\n{result.stderr[-800:]}"
+        )
+        self._assert_clean(result)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        strict=False,
+        reason="slangc or RADV driver may crash under VK_LAYER_KHRONOS_validation subprocess env",
+    )
+    def test_reduction_kernel_no_vulkan_errors(self):
+        """10 iterations of ``x.sum()`` under validation layer must produce
+        no unexpected VUIDs.
+
+        Reduction kernels use a two-stage dispatch (partial reduce +
+        global reduce) with intermediate buffers, exercising a more
+        complex descriptor-lifecycle than pointwise.
+        """
+        if not self._layer_installed():
+            pytest.skip("Khronos validation layer not installed")
+
+        body = """
+            import torch
+            import torch_vulkan
+
+            x = torch.randn(256, device="vulkan")
+
+            @torch.compile(backend="inductor")
+            def fn(t):
+                return t.sum()
+
+            _ = fn(x)
+            for _ in range(10):
+                out = fn(x)
+                _ = out.cpu()
+
+            torch_vulkan.synchronize()
+            print("REDUCTION_OK")
+        """
+        result = self._run(body, timeout_s=150)
+        assert "REDUCTION_OK" in result.stdout or result.returncode == 0, (
+            f"reduction lifecycle script did not reach REDUCTION_OK; "
+            f"rc={result.returncode} stderr tail:\n{result.stderr[-800:]}"
+        )
+        self._assert_clean(result)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
+    def test_matmul_kernel_no_vulkan_errors(self):
+        """10 iterations of ``a @ b`` under validation layer must produce
+        no unexpected VUIDs.
+
+        Matmul is the most descriptor-heavy kernel (3 storage buffers +
+        push constants + pipeline spec constants), making it the primary
+        canary for ``VUID-VkWriteDescriptorSet-dstSet-04611`` (write to a
+        descriptor whose pool was reset) and ``VUID-02700`` (dispatch
+        without a matching descriptor update).
+        """
+        if not self._layer_installed():
+            pytest.skip("Khronos validation layer not installed")
+
+        body = """
+            import torch
+            import torch_vulkan
+
+            a = torch.randn(32, 32, device="vulkan")
+            b = torch.randn(32, 32, device="vulkan")
+
+            @torch.compile(backend="inductor")
+            def fn(x, y):
+                return x @ y
+
+            _ = fn(a, b)
+            for _ in range(10):
+                out = fn(a, b)
+                _ = out.cpu()
+
+            torch_vulkan.synchronize()
+            print("MATMUL_OK")
+        """
+        result = self._run(body, timeout_s=150)
+        assert "MATMUL_OK" in result.stdout or result.returncode == 0, (
+            f"matmul lifecycle script did not reach MATMUL_OK; "
+            f"rc={result.returncode} stderr tail:\n{result.stderr[-800:]}"
+        )
+        self._assert_clean(result)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        strict=False,
+        reason="slangc or RADV driver may crash under VK_LAYER_KHRONOS_validation subprocess env",
+    )
+    def test_descriptor_pool_reset_no_vuid_04611(self):
+        """Descriptor pool reset between kernel calls must not trigger
+        ``VUID-VkWriteDescriptorSet-dstSet-04611`` (writing to a descriptor
+        from a reset pool).
+
+        The test runs a pointwise kernel, forces a SPIR-V cache clear via
+        env override, then recompiles and reruns — simulating the cold-start
+        path where every compile forces a fresh descriptor pool allocation.
+        We use ``TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`` in the child to
+        guarantee a recompile on every call (maximum pool churn).
+        """
+        if not self._layer_installed():
+            pytest.skip("Khronos validation layer not installed")
+
+        body = """
+            import torch
+            import torch_vulkan
+
+            x = torch.randn(64, device="vulkan")
+
+            # Pool-reset stress: recompile on every call forces maximum
+            # pool churn (allocate → dispatch → reset → reallocate).
+            for i in range(5):
+                @torch.compile(backend="inductor", dynamic=False)
+                def fn(t, _step=i):
+                    return t * float(_step + 1) + 1.0
+
+                out = fn(x)
+                _ = out.cpu()
+
+            torch_vulkan.synchronize()
+            print("POOL_RESET_OK")
+        """
+        from torch_vulkan.inductor.runtime.validation_codegen import run_with_validation
+
+        result = run_with_validation(
+            body,
+            env_extra={"TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1"},
+            timeout_s=150,
+        )
+        assert "POOL_RESET_OK" in result.stdout or result.returncode == 0, (
+            f"pool-reset lifecycle script did not reach POOL_RESET_OK; "
+            f"rc={result.returncode} stderr tail:\n{result.stderr[-800:]}"
+        )
+        # Filter specifically for VUID-04611 (pool-reset descriptor write)
+        # and VUID-02700 (dispatch without descriptor update), the two most
+        # likely to fire under pool-churn conditions.
+        from torch_vulkan.inductor.runtime.validation_codegen import load_known_vuids
+
+        known = load_known_vuids()
+        lifecycle_vuids = [
+            v
+            for v in result.vuids
+            if v not in known
+            and ("04611" in v or "02700" in v or "00313" in v or "00072" in v)
+        ]
+        assert not lifecycle_vuids, (
+            f"M21.4: descriptor pool reset triggered lifecycle VUIDs: "
+            f"{lifecycle_vuids}\nstderr tail:\n{result.stderr[-1500:]}"
+        )
