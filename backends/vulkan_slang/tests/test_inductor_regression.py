@@ -56738,3 +56738,503 @@ class TestTestCov4SpecialMathBwd:
         """``torch.special.i1e`` backward — exponentially scaled i1; avoid x=0."""
         x = torch.linspace(0.5, 5.0, 32)
         self._check_grad(lambda t: torch.special.i1e(t).sum(), x)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TEST.COV.2 — dtype matrix sweep: fp16 / bf16 × top-10 lowerings
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestTestCov2DtypeMatrix:
+    """TEST.COV.2 — dtype × op matrix sweep for fp16 and bf16.
+
+    Verifies that fp16/bf16 variants of the top-20 lowerings produce
+    CPU-matching output when compiled through the Vulkan Inductor backend.
+    Uses atol=5e-3 (fp16 precision floor; bf16 is ±10× coarser but
+    operations are simple enough to stay within 1% of CPU).
+
+    10 ops × 2 dtypes = 20 parametrized test cases.
+    Added 2026-05-23 for TEST.COV.2.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        try:
+            import torch_vulkan
+
+            if not torch_vulkan.is_available():
+                pytest.skip("No Vulkan device")
+        except ImportError:
+            pytest.skip("torch_vulkan not installed")
+
+    def _check(self, fn, *cpu_args, dtype=torch.float16, atol=5e-3, rtol=5e-3):
+        """Compile *fn* on Vulkan at *dtype* and verify parity with CPU.
+
+        *cpu_args* are float32 tensors; they are cast to *dtype* both for
+        Vulkan and for the CPU reference so the comparison is dtype-fair.
+        Output is up-cast to float32 before ``assert_close`` to avoid
+        fp16 comparison surprises.
+        """
+        import os
+
+        os.environ.setdefault("TORCH_VULKAN_MM_TILES", "64x64x16")
+        args_vk = tuple(
+            a.to(dtype).to("vulkan:0") if isinstance(a, torch.Tensor) else a
+            for a in cpu_args
+        )
+        args_cpu = tuple(
+            a.to(dtype) if isinstance(a, torch.Tensor) else a for a in cpu_args
+        )
+        compiled = torch.compile(fn, backend="inductor")
+        got = compiled(*args_vk).cpu().float()
+        expected = fn(*args_cpu).float()
+        torch.testing.assert_close(got, expected, atol=atol, rtol=rtol)
+
+    # ── pointwise ops ────────────────────────────────────────────────
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_relu_fp16_bf16(self, dtype):
+        """TEST.COV.2: relu at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        self._check(torch.relu, x, dtype=dtype)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_tanh_fp16_bf16(self, dtype):
+        """TEST.COV.2: tanh at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        self._check(torch.tanh, x, dtype=dtype)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sigmoid_fp16_bf16(self, dtype):
+        """TEST.COV.2: sigmoid at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        self._check(torch.sigmoid, x, dtype=dtype)
+
+    # ── binary ops ───────────────────────────────────────────────────
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_add_fp16_bf16(self, dtype):
+        """TEST.COV.2: add at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        y = torch.randn(128)
+        self._check(torch.add, x, y, dtype=dtype)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_mul_fp16_bf16(self, dtype):
+        """TEST.COV.2: mul at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        y = torch.randn(128)
+        self._check(torch.mul, x, y, dtype=dtype)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sub_fp16_bf16(self, dtype):
+        """TEST.COV.2: sub at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(128)
+        y = torch.randn(128)
+        self._check(torch.sub, x, y, dtype=dtype)
+
+    # ── reduction ops ────────────────────────────────────────────────
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_sum_fp16_bf16(self, dtype):
+        """TEST.COV.2: sum(dim=-1) at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(64, 64)
+        # Looser tolerance: reduction accumulation error grows with size
+        self._check(lambda t: t.sum(dim=-1), x, dtype=dtype, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_mean_fp16_bf16(self, dtype):
+        """TEST.COV.2: mean(dim=-1) at fp16/bf16 matches CPU."""
+        torch.manual_seed(0)
+        x = torch.randn(64, 64)
+        self._check(lambda t: t.mean(dim=-1), x, dtype=dtype, atol=2e-2, rtol=2e-2)
+
+    # ── norm ops ─────────────────────────────────────────────────────
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_softmax_fp16_bf16(self, dtype):
+        """TEST.COV.2: softmax at fp16/bf16 matches CPU."""
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        x = torch.randn(16, 64)
+        self._check(
+            lambda t: F.softmax(t, dim=-1), x, dtype=dtype, atol=1e-2, rtol=1e-2
+        )
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_layer_norm_fp16_bf16(self, dtype):
+        """TEST.COV.2: layer_norm at fp16/bf16 matches CPU."""
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        x = torch.randn(4, 64)
+        w = torch.ones(64)
+        b = torch.zeros(64)
+        # layer_norm involves two reductions — use looser tolerance
+        self._check(
+            lambda t, wt, bt: F.layer_norm(t, [64], wt, bt),
+            x,
+            w,
+            b,
+            dtype=dtype,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+    # ── matmul ───────────────────────────────────────────────────────
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_linear_fp16_bf16(self, dtype):
+        """TEST.COV.2: linear (mm) at fp16/bf16 matches CPU.
+
+        fp16 accumulation drift on large K requires loose tolerance.
+        atol=1e-1 matches the project's observed empirical range for
+        (8, 32) @ (32, 16) mm in half-precision.
+        """
+        import torch.nn.functional as F
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 32)
+        w = torch.randn(16, 32)
+        self._check(
+            lambda t, wt: F.linear(t, wt),
+            x,
+            w,
+            dtype=dtype,
+            atol=1e-1,
+            rtol=1e-1,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TEST.COV.3 — activation backward parity (hardtanh / hardsigmoid /
+#              softplus / mish + 12 trig + 10 exp/log)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestTestCov3ActivationBwd:
+    """TEST.COV.3 — backward gradient-parity tests for the activation,
+    trig, and exp/log ops that have ``[Differentiable]`` annotations in
+    ``shaders/lib/pointwise.slang`` and route through ``bwd_diff_table.py``
+    on the backward pass.
+
+    Each test:
+    1. Runs the forward op on a CPU tensor with ``requires_grad=True`` and
+       calls ``.backward()`` to get the reference gradient.
+    2. Compiles the same lambda via ``torch.compile(..., backend="inductor")``
+       and runs it on a Vulkan tensor, then calls ``.backward()``.
+    3. Asserts gradient parity within ``atol=rtol=2e-3``.
+
+    Ops covered (24):
+      Activations (4):
+        hardtanh   → threshold_backward in BWD_DIFF_TABLE
+        hardsigmoid → ``aten.hardsigmoid_backward``
+        softplus   → algebraic backward in bwd_lowerings.py (M-AG5.1)
+        mish       → ``aten.mish_backward``
+
+      Basic trig (6):
+        sin  → ``aten.sin_backward``
+        cos  → ``aten.cos_backward``
+        tan  → ``aten.tan_backward``
+        asin → ``aten.asin_backward``
+        acos → ``aten.acos_backward``
+        atan → ``aten.atan_backward``
+
+      Hyperbolic trig (6):
+        sinh  → ``aten.sinh_backward``
+        cosh  → ``aten.cosh_backward``
+        asinh → ``aten.asinh_backward``
+        acosh → ``aten.acosh_backward``
+        atanh → ``aten.atanh_backward``
+        tanh  → ``aten.tanh_backward``
+
+      Exp / log (8):
+        exp2   → ``aten.exp2_backward``
+        expm1  → ``aten.expm1_backward``
+        log2   → ``aten.log2_backward``
+        log10  → ``aten.log10_backward``
+        log1p  → ``aten.log1p_backward``
+        erf    → ``aten.erf_backward``
+        erfc   → ``aten.erfc_backward``
+        sqrt   → ``aten.sqrt_backward``
+
+    Domain notes:
+    - ``asin`` / ``acos`` input stays in (-0.9, 0.9) to avoid domain edges.
+    - ``acosh`` input must be > 1; use linspace(1.1, 4.0).
+    - ``atanh`` input stays in (-0.9, 0.9) to avoid divergence at ±1.
+    - ``log2`` / ``log10`` / ``log1p`` / ``sqrt`` use positive-domain input.
+    - ``expm1`` uses a modest range to avoid f32 overflow.
+
+    Added 2026-05-23 for TEST.COV.3.
+    Closed: TEST.COV.3 — ``TestTestCov3ActivationBwd`` (24 tests).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_vulkan(self):
+        try:
+            import torch_vulkan
+
+            if not torch_vulkan.is_available():
+                pytest.skip("No Vulkan device")
+        except ImportError:
+            pytest.skip("torch_vulkan not installed")
+
+    def _check_grad(self, fn, x_cpu, atol=2e-3, rtol=2e-3):
+        """Compile *fn* on Vulkan and assert gradient parity vs CPU.
+
+        Args:
+            fn: A ``Tensor → Tensor`` lambda ending in ``.sum()``.
+                Must be differentiable.
+            x_cpu: A 1-D CPU float32 ``Tensor`` (no ``requires_grad``).
+            atol / rtol: Passed to ``torch.testing.assert_close``.
+        """
+        import os
+
+        os.environ.setdefault("TORCH_VULKAN_MM_TILES", "64x64x16")
+
+        # CPU reference
+        x_ref = x_cpu.detach().clone().requires_grad_(True)
+        fn(x_ref).backward()
+        grad_ref = x_ref.grad.clone()
+
+        # Vulkan compiled
+        x_vk = x_cpu.detach().to("vulkan:0").requires_grad_(True)
+        compiled = torch.compile(fn, backend="inductor")
+        compiled(x_vk).backward()
+        grad_vk = x_vk.grad.cpu()
+
+        torch.testing.assert_close(grad_vk, grad_ref, atol=atol, rtol=rtol)
+
+    # ── activations ──────────────────────────────────────────────────────
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "COV.3/M18.TB.1: threshold_backward inline lowering registers a "
+            "2-arg (grad_out, self) handler but aten.threshold_backward has "
+            "3 args (grad_out, self, threshold). Mismatched call falls through "
+            "to a stub that returns [] — HardtanhBackward0 gradient is empty."
+        ),
+    )
+    @pytest.mark.timeout(300)
+    def test_hardtanh_backward_grad_parity(self):
+        """``F.hardtanh`` backward — routes via threshold_backward (BWD_DIFF_TABLE).
+
+        xfail: threshold_backward 3-arg/2-arg mismatch returns empty gradient.
+        Tracked as M18.TB.1.
+        """
+        import torch.nn.functional as F
+
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: F.hardtanh(t).sum(), x)
+
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "COV.3/M18.HS.1: F.hardsigmoid decomposes to "
+            "clamp(x*(1/6)+0.5, 0, 1) in the FX graph. The inductor "
+            "codegen then hits clamp's FakeTensorProp which tries to access "
+            "the data pointer of a FakeTensor, raising InductorError. "
+            "Fix: suppress hardsigmoid decomposition or add a composite lowering."
+        ),
+    )
+    @pytest.mark.timeout(300)
+    def test_hardsigmoid_backward_grad_parity(self):
+        """``F.hardsigmoid`` backward — ``aten.hardsigmoid_backward`` in BWD_DIFF_TABLE.
+
+        xfail: hardsigmoid decomposes to clamp which raises FakeTensorProp error.
+        Tracked as M18.HS.1.
+        """
+        import torch.nn.functional as F
+
+        x = torch.linspace(-4.0, 4.0, 32)
+        self._check_grad(lambda t: F.hardsigmoid(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_softplus_backward_grad_parity(self):
+        """``F.softplus`` backward — algebraic route (bwd_lowerings.py M-AG5.1).
+
+        Requires warm SPIR-V cache; first run compiles the algebraic backward kernel.
+        """
+        import torch.nn.functional as F
+
+        x = torch.linspace(-3.0, 3.0, 32)
+        self._check_grad(lambda t: F.softplus(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_mish_backward_grad_parity(self):
+        """``F.mish`` backward — ``aten.mish_backward`` in BWD_DIFF_TABLE.
+
+        Requires warm SPIR-V cache; first run compiles the mish backward kernel.
+        """
+        import torch.nn.functional as F
+
+        x = torch.linspace(-3.0, 3.0, 32)
+        self._check_grad(lambda t: F.mish(t).sum(), x)
+
+    # ── basic trig ───────────────────────────────────────────────────────
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_sin_backward_grad_parity(self):
+        """``torch.sin`` backward — ``aten.sin_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-1.0, 1.0, 32)
+        self._check_grad(lambda t: torch.sin(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_cos_backward_grad_parity(self):
+        """``torch.cos`` backward — ``aten.cos_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-1.0, 1.0, 32)
+        self._check_grad(lambda t: torch.cos(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_tan_backward_grad_parity(self):
+        """``torch.tan`` backward — ``aten.tan_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-1.0, 1.0, 32)
+        self._check_grad(lambda t: torch.tan(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_asin_backward_grad_parity(self):
+        """``torch.asin`` backward — domain (-0.9, 0.9) avoids domain edges."""
+        x = torch.linspace(-0.9, 0.9, 32)
+        self._check_grad(lambda t: torch.asin(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_acos_backward_grad_parity(self):
+        """``torch.acos`` backward — domain (-0.9, 0.9) avoids domain edges."""
+        x = torch.linspace(-0.9, 0.9, 32)
+        self._check_grad(lambda t: torch.acos(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_atan_backward_grad_parity(self):
+        """``torch.atan`` backward — ``aten.atan_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.atan(t).sum(), x)
+
+    # ── hyperbolic trig ──────────────────────────────────────────────────
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_sinh_backward_grad_parity(self):
+        """``torch.sinh`` backward — ``aten.sinh_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-1.0, 1.0, 32)
+        self._check_grad(lambda t: torch.sinh(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_cosh_backward_grad_parity(self):
+        """``torch.cosh`` backward — ``aten.cosh_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-1.0, 1.0, 32)
+        self._check_grad(lambda t: torch.cosh(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_asinh_backward_grad_parity(self):
+        """``torch.asinh`` backward — ``aten.asinh_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.asinh(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_acosh_backward_grad_parity(self):
+        """``torch.acosh`` backward — domain (1.1, 4.0); acosh undefined for x ≤ 1."""
+        x = torch.linspace(1.1, 4.0, 32)
+        self._check_grad(lambda t: torch.acosh(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_atanh_backward_grad_parity(self):
+        """``torch.atanh`` backward — domain (-0.9, 0.9); atanh diverges at ±1."""
+        x = torch.linspace(-0.9, 0.9, 32)
+        self._check_grad(lambda t: torch.atanh(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_tanh_backward_grad_parity(self):
+        """``torch.tanh`` backward — ``aten.tanh_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.tanh(t).sum(), x)
+
+    # ── exp / log ────────────────────────────────────────────────────────
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_exp2_backward_grad_parity(self):
+        """``torch.exp2`` backward — ``aten.exp2_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.exp2(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_expm1_backward_grad_parity(self):
+        """``torch.expm1`` backward — ``aten.expm1_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.expm1(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_log2_backward_grad_parity(self):
+        """``torch.log2`` backward — positive domain; ``aten.log2_backward`` (COV.3)."""
+        x = torch.linspace(0.5, 8.0, 32)
+        self._check_grad(lambda t: torch.log2(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_log10_backward_grad_parity(self):
+        """``torch.log10`` backward — positive domain; ``aten.log10_backward`` (COV.3)."""
+        x = torch.linspace(0.5, 8.0, 32)
+        self._check_grad(lambda t: torch.log10(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_log1p_backward_grad_parity(self):
+        """``torch.log1p`` backward — positive domain (x > -1); ``aten.log1p_backward`` (COV.3)."""
+        x = torch.linspace(0.1, 5.0, 32)
+        self._check_grad(lambda t: torch.log1p(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_erf_backward_grad_parity(self):
+        """``torch.erf`` backward — ``aten.erf_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.erf(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_erfc_backward_grad_parity(self):
+        """``torch.erfc`` backward — ``aten.erfc_backward`` in BWD_DIFF_TABLE (COV.3)."""
+        x = torch.linspace(-2.0, 2.0, 32)
+        self._check_grad(lambda t: torch.erfc(t).sum(), x)
+
+    @pytest.mark.slow_compile(seconds=600)
+    @pytest.mark.timeout(300)
+    def test_sqrt_backward_grad_parity(self):
+        """``torch.sqrt`` backward — positive domain; ``aten.sqrt_backward`` (COV.3)."""
+        x = torch.linspace(0.1, 5.0, 32)
+        self._check_grad(lambda t: torch.sqrt(t).sum(), x)
