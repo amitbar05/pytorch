@@ -27,7 +27,7 @@ struct KernelArgs {
     ByteAddressBuffer buf_in1;
     RWByteAddressBuffer buf_out;
 };
-ParameterBlock<KernelArgs> args;
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // ── Unary float entry point ───────────────────────────────────────────────
 

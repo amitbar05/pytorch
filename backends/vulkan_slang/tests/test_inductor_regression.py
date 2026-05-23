@@ -1252,9 +1252,6 @@ class TestM12ReductionBackward:
         assert x.grad is not None, "sum dim=0 backward produced None gradient"
         torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
 
-    @pytest.mark.xfail(
-        reason="Pre-existing: sum/mean backward expand path broken on Vulkan"
-    )
     def test_m12_mean_backward_matches_cpu(self):
         """mean().backward() matches CPU gradient."""
 
@@ -1273,9 +1270,6 @@ class TestM12ReductionBackward:
         assert x.grad is not None, "mean backward produced None gradient"
         torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
 
-    @pytest.mark.xfail(
-        reason="Pre-existing: sum/mean backward expand path broken on Vulkan"
-    )
     def test_m12_mean_dim_backward_matches_cpu(self):
         """mean(dim=-1).backward() matches CPU gradient."""
 
@@ -36094,6 +36088,72 @@ class TestCGM3ReductionBackward:
     # ── Var backward ────────────────────────────────────────────────────
 
 
+class TestMAuditPerf1Followup:
+    """M-AUDIT-PERF.1-followup — verify non-scalar tangent rewriting.
+
+    Root cause: ``helpers.slang`` had ``[require(spirv, spvGroupNonUniform)]``
+    on ``wave_active_count_bits`` — an unknown capability name in slangc
+    2026.5.2. This caused the entire ``helpers`` module to fail compilation,
+    which cascaded to any reduction kernel that imports it (including the
+    dim-reduced sum/mean backward kernels).
+
+    Fix: removed the invalid annotation from helpers.slang (the correct
+    ``[require(spirv, subgroup_ballot)]`` annotation on the following line
+    was already present and sufficient).
+
+    These tests confirm that both the forward and backward compilation
+    succeed and gradients match CPU for non-scalar-tangent backward paths.
+    """
+
+    def test_sum_dim0_backward_nonscalar_tangent(self):
+        """sum(dim=0) backward tangent must not be constant-folded to zeros."""
+        import os
+
+        if not os.environ.get("SLANGC"):
+            import pytest
+
+            pytest.skip("SLANGC env var not set")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return x.sum(dim=0)
+
+        torch.manual_seed(42)
+        x = torch.randn(8, 64, device="vulkan:0", requires_grad=True)
+        x_cpu = x.detach().cpu().requires_grad_()
+
+        out = fn(x)
+        out.sum().backward()
+        x_cpu.sum(dim=0).sum().backward()
+
+        assert x.grad is not None, "sum(dim=0) backward produced None gradient"
+        torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+    def test_mean_dim_backward_nonscalar_tangent(self):
+        """mean(dim=-1) backward tangent must not be constant-folded to zeros."""
+        import os
+
+        if not os.environ.get("SLANGC"):
+            import pytest
+
+            pytest.skip("SLANGC env var not set")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return x.mean(dim=-1)
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 32, device="vulkan:0", requires_grad=True)
+        x_cpu = x.detach().cpu().requires_grad_()
+
+        out = fn(x)
+        out.sum().backward()
+        x_cpu.mean(dim=-1).sum().backward()
+
+        assert x.grad is not None, "mean(dim=-1) backward produced None gradient"
+        torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+
 class TestCGM5MatmulBackward:
     """CG.M5 — Matmul backward via [Differentiable] tile_inner_madd."""
 
@@ -55052,6 +55112,40 @@ class TestM233RenderBindingSetRatchet:
                 violations.append(f"header.py:{i}: {raw.rstrip()!r}")
         assert not violations, (
             "M23.3: bare [[vk::binding(N)]] (no set-0) found in kernel/header.py:\n"
+            + "\n".join(violations)
+        )
+
+    def test_slang_lib_parameterblocks_use_set0_binding(self):
+        """All ParameterBlock declarations in shaders/lib/*.slang must carry
+        [[vk::binding(0, 0)]] so Slang places them on Set 0.
+
+        Without the explicit annotation slangc defaults ParameterBlock to
+        Descriptor Set 1, which our VkPipelineLayout does not declare —
+        causing VUID-07988 on conformant drivers (M-NEW.6 / M21.3.01).
+        RADV silently ignores the wrong-set annotation; NV/Intel/Apple/
+        MoltenVK reject it.
+        """
+        import re
+
+        lib_dir = (
+            __import__("pathlib").Path(__file__).parent.parent / "shaders/lib"
+        )
+        pb_re = re.compile(r"ParameterBlock\s*<")
+        binding_re = re.compile(r"\[\[vk::binding\(\s*0\s*,\s*0\s*\)\]\]")
+        violations = []
+        for slang_file in sorted(lib_dir.glob("*.slang")):
+            lines = slang_file.read_text().splitlines()
+            for i, raw in enumerate(lines, 1):
+                stripped = raw.lstrip()
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                if pb_re.search(raw) and "struct" not in raw and "interface" not in raw:
+                    # This is a ParameterBlock variable declaration — must have [[vk::binding(0,0)]]
+                    if not binding_re.search(raw):
+                        violations.append(f"{slang_file.name}:{i}: {raw.rstrip()!r}")
+        assert not violations, (
+            "M-NEW.6: ParameterBlock declaration without [[vk::binding(0, 0)]] "
+            "in shaders/lib (defaults to Set 1 on conformant drivers):\n"
             + "\n".join(violations)
         )
 

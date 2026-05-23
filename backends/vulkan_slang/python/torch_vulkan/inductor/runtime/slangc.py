@@ -5,13 +5,8 @@ hash, then dispatches the compute shader via the C++ `_jit_dispatch` pybind
 entry point. The in-memory cache is augmented by an on-disk cache
 (``~/.cache/torch_vulkan/spirv/``, overridable via ``TORCH_VULKAN_SPIRV_CACHE``)
 so subsequent Python sessions bypass slangc entirely once a kernel has been
-compiled.
-
-M22a Stage 1: module-level shared state extracted to ``common.py``.
-M22a Stage 2: shader-lib precompile / module management extracted to
-``shader_lib.py``.
-M22a Stage 3: reflection metrics / SPIR-V baseline / numthreads cluster
-extracted to ``reflection_ext.py``.
+compiled. See ``common.py``, ``shader_lib.py``, ``reflection_ext.py`` for
+the split-out submodules (M22a).
 """
 
 import hashlib
