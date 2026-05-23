@@ -194,6 +194,7 @@ public uint wave_active_bit_or(uint v) { return WaveActiveBitOr(v); }
 [require(spirv, subgroup_arithmetic)]
 public uint wave_active_bit_xor(uint v) { return WaveActiveBitXor(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_ballot)]
 public uint wave_active_count_bits(bool v) { return WaveActiveCountBits(v); }
 

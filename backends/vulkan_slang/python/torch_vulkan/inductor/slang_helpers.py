@@ -157,6 +157,9 @@ HELPERS_MODULE_HEADERS = frozenset(
         # Phase 3 — dependent math
         "polygamma",
         "igamma",
+        # M20.4.b — wave-intrinsic fast path (single-wave reductions, no LDS)
+        "wave_active_any",
+        "wave_active_bit_xor",
     }
 )
 # The generic IWaveReduction interface + OpSum/OpProd/OpMaxReduce/OpMinReduce

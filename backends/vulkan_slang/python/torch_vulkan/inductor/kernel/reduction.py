@@ -288,10 +288,20 @@ class ReductionMixin(ReductionLoadMixin):
         return (mean_v, m2_v, cnt_v)
 
     def _any_reduction(self, src_dtype, value):
-        """Boolean-OR reduction (any) via shared memory."""
-        self.headers.add("wgreduce_any")
+        """Boolean-OR reduction (any) via shared memory or wave intrinsic."""
         red_numel, _ = self._compute_red_numel()
         red_size = min(red_numel, self.max_threadgroup_size)
+        # M20.4.b: when data fits in one wave, use wave_active_any directly
+        # (no LDS needed, no vk_wg_reduce_any overhead).
+        simd = self.simd_group_size or 64  # RDNA1 wave64 fallback
+        if red_size <= simd:
+            self.headers.add("wave_active_any")
+            return self.cse.generate(
+                self.stores,
+                f"wave_active_any({value})",
+                dtype=torch.bool,
+            )
+        self.headers.add("wgreduce_any")
         return self.cse.generate(
             self.stores,
             f"vk_wg_reduce_any({value} ? 1.0f : 0.0f, lid.x, {red_size}, VK_SUBGROUP_SIZE) != 0.0f",
@@ -299,11 +309,19 @@ class ReductionMixin(ReductionLoadMixin):
         )
 
     def _xor_sum_reduction(self, src_dtype, value):
-        """Bitwise XOR reduction via shared memory."""
-        self.headers.add("wgreduce_xor")
+        """Bitwise XOR reduction via wave intrinsic or shared memory."""
         red_numel, _ = self._compute_red_numel()
         red_size = min(red_numel, self.max_threadgroup_size)
         layout_2d = self._persistent_2d_layout()
+        # M20.4.b: wave fast path for small 1D reductions
+        simd = self.simd_group_size or 64  # RDNA1 wave64 fallback
+        if red_size <= simd and layout_2d is None:
+            self.headers.add("wave_active_bit_xor")
+            return self.cse.generate(
+                self.stores,
+                f"wave_active_bit_xor({value})",
+                dtype=DTYPE_TO_COMPUTATION_DTYPE[src_dtype],
+            )
         if layout_2d is not None and not self.multistage_reduction_entry:
             ty, tx = layout_2d
             self.headers.add("wgreduce2d_xor")
@@ -313,6 +331,7 @@ class ReductionMixin(ReductionLoadMixin):
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[src_dtype],
             )
         else:
+            self.headers.add("wgreduce_xor")
             result = self.cse.generate(
                 self.stores,
                 f"vk_wg_reduce_xor({value}, lid.x, {red_size}, VK_SUBGROUP_SIZE)",
