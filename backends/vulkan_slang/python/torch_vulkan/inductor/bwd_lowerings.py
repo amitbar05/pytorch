@@ -130,7 +130,7 @@ def _make_unary_bwd_diff_lowering(
         return
 
     @register_lowering(target, type_promotion_kind=None)
-    def _lowering(grad_output, self, *, _op=op, _L=L):
+    def _lowering(grad_output, self, *_scalars, _op=op, _L=L):
         if not _is_vulkan(grad_output):
             return NotImplemented
         return _L.fallback_handler(_op)(grad_output, self)

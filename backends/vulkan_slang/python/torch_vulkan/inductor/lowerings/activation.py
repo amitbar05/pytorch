@@ -28,28 +28,29 @@ def _register_pow_scalar_lowering() -> None:
 
 
 def _register_clamp_lowerings() -> None:
-    """Register aten.clamp / clamp_min / clamp_max lowerings.
+    """Register aten.clamp lowering.
 
-    Without these, Inductor decomposes aten.clamp(x, min, max) into
-    clamp_max(clamp_min(x, min), max) -- two pointwise ops each emitting
-    NaN-guard branches via maximum/minimum expression printers.
+    We register aten.clamp (2-arg min+max form) as a composite of
+    clamp_min + clamp_max so Inductor sees a single pointwise IR node
+    rather than two chained ones.  We do NOT override clamp_min / clamp_max
+    themselves — the upstream Inductor lowerings (via register_pointwise) for
+    aten.maximum / aten.minimum already handle scalar broadcast correctly.
+
+    aten.clamp is suppressed from Inductor's decomposition table
+    (``_suppress_upstream_decomps`` in ``lowerings/__init__.py``) so that
+    it reaches this lowering rather than being split by the upstream
+    clamp → clamp_min → clamp_max path.
     """
-    from torch._inductor.lowering import register_lowering
+    from torch._inductor.lowering import lowerings, register_lowering
 
-    @register_lowering(torch.ops.aten.clamp_min.default, type_promotion_kind=None)
-    def _clamp_min(x, min_val):
-        return torch.ops.aten.maximum.default(x, min_val)
+    aten = torch.ops.aten
 
-    @register_lowering(torch.ops.aten.clamp_max.default, type_promotion_kind=None)
-    def _clamp_max(x, max_val):
-        return torch.ops.aten.minimum.default(x, max_val)
-
-    @register_lowering(torch.ops.aten.clamp.default, type_promotion_kind=None)
+    @register_lowering(aten.clamp.default, type_promotion_kind=None)
     def _clamp(x, min_val=None, max_val=None):
         if min_val is not None:
-            x = torch.ops.aten.maximum.default(x, min_val)
+            x = lowerings[aten.clamp_min.default](x, min_val)
         if max_val is not None:
-            x = torch.ops.aten.minimum.default(x, max_val)
+            x = lowerings[aten.clamp_max.default](x, max_val)
         return x
 
 

@@ -98,10 +98,18 @@ def _suppress_upstream_decomps() -> None:
         # cast through the C++ ``vulkan_to_copy`` kernel (which knows the
         # byte-packed layout) before fusing the two muls.
         aten.native_dropout_backward.default,
-        # P12: suppress aten.clamp decomposition so our Vulkan lowering
-        # fires instead of the upstream clamp → clamp_min → clamp_max
-        # decomposition.
+        # P12 / M18.TB.1: suppress aten.clamp, clamp_min, clamp_max
+        # decompositions.  The upstream torch._refs decomps form a cycle:
+        # clamp → clamp_min + clamp_max → clamp.  Without suppressing all
+        # three, any decomp that calls torch.clamp_min / torch.clamp_max
+        # (e.g. our _hardtanh_via_clamp_min_max) triggers infinite recursion
+        # under AOTAutograd tracing.  clamp / clamp_min / clamp_max all have
+        # proper Meta kernels and upstream Inductor lowerings
+        # (via register_pointwise / maximum / minimum), so suppressing the
+        # decomps does not affect correctness.
         aten.clamp.default,
+        aten.clamp_min.default,
+        aten.clamp_max.default,
         # OP.3: view-style copy ops whose stock decomp routes through
         # ``aten.narrow.default`` at the wrapper level on Vulkan, where the
         # storage_offset isn't propagated into the SSBO descriptor and the
@@ -137,6 +145,19 @@ def _suppress_upstream_decomps() -> None:
     # before AOT autograd produces the FX graph that Inductor lowers.
     # Remove it there too so the op survives to our register_lowering.
     _aot_decomps.pop(aten.native_dropout_backward.default, None)
+    # M18.TB.1 / P12: also pop clamp, clamp_min, clamp_max from the global
+    # AOT decomp table. Without this, the upstream torch._refs decomps cause
+    # infinite recursion under AOTAutograd tracing:
+    #   clamp_min → torch.clamp(min=...) → clamp → clamp_min → ...
+    # Both ``decompositions`` (already suppressed above for clamp) and
+    # ``_aot_decomps`` must be clean. clamp_min / clamp_max have proper Meta
+    # kernels, so FakeTensorProp can run them without storage access.
+    _aot_decomps.pop(aten.clamp.default, None)
+    _aot_decomps.pop(aten.clamp.Tensor, None)
+    _aot_decomps.pop(aten.clamp_min.default, None)
+    _aot_decomps.pop(aten.clamp_min.Tensor, None)
+    _aot_decomps.pop(aten.clamp_max.default, None)
+    _aot_decomps.pop(aten.clamp_max.Tensor, None)
     # OP.3: same pop in the AOT decomp table for the view-style ops, plus
     # the fast_random_decomps cache that snapshots ``decompositions`` early.
     _aot_decomps.pop(aten.narrow_copy.default, None)
@@ -156,6 +177,43 @@ def _suppress_upstream_decomps() -> None:
     # causing AOTAutograd to decompose the op away before our Vulkan lowering
     # in bwd_lowerings.py fires. Pop it here so Inductor sees the raw op.
     _aot_decomps.pop(aten.native_batch_norm_backward.default, None)
+    # M18.TB.1: Replace the upstream hardtanh decomp (hardtanh → clamp) with a
+    # clamp_min/clamp_max based decomp that avoids aten.clamp entirely.  The
+    # stock torch._refs decomp rewrites hardtanh as clamp(x, min, max), which
+    # then appears in the backward graph as a recomputation node.  Inductor's
+    # FakeTensorProp tries to run that clamp on Vulkan FakeTensors; PrivateUse1
+    # has higher dispatch priority than Meta, so it hits the real Vulkan C++
+    # clamp kernel which calls data_ptr() on a FakeTensor and crashes with
+    # "Cannot access data pointer of Tensor".  clamp_min/clamp_max each have
+    # proper Meta kernels and our Vulkan lowerings in activation.py, so
+    # FakeTensorProp can execute them without touching real storage.
+    def _hardtanh_via_clamp_min_max(self, min_val=-1.0, max_val=1.0):
+        import torch as _torch
+        return _torch.clamp_max(_torch.clamp_min(self, min_val), max_val)
+
+    # Replace in BOTH tables: Inductor's `decompositions` (used by
+    # AOTAutograd joint trace) and the global `_aot_decomps` (consulted by
+    # non-Inductor AOT paths).
+    decompositions[aten.hardtanh.default] = _hardtanh_via_clamp_min_max
+    _aot_decomps[aten.hardtanh.default] = _hardtanh_via_clamp_min_max
+    _aot_decomps[aten.hardtanh_.default] = (
+        lambda self, min_val=-1.0, max_val=1.0:
+        self.copy_(_hardtanh_via_clamp_min_max(self, min_val, max_val))
+    )
+
+    # M18.TB.1: inject hardtanh_backward into Inductor's decomp tables so
+    # ``make_fx`` decomposes it to mask*grad during joint-graph tracing instead
+    # of dispatching to the Vulkan PrivateUse1 ``hardtanh_backward`` C++ kernel
+    # on FakeTensors.  There is no upstream Meta registration for
+    # ``hardtanh_backward``, so without this the C++ eager kernel fires, returns
+    # shape () instead of the input shape, and
+    # ``HardtanhBackward0 returned invalid gradient [] vs [32]`` is raised.
+    def _hardtanh_bwd_for_aot(grad_output, self, min_val, max_val):
+        mask = (self > min_val) & (self < max_val)
+        return grad_output * mask
+
+    decompositions[aten.hardtanh_backward.default] = _hardtanh_bwd_for_aot
+    _aot_decomps[aten.hardtanh_backward.default] = _hardtanh_bwd_for_aot
 
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.

@@ -251,8 +251,19 @@ def _compile_slang_to_spirv_inner(
         # couldn't catch (ABI-incompatible slangc rebuild with same
         # stat). Hard-fail on second crash to prevent any retry loop
         # and to avoid masking non-stale-cache slangc bugs.
+        #
+        # M18.TB.1 / FA-race guard: only invalidate when modules are known
+        # stable (_shader_lib_modules_ready).  During precompile_shader_libs
+        # the modules are being actively written; a concurrent prewarm_compile
+        # (e.g. Flash-Attention specs) may race the writes, causing slangc to
+        # crash with rc=-11 (SIGSEGV) on a partially-complete cache.  Wiping
+        # the cache in that window creates an invalidation loop — each precompile
+        # pass completes then a racing prewarm crashes and wipes it.  When
+        # _shader_lib_modules_ready is False the cache is still being built;
+        # skip the invalidation and let the retry-without-modules path handle it.
         if proc.returncode < 0 and module_includes:
-            _invalidate_shader_lib_modules()
+            if _shader_lib_modules_ready:
+                _invalidate_shader_lib_modules()
             used_module_includes = False  # DR.7: retry without module includes
             cmd2 = [
                 _get_slangc(),

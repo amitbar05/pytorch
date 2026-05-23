@@ -57031,21 +57031,13 @@ class TestTestCov3ActivationBwd:
 
     # ── activations ──────────────────────────────────────────────────────
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "COV.3/M18.TB.1: threshold_backward inline lowering registers a "
-            "2-arg (grad_out, self) handler but aten.threshold_backward has "
-            "3 args (grad_out, self, threshold). Mismatched call falls through "
-            "to a stub that returns [] — HardtanhBackward0 gradient is empty."
-        ),
-    )
     @pytest.mark.timeout(300)
     def test_hardtanh_backward_grad_parity(self):
-        """``F.hardtanh`` backward — routes via threshold_backward (BWD_DIFF_TABLE).
+        """``F.hardtanh`` backward — gradient parity vs CPU.
 
-        xfail: threshold_backward 3-arg/2-arg mismatch returns empty gradient.
-        Tracked as M18.TB.1.
+        hardtanh decomposes to clamp_min + clamp_max in the AOT graph;
+        the backward flows through those ops' gradients (comparison masks
+        multiplied element-wise). Fixed by M18.TB.1 (2026-05-23).
         """
         import torch.nn.functional as F
 

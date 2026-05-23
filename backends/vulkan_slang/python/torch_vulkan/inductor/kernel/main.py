@@ -408,10 +408,13 @@ class VulkanKernel(
         for rd in self.range_trees:
             if rd.is_reduction:
                 _loop_depth_proxy += 1
-        # Persistent / cooperative reduction uses multi-stage loops.
-        if self.inside_reduction:
-            if not self.should_use_cooperative_reduction():
-                _loop_depth_proxy += 1  # persistent loop overhead
+        # Note: cooperative/persistent reduction distinction is deliberately
+        # excluded from _loop_depth_proxy here.  should_use_cooperative_reduction
+        # calls _get_cached_io_pressure / _get_cached_num_sgprs, both of which
+        # call _compute_config_key → config_key, creating a circular dependency
+        # that causes infinite recursion.  The reduction arity from range_trees
+        # above is sufficient differentiation; inside_reduction is already in
+        # the `parts` list below.
 
         # M-pipeline-3: include the input + output buffer DTYPES in the
         # cache key. Two kernels with identical shape / reduction
