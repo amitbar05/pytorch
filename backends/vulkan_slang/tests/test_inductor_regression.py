@@ -38831,6 +38831,118 @@ class TestM193ReductionBoundaryFusion:
             )
 
 
+class TestM193HorizontalFusion:
+    """M19.3 — Horizontal fusion wiring: ``_coalesce_orphan_pointwise`` is
+    now installed as Inductor's ``_post_fusion_custom_pass`` at backend
+    registration time.
+
+    Two tests:
+
+    1. **Wiring contract** (mock/unit): verify that the custom pass is
+       installed and that calling it on a list of orphan pointwise mocks
+       returns a shorter list (grouping happened).
+
+    2. **Dispatch-count floor** (compile-mode, xfail-strict): GN + ReLU
+       compiled to Vulkan should emit ≤ 2 dispatches once horizontal
+       fusion is wired.  The xfail-strict marker allows the test to
+       land before the target is hit and flips automatically when
+       the dispatch count drops.
+
+    Stage tag: ``BUG_ROOT="scheduler/fusion"``.
+    """
+
+    _BUG_ROOT_COMPONENT = "scheduler/fusion"
+
+    def test_m193_post_fusion_pass_is_wired(self):
+        """The ``_post_fusion_custom_pass`` must be set to our
+        ``_vulkan_post_fusion_pass`` wrapper after backend registration.
+
+        Verifies the wiring contract: the pass is callable and, when called
+        on a list of ≥ 2 orphan pointwise mocks with matching numel, returns
+        a shorter (coalesced) list.
+        """
+        from unittest.mock import MagicMock
+
+        import torch_vulkan  # noqa: F401 — triggers _legacy_register
+        from torch._inductor import config as _ic
+        from torch._inductor.scheduler import ForeachKernelSchedulerNode
+
+        # The pass must be installed.
+        assert _ic._post_fusion_custom_pass is not None, (
+            "M19.3: _post_fusion_custom_pass must be set after Vulkan backend "
+            "registration — _coalesce_orphan_pointwise was not wired."
+        )
+        assert callable(_ic._post_fusion_custom_pass), (
+            "M19.3: _post_fusion_custom_pass must be callable."
+        )
+
+        # Build 3 orphan pointwise mocks (same numel).
+        mock_nodes = []
+        for _ in range(3):
+            node = MagicMock()
+            node.is_template.return_value = False
+            node.is_reduction.return_value = False
+            node.is_extern.return_value = False
+            node.group = (None, (512, 1))
+            mock_nodes.append(node)
+
+        # Patch ForeachKernelSchedulerNode.__init__ to accept mocks.
+        orig_init = ForeachKernelSchedulerNode.__init__
+        try:
+            ForeachKernelSchedulerNode.__init__ = lambda self, *a, **kw: None
+            result = _ic._post_fusion_custom_pass(mock_nodes)
+        finally:
+            ForeachKernelSchedulerNode.__init__ = orig_init
+
+        # 3 pointwise orphans with matching numel should coalesce into 1 entry.
+        assert len(result) < len(mock_nodes), (
+            f"M19.3: expected _post_fusion_custom_pass to reduce 3 orphan "
+            f"pointwise nodes to <3 entries, got {len(result)}.  "
+            "Check that _coalesce_orphan_pointwise is wired correctly."
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "M19.3 horizontal-fusion target: GN+ReLU ≤ 2 dispatches. "
+            "Wiring _coalesce_orphan_pointwise as _post_fusion_custom_pass "
+            "is live; the dispatch count may still exceed 2 until the "
+            "welford → normalize boundary is eliminated. Flip to a hard "
+            "assert once the target holds in CI."
+        ),
+    )
+    def test_m193_gn_relu_horizontal_fusion_dispatch_count(self):
+        """GN + ReLU compiled to Vulkan must emit ≤ 2 dispatches.
+
+        This is the M19.3 ratchet target.  The xfail-strict marker allows
+        the test to land before the target is achieved; it flips to a pass
+        automatically when the dispatch count drops to ≤ 2.
+        """
+        import torch_vulkan
+
+        @torch.compile(backend="inductor")
+        def fn(x, w, b):
+            h = torch.nn.functional.group_norm(x, 4, w, b)
+            return torch.nn.functional.relu(h)
+
+        x = torch.randn(2, 8, 16, 16, device="vulkan:0")
+        w = torch.ones(8, device="vulkan:0")
+        b = torch.zeros(8, device="vulkan:0")
+
+        # Warm-up compile pass.
+        fn(x, w, b)
+
+        torch_vulkan._c_ext._reset_perf_counters()
+        fn(x, w, b)
+        d = torch_vulkan._c_ext._get_dispatch_count()
+
+        assert d <= 2, (
+            f"M19.3: expected GN+ReLU ≤ 2 dispatches after horizontal fusion "
+            f"wiring, got {d}.  Once _coalesce_orphan_pointwise fires and the "
+            "welford → normalize boundary is eliminated, this should be 1-2."
+        )
+
+
 class TestM99ComboBatcher:
     """M9.9 — Transformer combo-batcher UnboundLocalError fix.
 
@@ -55677,3 +55789,271 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
                 f"M20.7 probe kernel failed to compile via slangc: "
                 f"rc={proc.returncode}\nstderr:\n{proc.stderr[:2000]}"
             )
+
+
+class TestM205ReflectionMetadata:
+    """M20.5 — Reflection metadata coverage 40 % → 80 %.
+
+    Tests that ``_parse_reflection_metrics`` and ``_analyze_spirv_binary``
+    now extract the full set of M20.5 fields:
+      - subgroup_size (inferred from threadGroupSize in JSON)
+      - num_sgprs, num_loads, num_stores, num_atomics (from SPIR-V analysis)
+    and that ``_pick_numthreads_from_reflection`` uses them correctly.
+    """
+
+    # ── Static schema checks ─────────────────────────────────────────────
+
+    def test_parse_reflection_metrics_schema_has_new_fields(self):
+        """_parse_reflection_metrics returns all 8 M20.5 fields."""
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _parse_reflection_metrics,
+        )
+
+        result = _parse_reflection_metrics("{}")
+        expected_keys = {
+            "vgprs",
+            "shared_mem",
+            "subgroup_size",
+            "loop_depth",
+            "num_sgprs",
+            "num_loads",
+            "num_stores",
+            "num_atomics",
+        }
+        assert set(result.keys()) == expected_keys, (
+            f"M20.5: _parse_reflection_metrics schema mismatch. "
+            f"Got {set(result.keys())} expected {expected_keys}"
+        )
+
+    def test_parse_reflection_metrics_subgroup_size_from_threadgroupsize_64(self):
+        """M20.5: subgroup_size inferred as 64 when threadGroupSize X is 256."""
+        import json
+
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _parse_reflection_metrics,
+        )
+
+        refl = json.dumps(
+            {
+                "parameters": [],
+                "entryPoints": [
+                    {
+                        "name": "computeMain",
+                        "stage": "compute",
+                        "threadGroupSize": [256, 1, 1],
+                        "parameters": [],
+                        "bindings": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_reflection_metrics(refl)
+        assert result["subgroup_size"] == 64, (
+            f"M20.5: threadGroupSize=[256,1,1] should infer subgroup_size=64, "
+            f"got {result['subgroup_size']}"
+        )
+
+    def test_parse_reflection_metrics_subgroup_size_from_threadgroupsize_32(self):
+        """M20.5: subgroup_size inferred as 32 when threadGroupSize X is 32."""
+        import json
+
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _parse_reflection_metrics,
+        )
+
+        refl = json.dumps(
+            {
+                "parameters": [],
+                "entryPoints": [
+                    {
+                        "name": "computeMain",
+                        "stage": "compute",
+                        "threadGroupSize": [32, 1, 1],
+                        "parameters": [],
+                        "bindings": [],
+                    }
+                ],
+            }
+        )
+        result = _parse_reflection_metrics(refl)
+        assert result["subgroup_size"] == 32, (
+            f"M20.5: threadGroupSize=[32,1,1] should infer subgroup_size=32, "
+            f"got {result['subgroup_size']}"
+        )
+
+    def test_analyze_spirv_binary_new_fields(self):
+        """M20.5: _analyze_spirv_binary returns num_loads/stores/atomics/sgprs."""
+        from torch_vulkan.inductor.runtime.reflection_ext import _analyze_spirv_binary
+
+        # Empty / invalid SPV should return None for all new fields.
+        result = _analyze_spirv_binary(b"")
+        assert "num_loads" in result, "M20.5: num_loads key missing"
+        assert "num_stores" in result, "M20.5: num_stores key missing"
+        assert "num_atomics" in result, "M20.5: num_atomics key missing"
+        assert "num_sgprs" in result, "M20.5: num_sgprs key missing"
+
+    def test_analyze_spirv_binary_minimum_vgpr(self):
+        """M20.5: Simple kernels with 0 func vars get vgprs=1 (not None).
+
+        Previously a kernel with no function-scope OpVariables returned
+        vgprs=None, forcing the sizing path to fall back to heuristics.
+        M20.5 returns at least 1 so the reflection path stays active.
+        """
+        import subprocess
+        import tempfile
+
+        from torch_vulkan.inductor.runtime.reflection_ext import _analyze_spirv_binary
+        from torch_vulkan.inductor.runtime.slangc import _get_slangc, _slangc_available
+
+        if not _slangc_available():
+            pytest.skip("slangc not available")
+
+        # Simplest possible compute kernel — no function-scope variables.
+        probe_src = """
+RWStructuredBuffer<float> out_buf;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 sv_tid: SV_DispatchThreadID)
+{
+    out_buf[sv_tid.x] = 1.0f;
+}
+"""
+        slangc = _get_slangc()
+        with tempfile.TemporaryDirectory() as td:
+            src_path = os.path.join(td, "probe.slang")
+            spv_path = os.path.join(td, "probe.spv")
+            with open(src_path, "w") as f:
+                f.write(probe_src)
+            proc = subprocess.run(
+                [
+                    slangc,
+                    src_path,
+                    "-target",
+                    "spirv",
+                    "-entry",
+                    "computeMain",
+                    "-o",
+                    spv_path,
+                    "-matrix-layout-row-major",
+                    "-ignore-capabilities",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0:
+                pytest.skip(f"slangc compile failed: {proc.stderr[:500]}")
+
+            spv = open(spv_path, "rb").read()
+
+        result = _analyze_spirv_binary(spv)
+        assert result.get("vgprs") is not None and result["vgprs"] >= 1, (
+            f"M20.5: trivial kernel vgprs should be >= 1, got {result.get('vgprs')}"
+        )
+        assert result.get("num_loads") is not None, (
+            "M20.5: num_loads should be extracted from SPIR-V"
+        )
+        assert result.get("num_stores") is not None, (
+            "M20.5: num_stores should be extracted from SPIR-V"
+        )
+
+    def test_pick_numthreads_uses_num_sgprs(self):
+        """M20.5: High SGPR pressure (>64) drops one WG tier."""
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _pick_numthreads_from_reflection,
+        )
+
+        # Base: vgprs=16 → 256 threads.  With num_sgprs=80 → should drop to 128.
+        result = _pick_numthreads_from_reflection(
+            vgprs=16,
+            current_numthreads=(256, 1, 1),
+            num_sgprs=80,
+        )
+        assert result[0] <= 128, (
+            f"M20.5: num_sgprs=80 > 64 should drop WG from 256, got {result[0]}"
+        )
+
+    def test_pick_numthreads_io_heavy_raises_tier(self):
+        """M20.5: High I/O count (>128 loads+stores) raises WG tier."""
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _pick_numthreads_from_reflection,
+        )
+
+        # Base: vgprs=80 → 64 threads.  With 150 I/O ops → should raise to 128.
+        result = _pick_numthreads_from_reflection(
+            vgprs=80,
+            current_numthreads=(64, 1, 1),
+            num_loads=100,
+            num_stores=60,
+        )
+        assert result[0] >= 128, (
+            f"M20.5: high I/O count should raise WG from 64, got {result[0]}"
+        )
+
+    def test_pick_numthreads_preserves_2d_workgroups(self):
+        """M20.5: 2D/3D workgroups are passed through unchanged."""
+        from torch_vulkan.inductor.runtime.reflection_ext import (
+            _pick_numthreads_from_reflection,
+        )
+
+        result = _pick_numthreads_from_reflection(
+            vgprs=200,  # would normally drop to 32
+            current_numthreads=(64, 4, 1),
+            num_sgprs=128,  # high SGPR pressure
+        )
+        assert result == (64, 4, 1), (
+            f"M20.5: 2D workgroups should be preserved, got {result}"
+        )
+
+    def test_reflection_coverage_rate(self):
+        """M20.5: Document the current reflection coverage rate.
+
+        Counts how many cached kernel metrics have non-None values for
+        each field, confirming M20.5 improvements are persisted to disk.
+
+        The target is ≥ 80 % of kernels having vgprs data,
+        ≥ 60 % having num_loads/num_stores data (newly added),
+        and ≥ 40 % having subgroup_size data (inferred from threadGroupSize).
+
+        This is a documentation/audit test: it logs the coverage rates
+        and fails only if vgprs coverage falls below 80 %.
+        """
+        import glob
+
+        from torch_vulkan.inductor.runtime.common import _get_disk_cache_dir
+
+        cache_dir = _get_disk_cache_dir()
+        files = glob.glob(os.path.join(cache_dir, "**", "*.metrics.json"), recursive=True)
+
+        if len(files) < 10:
+            pytest.skip(f"Too few cached metrics ({len(files)}); run more kernels first")
+
+        total = len(files)
+        counts = {
+            "vgprs": 0,
+            "subgroup_size": 0,
+            "num_loads": 0,
+            "num_stores": 0,
+            "num_atomics": 0,
+            "num_sgprs": 0,
+        }
+        for f in files:
+            try:
+                m = json.load(open(f))
+                for k in counts:
+                    if m.get(k) is not None:
+                        counts[k] += 1
+            except Exception:
+                pass
+
+        vgpr_pct = 100 * counts["vgprs"] / total
+        # vgprs coverage must be ≥ 80 % (M20.5 target)
+        assert vgpr_pct >= 80.0, (
+            f"M20.5: vgprs coverage {vgpr_pct:.1f}% < 80% target "
+            f"({counts['vgprs']}/{total} kernels)"
+        )
+        # Log all coverage rates for reference (not failing assertions)
+        for k, cnt in sorted(counts.items()):
+            pct = 100 * cnt / total
+            print(f"  M20.5 coverage {k}: {cnt}/{total} = {pct:.1f}%")

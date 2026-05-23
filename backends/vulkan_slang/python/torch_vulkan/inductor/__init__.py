@@ -634,6 +634,31 @@ def _legacy_register() -> None:
     if hasattr(_ic, "combo_kernels_pointwise_only"):
         _ic.combo_kernels_pointwise_only = False
 
+    # M19.3 — wire _coalesce_orphan_pointwise as a post-fusion custom pass.
+    #
+    # After Inductor's vertical fusion loop (`fuse_nodes`), orphan pointwise
+    # nodes — nodes that couldn't be vertically fused and share the same numel
+    # as a sibling — are grouped into ``ForeachKernelSchedulerNode`` objects by
+    # ``_coalesce_orphan_pointwise``.  This collapses N separate pointwise
+    # dispatches into a single combo-kernel dispatch (handled by
+    # ``VulkanScheduling.codegen_combo_kernel``), reducing host overhead.
+    #
+    # Gated by ``aggressive_fusion()`` (``TORCH_VULKAN_AGGRESSIVE_FUSION``,
+    # default ON) so the behaviour can be disabled for debugging without
+    # rebuilding.  The upstream ``create_combo_kernel_nodes`` still runs
+    # afterwards and will skip any ``ForeachKernelSchedulerNode`` objects we
+    # created here (it filters them out at line 2620 of scheduler.py).
+    if hasattr(_ic, "_post_fusion_custom_pass"):
+        from . import config as _vk_cfg
+        from .vulkan_combo_kernel import VulkanComboKernel as _VCK
+
+        def _vulkan_post_fusion_pass(nodes):
+            if not _vk_cfg.aggressive_fusion():
+                return nodes
+            return _VCK._coalesce_orphan_pointwise(nodes)
+
+        _ic._post_fusion_custom_pass = _vulkan_post_fusion_pass
+
     from .vulkan_template_caller import (
         install_external_addmm,
         install_external_bmm,
