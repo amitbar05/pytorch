@@ -44882,6 +44882,137 @@ class TestM202MmParameterBlockRestore:
             assert os.path.getsize(spv_path) > 1000
 
 
+class TestM202SlangMMParameterBlock:
+    """M20.2 — slang_mm ParameterBlock restore + dispatch-path unification.
+
+    Static structural tests verifying that the loaded template source (from
+    ``templates/slang_mm.slang`` via ``_load_slang_template``) uses
+    ``ParameterBlock<KernelArgs>`` and not bare ``[[vk::binding(N, 0)]]``
+    global buffer declarations.  The compile-mode correctness is covered by
+    ``TestM17SlangMatmulCorrectness``; these tests lock the template shape.
+    """
+
+    @staticmethod
+    def _get_template_src(name: str) -> str:
+        """Load and unwrap the named Slang template (prefers .slang over .py.jinja)."""
+        from torch_vulkan.inductor.vulkan_template import (
+            _SLANG_TEMPLATES,
+            _load_slang_template,
+        )
+
+        # Clear the module-level cache so we always read from disk.
+        _SLANG_TEMPLATES.pop(name, None)
+        return _load_slang_template(name)
+
+    def test_slang_mm_template_uses_parameter_block(self):
+        """The rendered slang_mm template must contain
+        ``ParameterBlock<KernelArgs>`` — the M20.2 restore replaced the
+        M17.1 per-binding ``[[vk::binding(N, 0)]]`` workaround."""
+        from jinja2 import Environment
+
+        src = self._get_template_src("slang_mm")
+        # Render with minimal kwargs to get the concrete Slang text.
+        rendered = Environment().from_string(src).render(
+            tile_m=64,
+            tile_n=64,
+            tile_k=16,
+            m_per_thread=1,
+            n_per_thread=1,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_bias="float",
+            dtype_acc="float",
+            num_stages=1,
+            has_bias=False,
+            epilogue=False,
+        )
+        assert "ParameterBlock<KernelArgs>" in rendered, (
+            "slang_mm template missing ParameterBlock<KernelArgs> after M20.2 "
+            "restore. The template source is loaded from templates/slang_mm.slang "
+            "(preferred) or templates/slang_mm.py.jinja (fallback)."
+        )
+
+    def test_slang_mm_no_bare_vk_binding(self):
+        """The loaded slang_mm template must NOT contain bare
+        ``[[vk::binding(N, 0)]] StructuredBuffer`` global declarations —
+        those are the M17.1 workaround, replaced by ParameterBlock in M20.2.
+        Comments are excluded from the check."""
+        import re
+
+        src = self._get_template_src("slang_mm")
+        # Strip single-line comments to avoid false positives from history notes.
+        no_comments = re.sub(r"//[^\n]*", "", src)
+        # Match the M17.1 pattern: [[vk::binding(N, 0)]] StructuredBuffer<...>
+        # or RWStructuredBuffer<...> at global scope (not inside a struct).
+        bare_binding_re = re.compile(
+            r"\[\[vk::binding\(\d+,\s*0\)\]\]\s+(?:RW)?StructuredBuffer\s*<"
+        )
+        matches = bare_binding_re.findall(no_comments)
+        assert not matches, (
+            f"slang_mm template still has M17.1-style bare "
+            f"[[vk::binding(N, 0)]] StructuredBuffer declarations: {matches}. "
+            f"M20.2 replaced these with ParameterBlock<KernelArgs>."
+        )
+
+    def test_slang_mm_bwd_template_uses_parameter_block(self):
+        """The rendered slang_mm_bwd template must contain
+        ``ParameterBlock<KernelArgs>``."""
+        from jinja2 import Environment
+
+        src = self._get_template_src("slang_mm_bwd")
+        rendered = Environment().from_string(src).render(
+            tile_m=64,
+            tile_n=64,
+            tile_k=16,
+            m_per_thread=1,
+            n_per_thread=1,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_acc="float",
+            has_batch=False,
+        )
+        assert "ParameterBlock<KernelArgs>" in rendered, (
+            "slang_mm_bwd template missing ParameterBlock<KernelArgs> after M20.2 "
+            "restore."
+        )
+
+    def test_slang_mm_compile_mode_correctness(self):
+        """Compile-mode mm correctness is covered by
+        ``TestM17SlangMatmulCorrectness``; this test documents the coverage
+        and verifies the template renders without Jinja errors."""
+        from jinja2 import Environment
+
+        src = self._get_template_src("slang_mm")
+        # Render a bias variant to exercise the has_bias branch.
+        rendered = Environment().from_string(src).render(
+            tile_m=64,
+            tile_n=64,
+            tile_k=16,
+            m_per_thread=1,
+            n_per_thread=1,
+            dtype_a="float",
+            dtype_b="float",
+            dtype_c="float",
+            dtype_bias="float",
+            dtype_acc="float",
+            num_stages=1,
+            has_bias=True,
+            epilogue=False,
+        )
+        # Both ParameterBlock and args.bias must appear in has_bias render.
+        assert "ParameterBlock<KernelArgs>" in rendered
+        assert "args.bias" in rendered, (
+            "slang_mm has_bias render missing args.bias — bias buffer access "
+            "must go through ParameterBlock struct field."
+        )
+        assert "args.c[" in rendered, (
+            "slang_mm render missing args.c — output buffer access must go "
+            "through ParameterBlock struct field."
+        )
+
+
 class TestM206SubgroupSizeSpecConst:
     """M20.6 — replace the hardcoded ``simd_group_size = 64`` literal in
     rendered Slang with a ``[[vk::constant_id(100)]] VK_SUBGROUP_SIZE``
