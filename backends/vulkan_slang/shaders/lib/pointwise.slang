@@ -575,20 +575,28 @@ public float erf_fwd(float x) { return (x).erf(); }
 [BackwardDerivative(erfc_fast_bwd)]
 public float erfc_fwd(float x) { return 1.0f - (x).erf(); }
 
+[Differentiable]
 public float erfinv_fwd(float x) { return (x).erfinv(); }
 
+[Differentiable]
 public float lgamma_fwd(float x) { return (x).lgamma(); }
 
+[Differentiable]
 public float digamma_fwd(float x) { return (x).digamma(); }
 
+[Differentiable]
 public float ndtri_fwd(float x) { return (x).ndtri(); }
 
+[Differentiable]
 public float i0_fwd(float x) { return (x).i0(); }
 
+[Differentiable]
 public float i0e_fwd(float x) { return (x).i0e(); }
 
+[Differentiable]
 public float i1_fwd(float x) { return (x).i1(); }
 
+[Differentiable]
 public float i1e_fwd(float x) { return (x).i1e(); }
 
 public struct OpTan : IPointwise, IDifferentiable {

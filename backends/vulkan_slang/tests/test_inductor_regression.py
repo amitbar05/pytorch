@@ -20436,9 +20436,9 @@ class TestOpCoverageAudit:
         )
 
     def test_markdown_report_renders(self):
-        import os
-        import subprocess
+        import importlib.util
         import sys
+        from unittest.mock import patch
 
         script = os.path.join(
             os.path.dirname(__file__),
@@ -20446,13 +20446,19 @@ class TestOpCoverageAudit:
             "scripts",
             "audit_inductor_op_coverage.py",
         )
-        r = subprocess.run(
-            [sys.executable, script, "--markdown"],
-            capture_output=True,
-            text=True,
-            check=True,
+        spec = importlib.util.spec_from_file_location(
+            "_audit_inductor_op_coverage", script
         )
-        out = r.stdout
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+            # Skip slow model-tracing (FX make_fx on all benchmark models);
+            # the structure of the report is what we're testing, not the data.
+            with patch.object(mod, "_model_op_usage_uncached", return_value={}):
+                out = mod.markdown_report()
+        finally:
+            sys.modules.pop(spec.name, None)
         for header in (
             "# Inductor op-coverage audit",
             "## Coverage summary",
@@ -26115,13 +26121,15 @@ class TestBwdDiffCoverageGate:
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
-                if line.startswith("[Differentiable]"):
+                if line.startswith("[Differentiable]") or line.startswith("[BackwardDerivative"):
                     # Walk forward across additional attributes
-                    # (`[BackwardDerivative(...)]`, etc.) to find the
-                    # next non-attribute, non-blank line — which is the
-                    # function declaration. Skip when the search hits
-                    # something that isn't an attribute or a public
-                    # function decl (defensive).
+                    # (`[BackwardDerivative(...)]`, `[Differentiable]`, etc.)
+                    # to find the next non-attribute, non-blank line — which
+                    # is the function declaration. Skip when the search hits
+                    # something that isn't an attribute or a public function
+                    # decl (defensive). [BackwardDerivative] functions are
+                    # differentiable (they have custom backward derivatives)
+                    # and must be covered by BWD_DIFF_TABLE or EXCLUDED.
                     j = i + 1
                     while j < len(lines):
                         s = lines[j].strip()

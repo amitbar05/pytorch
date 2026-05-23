@@ -190,6 +190,43 @@ EXCLUDED_DIFFERENTIABLE_FWDS: dict[str, str] = {
         "scalars that softplus_fwd does not declare; backward "
         "lowered algebraically in bwd_lowerings.py"
     ),
+    # ── M12 / reduction-autodiff internal helpers ──────────────────────
+    # These carry [Differentiable] so Slang's autodiff engine can chain
+    # through them when differentiating reduction kernels. They are NOT
+    # direct aten ops — the aten-level ops (sum/mean/prod/etc.) are
+    # routed via their own BWD_DIFF_TABLE entries. Keeping [Differentiable]
+    # on the helpers enables bwd_diff(reduce_sum)(...) to trace through
+    # combine_sum_nan automatically, which is the M12 autodiff payoff.
+    "combine_max": "reduction helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    "combine_min": "reduction helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    "combine_prod_nan": "reduction helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    "combine_sum_nan": "reduction helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    "welford_combine": "Welford combine step: [Differentiable] for internal chaining; not a direct aten op",
+    "reduce_fold_prod": "reduction fold helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    "reduce_fold_sum": "reduction fold helper: [Differentiable] for autodiff chaining; not a direct aten op",
+    # ── Norm chain helpers ─────────────────────────────────────────────
+    # Full fused forward (Welford + normalize + affine). [Differentiable]
+    # enables autodiff through the chain, but the full norm backward
+    # also requires a reduction over normalized dims — not emittable from
+    # bwd_diff codegen alone. Norm backward routes via decomposed IR.
+    "layer_norm_chain": "norm chain: needs reduction for full bwd; routes via decomposed IR",
+    "layer_norm_chain_no_affine": "norm chain: needs reduction for full bwd; routes via decomposed IR",
+    "rms_norm_chain": "norm chain: needs reduction for full bwd; routes via decomposed IR",
+    "rms_norm_chain_no_affine": "norm chain: needs reduction for full bwd; routes via decomposed IR",
+    # ── SDPA / softmax helpers ─────────────────────────────────────────
+    # Element-wise steps inside SDPA backward and softmax backward.
+    # [Differentiable] enables Slang autodiff to chain through them.
+    # The SDPA / softmax aten ops are not yet in BWD_DIFF_TABLE.
+    "sdpa_score": "SDPA helper: [Differentiable] for attention-bwd chaining; aten op not yet in table",
+    "sdpa_output": "SDPA helper: [Differentiable] for attention-bwd chaining; aten op not yet in table",
+    "softmax_elem": "softmax helper: [Differentiable] for bwd chaining; aten op not yet in table",
+    "softmax_exp_sub": "softmax helper: [Differentiable] for bwd chaining; aten op not yet in table",
+    # ── Conv / mm inner helpers ────────────────────────────────────────
+    # Inner multiply-add steps. [Differentiable] enables bwd_diff to
+    # trace through the inner loop. The conv/mm aten backward ops are
+    # handled by hand-rolled lowerings, not via bwd_diff codegen.
+    "conv_inner_madd": "conv inner helper: [Differentiable] for conv-bwd autodiff chaining",
+    "tile_inner_madd": "mm-tile inner helper: [Differentiable] for mm-bwd autodiff chaining",
 }
 
 
