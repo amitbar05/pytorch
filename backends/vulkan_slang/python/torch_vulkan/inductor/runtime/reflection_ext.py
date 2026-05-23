@@ -248,18 +248,22 @@ def _check_spv_regression(short_key: str, metrics: dict) -> None:
 
 
 def _parse_reflection_metrics(refl_json: str) -> dict:
-    """Parse slangc reflection JSON for key performance metrics (P3.3/M13).
+    """Parse slangc reflection JSON for key performance metrics (P3.3/M13/M20.5).
 
-    Extracts:
-    - vgprs: estimated VGPR count (from SPIR-V analysis or
-      reflection hints)
-    - shared_mem: total groupshared / LDS bytes required
-    - subgroup_size: wave size (32 or 64) from entry-point config
-    - loop_depth: maximum nested loop depth
+    slangc 2026.7.1 JSON schema:
+      entryPoints[].{name, stage, parameters, threadGroupSize, bindings}
+    Hardware counters (numRegisters, subgroupSize, numSgprs, …) are NOT
+    emitted by slangc — those fields are filled later by
+    ``_analyze_spirv_binary``.
 
-    Returns a dict; missing keys are set to None. The output schema is
-    always {"vgprs": int|None, "shared_mem": int|None,
-    "subgroup_size": int|None, "loop_depth": int|None}.
+    M20.5 additions: schema extended with num_sgprs, num_loads,
+    num_stores, num_atomics (all None from JSON, filled by SPIR-V pass).
+    subgroup_size is inferred from threadGroupSize[0] % 64/32.
+
+    Returns a dict with keys:
+      vgprs, shared_mem, subgroup_size, loop_depth,
+      num_sgprs, num_loads, num_stores, num_atomics.
+    All missing keys are None.
     """
     import json
 
@@ -268,6 +272,10 @@ def _parse_reflection_metrics(refl_json: str) -> dict:
         "shared_mem": None,
         "subgroup_size": None,
         "loop_depth": None,
+        "num_sgprs": None,
+        "num_loads": None,
+        "num_stores": None,
+        "num_atomics": None,
     }
     try:
         data = json.loads(refl_json)
@@ -275,12 +283,24 @@ def _parse_reflection_metrics(refl_json: str) -> dict:
         return metrics
 
     # ── subgroup_size from entry points ──
+    # slangc 2026.7.1 does not emit subgroupSize in the JSON.
+    # Infer from threadGroupSize: if X is a multiple of 64, assume wave64.
     entry_points = data.get("entryPoints") or []
     for ep in entry_points:
         if ep.get("stage") == "compute":
             ss = ep.get("subgroupSize")
             if ss is not None:
                 metrics["subgroup_size"] = int(ss)
+            else:
+                # M20.5: infer from threadGroupSize X dimension
+                tgs = ep.get("threadGroupSize")
+                if tgs and len(tgs) >= 1:
+                    x = tgs[0]
+                    if x > 0:
+                        if x % 64 == 0:
+                            metrics["subgroup_size"] = 64
+                        elif x % 32 == 0:
+                            metrics["subgroup_size"] = 32
             break
 
     # ── shared_mem from groupshared parameters ──
@@ -294,6 +314,7 @@ def _parse_reflection_metrics(refl_json: str) -> dict:
         metrics["shared_mem"] = gs_size
 
     # ── num_registers / vgpr_count ──
+    # slangc 2026.7.1 does not emit numRegisters; filled by SPIR-V analysis.
     for ep in entry_points:
         regs = ep.get("numRegisters") or ep.get("usedRegisters")
         if regs is not None:
@@ -307,6 +328,22 @@ def _parse_reflection_metrics(refl_json: str) -> dict:
             metrics["loop_depth"] = int(ld)
             break
 
+    # ── M20.5: num_sgprs, num_loads, num_stores, num_atomics ──
+    # slangc 2026.7.1 does not emit these; filled by _analyze_spirv_binary.
+    for ep in entry_points:
+        for field, keys in (
+            ("num_sgprs", ("numSgprs", "numScalarRegisters")),
+            ("num_loads", ("numLoads", "numMemoryLoads")),
+            ("num_stores", ("numStores", "numMemoryStores")),
+            ("num_atomics", ("numAtomics", "numAtomicOps")),
+        ):
+            for k in keys:
+                v = ep.get(k)
+                if v is not None:
+                    metrics[field] = int(v)
+                    break
+        break
+
     return metrics
 
 
@@ -314,19 +351,20 @@ def _parse_reflection_metrics(refl_json: str) -> dict:
 
 
 def _analyze_spirv_binary(spv: bytes) -> dict:
-    """Estimate VGPR count and shared-memory usage from SPIR-V binary.
+    """Estimate VGPR/SGPR count, shared-memory, and I/O metrics from SPIR-V.
 
-    Lightweight SPIR-V parser that walks the module to count:
-    - OpVariable with StorageClass Function -> VGPRs lower-bound
-      (each scalar variable costs at least 1 register)
-    - OpVariable with StorageClass Workgroup -> shared-memory
-      lower-bound
-
-    Returns a partial metrics dict; only fields that could be estimated
-    are populated. This is a fallback for when slangc reflection doesn't
-    provide register counts.
+    M20.5: Extended to count OpLoad/OpStore/Atomics and approximate SGPR
+    usage from uniform/input/push-constant variable count.  Always returns
+    at least vgprs=1 (even for trivially simple kernels with 0 func vars).
     """
-    metrics: dict = {"vgprs": None, "shared_mem": None}
+    metrics: dict = {
+        "vgprs": None,
+        "shared_mem": None,
+        "num_sgprs": None,
+        "num_loads": None,
+        "num_stores": None,
+        "num_atomics": None,
+    }
 
     if len(spv) < 20:
         return metrics
@@ -345,19 +383,33 @@ def _analyze_spirv_binary(spv: bytes) -> dict:
         return int.from_bytes(b, "little" if little else "big")
 
     OP_VARIABLE = 59
+    OP_LOAD = 61
+    OP_STORE = 62
     STORAGE_CLASS_FUNCTION = 7
     STORAGE_CLASS_WORKGROUP = 4
+    # Uniform/Input/PushConstant classes → SGPR-class resources
+    STORAGE_CLASS_UNIFORM = 2
+    STORAGE_CLASS_INPUT = 1
+    STORAGE_CLASS_PUSH_CONSTANT = 9
+    STORAGE_CLASS_UNIFORM_CONSTANT = 0
     OP_TYPE_FLOAT = 22
     OP_TYPE_INT = 21
     OP_TYPE_ARRAY = 28
-    OP_DECORATE = 71
+
+    # Atomic opcode range: OpAtomicLoad=227 … OpAtomicFlagClear=240,
+    # plus OpAtomicFAddEXT=6035 (rarely emitted by slangc).
+    _ATOMIC_OPS: frozenset = frozenset(range(227, 241))
 
     n_words = len(spv) // 4
     i = 5  # skip 5-word header
 
     type_sizes: dict = {}
     func_vars = 0
+    sgpr_vars = 0
     workgroup_bytes = 0
+    num_loads = 0
+    num_stores = 0
+    num_atomics = 0
 
     while i < n_words:
         word = w32(i * 4)
@@ -386,14 +438,38 @@ def _analyze_spirv_binary(spv: bytes) -> dict:
             elif storage_class == STORAGE_CLASS_WORKGROUP:
                 elem_size = type_sizes.get(result_type, 4)
                 workgroup_bytes += elem_size
+            elif storage_class in (
+                STORAGE_CLASS_UNIFORM,
+                STORAGE_CLASS_INPUT,
+                STORAGE_CLASS_PUSH_CONSTANT,
+                STORAGE_CLASS_UNIFORM_CONSTANT,
+            ):
+                sgpr_vars += 1
+        elif op == OP_LOAD:
+            num_loads += 1
+        elif op == OP_STORE:
+            num_stores += 1
+        elif op in _ATOMIC_OPS:
+            num_atomics += 1
 
         i += wc
 
     # Heuristic: each function-scope variable costs ≥1 VGPR + 1 temp.
-    if func_vars > 0:
-        metrics["vgprs"] = func_vars * 2
+    # M20.5: Even kernels with 0 function-scope vars have at least 1 VGPR
+    # (the thread ID register).  Use 1 as the minimum so _pick_numthreads
+    # doesn't fall back to the heuristic for trivially simple kernels.
+    metrics["vgprs"] = max(func_vars * 2, 1)
+
     if workgroup_bytes > 0:
         metrics["shared_mem"] = workgroup_bytes
+
+    # M20.5: SGPR approximation from uniform/input variable count.
+    if sgpr_vars > 0:
+        metrics["num_sgprs"] = sgpr_vars * 2  # each binding uses ~2 SGPRs
+
+    metrics["num_loads"] = num_loads
+    metrics["num_stores"] = num_stores
+    metrics["num_atomics"] = num_atomics
 
     return metrics
 
@@ -462,13 +538,18 @@ def _harvest_reflection_metrics(
     # 1. Parse the reflection JSON
     metrics = _parse_reflection_metrics(refl_json)
 
-    # 2. Fill gaps with SPIR-V binary analysis
-    if metrics["vgprs"] is None or metrics["shared_mem"] is None:
-        spv_metrics = _analyze_spirv_binary(spv)
-        if metrics["vgprs"] is None:
-            metrics["vgprs"] = spv_metrics.get("vgprs")
-        if metrics["shared_mem"] is None:
-            metrics["shared_mem"] = spv_metrics.get("shared_mem")
+    # 2. Fill gaps with SPIR-V binary analysis.
+    # M20.5: _analyze_spirv_binary now also returns num_sgprs, num_loads,
+    # num_stores, num_atomics — always run it to fill those fields.
+    spv_metrics = _analyze_spirv_binary(spv)
+    if metrics["vgprs"] is None:
+        metrics["vgprs"] = spv_metrics.get("vgprs")
+    if metrics["shared_mem"] is None:
+        metrics["shared_mem"] = spv_metrics.get("shared_mem")
+    # M20.5: hardware I/O counters — always from SPIR-V analysis.
+    for _field in ("num_sgprs", "num_loads", "num_stores", "num_atomics"):
+        if metrics.get(_field) is None:
+            metrics[_field] = spv_metrics.get(_field)
 
     # 3. Loop-depth from source analysis
     if metrics["loop_depth"] is None:
@@ -606,8 +687,11 @@ def _pick_numthreads_from_reflection(
     shared_mem: int | None = None,
     loop_depth: int | None = None,
     current_numthreads: tuple[int, int, int] = (256, 1, 1),
+    num_sgprs: int | None = None,
+    num_loads: int | None = None,
+    num_stores: int | None = None,
 ) -> tuple[int, int, int]:
-    """DR.7 / M11.1: Pick optimal numthreads based on SPIR-V reflection metrics.
+    """DR.7 / M11.1 / M20.5: Pick optimal numthreads from SPIR-V metrics.
 
     RDNA1 occupancy heuristic (wave64, 256 VGPRs/CU, 1024 max threads/CU,
     64 KiB LDS/CU):
@@ -623,29 +707,59 @@ def _pick_numthreads_from_reflection(
     When *loop_depth* ≥ 3, drop one tier (deep loops increase register
     pressure beyond what the VGPR count captures). When ≥ 5, drop two.
 
-    Falls back to *current_numthreads* when *vgprs* is ``None``.
+    M20.5 additions:
+    - *num_sgprs* > 64: scalar-register pressure is high (many uniforms /
+      push-constant fields), which on RDNA1 constrains the number of
+      waves the hardware can schedule.  Drop one tier.
+    - *num_loads* + *num_stores* > 128: memory-bandwidth-heavy kernel.
+      Wider workgroups (more threads) hide latency better.  Raise the
+      base one tier (but never above 256).
+
+    Falls back to *current_numthreads* when *vgprs* is ``None`` and
+    *num_sgprs* is ``None`` (no reflection data at all).
 
     Args:
-        vgprs: VGPR count from slangc reflection (numRegisters / usedRegisters).
-        shared_mem: Groupshared / LDS bytes used (from reflection).
-        loop_depth: Maximum nested loop depth (from reflection).
+        vgprs: VGPR count (from SPIR-V function-variable analysis).
+        shared_mem: Groupshared / LDS bytes used.
+        loop_depth: Maximum nested loop depth.
         current_numthreads: The numthreads currently in the source.
+        num_sgprs: SGPR count estimate (uniform/input variable count × 2).
+        num_loads: OpLoad instruction count from SPIR-V.
+        num_stores: OpStore instruction count from SPIR-V.
 
     Returns:
         Optimal ``(x, y, z)`` numthreads tuple.
     """
-    if vgprs is None:
+    # Preserve 2D/3D workgroups — only adjust the X dimension.
+    if current_numthreads[1] != 1 or current_numthreads[2] != 1:
         return current_numthreads
 
-    # Base tier from VGPR count
-    if vgprs <= 32:
-        base = 256
-    elif vgprs <= 64:
-        base = 128
-    elif vgprs <= 128:
-        base = 64
+    if vgprs is None and num_sgprs is None:
+        return current_numthreads
+
+    # Base tier from VGPR count (fall back to 128 when only SGPR data)
+    if vgprs is not None:
+        if vgprs <= 32:
+            base = 256
+        elif vgprs <= 64:
+            base = 128
+        elif vgprs <= 128:
+            base = 64
+        else:
+            base = 32
     else:
-        base = 32
+        base = 128  # conservative default when only SGPR data
+
+    # M20.5: Memory-bandwidth-heavy kernels hide latency with more threads.
+    # If num_loads + num_stores is large (>128 I/O ops), the kernel spends
+    # significant time in memory transactions.  Raise one tier to expose
+    # more in-flight requests.  Never exceed 256.
+    total_io = (num_loads or 0) + (num_stores or 0)
+    if total_io > 128:
+        if base == 64:
+            base = 128
+        elif base == 128:
+            base = 256
 
     # M11.1: Shared-memory penalty — when LDS usage is high, drop a tier
     # to leave more LDS per workgroup for groupshared allocations.
@@ -654,6 +768,16 @@ def _pick_numthreads_from_reflection(
             base = 128
         elif base == 128:
             base = 64
+
+    # M20.5: SGPR pressure penalty — many uniform/input bindings increase
+    # scalar register pressure; the hardware limits concurrent waves.
+    if num_sgprs is not None and num_sgprs > 64:
+        if base == 256:
+            base = 128
+        elif base == 128:
+            base = 64
+        elif base == 64:
+            base = 32
 
     # M11.1: Loop-depth penalty — deep nests blow register pressure.
     if loop_depth is not None:

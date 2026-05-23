@@ -333,11 +333,18 @@ def _compile_slang_to_spirv_inner(
                     if current_nt is not None:
                         shared_mem = metrics.get("shared_mem")
                         loop_depth = metrics.get("loop_depth")
+                        # M20.5: pass SGPR/load/store counts to refine sizing.
+                        num_sgprs = metrics.get("num_sgprs")
+                        num_loads = metrics.get("num_loads")
+                        num_stores = metrics.get("num_stores")
                         optimal_nt = _pick_numthreads_from_reflection(
                             vgprs,
                             shared_mem,
                             loop_depth,
                             current_nt,
+                            num_sgprs=num_sgprs,
+                            num_loads=num_loads,
+                            num_stores=num_stores,
                         )
                         if optimal_nt != current_nt:
                             # Rewrite source with optimized numthreads.

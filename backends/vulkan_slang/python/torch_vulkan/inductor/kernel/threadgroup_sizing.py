@@ -215,6 +215,33 @@ class ThreadgroupSizingMixin:
         except (TypeError, ValueError):
             return None
 
+    def _get_cached_io_pressure(self) -> Optional[int]:
+        """M20.5: Retrieve total I/O pressure (num_loads + num_stores).
+
+        Returns the sum of load and store instruction counts from cached
+        reflection metrics, or None when no data is available.  Used to
+        identify memory-bandwidth-heavy kernels that benefit from wider
+        workgroups (more in-flight transactions hide latency).
+        """
+        from .. import config as _cfg
+
+        if not _cfg.reflection_enabled():
+            return None
+        config_key = self._compute_config_key()
+        from torch_vulkan.inductor.runtime import get_cached_metrics_for_key
+
+        metrics = get_cached_metrics_for_key(config_key)
+        if metrics is None:
+            return None
+        loads = metrics.get("num_loads")
+        stores = metrics.get("num_stores")
+        if loads is None and stores is None:
+            return None
+        try:
+            return int(loads or 0) + int(stores or 0)
+        except (TypeError, ValueError):
+            return None
+
     def _estimate_loop_depth(self) -> int:
         """DR.3: Structural loop-depth estimate from kernel config.
 
@@ -367,6 +394,13 @@ class ThreadgroupSizingMixin:
         if loop_depth is None:
             loop_depth = self._estimate_loop_depth()
         max_wg = self._apply_loop_depth_penalty(max_wg, vgpr_class, loop_depth)
+
+        # M20.5: I/O pressure boost — memory-bandwidth-heavy kernels
+        # (many loads + stores) hide latency better with more threads.
+        # Raise the effective cap by one tier when total I/O > 128 ops.
+        io_pressure = self._get_cached_io_pressure()
+        if io_pressure is not None and io_pressure > 128:
+            max_wg = min(1024, max(max_wg, sgs * 4))
 
         # ── Numel-driven sizing ────────────────────────────────────
         # Pointwise WG-size cap by VGPR pressure class.
