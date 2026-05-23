@@ -56691,41 +56691,49 @@ class TestTestCov4SpecialMathBwd:
             rtol=rtol,
         )
 
+    @pytest.mark.timeout(300)
     def test_erfinv_backward_grad_parity(self):
         """``torch.erfinv`` backward — domain (-0.9, 0.9) avoids edge divergence."""
         x = torch.linspace(-0.9, 0.9, 32)
         self._check_grad(lambda t: torch.erfinv(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_lgamma_backward_grad_parity(self):
         """``torch.lgamma`` backward — positive domain only."""
         x = torch.linspace(0.5, 5.0, 32)
         self._check_grad(lambda t: torch.lgamma(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_digamma_backward_grad_parity(self):
         """``torch.digamma`` backward — positive domain only."""
         x = torch.linspace(0.5, 5.0, 32)
         self._check_grad(lambda t: torch.digamma(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_ndtri_backward_grad_parity(self):
         """``torch.special.ndtri`` backward — domain (0.1, 0.9) inside (0, 1)."""
         x = torch.linspace(0.1, 0.9, 32)
         self._check_grad(lambda t: torch.special.ndtri(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_i0_backward_grad_parity(self):
         """``torch.i0`` backward — modified Bessel function of the first kind, order 0."""
         x = torch.linspace(-3.0, 3.0, 32)
         self._check_grad(lambda t: torch.i0(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_i0e_backward_grad_parity(self):
         """``torch.special.i0e`` backward — exponentially scaled i0."""
         x = torch.linspace(-3.0, 3.0, 32)
         self._check_grad(lambda t: torch.special.i0e(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_i1_backward_grad_parity(self):
         """``torch.special.i1`` backward — modified Bessel function, order 1; avoid x=0."""
         x = torch.linspace(0.5, 5.0, 32)
         self._check_grad(lambda t: torch.special.i1(t).sum(), x)
 
+    @pytest.mark.timeout(300)
     def test_i1e_backward_grad_parity(self):
         """``torch.special.i1e`` backward — exponentially scaled i1; avoid x=0."""
         x = torch.linspace(0.5, 5.0, 32)
