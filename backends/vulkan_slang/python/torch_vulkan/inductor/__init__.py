@@ -15,6 +15,21 @@ from __future__ import annotations
 _registered = False
 
 
+def _vulkan_post_fusion_pass(nodes):
+    """M19.3 — post-fusion custom pass installed as ``_post_fusion_custom_pass``.
+
+    Defined at module level (not as a local closure) so Inductor's codecache
+    can pickle the compilation key. Local closures fail pickle and silently
+    disable the disk cache for every graph that uses this pass.
+    """
+    from . import config as _vk_cfg
+    from .vulkan_combo_kernel import VulkanComboKernel as _VCK
+
+    if not _vk_cfg.aggressive_fusion():
+        return nodes
+    return _VCK._coalesce_orphan_pointwise(nodes)
+
+
 def _patch_aot_joint_trace(ctx_cls) -> None:
     """PF.1 / B1' frontend: convert meta-device tangents to vulkan FakeTensors
     BEFORE AOT autograd's joint graph trace runs.
@@ -649,14 +664,6 @@ def _legacy_register() -> None:
     # afterwards and will skip any ``ForeachKernelSchedulerNode`` objects we
     # created here (it filters them out at line 2620 of scheduler.py).
     if hasattr(_ic, "_post_fusion_custom_pass"):
-        from . import config as _vk_cfg
-        from .vulkan_combo_kernel import VulkanComboKernel as _VCK
-
-        def _vulkan_post_fusion_pass(nodes):
-            if not _vk_cfg.aggressive_fusion():
-                return nodes
-            return _VCK._coalesce_orphan_pointwise(nodes)
-
         _ic._post_fusion_custom_pass = _vulkan_post_fusion_pass
 
     from .vulkan_template_caller import (
