@@ -242,6 +242,32 @@ class ThreadgroupSizingMixin:
         except (TypeError, ValueError):
             return None
 
+    def _get_cached_num_sgprs(self) -> Optional[int]:
+        """M20.9: Retrieve SGPR count from cached reflection metrics.
+
+        Returns the scalar (non-vector) register count from SPIR-V reflection
+        if a prior compilation exists, or None when no data is available.
+        Used by ``should_use_cooperative_reduction`` to apply a threshold
+        penalty for register-heavy kernels that have little headroom left.
+        """
+        from .. import config as _cfg
+
+        if not _cfg.reflection_enabled():
+            return None
+        config_key = self._compute_config_key()
+        from torch_vulkan.inductor.runtime import get_cached_metrics_for_key
+
+        metrics = get_cached_metrics_for_key(config_key)
+        if metrics is None:
+            return None
+        raw = metrics.get("num_sgprs")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
     def _estimate_loop_depth(self) -> int:
         """DR.3: Structural loop-depth estimate from kernel config.
 

@@ -56065,3 +56065,226 @@ void computeMain(uint3 sv_tid: SV_DispatchThreadID)
         for k, cnt in sorted(counts.items()):
             pct = 100 * cnt / total
             print(f"  M20.5 coverage {k}: {cnt}/{total} = {pct:.1f}%")
+
+
+# ── M20.9 helpers ────────────────────────────────────────────────────────────
+
+
+class _M209MockRangeTree:
+    """Minimal range-tree node for testing should_use_cooperative_reduction."""
+
+    def __init__(self, numel: int, is_reduction: bool = False):
+        self.numel = numel
+        self.is_reduction = is_reduction
+
+
+class _M209MockKernel:
+    """Minimal mock of VulkanKernel for M20.9 unit tests.
+
+    Lets the caller control:
+      - range_trees: list of _M209MockRangeTree (determines rnumel / numel_hint)
+      - io_pressure: value returned by _get_cached_io_pressure (None = no data)
+      - num_sgprs: SGPR count returned by _get_cached_num_sgprs (None = no data)
+      - has_welford: whether _has_welford_reduction returns True
+
+    Delegates should_use_cooperative_reduction to the real VulkanKernel
+    implementation so the tests exercise production code, not a re-
+    implementation.
+    """
+
+    def __init__(
+        self,
+        *,
+        range_trees=None,
+        io_pressure=None,
+        num_sgprs=None,
+        has_welford: bool = False,
+    ):
+        self._range_trees = range_trees or []
+        self._io_pressure = io_pressure
+        self._num_sgprs = num_sgprs
+        self._has_welford = has_welford
+
+    @property
+    def range_trees(self):
+        return self._range_trees
+
+    def _has_welford_reduction(self) -> bool:
+        return self._has_welford
+
+    def _get_cached_io_pressure(self):
+        return self._io_pressure
+
+    def _get_cached_num_sgprs(self):
+        """M20.9: Return pre-set SGPR count (None = no cached data)."""
+        return self._num_sgprs
+
+    def _compute_config_key(self) -> str:
+        return "mock_key"
+
+    def should_use_cooperative_reduction(self) -> bool:
+        """Delegates to the real VulkanKernel implementation."""
+        from torch_vulkan.inductor.kernel.main import VulkanKernel
+
+        return VulkanKernel.should_use_cooperative_reduction(self)
+
+
+class TestM209CooperativeReductionReflectionAware:
+    """M20.9 — should_use_cooperative_reduction reflection-aware thresholds.
+
+    Tests that SGPR pressure lowers the cooperative-reduction rnumel threshold
+    (register-heavy kernels avoid extra sync pressure) and that I/O pressure
+    raises it (memory-bound kernels hide sync latency).
+
+    All tests use _M209MockKernel which directly controls _get_cached_num_sgprs
+    and _get_cached_io_pressure return values, exercising the production
+    VulkanKernel.should_use_cooperative_reduction code path without needing
+    a live GPU or full kernel compile.
+    """
+
+    # ── Static threshold reference (numel_hint > 16 path) ───────────
+    # Base: rn <= 4096 → cooperative; rn = 5000 → non-cooperative.
+    # With SGPR penalty (×0.5): threshold = 2048 → rn=3000 no longer cooperative.
+    # With I/O boost (×2.0): threshold = 8192 → rn=5000 becomes cooperative.
+
+    def _make_range_trees(self, rnumel, numel_hint: int = 32):
+        """Helper: one reduction axis (rnumel) + one pointwise axis (numel_hint)."""
+        return [
+            _M209MockRangeTree(rnumel, is_reduction=True),
+            _M209MockRangeTree(numel_hint, is_reduction=False),
+        ]
+
+    def test_high_sgpr_pressure_lowers_threshold(self):
+        """M20.9: num_sgprs > 64 halves the cooperative-reduction threshold.
+
+        Choose rnumel = 3000, numel_hint = 32 (> 16 path, base threshold = 4096).
+        Without SGPR pressure: 3000 <= 4096 → cooperative.
+        With SGPR pressure (>64): threshold = 2048 → 3000 > 2048 → non-cooperative.
+        """
+        # Baseline: no reflection data → static threshold = 4096.
+        k_base = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=3000, numel_hint=32),
+            io_pressure=None,
+            num_sgprs=None,
+        )
+        assert k_base.should_use_cooperative_reduction() is True, (
+            "M20.9: baseline (no reflection) with rnumel=3000 should be cooperative "
+            "(3000 <= 4096 static threshold)"
+        )
+
+        # With SGPR pressure > 64: threshold drops to 2048 → 3000 > 2048 → False.
+        k_sgpr = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=3000, numel_hint=32),
+            io_pressure=None,
+            num_sgprs=80,  # > 64 → 0.5× penalty
+        )
+        assert k_sgpr.should_use_cooperative_reduction() is False, (
+            "M20.9: num_sgprs=80 (>64) should lower threshold to 2048; "
+            "rnumel=3000 > 2048 → expected non-cooperative"
+        )
+
+    def test_high_io_pressure_raises_threshold(self):
+        """M20.9: num_loads + num_stores > 128 doubles the cooperative threshold.
+
+        Choose rnumel = 5000, numel_hint = 32 (base threshold = 4096).
+        Without I/O boost: 5000 > 4096 → non-cooperative.
+        With I/O boost (>128): threshold = 8192 → 5000 <= 8192 → cooperative.
+        """
+        # Baseline: rnumel=5000 > 4096 → non-cooperative.
+        k_base = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=5000, numel_hint=32),
+            io_pressure=None,
+            num_sgprs=None,
+        )
+        assert k_base.should_use_cooperative_reduction() is False, (
+            "M20.9: baseline with rnumel=5000 should be non-cooperative (5000 > 4096)"
+        )
+
+        # With high I/O pressure (> 128): threshold doubles to 8192.
+        k_io = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=5000, numel_hint=32),
+            io_pressure=150,  # 150 > 128 → 2× boost
+            num_sgprs=None,
+        )
+        assert k_io.should_use_cooperative_reduction() is True, (
+            "M20.9: io_pressure=150 (>128) should raise threshold to 8192; "
+            "rnumel=5000 <= 8192 → expected cooperative"
+        )
+
+    def test_no_reflection_data_uses_static_thresholds(self):
+        """M20.9: When reflection data is unavailable, static thresholds apply.
+
+        Both _get_cached_io_pressure and _get_cached_num_sgprs return None.
+        Verify that numel_hint > 16 path uses the unmodified 4096 threshold.
+        """
+        # Just at the static threshold → cooperative.
+        k_at = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=4096, numel_hint=32),
+            io_pressure=None,
+            num_sgprs=None,
+        )
+        assert k_at.should_use_cooperative_reduction() is True, (
+            "M20.9: no reflection data, rnumel=4096 <= 4096 (static) → cooperative"
+        )
+
+        # Just above the static threshold → non-cooperative.
+        k_above = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=4097, numel_hint=32),
+            io_pressure=None,
+            num_sgprs=None,
+        )
+        assert k_above.should_use_cooperative_reduction() is False, (
+            "M20.9: no reflection data, rnumel=4097 > 4096 (static) → non-cooperative"
+        )
+
+    def test_dynamic_rnumel_always_cooperative(self):
+        """M20.9: Dynamic rnumel short-circuits to True regardless of reflection.
+
+        Even with high SGPR pressure (would lower threshold), a kernel with
+        a dynamic reduction size must always use cooperative reduction so
+        that the runtime dispatch path remains valid.
+        """
+        import sympy
+
+        # Use a symbolic (dynamic) numel for the reduction axis.
+        _s = sympy.Symbol("N", positive=True)
+        range_trees = [
+            _M209MockRangeTree(_s, is_reduction=True),
+            _M209MockRangeTree(32, is_reduction=False),
+        ]
+        k = _M209MockKernel(
+            range_trees=range_trees,
+            num_sgprs=256,  # high SGPR pressure — should be irrelevant
+            io_pressure=None,
+        )
+        assert k.should_use_cooperative_reduction() is True, (
+            "M20.9: dynamic rnumel must always return cooperative=True, "
+            "even under high SGPR pressure"
+        )
+
+    def test_combined_sgpr_and_io_pressure_apply_both_scales(self):
+        """M20.9: When both SGPR and I/O pressure are high, both scales apply.
+
+        SGPR penalty ×0.5 and I/O boost ×2.0 cancel out → net scale = 1.0
+        (original threshold unchanged).
+        """
+        # With net scale = 1.0, threshold stays at 4096.
+        k_at = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=4096, numel_hint=32),
+            io_pressure=150,  # > 128 → ×2.0 boost
+            num_sgprs=80,    # > 64 → ×0.5 penalty; net = 1.0
+        )
+        assert k_at.should_use_cooperative_reduction() is True, (
+            "M20.9: combined SGPR×0.5 + I/O×2.0 = net×1.0; "
+            "rnumel=4096 <= 4096 → cooperative"
+        )
+
+        k_above = _M209MockKernel(
+            range_trees=self._make_range_trees(rnumel=4097, numel_hint=32),
+            io_pressure=150,
+            num_sgprs=80,
+        )
+        assert k_above.should_use_cooperative_reduction() is False, (
+            "M20.9: combined SGPR×0.5 + I/O×2.0 = net×1.0; "
+            "rnumel=4097 > 4096 → non-cooperative"
+        )

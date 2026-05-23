@@ -182,6 +182,8 @@ class VulkanKernel(
         for rd in self.range_trees:
             if rd.is_reduction:
                 rnumel = rnumel * rd.numel
+        # Dynamic rnumel always uses cooperative reduction regardless of
+        # reflection metadata — the threshold is not applicable.
         if is_dynamic(rnumel):
             return True
         rn = int(rnumel)
@@ -192,15 +194,57 @@ class VulkanKernel(
                     numel_hint = 1
                     break
                 numel_hint *= int(rd.numel)
+
+        # M20.9: reflection-aware threshold adjustment.
+        #
+        # Cooperative reduction adds per-wave sync + extra register pressure.
+        # Two orthogonal signals from SPIR-V reflection refine the static
+        # thresholds:
+        #
+        #   SGPR pressure penalty (num_sgprs > 64):
+        #     A register-heavy kernel has little headroom left; enabling
+        #     cooperative mode would push more waves into spill territory.
+        #     Lower the rnumel threshold by 50 % so we switch to cooperative
+        #     only for larger reductions where the benefit outweighs the cost.
+        #
+        #   I/O pressure boost (num_loads + num_stores > 128):
+        #     A memory-bandwidth-dominated kernel benefits from cooperative
+        #     reduction because the sync overhead is hidden by memory latency.
+        #     Raise the rnumel threshold by 2× so more kernels get the
+        #     latency-hiding benefit.
+        #
+        # Fallback: when reflection data is not yet available (first compile),
+        # the unmodified static thresholds are used.
+        _threshold_scale = 1.0
+        try:
+            # _get_cached_io_pressure returns num_loads + num_stores.
+            io_pressure = self._get_cached_io_pressure()
+            # _get_cached_num_sgprs returns the SGPR count from reflection.
+            num_sgprs = self._get_cached_num_sgprs()
+            if num_sgprs is not None and num_sgprs > 64:
+                # Register-heavy: lower threshold (fewer kernels switch to
+                # cooperative) — avoids the additional pressure from sync.
+                _threshold_scale *= 0.5
+            if io_pressure is not None and io_pressure > 128:
+                # Memory-bandwidth-heavy: raise threshold (more kernels switch
+                # to cooperative) — sync overhead is hidden by memory latency.
+                _threshold_scale *= 2.0
+        except Exception:
+            # Defensive: never let reflection failures affect correctness.
+            _threshold_scale = 1.0
+
+        def _scaled(base_threshold: int) -> int:
+            return int(base_threshold * _threshold_scale)
+
         if self._has_welford_reduction():
             if numel_hint <= 16:
-                return rn <= 65536
-            return rn <= 8192
+                return rn <= _scaled(65536)
+            return rn <= _scaled(8192)
         if numel_hint <= 4:
-            return rn <= 131072
+            return rn <= _scaled(131072)
         if numel_hint <= 16:
-            return rn <= 65536
-        return rn <= 4096
+            return rn <= _scaled(65536)
+        return rn <= _scaled(4096)
 
     def __init__(self, tiling: dict[str, sympy.Expr], **kwargs: Any) -> None:
         super().__init__(tiling, **kwargs)
