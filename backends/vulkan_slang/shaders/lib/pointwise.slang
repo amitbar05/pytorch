@@ -237,6 +237,70 @@ void erfc_fast_bwd(inout DifferentialPair<float> x, float dout) {
     x = diffPair(xv, x.d + grad);
 }
 
+// erfinv'(x) = sqrt(pi)/2 * exp(erfinv(x)^2)
+void erfinv_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    float y = xv.erfinv();
+    x = diffPair(xv, x.d + dout * 0.886226925f * exp(y * y));
+}
+
+// lgamma'(x) = digamma(x)
+void lgamma_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    x = diffPair(xv, x.d + dout * xv.digamma());
+}
+
+// digamma'(x) = polygamma(1, x) = trigamma(x)
+void digamma_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    x = diffPair(xv, x.d + dout * xv.polygamma(1.0f));
+}
+
+// ndtri'(x) = sqrt(2*pi) * exp(ndtri(x)^2 / 2)
+void ndtri_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    float y = xv.ndtri();
+    x = diffPair(xv, x.d + dout * 2.506628274f * exp(0.5f * y * y));
+}
+
+// i0'(x) = i1(x)
+void i0_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    x = diffPair(xv, x.d + dout * xv.i1());
+}
+
+// i0e'(x) = i1e(x) - sign(x) * i0e(x)
+void i0e_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    float sgn = xv > 0.0f ? 1.0f : (xv < 0.0f ? -1.0f : 0.0f);
+    x = diffPair(xv, x.d + dout * (xv.i1e() - sgn * xv.i0e()));
+}
+
+// i1'(x) = i0(x) - i1(x)/x; limit at x=0 is 0.5
+void i1_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    float grad;
+    if (abs(xv) < 1e-6f) {
+        grad = 0.5f;
+    } else {
+        grad = xv.i0() - xv.i1() / xv;
+    }
+    x = diffPair(xv, x.d + dout * grad);
+}
+
+// i1e'(x) = i0e(x) - i1e(x)*(1/x + sign(x)); limit at x=0 is 0.5
+void i1e_fast_bwd(inout DifferentialPair<float> x, float dout) {
+    float xv = x.p;
+    float grad;
+    if (abs(xv) < 1e-6f) {
+        grad = 0.5f;
+    } else {
+        float sgn = xv > 0.0f ? 1.0f : -1.0f;
+        grad = xv.i0e() - xv.i1e() * (1.0f / xv + sgn);
+    }
+    x = diffPair(xv, x.d + dout * grad);
+}
+
 // atan2'(y,x):  d/dy = x/(x^2+y^2),  d/dx = -y/(x^2+y^2)
 // Two-argument hand-written backward avoids autodiff emitting an
 // atan2 decomposition with multiple temporaries.
@@ -575,28 +639,21 @@ public float erf_fwd(float x) { return (x).erf(); }
 [BackwardDerivative(erfc_fast_bwd)]
 public float erfc_fwd(float x) { return 1.0f - (x).erf(); }
 
-[Differentiable]
+[BackwardDerivative(erfinv_fast_bwd)]
 public float erfinv_fwd(float x) { return (x).erfinv(); }
-
-[Differentiable]
+[BackwardDerivative(lgamma_fast_bwd)]
 public float lgamma_fwd(float x) { return (x).lgamma(); }
-
-[Differentiable]
+[BackwardDerivative(digamma_fast_bwd)]
 public float digamma_fwd(float x) { return (x).digamma(); }
-
-[Differentiable]
+[BackwardDerivative(ndtri_fast_bwd)]
 public float ndtri_fwd(float x) { return (x).ndtri(); }
-
-[Differentiable]
+[BackwardDerivative(i0_fast_bwd)]
 public float i0_fwd(float x) { return (x).i0(); }
-
-[Differentiable]
+[BackwardDerivative(i0e_fast_bwd)]
 public float i0e_fwd(float x) { return (x).i0e(); }
-
-[Differentiable]
+[BackwardDerivative(i1_fast_bwd)]
 public float i1_fwd(float x) { return (x).i1(); }
-
-[Differentiable]
+[BackwardDerivative(i1e_fast_bwd)]
 public float i1e_fwd(float x) { return (x).i1e(); }
 
 public struct OpTan : IPointwise, IDifferentiable {
