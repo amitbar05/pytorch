@@ -216,6 +216,61 @@ class VulkanComboKernel:
             numel_str = str(numel)
             buckets[numel_str].append(node)
 
+        # Safety filter: within each bucket, remove nodes that have an
+        # ordering constraint with another bucket member.  Two orphan
+        # pointwise nodes can only be fused into a single combo kernel
+        # dispatch if they are truly parallel (no data dependency between
+        # them through the rest of the graph).  A dependency exists when
+        # one node produces a buffer that another node in the same bucket
+        # reads — detected via ``node.ancestors`` (set of ancestor
+        # operation names) and ``node.get_name()`` cross-check.
+        #
+        # Without this guard the combo node's ForeachKernelSchedulerNode
+        # combines node A (which must run before extern op X) with node B
+        # (which must run after X), creating a cycle:
+        #   combo_node → X (because B depends on X's output)
+        #   X → combo_node (because A's output feeds X)
+        # This causes ``_topological_sort_nodes`` in
+        # ``create_combo_kernel_nodes`` to assert "Topological sort failed!".
+        filtered_buckets: dict[str, list[BaseSchedulerNode]] = {}
+        for key, bucket in buckets.items():
+            if len(bucket) < 2:
+                filtered_buckets[key] = bucket
+                continue
+            # Collect all output buffer names produced by each bucket member.
+            member_outputs: dict[int, set[str]] = {
+                id(n): set(n.get_buffer_names()) for n in bucket
+            }
+            # For each pair (A, B), check if A's outputs are in B's
+            # unmet_dependencies or B's outputs are in A's unmet_dependencies.
+            # We also use node.ancestors (populated by compute_ancestors before
+            # fuse_nodes) as a fast pre-filter.
+            dep_ids: set[int] = set()  # ids of nodes that have a dep conflict
+            for i, a in enumerate(bucket):
+                a_name = a.get_name()
+                a_ancestors = getattr(a, "ancestors", set())
+                for b in bucket[i + 1 :]:
+                    b_name = b.get_name()
+                    b_ancestors = getattr(b, "ancestors", set())
+                    # Ancestors cross-check: if A is in B's ancestor set (or
+                    # vice versa), they cannot be co-scheduled.
+                    if a_name in b_ancestors or b_name in a_ancestors:
+                        dep_ids.add(id(a))
+                        dep_ids.add(id(b))
+                        continue
+                    # Buffer-level check: if A produces a buffer that B reads
+                    # (or vice versa) through unmet_dependencies.
+                    a_out = member_outputs[id(a)]
+                    b_out = member_outputs[id(b)]
+                    b_reads = {dep.name for dep in b.unmet_dependencies}
+                    a_reads = {dep.name for dep in a.unmet_dependencies}
+                    if a_out & b_reads or b_out & a_reads:
+                        dep_ids.add(id(a))
+                        dep_ids.add(id(b))
+            independent = [n for n in bucket if id(n) not in dep_ids]
+            filtered_buckets[key] = independent if len(independent) >= 2 else []
+        buckets = defaultdict(list, filtered_buckets)
+
         # --- Phase 3: build ForeachKernelSchedulerNode for each group ---
         if not buckets:
             return nodes

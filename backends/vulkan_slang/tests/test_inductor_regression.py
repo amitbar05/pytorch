@@ -38656,27 +38656,43 @@ class TestM193ReductionBoundaryFusion:
 
     @pytest.mark.timeout(300)
     def test_m193_gn_relu_gap_dispatch_floor(self):
-        """GN + ReLU + GlobalAvgPool — M19.3 ratchet target."""
-        import torch_vulkan
+        """GN + ReLU + GlobalAvgPool — M19.3 ratchet target.
 
-        @torch.compile(backend="inductor")
+        Forces recompilation and disables WG autotune for the same reason as
+        ``test_m193_gn_relu_dispatch_floor``: the Inductor cache key excludes
+        our backend scheduler, so we must bypass the disk cache to test the
+        current fusion code.
+        """
+        import torch._dynamo
+        import torch._inductor.config as _ind_cfg
+        import torch_vulkan
+        import torch_vulkan.inductor.config as _vk_cfg
+
+        torch._dynamo.reset()
+
         def fn(x, w, b):
             h = torch.nn.functional.group_norm(x, 4, w, b)
             h = torch.nn.functional.relu(h)
             return torch.nn.functional.adaptive_avg_pool2d(h, 1)
 
+        compiled = torch.compile(fn, backend="inductor")
+
         x = torch.randn(2, 8, 16, 16, device="vulkan:0")
         w = torch.ones(8, device="vulkan:0")
         b = torch.zeros(8, device="vulkan:0")
 
-        # Warm-up compile pass.
-        fn(x, w, b)
-
-        torch_vulkan._c_ext._synchronize(0)
-        torch_vulkan._c_ext._reset_perf_counters()
-        fn(x, w, b)
-        torch_vulkan._c_ext._synchronize(0)
-        d = torch_vulkan._c_ext._get_dispatch_count()
+        _old_no_wg_tune = _vk_cfg._NO_WG_TUNE
+        _vk_cfg._NO_WG_TUNE = True
+        try:
+            with _ind_cfg.patch({"force_disable_caches": True}):
+                compiled(x, w, b)
+            torch_vulkan._c_ext._synchronize(0)
+            torch_vulkan._c_ext._reset_perf_counters()
+            compiled(x, w, b)
+            torch_vulkan._c_ext._synchronize(0)
+            d = torch_vulkan._c_ext._get_dispatch_count()
+        finally:
+            _vk_cfg._NO_WG_TUNE = _old_no_wg_tune
 
         if d > self._PRE_M193_GN_RELU_GAP_FLOOR:
             pytest.skip(
@@ -38700,39 +38716,64 @@ class TestM193ReductionBoundaryFusion:
 
     @pytest.mark.timeout(300)
     def test_m193_gn_relu_dispatch_floor(self):
-        """GN + ReLU — M19.3 ratchet target."""
-        import torch_vulkan
+        """GN + ReLU — M19.3 ratchet target.
 
-        @torch.compile(backend="inductor")
+        GN+ReLU dispatches 2 kernels on the hot path (welford reduction +
+        fused normalize+ReLU pointwise).  The test forces recompilation so it
+        always exercises the *current* scheduling.py — the Inductor disk-cache
+        key does not include our out-of-tree backend code, so a stale cache
+        entry from before the M19.3 fusion fix would otherwise be replayed,
+        producing the pre-fix 3-dispatch result.  WG autotune is also disabled
+        to prevent background benchmark threads from polluting the counter.
+        """
+        import torch._dynamo
+        import torch._inductor.config as _ind_cfg
+        import torch_vulkan
+        import torch_vulkan.inductor.config as _vk_cfg
+        import torch_vulkan.inductor.scheduling_helpers as _sh
+
+        # Flush any previously compiled version of fn from Dynamo's cache.
+        torch._dynamo.reset()
+
         def fn(x, w, b):
             h = torch.nn.functional.group_norm(x, 4, w, b)
             return torch.nn.functional.relu(h)
+
+        compiled = torch.compile(fn, backend="inductor")
 
         x = torch.randn(2, 8, 16, 16, device="vulkan:0")
         w = torch.ones(8, device="vulkan:0")
         b = torch.zeros(8, device="vulkan:0")
 
-        fn(x, w, b)
-        torch_vulkan._c_ext._synchronize(0)
-        torch_vulkan._c_ext._reset_perf_counters()
-        fn(x, w, b)
-        torch_vulkan._c_ext._synchronize(0)
-        d = torch_vulkan._c_ext._get_dispatch_count()
+        # Disable WG autotune to prevent background benchmark threads from
+        # dispatching GPU kernels into our measurement window.
+        _old_no_wg_tune = _vk_cfg._NO_WG_TUNE
+        _vk_cfg._NO_WG_TUNE = True
+        # Reset the module-level wave64 cache so it gets re-probed against the
+        # live device.  An earlier pytest test may have set _cached_wave64_ok=False
+        # (e.g. before device init), which forces rnumel_fuse_cap=256 → blocks
+        # fusion of GN+ReLU (rnumel=512 > 256) → produces 3 dispatches.
+        _old_wave64_ok = _sh._cached_wave64_ok
+        _sh._cached_wave64_ok = None
+        try:
+            # force_disable_caches skips the Inductor disk cache so this
+            # compilation always uses the current scheduling code.
+            with _ind_cfg.patch({"force_disable_caches": True}):
+                compiled(x, w, b)  # warm-up — triggers fresh compilation
+            torch_vulkan._c_ext._synchronize(0)
+            torch_vulkan._c_ext._reset_perf_counters()
+            compiled(x, w, b)  # measured — uses the freshly compiled kernels
+            torch_vulkan._c_ext._synchronize(0)
+            d = torch_vulkan._c_ext._get_dispatch_count()
+        finally:
+            _vk_cfg._NO_WG_TUNE = _old_no_wg_tune
+            _sh._cached_wave64_ok = _old_wave64_ok
 
         if d > self._PRE_M193_GN_RELU_FLOOR:
             pytest.skip(
                 f"GN+ReLU dispatch count {d} > pre-M19.3 floor "
                 f"{self._PRE_M193_GN_RELU_FLOOR} — investigate upstream "
                 "fusion regression."
-            )
-        if d > self._M193_GN_RELU_TARGET:
-            pytest.skip(
-                f"M19.3 ratchet pending: GN+ReLU at {d} dispatches, target "
-                f"≤ {self._M193_GN_RELU_TARGET}. Direct probe confirms d=2 "
-                "(b2dmrrysk/bwhs8h2ji/bwd9od205). Pytest context adds 1 extra "
-                "dispatch from async prewarm/autotune (FFT WG benchmarks "
-                "running concurrently). Flip this skip to a hard assert once "
-                "a device-sync before the counter reset drains async GPU work."
             )
         assert d <= self._M193_GN_RELU_TARGET, (
             f"M19.3: expected GN+ReLU <= {self._M193_GN_RELU_TARGET} "
@@ -46117,18 +46158,8 @@ class TestMNew1DuplicateExternKernel:
         x_vk = x_cpu.to("vulkan")
 
         fc = torch.compile(m_vk, backend="inductor", fullgraph=True)
-        try:
-            with torch.no_grad():
-                y_vk = fc(x_vk).cpu()
-        except Exception as e:
-            msg = str(e)
-            assert "duplicate extern kernel" not in msg, (
-                f"M-NEW.1 regression on 3-Linear: {msg[:500]}"
-            )
-            # Other compile-mode blockers (e.g. Inductor IR assertion) are
-            # out of scope for M-NEW.1 — skip rather than fail so this test
-            # stays focused on the duplicate-extern-kernel regression only.
-            pytest.skip(f"3-Linear compile hit unrelated blocker: {msg[:200]}")
+        with torch.no_grad():
+            y_vk = fc(x_vk).cpu()
 
         max_diff = (y_vk - y_cpu).abs().max().item()
         assert max_diff < 1e-3, (

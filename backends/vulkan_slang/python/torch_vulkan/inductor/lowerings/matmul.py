@@ -200,6 +200,32 @@ def _register_mm_lowering() -> None:
         # For Vulkan tensors: use our custom kernel that skips
         # realize_input.  We construct the layout from the input
         # shapes (standard mm: M×K @ K×N → M×N).
+        #
+        # Pre-realize any unrealized inputs (Pointwise / Reduction) before
+        # constructing _VulkanMMOut.  This mirrors what Inductor's
+        # mm_args() / realize_inputs() does for the standard tuned_mm path.
+        # Without this, an unrealized Pointwise that feeds into mm (e.g. a
+        # relu activation just before a Linear layer, lowered via
+        # aten.matmul → view → aten.mm) would reach unwrap_storage as
+        # TensorBox(StorageBox(Pointwise)) and fail the Buffer assertion.
+        # The Vulkan-specific BaseView → ReinterpretView optimisation in
+        # unwrap_storage_for_input only applies to *realized* view nodes;
+        # unrealized computation nodes must be materialized at the lowering
+        # site using realize_input so the scheduler can order them correctly.
+        def _needs_realize(t):
+            """Return True if t wraps an unrealized computation node."""
+            inner = t
+            if isinstance(inner, ir.TensorBox):
+                inner = inner.data
+            if isinstance(inner, ir.StorageBox):
+                return not isinstance(inner.data, ir.Buffer)
+            return False
+
+        if _needs_realize(tensor1):
+            tensor1 = ir.ExternKernel.realize_input(tensor1)
+        if _needs_realize(tensor2):
+            tensor2 = ir.ExternKernel.realize_input(tensor2)
+
         t1_size = tensor1.get_size()
         t2_size = tensor2.get_size()
         assert len(t1_size) == 2 and len(t2_size) == 2, "aten.mm expects 2D tensors"
@@ -362,6 +388,7 @@ def _register_matmul_lowering() -> None:
     3D inputs, we skip the problematic decomposition entirely.
     """
     import torch
+    from torch._inductor import ir
     from torch._inductor import lowering as L
     from torch._inductor.lowering import register_lowering
 
@@ -413,6 +440,22 @@ def _register_matmul_lowering() -> None:
             N = t2_sizes[-1]
             leading = t1_sizes[:-1]
             from torch._inductor.utils import sympy_product
+
+            # Pre-realize any unrealized computation (Pointwise / Reduction)
+            # in tensor1 before creating the view.  The view lowering may
+            # return the original TensorBox unchanged for same-shape views,
+            # so realizing here ensures the mm lowering gets a realized buffer
+            # instead of a raw Pointwise.  This is the canonical Inductor
+            # pattern — ``mm_args()`` calls ``realize_inputs()`` for the same
+            # reason.  Topological ordering is preserved because realize_input
+            # fires before the mm node is registered in the graph.
+            inner1 = tensor1
+            if isinstance(inner1, ir.TensorBox):
+                inner1 = inner1.data
+            if isinstance(inner1, ir.StorageBox) and not isinstance(
+                inner1.data, ir.Buffer
+            ):
+                ir.ExternKernel.realize_input(tensor1)
 
             M_flat = sympy_product(leading)
             t1_2d = view_lowering(tensor1, [M_flat, K])

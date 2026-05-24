@@ -434,14 +434,14 @@ class VulkanScheduling(SIMDScheduling):
             if node1.is_reduction() and not node2.is_reduction():
                 if (
                     rnumel1 != 1
-                    and isinstance(rnumel1, sympy.Integer)
+                    and isinstance(rnumel1, (int, sympy.Integer))
                     and int(rnumel1) <= rnumel_fuse_cap
                 ):
                     return True
             if not node1.is_reduction() and node2.is_reduction():
                 if (
                     rnumel2 != 1
-                    and isinstance(rnumel2, sympy.Integer)
+                    and isinstance(rnumel2, (int, sympy.Integer))
                     and int(rnumel2) <= rnumel_fuse_cap
                 ):
                     return True
