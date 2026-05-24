@@ -38654,6 +38654,7 @@ class TestM193ReductionBoundaryFusion:
     _M193_GN_RELU_TARGET = 2
     _M193_GN_RELU_GAP_TARGET = 3
 
+    @pytest.mark.timeout(300)
     def test_m193_gn_relu_gap_dispatch_floor(self):
         """GN + ReLU + GlobalAvgPool — M19.3 ratchet target."""
         import torch_vulkan
@@ -38671,8 +38672,10 @@ class TestM193ReductionBoundaryFusion:
         # Warm-up compile pass.
         fn(x, w, b)
 
+        torch_vulkan._c_ext._synchronize(0)
         torch_vulkan._c_ext._reset_perf_counters()
         fn(x, w, b)
+        torch_vulkan._c_ext._synchronize(0)
         d = torch_vulkan._c_ext._get_dispatch_count()
 
         if d > self._PRE_M193_GN_RELU_GAP_FLOOR:
@@ -38695,6 +38698,7 @@ class TestM193ReductionBoundaryFusion:
             "(see scheduling.py::_all_consumers_are_fusible)."
         )
 
+    @pytest.mark.timeout(300)
     def test_m193_gn_relu_dispatch_floor(self):
         """GN + ReLU — M19.3 ratchet target."""
         import torch_vulkan
@@ -38709,8 +38713,10 @@ class TestM193ReductionBoundaryFusion:
         b = torch.zeros(8, device="vulkan:0")
 
         fn(x, w, b)
+        torch_vulkan._c_ext._synchronize(0)
         torch_vulkan._c_ext._reset_perf_counters()
         fn(x, w, b)
+        torch_vulkan._c_ext._synchronize(0)
         d = torch_vulkan._c_ext._get_dispatch_count()
 
         if d > self._PRE_M193_GN_RELU_FLOOR:
