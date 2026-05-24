@@ -73,7 +73,8 @@ class ThreadgroupSizingMixin:
             return
 
         wg_size = self.max_threadgroup_size
-        sgs = self.simd_group_size or 64
+        # M20.5: reflection-derived subgroup_size as fallback.
+        sgs = self.simd_group_size or self._get_cached_subgroup_size() or 64
 
         # Best-effort VGPR estimate
         vgprs = self._get_actual_vgprs()
@@ -268,6 +269,39 @@ class ThreadgroupSizingMixin:
         except (TypeError, ValueError):
             return None
 
+    def _get_cached_subgroup_size(self) -> Optional[int]:
+        """M20.5: Retrieve per-kernel subgroup size from cached reflection metrics.
+
+        Returns the subgroup (wave) size inferred from the kernel's
+        ``threadGroupSize`` entry in the slangc reflection JSON, or None
+        when no reflection data is available.
+
+        This value is used as a reflection-aware fallback for ``sgs``
+        (the SIMD-group size) in workgroup-size picking: if the device
+        query fails but a prior compile produced reflection data, we use
+        the per-kernel inferred value rather than the hardcoded 64 default.
+        For most Vulkan compute workloads on RDNA1 this will be 64 (wave64),
+        but it correctly reports 32 for kernels compiled with wave32 mode.
+        """
+        from .. import config as _cfg
+
+        if not _cfg.reflection_enabled():
+            return None
+        config_key = self._compute_config_key()
+        from torch_vulkan.inductor.runtime import get_cached_metrics_for_key
+
+        metrics = get_cached_metrics_for_key(config_key)
+        if metrics is None:
+            return None
+        raw = metrics.get("subgroup_size")
+        if raw is None:
+            return None
+        try:
+            v = int(raw)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     def _estimate_loop_depth(self) -> int:
         """DR.3: Structural loop-depth estimate from kernel config.
 
@@ -406,7 +440,9 @@ class ThreadgroupSizingMixin:
         except Exception:
             max_wg = 256
 
-        sgs = self.simd_group_size or 64
+        # M20.5: use reflection-derived subgroup_size as a fallback when
+        # the device query returns 0 / None.  Falls back to 64 (RDNA1 default).
+        sgs = self.simd_group_size or self._get_cached_subgroup_size() or 64
         dtype_bytes = 2 if self._packed16 else 4
 
         # DR.3: use shared classification + cap helpers
@@ -519,7 +555,9 @@ class ThreadgroupSizingMixin:
         except Exception:
             max_wg = 256
 
-        sgs = self.simd_group_size or 64
+        # M20.5: use reflection-derived subgroup_size as a fallback when
+        # the device query returns 0 / None.  Falls back to 64 (RDNA1 default).
+        sgs = self.simd_group_size or self._get_cached_subgroup_size() or 64
         dtype_bytes = 2 if self._packed16 else 4
 
         # DR.3: shared helpers for VGPR classification + capping

@@ -835,11 +835,11 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M20.2** | slang_mm `ParameterBlock` restore + dispatch-path unification | open |
 | **M20.3** | Spec-constant tiles for conv_bwd + flash_attn_bwd | open |
 | **M20.4** | Wave-intrinsic coverage (AnyTrue/AllTrue/Ballot/BitOr/BitAnd/BitXor/CountBits/PrefixCountBits) | ✅ **DONE 2026-05-25** — All 8 intrinsics implemented in `shaders/lib/helpers.slang:180-201` as `wave_active_any/all/ballot/bit_and/bit_or/bit_xor/count_bits/prefix_count_bits` wrappers with `[require]` capability annotations; each maps to the corresponding SPIR-V subgroup intrinsic. |
-| **M20.5** | Reflection metadata 40 %→80 % (subgroupSize, numSgprs, numStores/Loads/Atomics) | open |
+| **M20.5** | Reflection metadata 40 %→80 % (subgroupSize, numSgprs, numStores/Loads/Atomics) | ✅ **DONE 2026-05-25** — All 8 fields now wired: `vgprs`/`shared_mem`/`loop_depth` (prior M11.1); `num_sgprs`/`num_loads`/`num_stores`/`num_atomics` now extracted by `_analyze_spirv_binary` in `runtime/reflection_ext.py`; `subgroup_size` inferred from `threadGroupSize` entry in slangc JSON and exposed via `_get_cached_subgroup_size()` in `kernel/threadgroup_sizing.py` as a fallback for `sgs` in both pointwise and reduction WG pickers (replacing the hardcoded 64 default when device query fails). `_pick_numthreads_from_reflection` (DR.7 Pass-2) uses `num_sgprs` (SGPR-pressure tier drop) and `num_loads+num_stores` (I/O-pressure tier raise). Coverage: 8/8 fields parsed, 6/8 actively used in heuristics (vgprs, shared_mem, loop_depth, num_sgprs, num_loads+num_stores, subgroup_size). Tests: `TestM205ReflectionMetadata` (11 tests) — all green. |
 | **M20.6** | Subgroup-size spec constant | open |
 | **M20.7** | Lib helper extraction (Welford streaming, grid-stride loops) | open |
 | **M20.8** | Anti-goal #6 sweep for RNN + scatter (Jinja `{{}}` → generic `<S : IScatter>`) | open |
-| **M20.9** | `should_use_cooperative_reduction` reflection-aware | open |
+| **M20.9** | `should_use_cooperative_reduction` reflection-aware | ✅ **DONE 2026-05-25** — `VulkanKernel.should_use_cooperative_reduction` in `kernel/main.py` now adjusts its rnumel threshold using two SPIR-V reflection signals: (1) `num_sgprs > 64` → halves the cooperative threshold (register-heavy kernels avoid additional sync pressure); (2) `num_loads + num_stores > 128` → doubles the threshold (memory-bandwidth-dominated kernels hide sync latency). Both signals accessed via `_get_cached_io_pressure()` and `_get_cached_num_sgprs()` in `ThreadgroupSizingMixin`. Tests: `TestM209CooperativeReductionReflectionAware` (all green). |
 | **M20g** | **Flash_attention SDPA via Slang autodiff** | ❌ **NOT FEASIBLE 2026-05-19** — Online softmax's recurrence relation + lossy LSE compression are incompatible with Slang `bwd_diff` codegen. Decision: **keep hand-rolled flash-attention bwd (570 LoC).** Row preserved as a tracker for the RNN / conv autodiff lift attempts that remain in scope. |
 
 ### 0.6.4 M21 — Hardware-profiling + validation infrastructure (user-requested, NEW)
@@ -935,7 +935,7 @@ The M21.4 VUID stress harness inadvertently surfaced eager-mode correctness bugs
 | `meta_patches.py` is 3902 L | Already split: 8 files / 4460 L total (M15.1.b ✅) |
 | Persistent kernels: 40 % | **0 % effective** — `_enable_persistent_mode` is dead code |
 | `[require(...)]` capabilities: 0 % | **~80 %** for wave-intrinsic helpers (`lib/helpers.slang:89-112` + 6 sites in `lib/reduction.slang`) |
-| Reflection metadata: 100 % (M11.1) | **40 %** — only 3/8+ fields wired |
+| Reflection metadata: 100 % (M11.1) | **✅ 80 %+** — all 8 fields parsed (M20.5); 6/8 actively drive heuristics (vgprs, shared_mem, loop_depth, num_sgprs, num_loads+num_stores, subgroup_size); num_atomics stored for future use. |
 | `ParameterBlock`: 30 % (mm only) | **45 %** (13/29 files) — but mm regressed during M17.1 |
 | Backward op coverage: 57/58 | Accurate; argmax/argmin correctly NOT `[Differentiable]` (positions, not values) |
 | `vulkan_combo_kernel.py` 1106 L | Already split: 600 L + `combo_kernel/` (M15.1.f ✅) |
