@@ -1018,16 +1018,16 @@ Coverage totals (Agent 2): ~270 ops across all dispatch paths; ~210 tested (78 %
 
 | # | Title | Effort |
 |---|-------|--------|
-| **M-docs-1** | Refresh root `CLAUDE.md` against v6.3 (currently at v6.2 — missing M17–M23 entirely; affects every session context) | 15 min |
-| **M-docs-2** | Fix backend `CLAUDE.md` key-files table (4 file→dir renames: `runtime.py` → `runtime/`, `meta_patches.py` → `meta_patches/`, `bwd_diff_dispatch.py` → `bwd_diff/`, `vulkan_combo_kernel.py` → `combo_kernel/`) + retire anti-goal #2 (model_ops.cpp deleted) | 10 min |
-| **M-docs-3** | Document ~20 active env knobs missing from backend CLAUDE.md (`TORCH_VULKAN_SLANGC_WORKERS`, `TORCH_VULKAN_DISABLE_SLANG_TILES`, `TORCH_VULKAN_PARAMETER_BLOCK`, etc.) | 20 min |
-| **M-docs-4** | Resolve MAX_JOBS conflict — memory=3, root CLAUDE.md=8, backend CLAUDE.md=4. Pick canonical value. | 5 min |
+| **M-docs-1** | ✅ **DONE 2026-05-24**: Root `CLAUDE.md` already has v6.3 milestones (M17–M23 active section, verified). | done |
+| **M-docs-2** | ✅ **DONE 2026-05-24**: Backend `CLAUDE.md` key-files table already has `runtime/`, `meta_patches/`, `bwd_diff/`, `combo_kernel/` dirs; anti-goal #2 retired with ✅ CLOSED 2026-05-17 note. | done |
+| **M-docs-3** | ✅ **DONE 2026-05-24**: Backend `CLAUDE.md` "Useful environment knobs" section documents all ~40 active env vars including `TORCH_VULKAN_SLANGC_WORKERS`, `TORCH_VULKAN_DISABLE_SLANG_TILES`, `TORCH_VULKAN_PARAMETER_BLOCK`. | done |
+| **M-docs-4** | ✅ **DONE 2026-05-24**: Canonical value is `MAX_JOBS=3` — root CLAUDE.md says "MAX_JOBS=3 is the project default"; backend CLAUDE.md says same with `feedback_build_config` reference. Docs and §14 build command now consistent. | done |
 | **M-docs-5** | ✅ **CLOSED 2026-05-18**: PyTorch version mismatch resolved. Live venv reports `2.11.0+cpu` (matches user memory); backend CLAUDE.md updated. | done |
-| **M-docs-6** | **Archive `docs/0[1-8].md` + `09-master-plan.md` under `docs/archive/`** (4000+ lines of stale pre-implementation checklists) | 10 min |
-| **M-docs-7** | Refresh `docs/10-lib-api-reference.md` counts (says 9 lib modules; live: 16; `[BackwardDerivative]` 14 → 50) | 15 min |
+| **M-docs-6** | ✅ **DONE 2026-05-24**: Archived `docs/0[1-8].md` + `docs/09-master-plan.md` → `docs/archive/`. Commit `4038d6aeabe`. | done |
+| **M-docs-7** | Refresh `docs/10-lib-api-reference.md` counts (says 9 lib modules; live: 18; `[BackwardDerivative]` 14 → updated). In flight. | 15 min |
 | **M-docs-8** | Refresh `docs/primtorch_coverage.md` shader paths (~260 rows, all stale: `unary_abs_fwd.slang` → `shaders/unary/abs.slang`) | 30 min |
 | **M-docs-9** | ✅ **CLOSED 2026-05-18**: § 0 active-milestones M9 row corrected (was "M9.6/M9.7 remain", actual = all closed; new sub-followups tracked as M-cpp-new-2 etc.). | done |
-| **M-docs-10** | Refresh `docs/10-inductor-backend.md` § 13 reference-files table (6 row updates) | 10 min |
+| **M-docs-10** | ✅ **DONE 2026-05-24**: `docs/10-inductor-backend.md` §13 table refreshed (14 row updates); §14 `MAX_JOBS=8→3`. Commit `f4b74ec10b2`. | done |
 
 ### 0.7.5.y TEST.COV sub-followups (2026-05-18 late, surfaced by Wave-4 TEST.COV.5-7 implementer)
 
