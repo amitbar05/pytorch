@@ -43,7 +43,6 @@ from .decomposition_passes import (
 from .dtype_ops import (
     _amax_amin_fake,
     _argmax_argmin_fake,
-    _avg_pool2d_backward_fake,
     _binary_fake,
     _binary_no_alpha_fake,
     _binary_scalar_fake,
@@ -52,23 +51,17 @@ from .dtype_ops import (
     _clamp_min_fake,
     _comparison_fake,
     _cross_entropy_loss_backward_fake,
-    _elu_backward_fake,
     _elu_fake,
     _expand_backward_fake,
-    _gelu_backward_fake,
     _gelu_fake,
     _hardsigmoid_backward_fake,
     _hardswish_backward_fake,
     _hardtanh_backward_fake,
     _hardtanh_fake,
-    _leaky_relu_backward_fake,
     _leaky_relu_fake,
-    _linear_backward_fake,
     _linear_fake,
-    _log_softmax_backward_data_fake,
     _log_softmax_fake,
     _max_dim_fake,
-    _max_pool2d_with_indices_backward_fake,
     _mean_dim_fake,
     _min_dim_fake,
     _mish_backward_fake,
@@ -79,9 +72,7 @@ from .dtype_ops import (
     _select_backward_fake,
     _selu_backward_fake,
     _sigmoid_backward_fake,
-    _silu_backward_fake,
     _slice_backward_fake,
-    _softmax_backward_data_fake,
     _softmax_fake,
     _softplus_backward_fake,
     _softplus_fake,
@@ -162,9 +153,6 @@ from .shape_ops import (
     _masked_scatter_fake,
     _mm_fake,
     _narrow_fake,
-    _native_batch_norm_backward_fake,
-    _native_group_norm_backward_fake,
-    _native_layer_norm_backward_fake,
     _one_hot_fake,
     _permute_fake,
     _randperm_fake,
@@ -177,7 +165,6 @@ from .shape_ops import (
     _scatter_src_fake,
     _scatter_value_fake,
     _sdpa_backward_fake,
-    _sdpa_fake,
     _select_int_fake,
     _slice_fake,
     _split_with_sizes_fake,
@@ -189,8 +176,6 @@ from .shape_ops import (
     _transpose_int_fake,
     _unflatten_int_fake,
     _unsqueeze_fake,
-    _upsample_bilinear2d_backward_fake,
-    _upsample_nearest2d_backward_fake,
     _view_as_fake,
     _view_fake,
     _where_self_fake,
@@ -199,10 +184,11 @@ from .shape_ops import (
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 #
-# M15.2 audit: 162 entries, all classified (a) — genuine FakeTensor
-# shape-inference patches. Ten backward-op entries also have meta
-# decompositions (op_registration.py) that fire first; those fake_impl
-# entries are dead fallbacks. See agent_space/m15.2_audit_report.md §2.
+# G.1 audit (post): 147 entries — all classified (a), genuine FakeTensor
+# shape-inference patches. The 15 dead backward-op fallbacks (meta decomps
+# in op_registration.py win the dispatch race, or AOT decomp table in
+# decomposition_passes.py handles shape inference) were removed; see
+# agent_space/m15.2_audit_report.md §2 + G.1 followup.
 
 _OP_IMPLS: dict[str, Callable] = {
     # View / shape ops
@@ -346,10 +332,6 @@ _OP_IMPLS: dict[str, Callable] = {
     # Conv
     "aten::convolution_overrideable": _convolution_overrideable_fake,
     "aten::convolution_backward_overrideable": _convolution_backward_overrideable_fake,
-    # Normalization backward
-    "aten::native_batch_norm_backward": _native_batch_norm_backward_fake,
-    "aten::native_layer_norm_backward": _native_layer_norm_backward_fake,
-    "aten::native_group_norm_backward": _native_group_norm_backward_fake,
     # Indexing
     "aten::gather": _gather_fake_backward,
     "aten::scatter_.src": _scatter_src_fake,
@@ -357,11 +339,6 @@ _OP_IMPLS: dict[str, Callable] = {
     "aten::scatter_add_": _scatter_add_fake,
     "aten::index_put_": _index_put_fake,
     "aten::repeat_interleave.self_int": _repeat_interleave_self_int_fake,
-    # Upsample backward
-    "aten::upsample_bilinear2d_backward": _upsample_bilinear2d_backward_fake,
-    "aten::upsample_nearest2d_backward": _upsample_nearest2d_backward_fake,
-    # Attention
-    "aten::scaled_dot_product_attention": _sdpa_fake,
     # Attention backward
     "aten::_scaled_dot_product_flash_attention_backward": _sdpa_backward_fake,
     # FFT
@@ -373,22 +350,13 @@ _OP_IMPLS: dict[str, Callable] = {
     # Activation backward ops
     "aten::hardtanh_backward": _hardtanh_backward_fake,
     "aten::threshold_backward": _threshold_backward_fake,
-    "aten::leaky_relu_backward": _leaky_relu_backward_fake,
-    "aten::elu_backward": _elu_backward_fake,
     "aten::selu_backward": _selu_backward_fake,
-    "aten::silu_backward": _silu_backward_fake,
-    "aten::gelu_backward": _gelu_backward_fake,
     "aten::mish_backward": _mish_backward_fake,
     "aten::hardswish_backward": _hardswish_backward_fake,
     "aten::hardsigmoid_backward": _hardsigmoid_backward_fake,
     "aten::softplus_backward": _softplus_backward_fake,
     "aten::sigmoid_backward": _sigmoid_backward_fake,
     "aten::tanh_backward": _tanh_backward_fake,
-    "aten::_softmax_backward_data": _softmax_backward_data_fake,
-    "aten::_log_softmax_backward_data": _log_softmax_backward_data_fake,
-    "aten::avg_pool2d_backward": _avg_pool2d_backward_fake,
-    "aten::max_pool2d_with_indices_backward": _max_pool2d_with_indices_backward_fake,
-    "aten::linear_backward": _linear_backward_fake,
     # Loss backward
     "aten::nll_loss_backward": _nll_loss_backward_fake,
     "aten::_cross_entropy_loss_backward": _cross_entropy_loss_backward_fake,
@@ -435,8 +403,9 @@ def apply() -> None:
             )
 
     # Register SDPA in meta_table so FakeTensorMode._dispatch_impl skips the
-    # CompositeImplicitAutograd decompose() path (which fires before fake_impl
-    # is checked) and reaches our _sdpa_fake fake_impl directly.
+    # CompositeImplicitAutograd decompose() path and routes through the
+    # op_registration meta decomposition (the _sdpa_fake fake_impl fallback
+    # was deleted in the G.1 dead-fallback sweep).
     _register_sdpa_meta()
     _register_matmul_meta()
     _patch_proxy_call_matmul_decomp()
