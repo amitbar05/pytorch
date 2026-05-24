@@ -1456,25 +1456,28 @@ M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
 | Concern | Primary file(s) |
 |---------|----------------|
 | Backend registration | `python/torch_vulkan/inductor/__init__.py` |
-| Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` |
-| Combo kernel | `python/torch_vulkan/inductor/vulkan_combo_kernel.py` |
+| Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` + `scheduling_helpers.py` |
+| Combo kernel | `python/torch_vulkan/inductor/combo_kernel/` (dir; M15.1.f split) |
 | Kernel codegen | `python/torch_vulkan/inductor/kernel/` |
 | Lowerings | `python/torch_vulkan/inductor/lowerings/` |
-| FX passes | `python/torch_vulkan/inductor/fx_passes/` |
-| Runtime / slangc | `python/torch_vulkan/inductor/runtime.py` |
+| Backward lowerings | `python/torch_vulkan/inductor/bwd_lowerings.py` + `bwd_lowerings_norm.py` |
+| FX passes | `python/torch_vulkan/inductor/fx_passes/` (includes `eager/`, `post_grad.py`) |
+| Runtime / slangc | `python/torch_vulkan/inductor/runtime/` (dir; M15.1.c split: `slangc.py`, `dispatch.py`, `batcher.py`, `profile.py`, `reflection.py`, `validation_codegen.py`) |
 | Buffer pool | `python/torch_vulkan/inductor/buffer_pool.py` |
-| bwd_diff dispatch | `python/torch_vulkan/inductor/bwd_diff_dispatch.py` |
+| bwd_diff dispatch | `python/torch_vulkan/inductor/bwd_diff/` (dir; M15.1.h split) |
 | bwd_diff table | `python/torch_vulkan/inductor/bwd_diff_table.py` |
+| Validation | `python/torch_vulkan/inductor/validate.py` + `validate_identifiers.py` + `validate_resource_limits.py` + `validate_types.py` |
+| Hardware probe | `python/torch_vulkan/inductor/hardware_probe.py` (M21.1.c) |
 | Templates | `python/torch_vulkan/inductor/templates/` |
 | Template caller | `python/torch_vulkan/inductor/vulkan_template_caller.py` |
-| meta patches | `python/torch_vulkan/inductor/meta_patches.py` |
+| meta patches | `python/torch_vulkan/inductor/meta_patches/` (dir; M15.1 split) |
 | M17.2 conv_gn_relu template | `python/torch_vulkan/inductor/templates/conv_gn_relu.slang` |
 | M17.7 alloc alias pass | `python/torch_vulkan/inductor/fx_passes/alloc_alias.py` |
 | C++ AOTI runtime | `csrc/backend/AotiRuntime.cpp` |
-| C++ legacy eager ops | `csrc/ops/model_ops.cpp` (slated for deletion — M16) |
-| Slang lib modules | `shaders/lib/{helpers,dtype_pack,philox,special_math,bucket,mm,mm_tile,atomics,conv,norm,pointwise,reduction,losses,tensor_layout}.slang` |
+| C++ legacy eager ops | `csrc/ops/legacy_eager.cpp` (5 residual ops; model_ops.cpp ✅ deleted M16.3) |
+| Slang lib modules | `shaders/lib/` (18 modules: `helpers`, `vk_helpers`, `dtype_pack`, `philox`, `special_math`, `bucket`, `mm`, `mm_tile`, `mm_int8`, `atomics`, `conv`, `norm`, `pointwise`, `pointwise_generic`, `reduction`, `vk_reduction`, `losses`, `tensor_layout`) |
 | Slang templates | `python/torch_vulkan/inductor/templates/*.{jinja,slang}` |
-| Regression tests | `tests/test_inductor_regression.py` (39 k lines, 66 e2e model tests, 9 training-grade architectures) |
+| Regression tests | `tests/test_inductor_regression.py` |
 | E2E model tests | `tests/test_e2e_models.py` |
 
 ---
@@ -1484,7 +1487,7 @@ M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
 ### Build
 ```bash
 cd backends/vulkan_slang
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=8 python setup.py build_ext --inplace
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3 python setup.py build_ext --inplace
 ```
 
 ### Regression suite (~90 s with xdist)
