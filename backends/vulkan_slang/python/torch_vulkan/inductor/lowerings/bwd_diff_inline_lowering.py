@@ -176,7 +176,12 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
         # The inline emitter's lowering signature is ``(grad_output, self)``,
         # incompatible with the aten op's ``(grad_output, self, beta,
         # threshold)``. Algebraic lowering in bwd_lowerings.py.
-        "aten.mish_backward",
+        #
+        # M-AG5.1 Tier-3 (2026-05-24): aten.mish_backward removed.
+        # slangc v2026.7.1 does not correctly propagate
+        # [BackwardDerivative(mish_fast_bwd)] across module import
+        # boundaries — inline bwd_diff(mish_fwd) returns all-zero
+        # gradients. Algebraic lowering in bwd_lowerings.py.
         "aten.sigmoid_backward",
         "aten.tanh_backward",
         "aten.gelu_backward",

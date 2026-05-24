@@ -13,7 +13,7 @@ struct Params {
 
 [[vk::binding(0)]] StructuredBuffer<float> input;
 [[vk::binding(1)]] RWStructuredBuffer<float> out;
-[[vk::binding(2)]] RWStructuredBuffer<float> indices;  // stores linear index as float (reinterpret as uint)
+[[vk::binding(2)]] RWStructuredBuffer<uint> indices;  // stores linear index as uint (avoids subnormal FTZ corruption)
 [[vk::push_constant]] Params params;
 
 [shader("compute")]
@@ -42,11 +42,13 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
             float v = input[linear_idx];
             if (v > max_val) {
                 max_val = v;
-                max_idx = linear_idx;
+                // Store SPATIAL index only (ih * iW + iw) to match PyTorch ATen contract.
+                // The batch/channel offset (in_base) is excluded so idx is in [0, iH*iW).
+                max_idx = uint(ih) * params.iW + uint(iw);
             }
         }
     }
 
     out[tid.x] = max_val;
-    indices[tid.x] = asfloat(max_idx);  // store uint as float bits
+    indices[tid.x] = max_idx;  // store uint directly (float buffer = same raw bytes, avoids subnormal flush)
 }

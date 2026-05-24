@@ -16,6 +16,7 @@ extracted to ``reflection_ext.py``.
 
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -419,6 +420,32 @@ def _compile_slang_to_spirv_inner(
     return spv
 
 
+_IMPORT_STMT_RE = re.compile(r"^\s*import\s+(\w+)\s*;", re.MULTILINE)
+
+
+def _shader_lib_import_hash(src: str) -> str:
+    """Return a cache-key tag mixing in the content hash of each shader-lib
+    file that `src` imports via ``import <name>;``.
+
+    When a shader-lib file changes (e.g. special_math.slang), kernels that
+    import it get a new hash_key and the old disk-cached SPIR-V is bypassed.
+    Kernels that don't import any changed file are unaffected.
+    """
+    names = _IMPORT_STMT_RE.findall(src)
+    if not names:
+        return ""
+    parts = []
+    for name in sorted(set(names)):
+        lib_path = os.path.join(_SHADERS_LIB_DIR, name + ".slang")
+        if os.path.exists(lib_path):
+            try:
+                with open(lib_path, "rb") as f:
+                    parts.append(name + "=" + hashlib.sha256(f.read()).hexdigest()[:16])
+            except OSError:
+                pass
+    return "\nLIB=" + "|".join(parts) if parts else ""
+
+
 def compile_slang_to_spirv(
     src: str,
     entry: str = "computeMain",
@@ -455,8 +482,12 @@ def compile_slang_to_spirv(
     # produce distinct SPIR-V cache entries (barrier / wave-intrinsic
     # code may differ across subgroup sizes).
     sgs_tag = _get_device_subgroup_size_tag()
+    # Mix in the content hash of each imported shader-lib file so that
+    # changes to shaders/lib/*.slang automatically invalidate the disk
+    # cache for all kernels that import those files (M22.16-cache-fix).
+    lib_tag = _shader_lib_import_hash(src)
     hash_key = hashlib.sha256(
-        (entry + "\n" + _normalize_slang_source(src) + inc_tag + sgs_tag).encode()
+        (entry + "\n" + _normalize_slang_source(src) + inc_tag + sgs_tag + lib_tag).encode()
     ).hexdigest()
     hit = _cache_by_hash.get(hash_key)
     if hit is not None:

@@ -283,20 +283,33 @@ def _register_batch_norm_backward() -> None:
 
         x_centered = L.lowerings[aten.sub.Tensor](inp, mean_b)
 
-        dY_sum = L.lowerings[aten.sum.dim_IntList](
-            grad_out, reduce_dims, keepdims=False
-        )
+        # M22.15 v3: 2-step reshape-reduce — same fix as BN forward.
+        # Reshape [N,C,H*] to [N,C,H_W] then:
+        #   step1 sum(dim=2) → [N,C]   (xnumel=N*C, r0_numel=H_W)
+        #   step2 sum(dim=0) → [C]     (xnumel=C,   r0_numel=N)
+        # The two steps have DIFFERENT xnumel/r0_numel so the combo-kernel
+        # scheduler never merges dY_sum and dY_xc into a buggy Welford combo.
         dY_xc_elem = L.lowerings[aten.mul.Tensor](grad_out, x_centered)
-        dY_xc_sum = L.lowerings[aten.sum.dim_IntList](
-            dY_xc_elem, reduce_dims, keepdims=False
-        )
+        N = int(sizes[0])
+        if ndim >= 3:
+            H_W = N_eff // N
+            go_3d = L.lowerings[aten.view.default](grad_out, [N, C, H_W])
+            xc_3d = L.lowerings[aten.view.default](dY_xc_elem, [N, C, H_W])
+            dY_sum_nc = L.lowerings[aten.sum.dim_IntList](go_3d, [2], keepdims=False)
+            dY_xc_nc = L.lowerings[aten.sum.dim_IntList](xc_3d, [2], keepdims=False)
+            dY_sum = L.lowerings[aten.sum.dim_IntList](dY_sum_nc, [0], keepdims=False)
+            dY_xc = L.lowerings[aten.sum.dim_IntList](dY_xc_nc, [0], keepdims=False)
+        else:
+            dY_sum = L.lowerings[aten.sum.dim_IntList](grad_out, [0], keepdims=False)
+            dY_xc = L.lowerings[aten.sum.dim_IntList](dY_xc_elem, [0], keepdims=False)
+        # dY_sum and dY_xc are now shape [C]
+        dY_sum_b = L.lowerings[aten.view.default](dY_sum, bcast_shape)
+        dY_xc_sum_b = L.lowerings[aten.view.default](dY_xc, bcast_shape)
 
         outputs: list = [None, None, None]
 
         if output_mask[0]:
             if bool(train):
-                dY_sum_b = L.lowerings[aten.view.default](dY_sum, bcast_shape)
-                dY_xc_sum_b = L.lowerings[aten.view.default](dY_xc_sum, bcast_shape)
                 inv_N = 1.0 / float(N_eff)
                 dY_sum_scaled = L.lowerings[aten.mul.Scalar](dY_sum_b, inv_N)
                 a = L.lowerings[aten.sub.Tensor](grad_out, dY_sum_scaled)
@@ -321,7 +334,7 @@ def _register_batch_norm_backward() -> None:
             outputs[0] = d_input
 
         if output_mask[1]:
-            outputs[1] = L.lowerings[aten.mul.Tensor](dY_xc_sum, invstd_1d)
+            outputs[1] = L.lowerings[aten.mul.Tensor](dY_xc, invstd_1d)
 
         if output_mask[2]:
             outputs[2] = dY_sum

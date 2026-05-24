@@ -220,6 +220,18 @@ class ReductionMixin(ReductionLoadMixin):
         red_numel, _ = self._compute_red_numel()
         red_size = min(red_numel, self.max_threadgroup_size)
 
+        # M22.15 fix: when the reduction uses a 2D thread block (numthreads.y > 1),
+        # the Welford thread-id must be the *flat* index lid.y*tx + lid.x, not
+        # just lid.x.  Using only lid.x makes all threads in wave 1 (lid.y==1)
+        # claim wave-index 0 in the cross-wave groupshared reduction, producing
+        # a data race and wrong mean/m2 values.
+        layout_2d = self._persistent_2d_layout()
+        if layout_2d is not None:
+            _ty, _tx = layout_2d
+            _linear_tid = f"lid.y * {_tx} + lid.x"
+        else:
+            _linear_tid = "lid.x"
+
         if self.multistage_reduction_entry:
             acc_name = f"_wf_acc_{next(self.acc_var_ids)}"
             self.indexing_code.writeline(
@@ -256,7 +268,7 @@ class ReductionMixin(ReductionLoadMixin):
             input_triple = acc_name
         elif reduction_type == "welford_reduce":
             input_triple = (
-                f"(lid.x < {red_numel} ? WelfordResult<float>( {value}, 0.0f, 1.0f ) : "
+                f"({_linear_tid} < {red_numel} ? WelfordResult<float>( {value}, 0.0f, 1.0f ) : "
                 f"WelfordResult<float>( 0.0f, 0.0f, 0.0f ))"
                 if red_numel < self.max_threadgroup_size
                 else f"WelfordResult<float>( {value}, 0.0f, 1.0f )"
@@ -264,7 +276,7 @@ class ReductionMixin(ReductionLoadMixin):
         else:  # welford_combine, persistent
             mean, m2, cnt = value
             input_triple = (
-                f"(lid.x < {red_numel} ? WelfordResult<float>( {mean}, {m2}, {cnt} ) : "
+                f"({_linear_tid} < {red_numel} ? WelfordResult<float>( {mean}, {m2}, {cnt} ) : "
                 f"WelfordResult<float>( 0.0f, 0.0f, 0.0f ))"
                 if red_numel < self.max_threadgroup_size
                 else f"WelfordResult<float>( {mean}, {m2}, {cnt} )"
@@ -273,7 +285,7 @@ class ReductionMixin(ReductionLoadMixin):
         tup_name = f"tmp_wf_{next(self.acc_var_ids)}"
         self.stores.writeline(
             f"WelfordResult<float> {tup_name} = "
-            f"wg_welford({input_triple}, lid.x, {red_size}, VK_SUBGROUP_SIZE);"
+            f"wg_welford({input_triple}, {_linear_tid}, {red_size}, VK_SUBGROUP_SIZE);"
         )
         comp_dtype = DTYPE_TO_COMPUTATION_DTYPE[dtype]
         mean_v = V.kernel.create_cse_var(

@@ -62,7 +62,13 @@ _UNARY_BWD_DIFF_LOWERING_OPS: set[str] = {
     "aten.elu_backward",
     "aten.hardswish_backward",
     "aten.hardsigmoid_backward",
-    "aten.mish_backward",
+    # M-AG5.1 Tier-3 (2026-05-24): aten.mish_backward removed from the
+    # bwd_diff compile path. slangc v2026.7.1 does not correctly propagate
+    # [BackwardDerivative(mish_fast_bwd)] across module import boundaries —
+    # bwd_diff(mish_fwd) returns all-zero gradients in compile mode.
+    # mish_fwd stays in BWD_DIFF_TABLE so dispatch_unary_bwd (eager path)
+    # still works. Compile mode lowers algebraically in
+    # _register_algebraic_backward_lowerings below.
 }
 # NOTE: aten.gelu_backward is NOT in the auto-generated set because
 # gelu_fwd in pointwise.slang uses the tanh approximation, while
@@ -339,6 +345,32 @@ def _register_algebraic_backward_lowerings() -> None:
         sig_branch = L.lowerings[aten.mul.Tensor](grad_output, sig_bx)
         return L.lowerings[aten.where.self](gt_thr, grad_output, sig_branch)
 
+    # ── mish_backward ──────────────────────────────────────────────
+    # M-AG5.1 Tier-3 (2026-05-24): slangc v2026.7.1 does not correctly
+    # propagate [BackwardDerivative(mish_fast_bwd)] across module import
+    # boundaries — bwd_diff(mish_fwd) returns all-zero gradients in
+    # compile mode. mish_fwd stays in BWD_DIFF_TABLE so dispatch_unary_bwd
+    # (eager path) still works. Compile mode lowers algebraically:
+    #
+    #   mish'(x) = tanh(sp) + x * (1 - tanh(sp)^2) * sigmoid(x)
+    #   where sp = log(1 + exp(x))  [softplus(x)]
+    #
+    @register_lowering(aten.mish_backward, type_promotion_kind=None)
+    def _vulkan_mish_backward(grad_output, self):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+        sp = L.lowerings[aten.log1p.default](L.lowerings[aten.exp.default](self))
+        th = L.lowerings[aten.tanh.default](sp)
+        th_sq = L.lowerings[aten.mul.Tensor](th, th)
+        neg_th_sq = L.lowerings[aten.mul.Scalar](th_sq, -1.0)
+        sech2 = L.lowerings[aten.add.Scalar](neg_th_sq, 1.0)  # 1 - tanh(sp)^2
+        sig = L.lowerings[aten.sigmoid.default](self)
+        x_sech2_sig = L.lowerings[aten.mul.Tensor](
+            self, L.lowerings[aten.mul.Tensor](sech2, sig)
+        )
+        grad_fn = L.lowerings[aten.add.Tensor](th, x_sech2_sig)
+        return L.lowerings[aten.mul.Tensor](grad_output, grad_fn)
+
     # ── native_dropout_backward ────────────────────────────────────
     # Not autodiff-eligible — simple mask * scale * grad.
     @register_lowering(aten.native_dropout_backward, type_promotion_kind=None)
@@ -503,6 +535,108 @@ def _register_softmax_backward() -> None:
         return L.lowerings[aten.sub.Tensor](grad_output, prod)
 
 
+def _register_pool_backward() -> None:
+    """M22.15 — pool backward ops and max_pool2d_with_indices forward via
+    FallbackKernel.
+
+    avg_pool2d_backward: upstream lowering uses ops.indirect_indexing which
+    generates incorrect SPIR-V on Vulkan; route through FallbackKernel.
+
+    max_pool2d_with_indices (forward): AOTAutograd rematerialises indices in
+    the backward graph rather than saving them from the forward.  The upstream
+    Inductor lowering uses ops.indirect_indexing → wrong Vulkan SPIR-V for
+    the index output; route through FallbackKernel so the remat produces
+    correct int64 flat indices.
+
+    max_pool2d_with_indices_backward: the upstream Pointwise lowering uses
+    ops.indirect_indexing for bounded pool-window iteration.  For the common
+    2×2/stride-2 case window_size=1 so the indirect-indexing is trivial and
+    generates correct SPIR-V.  Do NOT override — let the upstream lowering
+    handle this op so PF.25 (TestMaxPool2dWithIndicesBackwardLowering) passes.
+    """
+    import torch
+    from torch._inductor.lowering import (
+        fallback_handler,
+        register_lowering,
+    )
+
+    aten = torch.ops.aten
+
+    _vk_avg_pool2d_bwd_fallback = fallback_handler(
+        aten.avg_pool2d_backward.default,
+        add_to_fallback_set=False,
+    )
+
+    # Use .default (specific overload) instead of the packet so
+    # register_lowering's get_overloads() guard does not skip the
+    # entry when the upstream lowering has already registered .default.
+    @register_lowering(aten.avg_pool2d_backward.default, type_promotion_kind=None)
+    def _vulkan_avg_pool2d_bwd(
+        grad_output, x, kernel_size, stride, padding, ceil_mode,
+        count_include_pad, divisor_override
+    ):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+        return _vk_avg_pool2d_bwd_fallback(
+            grad_output, x, kernel_size, stride, padding, ceil_mode,
+            count_include_pad, divisor_override
+        )
+
+    # Forward: max_pool2d_with_indices — AOTAutograd rematerialises indices
+    # in the backward, so this op appears in the backward graph too.  The
+    # upstream Inductor lowering uses ops.indirect_indexing which produces
+    # wrong SPIR-V on Vulkan for the indices output; route through
+    # FallbackKernel instead.
+    _vk_max_pool_fwd_fallback = fallback_handler(
+        aten.max_pool2d_with_indices.default,
+        add_to_fallback_set=False,
+    )
+
+    @register_lowering(aten.max_pool2d_with_indices.default, type_promotion_kind=None)
+    def _vulkan_max_pool_with_indices(
+        x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False
+    ):
+        if not _is_vulkan(x):
+            return NotImplemented
+        # Normalize scalar pool args to 2-element lists.  Inductor's
+        # FallbackKernel validates that pool parameters are list/tuple
+        # (ir.py:_check_kernel_args_for_fallback); the ATen schema
+        # expects IntList for these slots.
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size, kernel_size]
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, int):
+            stride = [stride, stride]
+        if isinstance(padding, int):
+            padding = [padding, padding]
+        if isinstance(dilation, int):
+            dilation = [dilation, dilation]
+        return _vk_max_pool_fwd_fallback(
+            x, kernel_size, stride, padding, dilation, ceil_mode
+        )
+
+    # Backward: max_pool2d_with_indices_backward — the upstream Pointwise
+    # lowering uses ops.indirect_indexing AND int64 index loads; int64 ops
+    # in Slang/SPIR-V don't work on RDNA1 (and likely other Vulkan devices).
+    # Route through FallbackKernel so index conversion (int64→uint32) happens
+    # on the C++ host before dispatching our uint32-based scatter shader.
+    _vk_max_pool_bwd_fallback = fallback_handler(
+        aten.max_pool2d_with_indices_backward.default,
+        add_to_fallback_set=False,
+    )
+
+    @register_lowering(aten.max_pool2d_with_indices_backward.default, type_promotion_kind=None)
+    def _vulkan_max_pool_bwd(
+        grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+    ):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+        return _vk_max_pool_bwd_fallback(
+            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 4.  Master registration entry point
 # ═══════════════════════════════════════════════════════════════════════
@@ -521,3 +655,4 @@ def register() -> None:
     register_norm_backward_lowerings()  # layer_norm / group_norm / batch_norm
     _register_softmax_backward()
     _register_embedding_bag_backward()  # OP.21 — scatter backward via decomposition
+    _register_pool_backward()  # M22.15 — max_pool2d_with_indices_backward

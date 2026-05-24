@@ -35,14 +35,17 @@ def _patch_decompositions() -> None:
       unsupported in ``bwd_diff`` codegen.
 
     Shape-only backward decomps (``_softmax_bwd``, ``_log_softmax_bwd``,
-    ``_avg_pool2d_bwd``, ``_max_pool_bwd``, ``_linear_bwd``,
-    ``_layer_norm_bwd``) remain; they hand out ``new_empty`` proxies so the
-    partitioner sees a storage-bound tensor (M18.3 — replaces the
-    ``empty_like`` literal-zero trap).
+    ``_linear_bwd``, ``_layer_norm_bwd``) remain; they hand out
+    ``new_empty`` proxies so the partitioner sees a storage-bound tensor
+    (M18.3 — replaces the ``empty_like`` literal-zero trap).
 
     ``_group_norm_bwd`` was removed in M-NEW.14 (2026-05-22).
     ``_batch_norm_bwd`` was removed in M-NEW.15 (2026-05-22).
     Both now route through dedicated Vulkan lowerings in ``bwd_lowerings.py``.
+    ``_avg_pool2d_bwd`` and ``_max_pool_bwd`` were removed in M22.15
+    (2026-05-24). They were replacing the upstream Inductor @register_lowering
+    entries with new_empty() calls; removing them lets the correct upstream
+    Inductor Pointwise lowerings fire instead.
     """
     import torch
     from torch._decomp import decomposition_table
@@ -82,22 +85,13 @@ def _patch_decompositions() -> None:
     def _log_softmax_bwd(grad_output, output, dim, input_dtype):
         return grad_output.new_empty(grad_output.shape)
 
-    def _avg_pool2d_bwd(
-        grad_output,
-        self,
-        kernel_size,
-        stride,
-        padding,
-        ceil_mode,
-        count_include_pad,
-        divisor_override,
-    ):
-        return self.new_empty(self.shape)
-
-    def _max_pool_bwd(
-        grad_output, self, kernel_size, stride, padding, dilation, ceil_mode, indices
-    ):
-        return self.new_empty(self.shape)
+    # M22.15 (2026-05-24): _avg_pool2d_bwd and _max_pool_bwd shape-only proxies
+    # removed.  These proxies replaced the upstream Inductor @register_lowering
+    # entries (torch/_inductor/lowering.py:avg_pool2d_backward / max_pool2d_
+    # with_indices_backward) with new_empty() calls, producing uninitialized
+    # gradient memory.  Without these entries in the decomp table, the ops flow
+    # through AOT unchanged and the upstream Inductor lowerings (which generate
+    # correct Pointwise kernels) fire at compilation time.
 
     def _linear_bwd(input, grad_output, weight, output_mask):
         gi = (
@@ -179,8 +173,6 @@ def _patch_decompositions() -> None:
         aten.gelu_backward.default: _gelu_bwd,
         aten._softmax_backward_data.default: _softmax_bwd,
         aten._log_softmax_backward_data.default: _log_softmax_bwd,
-        aten.avg_pool2d_backward.default: _avg_pool2d_bwd,
-        aten.max_pool2d_with_indices_backward.default: _max_pool_bwd,
         aten.linear_backward.default: _linear_bwd,
         aten.native_layer_norm_backward.default: _layer_norm_bwd,
         # M-NEW.14 (2026-05-22): native_group_norm_backward is no longer in

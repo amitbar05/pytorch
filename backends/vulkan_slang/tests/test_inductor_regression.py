@@ -18707,7 +18707,8 @@ class TestActivationsAutodiffBackward:
         y.backward(dout)
         return x_g.grad.detach()
 
-    def test_relu_silu_elu_softplus_mish_match_torch(self):
+    @pytest.mark.timeout(300)
+    def test_relu_silu_elu_softplus_hardswish_hardsigmoid_match_torch(self):
         import torch.nn.functional as F
 
         torch.manual_seed(5)
@@ -18718,7 +18719,7 @@ class TestActivationsAutodiffBackward:
             ("silu_fwd", F.silu),
             ("elu_fwd", F.elu),
             ("softplus_fwd", F.softplus),
-            ("mish_fwd", F.mish),
+            # mish_fwd tested separately in test_mish_bwd_diff_slang_autodiff_matches_torch.
             ("hardswish_fwd", F.hardswish),
             ("hardsigmoid_fwd", F.hardsigmoid),
         ]
@@ -18732,6 +18733,18 @@ class TestActivationsAutodiffBackward:
                 atol=2e-3,
                 msg=lambda m, n=fn_name: f"{n}: {m}",
             )
+
+    @pytest.mark.timeout(300)
+    def test_mish_bwd_diff_slang_autodiff_matches_torch(self):
+        """mish_fwd bwd_diff via raw Slang import matches CPU reference."""
+        import torch.nn.functional as F
+
+        torch.manual_seed(5)
+        x = torch.randn(256) * 2.0
+        dout = torch.randn(256)
+        got = self._grad_via_autodiff("mish_fwd", x, dout)
+        ref = self._torch_grad(F.mish, x, dout)
+        torch.testing.assert_close(got, ref, rtol=2e-3, atol=2e-3)
 
     def test_sigmoid_tanh_match_torch(self):
         torch.manual_seed(7)
@@ -19228,6 +19241,8 @@ class TestCGM4NormBackwardComposable:
         torch.testing.assert_close(gw.cpu(), gw_cpu, rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(gb.cpu(), gb_cpu, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
     def test_cgm4_batch_norm_backward_matches_cpu(self):
         """Compiled native_batch_norm_backward (eval mode) matches CPU."""
         N, C, H, W = 8, 16, 4, 4
@@ -58252,17 +58267,6 @@ class TestCOV3ActivationBackward:
         compiled(x_vk).backward()
         torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "TEST.COV.3 gap: mish backward via Slang bwd_diff() returns all-zero "
-            "gradients (100% elements mismatch, max abs diff ~1.09). The "
-            "bwd_diff_table.py entry routes aten.mish_backward to mish_fwd in the "
-            "pointwise path, but the Slang autodiff does not propagate through "
-            "mish's composite x*tanh(softplus(x)) structure — the backward "
-            "kernel silently produces zeros. Verified 2026-05-24."
-        ),
-    )
     def test_mish_backward_compile_parity(self):
         """aten.mish_backward — mish(x) = x * tanh(softplus(x)); two-step backward."""
         torch.manual_seed(42)

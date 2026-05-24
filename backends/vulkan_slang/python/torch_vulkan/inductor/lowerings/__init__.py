@@ -131,6 +131,14 @@ def _suppress_upstream_decomps() -> None:
         # decomp. The upstream lowering produces IR that our reduction
         # template can fuse with adjacent pointwise ops.
         aten._adaptive_avg_pool2d.default,
+        # M22.15 (2026-05-24): suppress avg_pool2d_backward (upstream uses
+        # ops.indirect_indexing → wrong SPIR-V) and both max_pool2d_with_indices
+        # ops (forward uses indirect_indexing for wrong index output; backward
+        # uses indirect_indexing + int64 loads which don't work on RDNA1 Vulkan;
+        # FallbackKernel overrides for both in bwd_lowerings.py).
+        aten.avg_pool2d_backward.default,
+        aten.max_pool2d_with_indices.default,
+        aten.max_pool2d_with_indices_backward.default,
     ]
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
