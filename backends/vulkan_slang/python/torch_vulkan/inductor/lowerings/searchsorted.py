@@ -77,8 +77,9 @@ def _dispatch_searchsorted_gpu(
     seq_len = sorted_sequence.shape[0]
     num_values = values_flat.shape[0]
 
-    out_dtype = torch.int32 if out_int32 else torch.int64
-    output_flat = torch.empty(num_values, dtype=out_dtype, device=self.device)
+    # Shader writes RWStructuredBuffer<uint> (4 bytes/elem). Always allocate
+    # int32 so the shader writes the correct byte width; cast to int64 below.
+    output_flat = torch.empty(num_values, dtype=torch.int32, device=self.device)
 
     # Ensure sorted_sequence is float32.
     sorted_seq_f32 = sorted_sequence.float()
@@ -113,9 +114,9 @@ def _dispatch_searchsorted_gpu(
         cache_key=cache_key,
     )
 
-    # Reshape output to match input shape; cast to int64 if needed.
+    # Reshape output to match input shape; cast to the requested dtype.
     result = output_flat.reshape(self.shape)
-    if not out_int32 and result.dtype != torch.int64:
+    if not out_int32:
         result = result.to(torch.int64)
     return result
 

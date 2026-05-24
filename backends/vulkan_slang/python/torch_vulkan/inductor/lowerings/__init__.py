@@ -215,6 +215,37 @@ def _suppress_upstream_decomps() -> None:
     decompositions[aten.hardtanh_backward.default] = _hardtanh_bwd_for_aot
     _aot_decomps[aten.hardtanh_backward.default] = _hardtanh_bwd_for_aot
 
+    # M18.HS.1: hardsigmoid stock AOT decomp goes to aten.clamp which triggers
+    # FakeTensorProp crash (AutogradPrivateUse1 kernel for clamp has higher
+    # dispatch priority than Python/__torch_dispatch__, so the real C++ Vulkan
+    # clamp kernel fires on a FakeTensor and crashes with "Cannot access data
+    # pointer").
+    #
+    # Fix (same pattern as M18.TB.1 hardtanh fix):
+    #   1. Remove hardsigmoid from Inductor's decompositions dict so the stock
+    #      clamp decomp never runs.  hardsigmoid has NO AutogradPrivateUse1
+    #      kernel (only PrivateUse1), so FakeTensorMode._dispatch_impl reaches
+    #      the fake_impl check and finds _unary_fake — no crash.
+    #   2. Also pop from _aot_decomps to prevent the non-Inductor AOT path from
+    #      inserting a clamp node into the graph.
+    #   3. Inject hardsigmoid_backward as a primitive Python decomp (gt+lt+mask
+    #      pattern, same as _hardtanh_bwd_for_aot).  Without this, the backward
+    #      uses aten.hardsigmoid_backward with a frozen Vulkan constant as
+    #      grad_output (null storage → zero), producing all-zero gradients.
+    decompositions.pop(aten.hardsigmoid.default, None)
+    decompositions.pop(aten.hardsigmoid_.default, None)
+    _aot_decomps.pop(aten.hardsigmoid.default, None)
+    _aot_decomps.pop(aten.hardsigmoid_.default, None)
+
+    def _hardsigmoid_bwd_for_aot(grad_output, self):
+        # hardsigmoid(x) = clamp(x/6+0.5, 0, 1)
+        # d/dx = 1/6  if -3 < x < 3,  else 0
+        mask = (self > -3.0) & (self < 3.0)
+        return grad_output * mask.to(grad_output.dtype) * (1.0 / 6.0)
+
+    decompositions[aten.hardsigmoid_backward.default] = _hardsigmoid_bwd_for_aot
+    _aot_decomps[aten.hardsigmoid_backward.default] = _hardsigmoid_bwd_for_aot
+
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.
     fast_random_decomps.cache_clear()

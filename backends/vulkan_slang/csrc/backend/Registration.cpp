@@ -39,15 +39,30 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
         src.device().type() == c10::DeviceType::PrivateUse1) {
         // Note: VulkanBuffer::read() auto-flushes pending GPU work via callback
         // Vulkan → CPU (read raw bytes, then convert dtype on CPU if needed)
-        if (src.scalar_type() == self.scalar_type()) {
-            auto* buf = alloc.get_buffer(src.data_ptr());
+        //
+        // M18.9-followup (2026-05-24): guard against non-contiguous src.
+        // VulkanBuffer::read() copies raw bytes from the underlying VkBuffer
+        // and ignores stride / storage_offset.  All current Vulkan ops
+        // materialise a fresh contiguous buffer rather than creating metadata-
+        // only views (slicing, permuting, as_strided all run GPU shaders), so
+        // src.is_contiguous() is true in practice.  However, vulkan_view /
+        // vulkan_reshape do produce zero-copy views sharing the same storage,
+        // and future view ops could do the same.  The defensive contiguous()
+        // call costs nothing in the common case (one is_contiguous() check)
+        // and prevents silent data corruption if a non-contiguous src ever
+        // reaches this path.  .contiguous() on a Vulkan tensor routes through
+        // the Vulkan→Vulkan branch above, which uses dispatch_strided_copy to
+        // respect strides correctly before the host readback.
+        const at::Tensor& src_read = src.is_contiguous() ? src : src.contiguous();
+        if (src_read.scalar_type() == self.scalar_type()) {
+            auto* buf = alloc.get_buffer(src_read.data_ptr());
             TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
             buf->read(self.data_ptr(),
                       static_cast<VkDeviceSize>(self.nbytes()));
         } else {
             // Read into a temp CPU tensor with src's dtype, then convert
-            auto tmp = at::empty(src.sizes(), src.options().device(c10::kCPU));
-            auto* buf = alloc.get_buffer(src.data_ptr());
+            auto tmp = at::empty(src_read.sizes(), src_read.options().device(c10::kCPU));
+            auto* buf = alloc.get_buffer(src_read.data_ptr());
             TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
             buf->read(tmp.data_ptr(),
                       static_cast<VkDeviceSize>(tmp.nbytes()));

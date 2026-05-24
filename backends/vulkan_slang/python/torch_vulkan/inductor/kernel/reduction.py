@@ -571,21 +571,27 @@ class ReductionMixin(ReductionLoadMixin):
             if red_numel < self.max_threadgroup_size
             else str(val)
         )
-        pair = self.cse.generate(
-            self.compute,
-            f"float2({guarded_key}, {guarded_val})",
-            dtype=dtypes[0],
-        )
-        sorted_pair = self.cse.generate(
-            self.compute,
-            f"wg_bitonic_sort_float2({pair}, lid.x, {red_size}, "
-            f"{'true' if descending else 'false'})",
-            dtype=dtypes[0],
-        )
-        sorted_key = self.cse.newvar(dtypes[0])
-        sorted_val = self.cse.newvar(dtypes[1])
-        self.compute.writeline(f"float {sorted_key} = ({sorted_pair}).x;")
-        self.compute.writeline(f"float {sorted_val} = ({sorted_pair}).y;")
+        # wg_bitonic_sort_wave(inout float2 v, uint lane) sorts ascending
+        # in-place within the wave using WaveReadLaneAt shuffle.
+        # For descending sort: negate keys so smallest negated key = largest
+        # original key comes first; sentinel for unused slots is +FLT_MAX
+        # (after negation, so -(original_guard) → +FLT_MAX → sorts last ✓).
+        if descending:
+            key_expr = f"-({guarded_key})"
+        else:
+            key_expr = guarded_key
+        pair = self.cse.newvar(dtype=dtypes[0])
+        self.compute.writeline(f"float2 {pair} = float2({key_expr}, {guarded_val});")
+        sorted_pair = self.cse.newvar(dtype=dtypes[0])
+        self.compute.writeline(f"float2 {sorted_pair} = {pair};")
+        self.compute.writeline(f"wg_bitonic_sort_wave({sorted_pair}, lid.x);")
+        sorted_key = self.cse.newvar(dtype=dtypes[0])
+        sorted_val = self.cse.newvar(dtype=dtypes[1])
+        if descending:
+            self.compute.writeline(f"float {sorted_key} = -({sorted_pair}.x);")
+        else:
+            self.compute.writeline(f"float {sorted_key} = {sorted_pair}.x;")
+        self.compute.writeline(f"float {sorted_val} = {sorted_pair}.y;")
         return (sorted_key, sorted_val)
 
     def bucketize(

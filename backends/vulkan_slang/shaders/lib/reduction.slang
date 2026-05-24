@@ -472,15 +472,14 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
 [require(spirv, subgroup_shuffle)]
 [ForceInline]
 public void wg_bitonic_sort_wave(inout float2 v, uint lane) {
-    for (uint mask = 1u; mask < 64u; mask <<= 1u) {
-        float2 other = WaveReadLaneAt(v, lane ^ mask);
-        bool swap = (lane & mask) != 0u;
-        float2 a = swap ? other : v;
-        float2 b = swap ? v : other;
-        if (a.x > b.x || (a.x == b.x && a.y > b.y)) {
-            v = swap ? a : b;
-        } else {
-            v = swap ? b : a;
+    for (uint k = 2u; k <= 64u; k <<= 1u) {
+        for (uint j = k >> 1u; j >= 1u; j >>= 1u) {
+            float2 other = WaveReadLaneAt(v, lane ^ j);
+            bool ascending = (lane & k) == 0u;
+            bool lower = (lane & j) == 0u;
+            bool v_gt = v.x > other.x || (v.x == other.x && v.y > other.y);
+            bool should_swap = ascending ? (lower == v_gt) : (lower != v_gt);
+            if (should_swap) v = other;
         }
     }
 }
