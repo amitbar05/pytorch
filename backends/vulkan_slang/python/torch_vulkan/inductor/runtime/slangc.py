@@ -5,8 +5,13 @@ hash, then dispatches the compute shader via the C++ `_jit_dispatch` pybind
 entry point. The in-memory cache is augmented by an on-disk cache
 (``~/.cache/torch_vulkan/spirv/``, overridable via ``TORCH_VULKAN_SPIRV_CACHE``)
 so subsequent Python sessions bypass slangc entirely once a kernel has been
-compiled. See ``common.py``, ``shader_lib.py``, ``reflection_ext.py`` for
-the split-out submodules (M22a).
+compiled.
+
+M22a Stage 1: module-level shared state extracted to ``common.py``.
+M22a Stage 2: shader-lib precompile / module management extracted to
+``shader_lib.py``.
+M22a Stage 3: reflection metrics / SPIR-V baseline / numthreads cluster
+extracted to ``reflection_ext.py``.
 """
 
 import hashlib
@@ -246,19 +251,8 @@ def _compile_slang_to_spirv_inner(
         # couldn't catch (ABI-incompatible slangc rebuild with same
         # stat). Hard-fail on second crash to prevent any retry loop
         # and to avoid masking non-stale-cache slangc bugs.
-        #
-        # M18.TB.1 / FA-race guard: only invalidate when modules are known
-        # stable (_shader_lib_modules_ready).  During precompile_shader_libs
-        # the modules are being actively written; a concurrent prewarm_compile
-        # (e.g. Flash-Attention specs) may race the writes, causing slangc to
-        # crash with rc=-11 (SIGSEGV) on a partially-complete cache.  Wiping
-        # the cache in that window creates an invalidation loop — each precompile
-        # pass completes then a racing prewarm crashes and wipes it.  When
-        # _shader_lib_modules_ready is False the cache is still being built;
-        # skip the invalidation and let the retry-without-modules path handle it.
         if proc.returncode < 0 and module_includes:
-            if _shader_lib_modules_ready:
-                _invalidate_shader_lib_modules()
+            _invalidate_shader_lib_modules()
             used_module_includes = False  # DR.7: retry without module includes
             cmd2 = [
                 _get_slangc(),
@@ -339,18 +333,11 @@ def _compile_slang_to_spirv_inner(
                     if current_nt is not None:
                         shared_mem = metrics.get("shared_mem")
                         loop_depth = metrics.get("loop_depth")
-                        # M20.5: pass SGPR/load/store counts to refine sizing.
-                        num_sgprs = metrics.get("num_sgprs")
-                        num_loads = metrics.get("num_loads")
-                        num_stores = metrics.get("num_stores")
                         optimal_nt = _pick_numthreads_from_reflection(
                             vgprs,
                             shared_mem,
                             loop_depth,
                             current_nt,
-                            num_sgprs=num_sgprs,
-                            num_loads=num_loads,
-                            num_stores=num_stores,
                         )
                         if optimal_nt != current_nt:
                             # Rewrite source with optimized numthreads.
@@ -618,14 +605,9 @@ def batch_compile_slang_to_spirv(
             errors.append(e)
             return None
 
-    # PF.14 extension: workers in this local pool call compile_slang_to_spirv,
-    # which re-submits to _ASYNC_POOL when _is_in_pool_worker() is False.
-    # Wrap with _wrap_pool_worker so the flag is set and the re-submission
-    # (which would deadlock if both pools share all workers) is bypassed.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        wrapped_compile = _wrap_pool_worker(_compile_one)
         futures = {
-            pool.submit(wrapped_compile, src, entry, ck, ip): ck
+            pool.submit(_compile_one, src, entry, ck, ip): ck
             for src, entry, ck, ip in pending
         }
         for fut in futures:
