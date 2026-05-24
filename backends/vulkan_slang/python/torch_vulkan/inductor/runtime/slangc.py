@@ -16,7 +16,6 @@ extracted to ``reflection_ext.py``.
 
 import hashlib
 import os
-import re
 import subprocess
 import tempfile
 import threading
@@ -87,6 +86,7 @@ from .shader_lib import (  # noqa: F401
     _mm_int8_module_path,
     _mm_tile_module_available,
     _mm_tile_module_path,
+    _shader_lib_import_hash,
     _prewarm_filtered_sources,
     _prewarm_level,
     _reset_shader_lib_modules_ready,
@@ -418,32 +418,6 @@ def _compile_slang_to_spirv_inner(
     _cache_by_hash[hash_key] = spv
     _disk_cache_write(hash_key, spv)
     return spv
-
-
-_IMPORT_STMT_RE = re.compile(r"^\s*import\s+(\w+)\s*;", re.MULTILINE)
-
-
-def _shader_lib_import_hash(src: str) -> str:
-    """Return a cache-key tag mixing in the content hash of each shader-lib
-    file that `src` imports via ``import <name>;``.
-
-    When a shader-lib file changes (e.g. special_math.slang), kernels that
-    import it get a new hash_key and the old disk-cached SPIR-V is bypassed.
-    Kernels that don't import any changed file are unaffected.
-    """
-    names = _IMPORT_STMT_RE.findall(src)
-    if not names:
-        return ""
-    parts = []
-    for name in sorted(set(names)):
-        lib_path = os.path.join(_SHADERS_LIB_DIR, name + ".slang")
-        if os.path.exists(lib_path):
-            try:
-                with open(lib_path, "rb") as f:
-                    parts.append(name + "=" + hashlib.sha256(f.read()).hexdigest()[:16])
-            except OSError:
-                pass
-    return "\nLIB=" + "|".join(parts) if parts else ""
 
 
 def compile_slang_to_spirv(

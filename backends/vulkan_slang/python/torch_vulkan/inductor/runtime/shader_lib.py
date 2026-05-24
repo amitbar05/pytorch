@@ -774,3 +774,23 @@ def _ensure_mm_int8_module() -> str:
             "Ensure shaders/lib/mm_int8.slang exists and slangc is available."
         )
     return mod_path
+
+
+_IMPORT_STMT_RE = _re.compile(r"^\s*import\s+(\w+)\s*;", _re.MULTILINE)
+
+
+def _shader_lib_import_hash(src: str) -> str:
+    # Cache-key tag: mixes in content hash of each shader-lib file imported via 'import <name>;'
+    names = _IMPORT_STMT_RE.findall(src)
+    if not names:
+        return ""
+    parts = []
+    for name in sorted(set(names)):
+        lib_path = os.path.join(_SHADERS_LIB_DIR, name + ".slang")
+        if os.path.exists(lib_path):
+            try:
+                with open(lib_path, "rb") as f:
+                    parts.append(name + "=" + hashlib.sha256(f.read()).hexdigest()[:16])
+            except OSError:
+                pass
+    return "\nLIB=" + "|".join(parts) if parts else ""
