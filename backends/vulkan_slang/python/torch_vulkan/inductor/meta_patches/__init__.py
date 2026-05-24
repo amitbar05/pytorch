@@ -95,6 +95,7 @@ from .faketensor_hooks import (
     _patch_fake_tensor_skip_const_fold_for_vulkan_null,
     _patch_fake_tensor_view_op_device,
     _patch_fx_graph_cache_reduce_tensor_for_vulkan,
+    _patch_graph_lowering_get_attr_for_vulkan_null,
     _patch_tensor_deepcopy_for_vulkan,
 )
 
@@ -474,6 +475,14 @@ def apply() -> None:
     # ``t.tolist()`` on Vulkan view tensors (e.g. k.transpose(-2,-1))
     # whose storage data pointer is invalid during AOTAutograd compilation.
     _patch_fx_graph_cache_reduce_tensor_for_vulkan()
+
+    # M-CV.2: fix GraphLowering.get_attr for zero-stride Vulkan constants.
+    # M-CV.2: GraphLowering.get_attr calls value.tolist() on Vulkan FakeTensors
+    # that have no real backing storage (null data_ptr or zero strides).
+    # This produces zeros → wrong gradients in maximum/atan2/etc backward.
+    # Route null-storage Vulkan constants to add_tensor_constant() instead,
+    # creating a ConstantBuffer that receives the real values at runtime.
+    _patch_graph_lowering_get_attr_for_vulkan_null()
 
     # C1: rewrite ``aten.relu`` to ``where + gt + full_like`` BEFORE the
     # AOT joint trace, so ReluBackward0/threshold_backward never fires

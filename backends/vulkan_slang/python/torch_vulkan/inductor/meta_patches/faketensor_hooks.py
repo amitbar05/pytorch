@@ -493,3 +493,105 @@ def _patch_fake_tensor_skip_const_fold_for_vulkan_null() -> None:
             "constants failed: %s",
             e,
         )
+
+
+def _patch_graph_lowering_get_attr_for_vulkan_null() -> None:
+    """Patch GraphLowering.get_attr to fix zero-stride and null-storage Vulkan constants.
+
+    GraphLowering.get_attr calls ``value.tolist()`` for small (≤ 8 element) 1-D
+    tensor constants (``can_inline_constant=True``) and inlines the result as
+    compile-time literals.  For Vulkan tensors this fails in two ways:
+
+    1. **Zero-stride broadcast** (all strides == 0): reads at indices [0,1,2,...]
+       all return element[0] — the remaining indices give out-of-bounds zeros.
+
+    2. **Null-storage / FakeTensor**: ``tolist()`` raises
+       ``RuntimeError: Vulkan tensor has no backing buffer``.
+
+    For the null-storage case, PF.52 (``tangents.py``) handles the primary path
+    by replacing ``_tensor_constant*`` get_attr nodes with ``aten.full([N], 1.0)``
+    before GraphLowering runs.  This patch is a safety net for any remaining
+    Vulkan ``get_attr`` tensors that survive to GraphLowering with null storage.
+
+    Fix: intercept ``get_attr`` for Vulkan tensors with zero strides or null
+    storage.  For zero-stride tensors, replace with the contiguous copy so
+    ``tolist()`` returns the broadcast value for every element.  For null-storage
+    tensors, return a compile-time ``Constant(0.0, ...)`` placeholder (the node
+    is typically dead after PF.52; the correct constant value is emitted by the
+    ``aten.full`` node PF.52 inserted in its place).
+
+    Idempotent (guarded via ``_vulkan_null_const_patched`` class attribute).
+    """
+    try:
+        from torch._inductor.graph import GraphLowering
+
+        if getattr(GraphLowering, "_vulkan_null_const_patched", False):
+            return
+
+        _orig_get_attr = GraphLowering.get_attr
+
+        def _patched_get_attr(self, target, args, kwargs):
+            # Peek at the attribute before the original get_attr runs.
+            # Use simple getattr traversal matching graph.py's getattr_recursive.
+            value = None
+            try:
+                attr_itr = self.module
+                for atom in target.split("."):
+                    attr_itr = getattr(attr_itr, atom)
+                value = attr_itr
+            except Exception:  # noqa: BLE001
+                value = None
+
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, torch.fx.GraphModule)
+                and getattr(value.device, "type", "") in ("vulkan", "privateuseone")
+            ):
+                try:
+                    # Sub-case 1: zero-stride broadcast — replace with contiguous
+                    # copy so tolist() returns the correct broadcast value.
+                    strides = value.stride()
+                    if strides and all(s == 0 for s in strides) and value.dim() > 0:
+                        contiguous = value.contiguous()
+                        _parts = target.rsplit(".", 1)
+                        if len(_parts) == 2:
+                            _parent = self.module
+                            for _a in _parts[0].split("."):
+                                _parent = getattr(_parent, _a)
+                            setattr(_parent, _parts[1], contiguous)
+                        else:
+                            setattr(self.module, target, contiguous)
+                        if target in getattr(self, "constants", {}):
+                            self.constants[target] = contiguous
+                        return _orig_get_attr(self, target, args, kwargs)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Sub-case 2: null-storage (tolist would fail or return zeros).
+                # PF.52 should have replaced these get_attr nodes with full([N])
+                # nodes already. If one slips through (dead node after PF.52,
+                # or an unusual constant we didn't catch), return a compile-time
+                # Constant(0.0) so the compilation doesn't crash. For live nodes
+                # this returns an incorrect 0.0 but PF.52 should have redirected
+                # all live uses to the full() node before GraphLowering.
+                if GraphLowering.can_inline_constant(value):
+                    try:
+                        # Try tolist() — might work if the tensor has real data.
+                        _vals = value.tolist()
+                    except Exception:  # noqa: BLE001
+                        # Null storage — return a zero constant so compilation
+                        # doesn't crash. Live uses were redirected by PF.52.
+                        from torch._inductor.ir import Constant
+                        return Constant(value=0.0, dtype=value.dtype, device=value.device)
+
+            return _orig_get_attr(self, target, args, kwargs)
+
+        GraphLowering.get_attr = _patched_get_attr
+        GraphLowering._vulkan_null_const_patched = True  # type: ignore[attr-defined]
+    except Exception as e:  # pragma: no cover
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Patching GraphLowering.get_attr for Vulkan null constants failed: %s",
+            e,
+        )

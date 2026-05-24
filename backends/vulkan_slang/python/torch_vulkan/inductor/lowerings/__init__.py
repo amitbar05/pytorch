@@ -408,6 +408,80 @@ def register() -> None:
 
         return L.lowerings[aten.to.dtype](x, torch.float32)
 
+    # M-CV.2: masked_fill.Scalar — decompose to where(mask, value, self) so
+    # backward graphs that contain aten.masked_fill.Scalar (e.g.
+    # maximum_backward / minimum_backward decompositions) compile correctly
+    # instead of falling through to the Vulkan eager kernel which has no
+    # backing-buffer for the output tensor.
+    @_reg_low(aten.masked_fill.Scalar, type_promotion_kind=None)
+    def _vulkan_masked_fill_scalar(x, mask, value):
+        # masked_fill(self, mask, value): set elements to `value` where mask
+        # is True, leave others unchanged.
+        #
+        # Decompose as where(mask, value_scalar, x).  The upstream Inductor
+        # where() lowering (torch/_inductor/lowering.py:where) handles scalar
+        # ``a``/``b`` arguments via ``constant_like(a)(b)``, which inlines the
+        # constant directly into the pointwise IR without creating a full_like
+        # broadcast that the scheduler might mis-represent.  Passing the
+        # scalar directly avoids the stale-expand/index-bounds codegen bug that
+        # was producing all-zeros for the "gt=False → keep original" case in
+        # maximum_backward.
+        from torch._inductor import lowering as L
+
+        return L.lowerings[aten.where.self](mask, float(value), x)
+
+    # M-CV.2: aten.expand broadcast-stride-0 fix.
+    #
+    # Root cause: when Inductor constant-folds ``tangents_1.expand([N])``
+    # (where tangents_1=1.0 for sum().backward()), it creates a ConstantBuffer
+    # backed by a *single-element* Vulkan tensor with stride=0 but shape=[N].
+    # The Slang kernel then reads ``in_ptr[x0]`` for x0=0..N-1, but the
+    # backing buffer only has 1 element (4 bytes), so reads at x0>0 are
+    # out-of-bounds and return 0 in the Vulkan driver — producing all-zero
+    # gradients for the second argument of maximum/atan2.
+    #
+    # Fix: when aten.expand produces a broadcast (output has more elements than
+    # input), call `.realize()` to force a fully-allocated N-element contiguous
+    # buffer instead of a stride-0 ExpandView.  Every ``in_ptr[x0]`` read is
+    # then in-bounds.  Identity expands (same numel) are left unchanged.
+    #
+    # We save the upstream expand lowering before registering the override so we
+    # can call it without recursing into ourselves.  Both ``aten.expand`` (the
+    # overloaded namespace key) and ``aten.expand.default`` (the specific
+    # overload) may appear in the backward graph — override both.
+    from torch._inductor import lowering as _L_inner
+
+    _upstream_expand_fn = _L_inner.lowerings.get(aten.expand)
+    _upstream_expand_default_fn = _L_inner.lowerings.get(aten.expand.default)
+
+    def _realize_if_broadcast(x, sizes, result):
+        """Call result.realize() when the expand creates stride-0 dims."""
+        try:
+            x_size = getattr(x, "get_size", lambda: ())()
+            x_numel = 1
+            for s in x_size:
+                x_numel *= int(s)
+            out_numel = 1
+            for s in sizes:
+                s_int = int(s)
+                if s_int > 0:
+                    out_numel *= s_int
+            if x_numel > 0 and x_numel != out_numel:
+                result.realize()
+        except Exception:
+            pass  # Dynamic shapes or non-integer sizes — leave as-is.
+        return result
+
+    if _upstream_expand_fn is not None:
+        @_reg_low(aten.expand, type_promotion_kind=None)
+        def _vulkan_expand(x, sizes):
+            return _realize_if_broadcast(x, sizes, _upstream_expand_fn(x, sizes))
+
+    if _upstream_expand_default_fn is not None:
+        @_reg_low(aten.expand.default, type_promotion_kind=None)
+        def _vulkan_expand_default(x, sizes):
+            return _realize_if_broadcast(x, sizes, _upstream_expand_default_fn(x, sizes))
+
     from .norm import (
         _register_batch_norm_backward,
         _register_batch_norm_forward,

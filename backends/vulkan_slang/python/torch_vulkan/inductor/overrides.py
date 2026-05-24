@@ -344,6 +344,37 @@ class VulkanOverrides(OpOverrides):
     def cosh(x) -> str:
         return f"cosh({x})"
 
+    # ── Basic trig (sin/cos/tan + inverses) ───────────────────────────────
+    # These are HLSL/Slang builtins. The default OpsHandler raises
+    # NotImplementedError for all six; VulkanOverrides must override them so
+    # that backward decompositions that emit aten.sin / aten.cos (e.g.
+    # cos_backward decomposes to neg(sin(x)) * grad_out) can compile without
+    # falling through to the unimplemented base-class method.
+
+    @staticmethod
+    def sin(x) -> str:
+        return f"sin({x})"
+
+    @staticmethod
+    def cos(x) -> str:
+        return f"cos({x})"
+
+    @staticmethod
+    def tan(x) -> str:
+        return f"tan({x})"
+
+    @staticmethod
+    def asin(x) -> str:
+        return f"asin({x})"
+
+    @staticmethod
+    def acos(x) -> str:
+        return f"acos({x})"
+
+    @staticmethod
+    def atan(x) -> str:
+        return f"atan({x})"
+
     @staticmethod
     def heaviside(x, values) -> str:
         # `heaviside(x, values)` = `(x > 0) ? 1 : ((x == 0) ? values : 0)`.

@@ -14,45 +14,46 @@ def _materialize_implicit_tangents(
     loss lifts the implicit ``tangents_1 = torch.ones(())`` and either
     (a) keeps it as a ``tangents_*`` placeholder, or (b) lifts it via
     ``self._tensor_constantN`` as a ``get_attr`` node on the partitioned
-    graph — depending on partitioner choices. Both paths produce a
+    graph — depending on partitioner choices.  Both paths produce a
     Vulkan-device null-storage tensor at runtime when the value is
     statically broadcast-known, because the wrapper never allocates a
     real buffer for it.
 
-    This pass walks the post-partition FX graph and rewrites both
+    This pass walks the post-partition FX graph and rewrites all three
     flavors:
 
     1. ``placeholder`` named ``tangents_*`` whose ``meta['val']`` is a
        Vulkan-device 1-element tensor.
     2. ``get_attr`` whose target attribute is a Vulkan-device tensor
-       with ``data_ptr() == 0`` *or* with all-zero strides + 1-element
-       underlying storage (the canonical ``_tensor_constant`` pattern
-       for a broadcast tangent).
+       with all-zero strides + non-empty shape (the CPU-side canonical
+       ``_tensor_constant`` pattern for a broadcast tangent lifted via
+       ``tangents_1.expand([N])``).
+    3. ``get_attr`` for ``_tensor_constant*`` attributes on Vulkan device
+       whose Python-level storage is invalid (``untyped_storage().data_ptr()``
+       raises).  These are the implicit grad_output=1.0 tangents lifted by
+       the AOTAutograd partitioner for binary-backward ops (maximum, minimum,
+       atan2, etc.) that use two separate lifted constant nodes.
 
     For each match, replace every consumer of the node with an
-    ``aten.full(target_shape, 1.0, dtype=..., device=vulkan)`` call:
-
-    - When the consumer is ``aten.expand.default(node, target_shape)``,
-      fold expand+full into the same call (the expand's output shape is
-      the full's shape).
-    - Otherwise, splice ``aten.full(node.shape, 1.0, ...)`` immediately
-      after the source node and reroute consumers.
+    ``aten.full(target_shape, 1.0, dtype=..., device=vulkan)`` call.
 
     The fill value is ``1.0`` — autograd's implicit grad_output for
-    a scalar ``loss.backward()``. Validated by inspecting the source
-    tensor for non-``get_attr`` cases (or trusting the AOTAutograd
-    invariant for placeholders).
+    a scalar ``loss.backward()``.
 
     Idempotent (guarded via ``gm.meta['_pf52_materialized']``) and
     Vulkan-gated (CPU graphs are untouched).
 
-    Stage tag: ``BUG_ROOT="fx-passes"``. Failure mode without this pass:
-    ``RuntimeError: Tensor has no backing Vulkan buffer`` (or PF.51's
-    pre-validation surface) on backward dispatch.
+    **Critical structural note**: Fix 3 (null-storage _tensor_constant*
+    detection) MUST NOT be guarded by ``if not sources: return gm``.
+    The backward graph for binary ops (maximum, minimum, atan2) typically
+    has NO ``tangents_*`` placeholders — only ``_tensor_constant*`` attrs —
+    so ``sources`` is always empty for those graphs.  Fix 3 must run
+    unconditionally to handle them.
+
+    Stage tag: ``BUG_ROOT="fx-passes"``.
     """
     import re
     import torch
-    from torch.fx import Node
 
     aten = torch.ops.aten
 
@@ -78,10 +79,7 @@ def _materialize_implicit_tangents(
             return ""
 
     def _is_zero_stride_broadcast(t: "torch.Tensor") -> bool:
-        """A `_tensor_constant` lifted from a scalar tangent has all-zero
-        strides (broadcast-only), shape > 0, and a 1-element underlying
-        view. That's the canonical lift pattern.
-        """
+        """Return True for a tensor with all-zero strides and non-empty shape."""
         try:
             strides = t.stride()
         except Exception:  # noqa: BLE001
@@ -90,11 +88,19 @@ def _materialize_implicit_tangents(
             return False
         if any(s != 0 for s in strides):
             return False
-        # Shape must be non-empty (a true scalar would have stride=()).
         return t.dim() > 0
 
-    # Collect (node, fill_value, target_dtype, target_device) tuples.
-    Sources: list = []  # list of (node, dtype, device)
+    fill_value = 1.0  # autograd's implicit grad_output for ``.sum()`` / scalars.
+    changed = False
+
+    # Collect expand-target (shape, dtype) pairs seen in Fix 1 Pass 1.
+    # Fix 3 uses this set to identify co-lifted _tensor_constant* nodes
+    # without relying on untyped_storage().data_ptr() (which returns a
+    # non-zero VkBuffer handle even for null-storage Vulkan FakeTensors).
+    _tangent_shapes: set = set()
+
+    # ── Fix 1 + Fix 2: tangents_* placeholders and zero-stride get_attr ──────
+    sources: list = []
     for node in list(gm.graph.nodes):
         if node.op == "placeholder" and tangent_re.match(node.name):
             val = node.meta.get("val")
@@ -102,7 +108,7 @@ def _materialize_implicit_tangents(
                 _is_scalar_val(val)
                 and _val_device_type(val) == "vulkan"
             ):
-                Sources.append((node, val.dtype, val.device))
+                sources.append((node, val.dtype, val.device))
         elif node.op == "get_attr":
             try:
                 attr = getattr(gm, node.target, None)
@@ -112,27 +118,15 @@ def _materialize_implicit_tangents(
                 continue
             if attr.device.type != "vulkan":
                 continue
-            # Either null-storage (data_ptr == 0) or zero-stride broadcast.
-            try:
-                ptr = attr.data_ptr()
-            except RuntimeError:
-                ptr = 0
-            if ptr != 0 and not _is_zero_stride_broadcast(attr):
+            # Only match zero-stride broadcast constants.
+            # On Vulkan, ``tensor.expand([N])`` produces stride=(1,) tensors
+            # (not stride=(0,)), so this branch currently never fires; kept
+            # for forward-compatibility.
+            if not _is_zero_stride_broadcast(attr):
                 continue
-            Sources.append((node, attr.dtype, attr.device))
+            sources.append((node, attr.dtype, attr.device))
 
-    if not Sources:
-        gm.meta["_pf52_materialized"] = True
-        return gm
-
-    fill_value = 1.0  # autograd's implicit grad_output for ``.sum()`` / scalars.
-
-    changed = False
-    for src, dtype, device in Sources:
-        # Resolve the source's shape — for a placeholder use its val
-        # shape; for a get_attr inspect the resolved attribute. The
-        # broadcast-stride cases have a non-trivial shape we use as
-        # the materialized full's shape when there's no expand consumer.
+    for src, dtype, device in sources:
         if src.op == "placeholder":
             val = src.meta["val"]
             self_shape = list(val.shape)
@@ -156,13 +150,22 @@ def _materialize_implicit_tangents(
                         kwargs={"dtype": dtype, "device": device},
                     )
                     full_node.meta = dict(consumer.meta)
+                    # Preserve the Vulkan FakeTensor in meta["val"] — do NOT
+                    # overwrite with a real CPU tensor (which would cause
+                    # FakeTensorUpdater.incremental_update to pass a real tensor
+                    # to ops under FakeTensorMode, crashing with
+                    # "Please convert all Tensors to FakeTensors first").
                 consumer.replace_all_uses_with(full_node)
                 gm.graph.erase_node(consumer)
+                # Record this expand target shape so Fix 3 can match the
+                # co-lifted _tensor_constant* node for the other gradient.
+                try:
+                    _tangent_shapes.add((tuple(int(s) for s in target_shape), dtype))
+                except Exception:  # noqa: BLE001
+                    pass
                 changed = True
 
-        # Pass 2: any remaining consumer reads the source directly.
-        # Splice ``aten.full(self_shape, 1.0, ...)`` after the source
-        # and route them to it.
+        # Pass 2: remaining consumers read the source directly.
         if src.users:
             with gm.graph.inserting_after(src):
                 full_node = gm.graph.call_function(
@@ -170,8 +173,8 @@ def _materialize_implicit_tangents(
                     args=(self_shape, fill_value),
                     kwargs={"dtype": dtype, "device": device},
                 )
-                # Borrow source meta if available so downstream shape
-                # inference is unaffected.
+                # Borrow source meta (Vulkan FakeTensor) — do NOT set to
+                # real CPU tensor.
                 src_val = src.meta.get("val")
                 if src_val is not None:
                     full_node.meta["val"] = src_val
@@ -179,18 +182,78 @@ def _materialize_implicit_tangents(
             changed = True
 
         # Never erase placeholders — they are part of the GraphModule's
-        # input contract and AOTAutograd's runtime wrapper passes the
-        # original argument list regardless. ``get_attr`` nodes are also
-        # left in place — the constant attribute is owned by the
-        # partitioner and erasing it can confuse downstream caching.
-        # Leaving the source in place is safe: with no users it's a
-        # dead-code input that the wrapper-codegen will preserve as
-        # ``del placeholder`` after entry but never dispatch with.
+        # input contract. get_attr nodes: also left in place (owned by
+        # partitioner).
+
+    # ── Fix 3: null-storage _tensor_constant* get_attr nodes ─────────────────
+    # This fix runs UNCONDITIONALLY — it must not be gated by ``if not sources``
+    # because backward graphs for binary ops (maximum, minimum, atan2) have NO
+    # tangents_* placeholders; their implicit grad_outputs are lifted as
+    # _tensor_constant* module attributes.
+    #
+    # Discriminant: ``untyped_storage().data_ptr()`` raises for FakeTensors
+    # with invalid Python storage (the null-storage implicit tangents), while
+    # it succeeds for real saved-activation tensors.  This matches the EXACT
+    # same condition that causes ``add_tensor_constant`` → ``is_same_tensor``
+    # to crash: ``data.untyped_storage().data_ptr()`` → RuntimeError.
+    _const_re = re.compile(r"^_tensor_constant\d+$")
+    for node in list(gm.graph.nodes):
+        if node.op != "get_attr" or not _const_re.match(node.target):
+            continue
+        try:
+            attr = getattr(gm, node.target, None)
+        except Exception:  # noqa: BLE001
+            attr = None
+        if not isinstance(attr, torch.Tensor):
+            continue
+        if attr.device.type not in ("vulkan", "privateuseone"):
+            continue
+        # On Vulkan, untyped_storage().data_ptr() returns a non-zero VkBuffer
+        # handle even for null-storage FakeTensors — it never raises, so it
+        # cannot discriminate tangent constants from real saved activations.
+        # Primary discriminant: shape-based matching.  Fix 1's Pass 1 records
+        # each tangent expand target in _tangent_shapes; a _tensor_constant*
+        # with the same (shape, dtype) is the co-lifted tangent for the other
+        # gradient in a binary-backward graph (atan2, maximum, minimum, …).
+        _shape_key = (tuple(int(s) for s in attr.shape), attr.dtype)
+        if _shape_key not in _tangent_shapes:
+            # No shape match — fallback to Python-storage check for future
+            # PyTorch versions where null-storage may raise.
+            try:
+                attr.untyped_storage().data_ptr()
+                continue  # valid storage → real saved activation
+            except Exception:  # noqa: BLE001
+                pass  # invalid storage → implicit tangent → fall through
+        if not attr.shape:
+            continue  # skip 0-dim scalars
+        # Use the original node's meta["val"] (Vulkan FakeTensor) as the
+        # meta for the replacement aten.full node.  Do NOT use a real CPU
+        # tensor — FakeTensorUpdater.incremental_update reads meta["val"]
+        # and passes it to ops under V.fake_mode.
+        src_val = node.meta.get("val")
+        with gm.graph.inserting_before(node):
+            const_full = gm.graph.call_function(
+                aten.full.default,
+                args=(list(attr.shape), fill_value),
+                kwargs={"dtype": attr.dtype, "device": attr.device},
+            )
+            if src_val is not None:
+                const_full.meta["val"] = src_val
+        node.replace_all_uses_with(const_full)
+        # Erase the dead get_attr node so GraphLowering.run_node never
+        # processes it.  The module attribute is left intact so cache keys
+        # remain stable.
+        try:
+            gm.graph.erase_node(node)
+        except Exception:  # noqa: BLE001
+            pass
+        changed = True
 
     gm.meta["_pf52_materialized"] = True
     if changed:
-        gm.graph.lint()
-        gm.recompile()
+        try:
+            gm.graph.lint()
+            gm.recompile()
+        except Exception:  # noqa: BLE001
+            pass
     return gm
-
-
