@@ -49,6 +49,7 @@ from .dtype_ops import (
     _clamp_fake,
     _clamp_max_fake,
     _clamp_min_fake,
+    _comparison_out_fake,
     _comparison_fake,
     _cross_entropy_loss_backward_fake,
     _elu_fake,
@@ -114,6 +115,7 @@ from .op_registration import (
     _patch_einsum_proxy_decomp,
     _patch_proxy_call_matmul_decomp,
     _register_backward_meta_decomps,
+    _register_logical_and_for_vulkan,
     _register_matmul_meta,
     _register_sdpa_meta,
 )
@@ -268,6 +270,16 @@ _OP_IMPLS: dict[str, Callable] = {
     "aten::bitwise_not": _unary_fake,
     "aten::isnan": _unary_fake,
     "aten::isinf": _unary_fake,
+    # Logical binary ops — return bool tensors.
+    # pow_backward_exponent (PowBackward1) calls at::logical_and() to guard
+    # the 0^0 edge case.  The real BackendCompilerFailed root cause was
+    # _where_self_fake not broadcasting (see shape_ops.py fix), but the
+    # fake_impls here ensure FakeTensorMode doesn't fall to the C++ Vulkan
+    # dispatch for logical_and.
+    "aten::logical_and.Tensor": _comparison_fake,
+    "aten::logical_and.out": _comparison_out_fake,
+    "aten::logical_or.Tensor": _comparison_fake,
+    "aten::logical_or.out": _comparison_out_fake,
     # Activations (forward)
     "aten::relu": _unary_fake,
     "aten::sigmoid": _unary_fake,
@@ -412,6 +424,11 @@ def apply() -> None:
     _patch_proxy_call_matmul_decomp()
     _patch_einsum_proxy_decomp()
     _disable_bmm_to_mm_for_vulkan()
+    # M-CV.2 Phase 2: register logical_and.{Tensor,out} for Vulkan eager.
+    # PowBackward1's pow_backward_exponent calls at::logical_and() on Vulkan
+    # tensors. The compiled backward lowers through overrides.py (&&), but
+    # eager callers and any un-lowered path need the PrivateUse1 impl.
+    _register_logical_and_for_vulkan()
 
     # PF.55 — Python AutogradPrivateUse1 impl for view/reshape/_unsafe_view
     # so dynamic-shape compile (`torch.compile(dynamic=True)`) doesn't blow

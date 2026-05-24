@@ -291,6 +291,10 @@ def _comparison_fake(self, other):
     return torch.empty(out_shape, dtype=torch.bool, device=self.device)
 
 
+def _comparison_out_fake(self, other, *, out):
+    return out
+
+
 def _gelu_fake(self, *, approximate="none"):
     return self.new_empty(self.shape)  # M-pipeline-9: not `torch.empty_like` — see M18.3.
 

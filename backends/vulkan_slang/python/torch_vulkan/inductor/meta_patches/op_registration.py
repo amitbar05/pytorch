@@ -645,3 +645,50 @@ def _register_sdpa_meta() -> None:
         logging.getLogger(__name__).warning(
             "Registering SDPA in meta_table failed: %s", e
         )
+
+
+def _register_logical_and_for_vulkan() -> None:
+    """Register aten::logical_and.{Tensor,out} for the Vulkan (PrivateUse1) eager path.
+
+    PowBackward1 (pow.Tensor_Tensor backward) calls ``at::logical_and()`` on
+    bool tensors to guard the 0^0 and 0^(-n) edge cases.  This dispatches to
+    ``logical_and.Tensor`` (non-out) and then internally to ``logical_and.out``.
+    Neither is implemented in the Vulkan C++ backend, so AOTAutograd's
+    anomaly-detection backward pass (which runs eagerly on real Vulkan tensors)
+    raises "not yet implemented for the Vulkan backend" → BackendCompilerFailed.
+
+    Implementation: convert both operands to float32, multiply, convert to
+    bool.  ``a.float() * b.float()`` is non-zero iff BOTH inputs are non-zero
+    (truthy), which matches logical AND semantics exactly.  This avoids
+    ``bitwise_and`` which is not registered for Vulkan bool/int8 tensors.
+    """
+    try:
+        _logical_lib = torch.library.Library("aten", "IMPL", "PrivateUse1")
+
+        def _logical_and_result(
+            self: torch.Tensor, other: torch.Tensor
+        ) -> torch.Tensor:
+            return (self.to(torch.float32) * other.to(torch.float32)).to(torch.bool)
+
+        def _vulkan_logical_and_tensor(
+            self: torch.Tensor, other: torch.Tensor
+        ) -> torch.Tensor:
+            return _logical_and_result(self, other)
+
+        def _vulkan_logical_and_out(
+            self: torch.Tensor, other: torch.Tensor, *, out: torch.Tensor
+        ) -> torch.Tensor:
+            result = _logical_and_result(self, other)
+            out.copy_(result)
+            return out
+
+        _logical_lib.impl("logical_and.Tensor", _vulkan_logical_and_tensor)
+        _logical_lib.impl("logical_and.out", _vulkan_logical_and_out)
+        # Keep a reference so GC doesn't destroy the Library object.
+        _register_logical_and_for_vulkan._lib = _logical_lib  # type: ignore[attr-defined]
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Registering logical_and.out for Vulkan failed: %s", e
+        )

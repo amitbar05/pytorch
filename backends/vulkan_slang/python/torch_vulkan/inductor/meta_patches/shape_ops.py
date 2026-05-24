@@ -662,7 +662,12 @@ def _roll_fake(self, shifts, dims=None):
 
 
 def _where_self_fake(condition, self, other):
-    return torch.empty(list(self.shape), dtype=self.dtype, device=self.device)
+    # M-CV.2 pow fix: must broadcast all three shapes, not just use self.shape.
+    # pow_backward_self calls where(cond, scalar_tensor(0.0), [N]-expr) → self
+    # has shape [] while other has shape [N]; without broadcast, returns [].
+    out_shape = torch.broadcast_shapes(condition.shape, self.shape, other.shape)
+    out_dtype = torch.promote_types(self.dtype, other.dtype)
+    return torch.empty(list(out_shape), dtype=out_dtype, device=self.device)
 
 
 def _index_select_fake(self, dim, index):
