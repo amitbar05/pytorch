@@ -58194,3 +58194,85 @@ class TestM189FollowupStridedCopy:
             dst, expected, atol=1e-5, rtol=1e-5,
             msg="M18.9-followup: dtype-conversion strided Vulkan→CPU mismatch"
         )
+
+
+# ---------------------------------------------------------------------------
+# TEST.COV.3 — Activation backward compile-mode parity
+# ---------------------------------------------------------------------------
+
+
+class TestCOV3ActivationBackward:
+    """Compile-mode backward parity for activation ops — TEST.COV.3.
+
+    Tests that hardtanh, hardsigmoid, softplus, and mish backward passes
+    produce gradients that match the CPU eager oracle when executed through
+    ``torch.compile(backend="inductor")``.  All ops route through
+    ``bwd_diff_table.py`` via Slang ``bwd_diff()`` (anti-goal #3).
+    """
+
+    def test_hardtanh_backward_compile_parity(self):
+        """aten.hardtanh_backward — clamp(-1,1) gradient is a box function."""
+        torch.manual_seed(42)
+        x_cpu = torch.randn(64).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        def fn(x):
+            return torch.nn.functional.hardtanh(x).sum()
+
+        compiled = torch.compile(fn, backend="inductor")
+        fn(x_cpu).backward()
+        compiled(x_vk).backward()
+        torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
+
+    def test_hardsigmoid_backward_compile_parity(self):
+        """aten.hardsigmoid_backward — piecewise-linear sigmoid gradient."""
+        torch.manual_seed(42)
+        x_cpu = torch.randn(64).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        def fn(x):
+            return torch.nn.functional.hardsigmoid(x).sum()
+
+        compiled = torch.compile(fn, backend="inductor")
+        fn(x_cpu).backward()
+        compiled(x_vk).backward()
+        torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
+
+    def test_softplus_backward_compile_parity(self):
+        """aten.softplus_backward — smooth relu; gradient uses log/exp."""
+        torch.manual_seed(42)
+        x_cpu = torch.randn(64).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        def fn(x):
+            return torch.nn.functional.softplus(x).sum()
+
+        compiled = torch.compile(fn, backend="inductor")
+        fn(x_cpu).backward()
+        compiled(x_vk).backward()
+        torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "TEST.COV.3 gap: mish backward via Slang bwd_diff() returns all-zero "
+            "gradients (100% elements mismatch, max abs diff ~1.09). The "
+            "bwd_diff_table.py entry routes aten.mish_backward to mish_fwd in the "
+            "pointwise path, but the Slang autodiff does not propagate through "
+            "mish's composite x*tanh(softplus(x)) structure — the backward "
+            "kernel silently produces zeros. Verified 2026-05-24."
+        ),
+    )
+    def test_mish_backward_compile_parity(self):
+        """aten.mish_backward — mish(x) = x * tanh(softplus(x)); two-step backward."""
+        torch.manual_seed(42)
+        x_cpu = torch.randn(64).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        def fn(x):
+            return torch.nn.functional.mish(x).sum()
+
+        compiled = torch.compile(fn, backend="inductor")
+        fn(x_cpu).backward()
+        compiled(x_vk).backward()
+        torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
