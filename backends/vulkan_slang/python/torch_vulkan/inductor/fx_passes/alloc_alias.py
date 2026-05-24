@@ -1,5 +1,18 @@
 """M17.7 — Compile-time alloc→free→alloc aliasing pass.
 
+.. deprecated:: M22.2
+    This module is **superseded** by :mod:`alloc_alias_ir`.
+
+    The IR-level pass (``alloc_alias_ir.apply_vulkan_ir_alias_pass``) runs
+    inside ``VulkanPythonWrapperCodegen.run_wrapper_ir_passes()`` and operates
+    directly on Inductor's ``wrapper.lines`` data structures — no regex, no
+    string parsing. It was wired in at M22.2 (2026-05-24).
+
+    This module is retained as a reference implementation and for backward
+    compatibility (unit tests + any external tooling that imports
+    ``alias_alloc_free_pairs`` directly). It is **not called** at runtime by
+    the wrapper codegen path; do not add new call sites.
+
 Post-processes the generated Inductor wrapper source code string to
 elide redundant ``empty_strided_vulkan`` calls. When two buffers have
 the same size/stride/dtype and non-overlapping lifetimes (the first is

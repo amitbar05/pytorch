@@ -14,17 +14,14 @@ import torch._inductor.compile_fx
 from torch._inductor.virtualized import V
 
 
-# ── M17.7 — defer heavy import to first use ─────────────────────────
-_alloc_alias_fn = None
-
-
-def _get_alloc_alias_fn():
-    global _alloc_alias_fn
-    if _alloc_alias_fn is None:
-        from torch_vulkan.inductor.fx_passes.alloc_alias import alias_alloc_free_pairs
-
-        _alloc_alias_fn = alias_alloc_free_pairs
-    return _alloc_alias_fn
+# ── M22.2 — _get_alloc_alias_fn / _alloc_alias_fn removed ──────────
+# The M17.7 regex post-processor (alloc_alias.py) has been superseded by
+# the IR-level pass in alloc_alias_ir.py, which runs inside
+# VulkanPythonWrapperCodegen.run_wrapper_ir_passes(). The lazy-import
+# shim _get_alloc_alias_fn / _alloc_alias_fn that previously wired the
+# regex pass into wrapper.py was dead code after the IR migration landed;
+# it is removed here. alloc_alias.py itself is retained as a legacy
+# reference (see its module docstring).
 
 
 def _install_vulkan_skip_alignment_clone() -> None:
