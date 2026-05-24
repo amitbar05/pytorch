@@ -5,8 +5,9 @@
 > function documented here must keep its signature stable. Breaking changes
 > require a version bump in the CI gate.
 
-**Last verified:** 2026-05-24
-**`[BackwardDerivative]` count:** 49 (31 pointwise + 9 losses + 4 norm + 2 reduction + 2 vk_reduction + 1 conv)
+**Last verified:** 2026-05-25
+**`[BackwardDerivative]` count:** 64 (37 pointwise + 10 losses + 4 norm + 6 reduction + 6 vk_reduction + 1 conv)
+**Lib modules:** 18 (atomics, bucket, conv, dtype_pack, helpers, losses, mm, mm_int8, mm_tile, norm, philox, pointwise, pointwise_generic, reduction, special_math, tensor_layout, vk_helpers, vk_reduction)
 
 ---
 

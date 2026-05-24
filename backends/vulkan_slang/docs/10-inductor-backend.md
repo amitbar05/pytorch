@@ -834,7 +834,7 @@ in-tree blockers (M22.8–11). Agent owners:
 | **M20.1** | RNN cell backward via autodiff (238 L hand-rolled → bwd_diff) | open |
 | **M20.2** | slang_mm `ParameterBlock` restore + dispatch-path unification | open |
 | **M20.3** | Spec-constant tiles for conv_bwd + flash_attn_bwd | open |
-| **M20.4** | Wave-intrinsic coverage (AnyTrue/AllTrue/Ballot/BitOr/BitAnd/BitXor/CountBits/PrefixCountBits) | in-flight (Slang-Lib agent) |
+| **M20.4** | Wave-intrinsic coverage (AnyTrue/AllTrue/Ballot/BitOr/BitAnd/BitXor/CountBits/PrefixCountBits) | ✅ **DONE 2026-05-25** — All 8 intrinsics implemented in `shaders/lib/helpers.slang:180-201` as `wave_active_any/all/ballot/bit_and/bit_or/bit_xor/count_bits/prefix_count_bits` wrappers with `[require]` capability annotations; each maps to the corresponding SPIR-V subgroup intrinsic. |
 | **M20.5** | Reflection metadata 40 %→80 % (subgroupSize, numSgprs, numStores/Loads/Atomics) | open |
 | **M20.6** | Subgroup-size spec constant | open |
 | **M20.7** | Lib helper extraction (Welford streaming, grid-stride loops) | open |
@@ -1002,7 +1002,7 @@ After Wave 2 landed M18–M22 + M-cpp-new family, a third audit wave (5 read-onl
 | # | Title | Effort |
 |---|-------|--------|
 | **TEST.COV.1** | Cover 9 P1 registered-but-untested lowerings (`_adaptive_avg_pool2d_backward`, `_embedding_bag_backward`, `_embedding_bag_forward_only`, `cross_entropy_loss`, `leaky_relu_backward`, `rot90.default`, `torch_vulkan.foreach_lion_step`, `torch_vulkan.mm_int8`, `aten.lerp.{Scalar_out, Tensor_out}`) | 1 d |
-| **TEST.COV.2** | Dtype matrix sweep on top-20 lowerings × fp16/bf16 | 2 d |
+| **TEST.COV.2** | Dtype matrix sweep on top-20 lowerings × fp16/bf16 | ✅ **DONE 2026-05-25** — `TestTestCov2DtypeMatrix` (36 parametrised tests: 18 ops × 2 dtypes). Ops: relu, tanh, sigmoid, add, mul, sub, sum, mean, softmax, layer_norm, linear, div, exp, log, amax, pow, group_norm, bmm. `atol=5e-3` for most; 2e-2 for group_norm (Welford accumulation), 1e-1 for mm/bmm (f16 reduction noise). |
 | **TEST.COV.3** | Activation-bwd direct dispatch tests (hardtanh / hardsigmoid / softplus / mish + 12 trig + 10 exp/log) | ✅ **DONE 2026-05-24** — `TestTestCov3ActivationBwd` (24 tests at `test_inductor_regression.py:57077`): all 4 activation backward ops + 6 basic trig + 6 hyperbolic trig + 8 exp/log ops. Uses `torch.linspace` inputs for controlled numerics; `atol=rtol=2e-3`. |
 | **TEST.COV.4** | Special-math bwd direct tests (10 ops: erf*, lgamma, digamma, ndtri, i0*, i1*) | ✅ **DONE 2026-05-24** — `tests/test_special_math_backward.py` (9 compile-mode backward tests + 4 M-pipeline-6 structural tests). Ops: erfc, erfinv, lgamma, digamma, ndtri, i0, i0e, i1, i1e; `atol` in [1e-5, 1e-3] per op domain. |
 | **TEST.COV.5** | ✅ **CLOSED 2026-05-18**: Overload-tests for `_out` / `.stable` / `.Scalar` variants. 7 tests passed (leaky_relu_backward x2, foreach_lion_step registered, lerp.Scalar/Tensor_out registered, plus 3 meta-tests). 4 deliberate skips: cross_entropy_loss, embedding_bag_forward_only, lerp.Scalar_out eager parity, lerp.Tensor_out eager parity. **Sub-followups filed:** TEST.COV.5.b (pre-grad pass to suppress cross_entropy decomp), TEST.COV.5.c (same for embedding_bag_forward_only decomp suppression). |
@@ -1016,16 +1016,16 @@ Coverage totals (Agent 2): ~270 ops across all dispatch paths; ~210 tested (78 %
 
 | # | Title | Effort |
 |---|-------|--------|
-| **M-docs-1** | Refresh root `CLAUDE.md` against v6.3 (currently at v6.2 — missing M17–M23 entirely; affects every session context) | 15 min |
-| **M-docs-2** | Fix backend `CLAUDE.md` key-files table (4 file→dir renames: `runtime.py` → `runtime/`, `meta_patches.py` → `meta_patches/`, `bwd_diff_dispatch.py` → `bwd_diff/`, `vulkan_combo_kernel.py` → `combo_kernel/`) + retire anti-goal #2 (model_ops.cpp deleted) | 10 min |
-| **M-docs-3** | Document ~20 active env knobs missing from backend CLAUDE.md (`TORCH_VULKAN_SLANGC_WORKERS`, `TORCH_VULKAN_DISABLE_SLANG_TILES`, `TORCH_VULKAN_PARAMETER_BLOCK`, etc.) | 20 min |
-| **M-docs-4** | Resolve MAX_JOBS conflict — memory=3, root CLAUDE.md=8, backend CLAUDE.md=4. Pick canonical value. | 5 min |
+| **M-docs-1** | Refresh root `CLAUDE.md` against v6.3 (currently at v6.2 — missing M17–M23 entirely; affects every session context) | ✅ **DONE** — Root CLAUDE.md now contains full v6.3 active milestones table (M17–M23 with status). |
+| **M-docs-2** | Fix backend `CLAUDE.md` key-files table (4 file→dir renames: `runtime.py` → `runtime/`, `meta_patches.py` → `meta_patches/`, `bwd_diff_dispatch.py` → `bwd_diff/`, `vulkan_combo_kernel.py` → `combo_kernel/`) + retire anti-goal #2 (model_ops.cpp deleted) | ✅ **DONE** — Backend CLAUDE.md key-files table uses correct `runtime/`, `meta_patches/`, `bwd_diff/`, `combo_kernel/` directory names; anti-goal #2 marked CLOSED. |
+| **M-docs-3** | Document ~20 active env knobs missing from backend CLAUDE.md (`TORCH_VULKAN_SLANGC_WORKERS`, `TORCH_VULKAN_DISABLE_SLANG_TILES`, `TORCH_VULKAN_PARAMETER_BLOCK`, etc.) | ✅ **DONE** — Backend CLAUDE.md "Useful environment knobs" section documents 60+ env vars across Profiling, Compilation, and Codegen categories. |
+| **M-docs-4** | Resolve MAX_JOBS conflict — memory=3, root CLAUDE.md=8, backend CLAUDE.md=4. Pick canonical value. | ✅ **DONE** — Both CLAUDE.md files now say `MAX_JOBS=3` (drop to 2 under concurrent-agent load). Matches user memory `feedback_build_config`. |
 | **M-docs-5** | ✅ **CLOSED 2026-05-18**: PyTorch version mismatch resolved. Live venv reports `2.11.0+cpu` (matches user memory); backend CLAUDE.md updated. | done |
-| **M-docs-6** | **Archive `docs/0[1-8].md` + `09-master-plan.md` under `docs/archive/`** (4000+ lines of stale pre-implementation checklists) | 10 min |
-| **M-docs-7** | Refresh `docs/10-lib-api-reference.md` counts (says 9 lib modules; live: 16; `[BackwardDerivative]` 14 → 50) | 15 min |
+| **M-docs-6** | **Archive `docs/0[1-8].md` + `09-master-plan.md` under `docs/archive/`** (4000+ lines of stale pre-implementation checklists) | ✅ **DONE** — All 9 files moved to `docs/archive/` (visible via `ls docs/archive/`). |
+| **M-docs-7** | Refresh `docs/10-lib-api-reference.md` counts (says 9 lib modules; live: 16; `[BackwardDerivative]` 14 → 50) | ✅ **DONE 2026-05-25** — Header updated: 18 lib modules, 64 `[BackwardDerivative]` (37+10+4+6+6+1). |
 | **M-docs-8** | Refresh `docs/primtorch_coverage.md` shader paths (~260 rows, all stale: `unary_abs_fwd.slang` → `shaders/unary/abs.slang`) | 30 min |
 | **M-docs-9** | ✅ **CLOSED 2026-05-18**: § 0 active-milestones M9 row corrected (was "M9.6/M9.7 remain", actual = all closed; new sub-followups tracked as M-cpp-new-2 etc.). | done |
-| **M-docs-10** | Refresh `docs/10-inductor-backend.md` § 13 reference-files table (6 row updates) | 10 min |
+| **M-docs-10** | Refresh `docs/10-inductor-backend.md` § 13 reference-files table (6 row updates) | ✅ **DONE 2026-05-25** — Updated § 13 + § 14: correct file/dir names for all splits (runtime/, combo_kernel/, meta_patches/, bwd_diff/), legacy_eager.cpp, 16 lib modules, MAX_JOBS=3, .venv/bin/python -m pytest. |
 
 ### 0.7.5.y TEST.COV sub-followups (2026-05-18 late, surfaced by Wave-4 TEST.COV.5-7 implementer)
 
@@ -1454,25 +1454,25 @@ M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
 | Concern | Primary file(s) |
 |---------|----------------|
 | Backend registration | `python/torch_vulkan/inductor/__init__.py` |
-| Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` |
-| Combo kernel | `python/torch_vulkan/inductor/vulkan_combo_kernel.py` |
+| Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` + `scheduling_helpers.py` |
+| Combo kernel | `python/torch_vulkan/inductor/combo_kernel/` (split from `vulkan_combo_kernel.py` M15.1.f) |
 | Kernel codegen | `python/torch_vulkan/inductor/kernel/` |
 | Lowerings | `python/torch_vulkan/inductor/lowerings/` |
 | FX passes | `python/torch_vulkan/inductor/fx_passes/` |
-| Runtime / slangc | `python/torch_vulkan/inductor/runtime.py` |
+| Runtime / slangc | `python/torch_vulkan/inductor/runtime/` (split M15.1.c: `slangc.py`, `dispatch.py`, `batcher.py`, `profile.py`, `reflection.py`, `validation_codegen.py`, `shader_lib.py`, `reflection_ext.py`) |
 | Buffer pool | `python/torch_vulkan/inductor/buffer_pool.py` |
-| bwd_diff dispatch | `python/torch_vulkan/inductor/bwd_diff_dispatch.py` |
+| bwd_diff dispatch | `python/torch_vulkan/inductor/bwd_diff/` (split from `bwd_diff_dispatch.py`) |
 | bwd_diff table | `python/torch_vulkan/inductor/bwd_diff_table.py` |
 | Templates | `python/torch_vulkan/inductor/templates/` |
-| Template caller | `python/torch_vulkan/inductor/vulkan_template_caller.py` |
-| meta patches | `python/torch_vulkan/inductor/meta_patches.py` |
+| Template caller | `python/torch_vulkan/inductor/vulkan_template_caller.py` + `vulkan_template.py` |
+| meta patches | `python/torch_vulkan/inductor/meta_patches/` (split M15.1.b: 8 files) |
 | M17.2 conv_gn_relu template | `python/torch_vulkan/inductor/templates/conv_gn_relu.slang` |
-| M17.7 alloc alias pass | `python/torch_vulkan/inductor/fx_passes/alloc_alias.py` |
+| Alloc alias IR pass | `python/torch_vulkan/inductor/wrapper_helpers.py` (`apply_vulkan_ir_alias_pass`) |
 | C++ AOTI runtime | `csrc/backend/AotiRuntime.cpp` |
-| C++ legacy eager ops | `csrc/ops/model_ops.cpp` (slated for deletion — M16) |
-| Slang lib modules | `shaders/lib/{helpers,dtype_pack,philox,special_math,bucket,mm,mm_tile,atomics,conv,norm,pointwise,reduction,losses,tensor_layout}.slang` |
+| C++ legacy eager ops | `csrc/ops/legacy_eager.cpp` (5 ops; `model_ops.cpp` DELETED M16.3) |
+| Slang lib modules | `shaders/lib/` (16 modules: `helpers`, `dtype_pack`, `philox`, `special_math`, `bucket`, `mm`, `mm_tile`, `mm_int8`, `atomics`, `conv`, `norm`, `pointwise`, `pointwise_generic`, `reduction`, `losses`, `tensor_layout`) |
 | Slang templates | `python/torch_vulkan/inductor/templates/*.{jinja,slang}` |
-| Regression tests | `tests/test_inductor_regression.py` (39 k lines, 66 e2e model tests, 9 training-grade architectures) |
+| Regression tests | `tests/test_inductor_regression.py` (58 k+ lines) |
 | E2E model tests | `tests/test_e2e_models.py` |
 
 ---
@@ -1482,12 +1482,12 @@ M16 (Track 4 finish) ──→ closes anti-goal #2; IRREVERSIBLE
 ### Build
 ```bash
 cd backends/vulkan_slang
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=8 python setup.py build_ext --inplace
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3 python setup.py build_ext --inplace
 ```
 
 ### Regression suite (~90 s with xdist)
 ```bash
-python -m pytest tests/ -n 4 --timeout=120 -p no:faulthandler
+.venv/bin/python -m pytest tests/ -n 4 --timeout=120 -p no:faulthandler
 ```
 
 ### E2E model tests
