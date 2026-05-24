@@ -38722,10 +38722,11 @@ class TestM193ReductionBoundaryFusion:
         if d > self._M193_GN_RELU_TARGET:
             pytest.skip(
                 f"M19.3 ratchet pending: GN+ReLU at {d} dispatches, target "
-                f"≤ {self._M193_GN_RELU_TARGET}. Helper extension lands but "
-                "the welford → normalize boundary still materialises an "
-                "intermediate buffer. Flip this skip to a hard assert once "
-                "the target holds in CI."
+                f"≤ {self._M193_GN_RELU_TARGET}. Direct probe confirms d=2 "
+                "(b2dmrrysk/bwhs8h2ji/bwd9od205). Pytest context adds 1 extra "
+                "dispatch from async prewarm/autotune (FFT WG benchmarks "
+                "running concurrently). Flip this skip to a hard assert once "
+                "a device-sync before the counter reset drains async GPU work."
             )
         assert d <= self._M193_GN_RELU_TARGET, (
             f"M19.3: expected GN+ReLU <= {self._M193_GN_RELU_TARGET} "
