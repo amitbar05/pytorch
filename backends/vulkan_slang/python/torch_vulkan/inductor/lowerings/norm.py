@@ -39,6 +39,21 @@ def _register_layer_norm() -> None:
         rstd_kd = L.lowerings[aten.rsqrt.default](var_eps)
         # normalize
         out = L.lowerings[aten.mul.Tensor](dx, rstd_kd)
+
+        # GPU.1: AMD RDNA1 (NAVI10) L2 cache bug — after WaveActiveSum
+        # (used by wg_welford), WGs 1-N cannot read the same SSBO cache line
+        # as WG 0 in the SAME dispatch.  weight/bias share the same [C]
+        # addresses across all batch WGs, triggering this race regardless of
+        # dtype (confirmed empirically for fp16/bf16; also observed for fp32
+        # with fresh cache compiles).
+        # Confirmed via diag_l2_race.py: Case A (no reduction) always passes;
+        # Case B (reduction then same-address read) always fails.
+        # Fix: realize() forces the normalized intermediate to be materialized
+        # in a concrete buffer, so the weight/bias application runs in a
+        # SEPARATE kernel dispatch with no preceding WaveActiveSum.
+        if weight is not None or bias is not None:
+            out.realize()
+
         if weight is not None:
             out = L.lowerings[aten.mul.Tensor](out, weight)
         if bias is not None:

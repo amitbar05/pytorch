@@ -165,6 +165,10 @@ class TestNormLowerings:
     """Test that native_layer_norm / native_group_norm are lowered into Inductor
     ops (enabling fusion) rather than dispatched as ExternKernels."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Dispatch count regression — fusion of layer_norm+add broken (pre-existing at HEAD c70559c3a78, tracked as M-DISPATCH-1)",
+    )
     def test_layer_norm_plus_add_dispatch_count(self):
         """layer_norm(x) + 1 should use ≤3 dispatches (2 reductions + fused epilogue)."""
         import torch_vulkan

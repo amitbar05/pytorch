@@ -708,6 +708,29 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
             return
 
         dtype_str = self.dtype_to_str(out_dtype)
+        if out_dtype == torch.bfloat16 and not self.inside_reduction:
+            # Fallback packed16 store for bf16 output when packed16 loads were
+            # disabled (e.g. mixed fp32/bf16 inputs disabling _decide_packed16).
+            # DTYPE_TO_SLANG[bfloat16]="uint", so the generic cast_val path
+            # would emit ((uint)(value)) which TRUNCATES the float to integer.
+            # Correct bf16 packing requires reading the adjacent lane's value
+            # (WaveReadLaneAt) and packing two bf16 values per uint slot.
+            # This is identical to the packed16 store path above but entered
+            # unconditionally when out_dtype is bfloat16.
+            self._pw_uses_subbyte_packing = True
+            self.headers.add("packed16_bf16")
+            self._packed16_bufs.add(var)
+            uid = f"{abs(hash((var, idx_str))) & 0xFFFF:04x}"
+            line = (
+                f"{{ float _p16_odd_{uid} = WaveReadLaneAt((float)({value}), "
+                f"WaveGetLaneIndex() ^ 1u); "
+                f"if (({idx_str}) % 2u == 0u) "
+                f"{self._buf_path(var)}[({idx_str}) >> 1u] = "
+                f"_vk_pack_bf16((float)({value}), _p16_odd_{uid}); }}"
+            )
+            self.stores.writeline(DeferredLine(name, line))
+            self._p16_store_records.append((var, str(value), "bf16"))
+            return
         if out_dtype == torch.bool:
             # M-NEW.13 (2026-05-22) — comment refresh: bool output buffers
             # are declared as ``RWStructuredBuffer<uint8_t>`` (1 B/slot)

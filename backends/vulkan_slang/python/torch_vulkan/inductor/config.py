@@ -322,7 +322,7 @@ def parameter_block() -> bool:
     When True, buffer bindings use ``ParameterBlock<KernelArgs> args;``
     instead of ``[[vk::binding(N)]]`` annotations. Slang auto-assigns
     binding indices from the struct field order. Set
-    ``TORCH_VULKAN_PARAMETER_BLOCK=1`` to enable. Default: off.
+    ``TORCH_VULKAN_PARAMETER_BLOCK=0`` to disable. Default: on.
     """
     return _PARAMETER_BLOCK
 

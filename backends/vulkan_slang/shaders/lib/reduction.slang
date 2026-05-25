@@ -338,9 +338,19 @@ public WelfordResult<float> wg_welford(
     uint wave_base = wave_id * simd;
     uint wave_valid = min(simd, size > wave_base ? size - wave_base : 0u);
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-        float other_mean = WaveReadLaneAt(acc.mean, lane + offset);
-        float other_m2 = WaveReadLaneAt(acc.m2, lane + offset);
-        float other_n = WaveReadLaneAt(acc.n, lane + offset);
+        // GPU.2: AMD RDNA1 WaveReadLaneAt with a dynamic index >= wave_size
+        // has implementation-defined behavior under RADV ACO (may return wrong
+        // values non-deterministically, causing silent m2≈0 in adjacent WGs of
+        // the same dispatch).  Clamp to [0, simd-1] via & mask so the index is
+        // always in-range; the guard below still prevents out-of-range lanes
+        // from contributing to the combine.  For power-of-2 simd, this is
+        // identical to the modular wrap the hardware already performs, but makes
+        // the semantic explicit so ACO doesn't emit v_readlane (undefined for
+        // index>=simd) instead of ds_bpermute (which wraps).
+        uint _src = (lane + offset) & (simd - 1u);
+        float other_mean = WaveReadLaneAt(acc.mean, _src);
+        float other_m2 = WaveReadLaneAt(acc.m2, _src);
+        float other_n = WaveReadLaneAt(acc.n, _src);
         if (lane + offset < wave_valid) {
             float n_total = acc.n + other_n;
             float inv = n_total > 0.0f ? 1.0f / n_total : 0.0f;
@@ -433,10 +443,11 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
 
     ArgPair acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-        float other_val = WaveReadLaneAt(acc.val, lane + offset);
+        uint _src = (lane + offset) & (simd - 1u);  // GPU.2: clamp to [0,simd-1]
+        float other_val = WaveReadLaneAt(acc.val, _src);
         if (lane + offset < size && other_val > acc.val) {
             acc.val = other_val;
-            acc.idx = WaveReadLaneAt(acc.idx, lane + offset);
+            acc.idx = WaveReadLaneAt(acc.idx, _src);
         }
     }
 
@@ -453,10 +464,11 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
         result.idx = (tid < n_waves) ? _wg_arg_smem_idx[tid] : -1.0f;
         GroupMemoryBarrierWithGroupSync();
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-            float other_val = WaveReadLaneAt(result.val, lane + offset);
+            uint _src_w = (lane + offset) & (simd - 1u);  // GPU.2: clamp
+            float other_val = WaveReadLaneAt(result.val, _src_w);
             if (lane + offset < n_waves && other_val > result.val) {
                 result.val = other_val;
-                result.idx = WaveReadLaneAt(result.idx, lane + offset);
+                result.idx = WaveReadLaneAt(result.idx, _src_w);
             }
         }
     }
@@ -822,8 +834,9 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
 
     float2 acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-        float other_val = WaveReadLaneAt(acc.x, lane + offset);
-        float other_idx = WaveReadLaneAt(acc.y, lane + offset);
+        uint _src = (lane + offset) & (simd - 1u);  // GPU.2: clamp to [0,simd-1]
+        float other_val = WaveReadLaneAt(acc.x, _src);
+        float other_idx = WaveReadLaneAt(acc.y, _src);
         if (lane + offset < red_size) {
             bool take = (other_val > acc.x) ||
                         (other_val == acc.x && other_idx < acc.y);
@@ -848,8 +861,9 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
         r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : -3.402823e38f;
         r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-            float other_val = WaveReadLaneAt(r.x, lane + offset);
-            float other_idx = WaveReadLaneAt(r.y, lane + offset);
+            uint _src_w = (lane + offset) & (simd - 1u);  // GPU.2: clamp
+            float other_val = WaveReadLaneAt(r.x, _src_w);
+            float other_idx = WaveReadLaneAt(r.y, _src_w);
             if (lane + offset < n_waves) {
                 bool take = (other_val > r.x) ||
                             (other_val == r.x && other_idx < r.y);
@@ -880,8 +894,9 @@ public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
 
     float2 acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-        float other_val = WaveReadLaneAt(acc.x, lane + offset);
-        float other_idx = WaveReadLaneAt(acc.y, lane + offset);
+        uint _src = (lane + offset) & (simd - 1u);  // GPU.2: clamp to [0,simd-1]
+        float other_val = WaveReadLaneAt(acc.x, _src);
+        float other_idx = WaveReadLaneAt(acc.y, _src);
         if (lane + offset < red_size) {
             bool take = (other_val < acc.x) ||
                         (other_val == acc.x && other_idx < acc.y);
@@ -906,8 +921,9 @@ public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
         r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : 3.402823e38f;
         r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
-            float other_val = WaveReadLaneAt(r.x, lane + offset);
-            float other_idx = WaveReadLaneAt(r.y, lane + offset);
+            uint _src_w = (lane + offset) & (simd - 1u);  // GPU.2: clamp
+            float other_val = WaveReadLaneAt(r.x, _src_w);
+            float other_idx = WaveReadLaneAt(r.y, _src_w);
             if (lane + offset < n_waves) {
                 bool take = (other_val < r.x) ||
                             (other_val == r.x && other_idx < r.y);

@@ -42,9 +42,9 @@ def _init_load_dispatch() -> None:
     # ``StructuredBuffer<uint>`` 4B-slot binding).
     #
     # ``bfloat16`` still binds as a 32-bit ``uint`` slot — see the
-    # ``M18.4-followup-bfloat16`` comment in ``overrides.py``. The
-    # ``packed16_bf16`` load path covers eligible fusion shapes; the
-    # bare-load fallback below stays at ``(float)(v[i])`` for now.
+    # ``M18.4-followup-bfloat16`` comment in ``overrides.py``. Both the
+    # packed16 path and this bare-load fallback use ``_vk_unpack_bf16``
+    # to correctly unpack the 2-bf16-per-uint storage layout.
     _LOAD_DISPATCH.update(
         {
             torch.bool: (lambda v, i: f"((float)({v}[{i}]))", None),
@@ -53,7 +53,14 @@ def _init_load_dispatch() -> None:
             torch.int16: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.uint16: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.float16: (lambda v, i: f"((float)({v}[{i}]))", None),
-            torch.bfloat16: (lambda v, i: f"((float)({v}[{i}]))", None),
+            # bf16 binds as StructuredBuffer<uint> with 2 bf16 per slot (DTYPE_TO_SLANG
+            # maps bfloat16→"uint", 4B/slot, raw PyTorch buffer layout).  Index i must be
+            # mapped to slot i>>1, lane i&1 — same as the packed16_bf16 load path.  Using
+            # ((float)(v[i])) directly is OOB for i≥numel/2 and wrong for all i.
+            torch.bfloat16: (
+                lambda v, i: f"_vk_unpack_bf16({v}[({i}) >> 1u], ({i}) & 1u)",
+                "packed16_bf16",
+            ),
             torch.int32: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.uint32: (lambda v, i: f"((float)({v}[{i}]))", None),
             torch.int64: (lambda v, i: f"((float)(int)({v}[{i}].x))", None),
@@ -88,18 +95,37 @@ class PointwiseLoadMixin:
         dtype of the new buffer matches the dtype already locked in.  Flips
         self._packed16 to False permanently on the first disqualifying event.
 
-        Eligibility rules (all must hold):
+        Eligibility rules for the INITIAL decision (all must hold):
         - No reduction, multistage, or welford (unless _packed16_load_only).
         - All I/O buffers share the same half dtype (f16 or bf16).
         - Innermost non-reduction axis has even numel (so pairs of adjacent
           elements can be packed into one uint32 word).
         - For small persistent reductions (rnumel <= simd_group_size, even
           rnumel): packed16 is load-only — stores remain f32.
+
+        Once the initial decision is True, subsequent calls with the same dtype
+        return True immediately (before the has_welford/multistage guards) to
+        preserve the _vk_unpack_f16 load pattern for all reads of the same
+        fp16 buffer within the kernel.
         """
         from .. import config
 
         if self._packed16 is False:
             return False
+
+        # M-LAYER-NORM-FP16: honor a prior True decision without re-checking
+        # has_welford.  When a kernel has two welford reductions over the same
+        # fp16 input (e.g. var_mean → separate mean + m2 reductions), the
+        # first load decides packed16=True (has_welford is still False at that
+        # point).  The first welford then sets has_welford=True.  Without this
+        # early return, the second fp16 load hits the has_welford guard below
+        # and falls back to float(StructuredBuffer<uint>[idx]) — raw uint cast
+        # instead of _vk_unpack_f16 — producing garbage values.
+        if self._packed16 is True:
+            if dtype != self._packed16_dtype:
+                self._packed16 = False
+                return False
+            return True
 
         if (
             self.has_welford
@@ -226,6 +252,11 @@ class PointwiseLoadMixin:
                     if hdr is not None:
                         self._pw_uses_subbyte_packing = True
                         self.headers.add(hdr)
+                        # bf16 uses _vk_unpack_bf16 which requires
+                        # StructuredBuffer<uint> (2 bf16 per uint slot).
+                        # Mark this buffer so header.py declares it as uint,
+                        # not the "float" fallback for non-packed16 bf16.
+                        self._packed16_bufs.add(var)
                     line = emit_fn(self._buf_path(var), idx_str)
                     dtype = torch.float32
                 else:

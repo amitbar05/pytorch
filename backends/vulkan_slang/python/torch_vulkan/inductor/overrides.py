@@ -140,6 +140,13 @@ class VulkanOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype(x, dtype: torch.dtype, src_dtype=None, use_compute_types=True) -> str:
+        if dtype == torch.bfloat16:
+            # DTYPE_TO_SLANG[bfloat16] = "uint" (2-bf16-per-slot packing) so a
+            # naive ((uint)(x)) would TRUNCATE the float to an integer — wrong.
+            # All Vulkan Inductor compute happens in fp32; a logical "to bf16"
+            # inside a kernel is a no-op at the fp32 compute level.  The actual
+            # bf16 bit-packing is handled by store() via _vk_pack_bf16.
+            return f"((float)({x}))"
         s = DTYPE_TO_SLANG.get(dtype, "float")
         return f"(({s})({x}))"
 

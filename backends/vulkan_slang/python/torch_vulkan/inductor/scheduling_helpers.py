@@ -132,3 +132,40 @@ def _register_vulkan_benchmarker_once() -> None:
 
 
 _register_vulkan_benchmarker_once()
+
+
+def _fusion_has_new_float_reads(node1, node2) -> bool:
+    """Return True if node2 reads float buffers not in node1's input/output set.
+
+    GPU.1 guard: On AMD RDNA1, after wg_welford's cross-wave LDS reduction,
+    L2 cache state is corrupted for same-cache-line SSBO reads by WGs 1-N.
+    Triggered by any broadcast buffer (weight/bias) read in the same dispatch,
+    regardless of dtype — confirmed empirically for fp16/bf16, also observed
+    for fp32 layer_norm with fresh cache compiles.
+    """
+    import torch
+
+    _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
+    try:
+        node1_produces: set[str] = set(node1.get_buffer_names())
+        node1_reads: set[str] = set(node1.used_buffer_names())
+        node2_reads: set[str] = set(node2.used_buffer_names())
+
+        known = node1_produces | node1_reads
+        extra = node2_reads - known
+        if not extra:
+            return False
+
+        from torch._inductor.virtualized import V
+
+        for name in extra:
+            buf = V.graph.get_buffer(name)
+            if buf is not None and buf.get_dtype() in _FLOAT_DTYPES:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# Backwards-compat alias used by existing callers.
+_fusion_has_new_half_reads = _fusion_has_new_float_reads

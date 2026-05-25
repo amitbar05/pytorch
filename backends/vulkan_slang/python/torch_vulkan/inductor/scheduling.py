@@ -16,6 +16,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .kernel import VulkanKernel
 from .scheduling_helpers import (
+    _fusion_has_new_half_reads,
     _get_benchmarker,
     _reset_benchmarker_cache,
     _wave64_persistent_ok,
@@ -324,6 +325,12 @@ class VulkanScheduling(SIMDScheduling):
         from . import config
 
         base = super().can_fuse_vertical(node1, node2)
+
+        # GPU.1: AMD RDNA1 L2 cache race — reject fp16/bf16 extra-read fusion
+        # after a wg_welford reduction.  See scheduling_helpers._fusion_has_new_half_reads.
+        if base and node1.is_reduction():
+            if _fusion_has_new_half_reads(node1, node2):
+                return False
 
         # --- DR.1: Fusion-group aware scheduling ---
         fg1 = self._get_fusion_group_from_node(node1)
