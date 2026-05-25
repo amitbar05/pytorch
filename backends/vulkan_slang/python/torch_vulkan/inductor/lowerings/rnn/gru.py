@@ -7,8 +7,8 @@ on the ``AutogradPrivateUse1`` dispatch key.
 
 from __future__ import annotations
 
-from ..rnn_template import run_rnn_via_template as _run_rnn_via_template
 from .common import _RNN_CUSTOM_OPS, _use_cpu_fallback
+from .rnn_autograd import apply_vulkan_rnn
 
 
 def register_gru_intercepts(rnn_lib) -> None:
@@ -30,19 +30,21 @@ def register_gru_intercepts(rnn_lib) -> None:
         batch_first,
     ):
         if not _use_cpu_fallback():
-            result = _run_rnn_via_template(
+            out = apply_vulkan_rnn(
                 "gru",
+                False,
                 input,
                 hx,
-                params,
+                list(params),
                 has_biases,
                 num_layers,
+                dropout,
+                train,
                 bidirectional,
                 batch_first,
-                dropout=dropout,
-                train=train,
             )
-            return result[0], result[1]
+            # out = (output, h_n)
+            return out[0], out[1]
         tensors = [input, hx, *params]
         out = gru_op(
             tensors,
@@ -94,19 +96,20 @@ def register_gru_intercepts(rnn_lib) -> None:
         batch_first,
     ):
         if not _use_cpu_fallback():
-            result = _run_rnn_via_template(
+            out = apply_vulkan_rnn(
                 "rnn_tanh",
+                False,
                 input,
                 hx,
-                params,
+                list(params),
                 has_biases,
                 num_layers,
+                dropout,
+                train,
                 bidirectional,
                 batch_first,
-                dropout=dropout,
-                train=train,
             )
-            return result[0], result[1]
+            return out[0], out[1]
         tensors = [input, hx, *params]
         out = rnn_tanh_op(
             tensors,
@@ -133,19 +136,20 @@ def register_gru_intercepts(rnn_lib) -> None:
         batch_first,
     ):
         if not _use_cpu_fallback():
-            result = _run_rnn_via_template(
+            out = apply_vulkan_rnn(
                 "rnn_relu",
+                False,
                 input,
                 hx,
-                params,
+                list(params),
                 has_biases,
                 num_layers,
+                dropout,
+                train,
                 bidirectional,
                 batch_first,
-                dropout=dropout,
-                train=train,
             )
-            return result[0], result[1]
+            return out[0], out[1]
         tensors = [input, hx, *params]
         out = rnn_relu_op(
             tensors,

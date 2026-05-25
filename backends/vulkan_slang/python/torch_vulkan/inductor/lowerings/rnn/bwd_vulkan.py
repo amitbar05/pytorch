@@ -13,6 +13,8 @@ The BPTT algorithm:
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 # ── Module-level caches ──────────────────────────────────────────────────

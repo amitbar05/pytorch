@@ -18,7 +18,6 @@ Usage from ``rnn.py`` eager intercepts::
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -155,6 +154,43 @@ def run_rnn_via_template(
 
     hidden_size = h0.shape[-1]
     D = 2 if bidirectional else 1
+
+    # ── Tracing guard (Dynamo / AOTAutograd fake-tensor mode) ───────
+    # When Dynamo traces _VF.lstm with a mix of FakeTensors (input, params)
+    # and real Vulkan tensors (h0/c0 from nn.LSTM state), the PF.51 guard in
+    # dispatch.py fires because not ALL Vulkan tensors are FakeTensors.
+    # Short-circuit here: return empty tensors with the correct output shapes.
+    # This is sufficient for Dynamo to infer output shapes without dispatching.
+    from ..fx_passes.eager._common import _has_real_vulkan_storage
+
+    if not _has_real_vulkan_storage(input_t):
+        if batch_first:
+            output = torch.empty(
+                batch_size,
+                seq_len,
+                hidden_size * D,
+                device=input_t.device,
+                dtype=input_t.dtype,
+            )
+        else:
+            output = torch.empty(
+                seq_len,
+                batch_size,
+                hidden_size * D,
+                device=input_t.device,
+                dtype=input_t.dtype,
+            )
+        h_n = torch.empty(
+            num_layers * D,
+            batch_size,
+            hidden_size,
+            device=input_t.device,
+            dtype=input_t.dtype,
+        )
+        c_n: Optional[torch.Tensor] = None
+        if is_lstm:
+            c_n = torch.empty_like(h_n)
+        return output, h_n, c_n
 
     # T.10-fast: decide dispatch strategy.
     use_fused = _can_use_fused_rnn_template(cell_type, hidden_size)

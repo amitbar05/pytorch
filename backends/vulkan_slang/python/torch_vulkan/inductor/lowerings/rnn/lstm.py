@@ -6,8 +6,8 @@ Registers ``aten.lstm.input`` and ``aten.lstm.data`` on the
 
 from __future__ import annotations
 
-from ..rnn_template import run_rnn_via_template as _run_rnn_via_template
 from .common import _RNN_CUSTOM_OPS, _use_cpu_fallback
+from .rnn_autograd import apply_vulkan_rnn
 
 
 def register_lstm_intercepts(rnn_lib) -> None:
@@ -27,18 +27,23 @@ def register_lstm_intercepts(rnn_lib) -> None:
         batch_first,
     ):
         if not _use_cpu_fallback():
-            return _run_rnn_via_template(
+            # T.10-bwd: Use the differentiable Vulkan autograd wrapper so that
+            # backward (loss.backward()) works in training mode.
+            out = apply_vulkan_rnn(
                 "lstm",
+                True,
                 input,
                 hx,
-                params,
+                list(params),
                 has_biases,
                 num_layers,
+                dropout,
+                train,
                 bidirectional,
                 batch_first,
-                dropout=dropout,
-                train=train,
             )
+            # out = (output, h_n, c_n)
+            return out
         tensors = [input, hx[0], hx[1], *params]
         out = lstm_op(
             tensors,

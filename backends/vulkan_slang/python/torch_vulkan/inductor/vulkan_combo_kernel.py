@@ -183,12 +183,17 @@ class VulkanComboKernel:
         from torch._inductor.scheduler import (
             BaseSchedulerNode,
             ForeachKernelSchedulerNode,
+            NopKernelSchedulerNode,
         )
 
         # --- Phase 1: identify orphan pointwise nodes ---
         orphans: list[BaseSchedulerNode] = []
         for node in nodes:
             if isinstance(node, ForeachKernelSchedulerNode):
+                continue
+            # NopKernelSchedulerNode has no .group attribute and represents a
+            # no-op (e.g. alias, view); skip it.
+            if isinstance(node, NopKernelSchedulerNode):
                 continue
             if node.is_template():
                 continue

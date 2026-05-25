@@ -225,6 +225,11 @@ def _validate_no_null_storage(key: str, tensors: list[torch.Tensor]) -> bool:
             )
             continue
         if ptr == 0:
+            # Zero-element tensors are intentional placeholders (e.g., dummy
+            # c0/c_last slots for non-LSTM cells in the fused RNN kernel) —
+            # not FakeTensor leakage.  Skip them rather than raising PF.51.
+            if t.numel() == 0:
+                continue
             offenders.append(
                 f"arg{i}: shape={list(t.shape)} dtype={t.dtype} device={t.device}"
             )
