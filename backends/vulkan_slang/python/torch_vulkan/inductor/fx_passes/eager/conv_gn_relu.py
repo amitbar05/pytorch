@@ -245,202 +245,95 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
     gn_relu_op.register_fake(_conv2d_gn_relu_fake)
 
     # Backward: chain GN backward + Conv backward.
-    # We recompute the pre-GN tensor (conv+ReLU output) during backward
-    # rather than saving it, trading extra compute for reduced memory.
+    # setup_context computes and saves conv_out + GN statistics so the backward
+    # can use them directly — no recomputation inside the compiled backward graph.
+    # Recomputing inside the backward caused Inductor buffer-planner aliasing:
+    # intermediates produced during the native_group_norm lowering (same shape
+    # [N,C,H,W] as conv_out) were assigned to conv_out_bwd's buffer, corrupting
+    # the GN backward's xhat = (conv_out - mean) * rstd computation and producing
+    # conv/gn gradient errors of 0.07–0.21 (vs ~1e-7 for the unfused path).
     def _conv2d_gn_relu_setup_context(ctx, inputs, output):
         inp, w, b, stride, padding, dilation, groups, gn_w, gn_b, num_g, eps = inputs
-        ctx.save_for_backward(inp, w, b if b is not None else None, gn_w, gn_b)
         ctx.stride = list(stride)
         ctx.padding = list(padding)
         ctx.dilation = list(dilation)
         ctx.groups = int(groups)
         ctx.num_groups = int(num_g) if num_g is not None else 1
         ctx.eps = float(eps) if eps is not None else 1e-5
+        has_bias = b is not None
+        ctx.has_bias = has_bias
 
-    # M18.2 (2026-05-18): @torch.compiler.disable removed and the local
-    # _has_real_vulkan_storage replaced with the shared M17.8.d.2-fixed
-    # helper — see _conv2d_relu_backward / _conv2d_backward.
-    #
-    # M18.8.b (2026-05-18): backward op order fixed to match the corrected
-    # forward (``conv → GN → ReLU``). Previously this assumed
-    # ``conv → ReLU → GN`` — ``pre_gn = relu(conv(inp))`` was fed to GN
-    # backward, and the ReLU backward mask was missing entirely. The result
-    # was conv weight grads ~5.6× larger than the CPU baseline (because the
-    # GN backward output was treated as ``grad(conv_out)`` rather than
-    # ``grad(GN_out)``, skipping the cross-correlation reduction inside GN
-    # backward and the ReLU mask).
-    def _conv2d_gn_relu_backward(ctx, grad_output):
-        inp, w, saved_b, gn_w, gn_b = ctx.saved_tensors
-        has_bias = saved_b is not None and saved_b.numel() > 0
-
-        # M-pipeline-1 (2026-05-18): N/C/HxW must describe the GN INPUT —
-        # i.e. the conv OUTPUT — not the conv INPUT.  Previously this used
-        # inp.shape[1] for C and inp.shape[2:] for HxW; once the M-pipeline-1
-        # fix removed the Dynamo graph break, this codepath actually runs
-        # and ``aten.native_group_norm`` chokes with
-        # ``C_in (=3) % num_groups != 0`` for the SmallCNN test
-        # (Conv2d(3, 8) → GroupNorm(2, 8)).  Compute the output spatial
-        # dims here so both the GN call below and the recomputed conv_out
-        # are sized correctly.
-        sH, sW = ctx.stride[0], ctx.stride[-1]
-        pH, pW = ctx.padding[0], ctx.padding[-1]
-        dH, dW = ctx.dilation[0], ctx.dilation[-1]
-        kH, kW = w.shape[2], w.shape[3]
-        H_in, W_in = inp.shape[2], inp.shape[3]
-        H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
-        W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+        # Compute conv_out and GN stats here (forward time, not inside the
+        # compiled backward) so they are saved as proper save_for_backward
+        # tensors.  As inputs to the backward graph they cannot be aliased
+        # with backward intermediates, eliminating the Inductor buffer-planner
+        # aliasing that caused 0.07–0.21 gradient errors in the old approach.
+        #
+        # IMPORTANT: detach inp/w/gn_w/gn_b before the setup_context ops.
+        # Without detach, AOTAutograd traces backward through BOTH the custom
+        # backward AND this convolution (using the same w), doubling
+        # conv.weight.grad (~2× factor).  Detach breaks that extra gradient
+        # path while leaving the numerical values of conv_out/mean/rstd intact.
+        _b_d = (b.detach() if has_bias else torch.zeros(
+            w.shape[0], device=inp.device, dtype=inp.dtype
+        ))
+        conv_out = torch.ops.aten.convolution.default(
+            inp.detach(), w.detach(), _b_d,
+            ctx.stride, ctx.padding, ctx.dilation,
+            False, [0] * len(ctx.stride), ctx.groups,
+        )
         N = inp.shape[0]
-        C = int(w.shape[0])  # conv-output channels (= GN input channels)
+        C = int(w.shape[0])
+        HxW = int(conv_out.shape[2]) * int(conv_out.shape[3])
+        _, gn_save_mean, gn_save_rstd = torch.ops.aten.native_group_norm.default(
+            conv_out, gn_w.detach(), gn_b.detach(), N, C, HxW, ctx.num_groups, ctx.eps
+        )
+        ctx.save_for_backward(
+            inp, w, b if has_bias else None,   # NON-detached: needed by custom backward
+            gn_w, gn_b, output,                # output = relu output (for mask)
+            conv_out, gn_save_mean, gn_save_rstd,  # detached: no extra grad paths
+        )
+
+    from .conv_backward import _ensure_conv2d_backward_op_registered
+
+    _ensure_conv2d_backward_op_registered()
+
+    def _conv2d_gn_relu_backward(ctx, grad_output):
+        (inp, w, saved_b, gn_w, gn_b, saved_output,
+         conv_out, gn_save_mean, gn_save_rstd) = ctx.saved_tensors
+        has_bias = ctx.has_bias
+
+        N = inp.shape[0]
+        C = int(w.shape[0])
         G = ctx.num_groups
-        HxW = H_out * W_out
+        HxW = int(conv_out.shape[2]) * int(conv_out.shape[3])
 
-        from ._common import _has_real_vulkan_storage
-
-        use_slang = (
-            ctx.groups == 1
-            and inp.device.type == "vulkan"
-            and inp.dtype == torch.float32
-            and _has_real_vulkan_storage(inp)
-        )
-
-        # Recompute conv output for GN backward.  Forward is
-        # ``conv → GN → ReLU``, so the GN input is the raw conv output
-        # (no ReLU applied). We also recompute the GN output (used for
-        # the ReLU mask).
-        if use_slang:
-            from torch_vulkan.inductor.templates.caller import _slang_tile_conv2d
-
-            conv_out = torch.empty(
-                (N, C, H_out, W_out),
-                device=inp.device,
-                dtype=inp.dtype,
-            )
-            _slang_tile_conv2d(
-                inp.contiguous() if not inp.is_contiguous() else inp,
-                w.contiguous() if not w.is_contiguous() else w,
-                conv_out,
-                stride=(sH, sW),
-                padding=(pH, pW),
-                dilation=(dH, dW),
-                groups=1,
-                bias=saved_b if has_bias else None,
-                epilogue="OpIdent",
-            )
-        else:
-            conv_out = torch.ops.aten.convolution.default(
-                inp,
-                w,
-                saved_b
-                if has_bias
-                else torch.zeros(w.shape[0], device=inp.device, dtype=inp.dtype),
-                ctx.stride,
-                ctx.padding,
-                ctx.dilation,
-                False,
-                [0, 0],
-                int(ctx.groups),
-            )
-
-        # GN output (= ReLU input). Needed for ReLU mask AND to capture
-        # the saved mean/rstd for the GN backward (passing ``None`` makes
-        # aten error out; the backward needs the exact forward statistics).
-        # Use the explicit aten call (not F.group_norm) because the proxy
-        # tracer can mis-classify F.group_norm's saved-tensor args as
-        # shape-only and drop ``gn_w`` from the joint graph.
-        gn_out_tuple = torch.ops.aten.native_group_norm.default(
-            conv_out, gn_w, gn_b, N, C, HxW, G, ctx.eps
-        )
-        gn_out = gn_out_tuple[0]
-        gn_save_mean = gn_out_tuple[1]
-        gn_save_rstd = gn_out_tuple[2]
-
-        # ReLU backward: zero-out the gradient where the GN output (= ReLU
-        # input) was <= 0.  This converts ``grad(ReLU_out)`` (the incoming
-        # ``grad_output``) into ``grad(ReLU_in) = grad(GN_out)``.
-        relu_mask = (gn_out > 0).to(dtype=grad_output.dtype)
+        # ReLU backward: use the exact forward relu output for the mask.
+        relu_mask = (saved_output > 0).to(dtype=grad_output.dtype)
         grad_gn_out = grad_output * relu_mask
 
-        # GN backward via aten.  Input is the conv output (raw, no ReLU),
-        # output is grad w.r.t. conv output (= GN input).
+        # GN backward: conv_out / mean / rstd are saved tensors (backward graph
+        # inputs), so the memory planner cannot alias them with any intermediate.
         gn_grad_input, gn_grad_w, gn_grad_b = (
             torch.ops.aten.native_group_norm_backward.default(
-                grad_gn_out,
-                conv_out,
-                gn_save_mean,
-                gn_save_rstd,
-                gn_w,
-                N,
-                C,
-                HxW,
-                G,
-                [True, True, True],
+                grad_gn_out, conv_out, gn_save_mean, gn_save_rstd,
+                gn_w, N, C, HxW, G, [True, True, True],
             )
         )
 
-        # Conv backward
-        if use_slang:
-            from torch_vulkan.inductor.templates.caller import _slang_tile_conv2d_bwd
-
-            g_inp = torch.zeros_like(inp)
-            g_w = torch.zeros_like(w)
-            g_b = (
-                torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
-                if has_bias
-                else None
-            )
-            _slang_tile_conv2d_bwd(
-                inp,
-                w,
-                gn_grad_input,
-                g_inp,
-                g_w,
-                stride=tuple(ctx.stride),
-                padding=tuple(ctx.padding),
-                dilation=tuple(ctx.dilation),
-                bias=saved_b if has_bias else None,
-                grad_bias=g_b,
-            )
-            conv_grads = (g_inp, g_w, g_b if has_bias else None)
-        else:
-            result = torch.ops.aten.convolution_backward.default(
-                gn_grad_input,
-                inp,
-                w,
-                None,
-                ctx.stride,
-                ctx.padding,
-                ctx.dilation,
-                False,
-                [0] * len(ctx.stride),
-                int(ctx.groups),
-                [True, True, has_bias],
-            )
-            # M18.3 (2026-05-18): safety fallbacks use new_empty(shape) so the
-            # proxy tracer treats these as storage-bound rather than shape-only.
-            conv_grads = (
-                result[0] if result[0] is not None else inp.new_empty(inp.shape),
-                result[1] if result[1] is not None else w.new_empty(w.shape).zero_(),
-                result[2]
-                if len(result) > 2 and result[2] is not None and has_bias
-                else (
-                    w.new_empty((int(w.shape[0]),)).zero_()
-                    if has_bias
-                    else None
-                ),
-            )
+        # Conv backward via opaque custom op (avoids M17.8.d.2 partitioner drop).
+        g_inp, g_w, g_b_raw = torch.ops.torch_vulkan.conv2d_backward.default(
+            inp, gn_grad_input, w,
+            list(ctx.stride), list(ctx.padding), list(ctx.dilation),
+            int(ctx.groups), has_bias,
+        )
 
         return (
-            conv_grads[0],  # grad_input
-            conv_grads[1],  # grad_weight
-            conv_grads[2] if has_bias else None,  # grad_bias
-            None,  # stride
-            None,  # padding
-            None,  # dilation
-            None,  # groups
-            gn_grad_w,  # grad_gn_weight
-            gn_grad_b,  # grad_gn_bias
-            None,  # num_groups
-            None,  # eps
+            g_inp, g_w,
+            g_b_raw if has_bias else None,
+            None, None, None, None,  # stride, padding, dilation, groups
+            gn_grad_w, gn_grad_b,
+            None, None,  # num_groups, eps
         )
 
     gn_relu_op.register_autograd(

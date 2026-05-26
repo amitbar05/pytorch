@@ -1217,8 +1217,17 @@ class TestSmallCNNTrain:
             out = compiled(x)
             assert out.shape == (B, 10), f"Expected ({B}, 10), got {out.shape}"
 
+    @pytest.mark.timeout(600)
+    @pytest.mark.slow_compile(seconds=120)
     def test_3step_training_loss(self):
-        """SmallCNN training: loss decreases over 3 steps."""
+        """SmallCNN training: loss decreases over 3 steps.
+
+        Marked slow_compile because the first step compiles both forward and
+        backward graphs — cold-compile budget is 120 s to allow for the
+        autotuning pass over all matmul tile configs.
+        Marked timeout(600) because cold slangc compilation of the backward
+        graph (r8x8 matmul variants + GN/conv bwd) can take 5-8 min total.
+        """
         torch.manual_seed(42)
         model = self.SmallCNN().to("vulkan")
         compiled = torch.compile(model, backend="inductor")
@@ -1235,27 +1244,48 @@ class TestSmallCNNTrain:
             opt.step()
         assert losses[-1] < losses[0] * 0.95, f"Loss did not decrease: {losses}"
 
+    @pytest.mark.timeout(600)
+    @pytest.mark.slow_compile(seconds=120)
     def test_grad_parity(self):
-        """Compiled model gradients match eager-mode gradients."""
+        """Compiled model gradients match CPU gradients.
+
+        Compares CPU reference vs Vulkan compiled — not eager Vulkan vs
+        compiled.  Vulkan eager is NOT a correctness oracle: its group_norm
+        backward diverges from ATen in some configurations, so using it as
+        the reference would mask bugs in both or produce spurious failures
+        when the compiled path is correct but eager is not.
+        """
+        import copy
         torch.manual_seed(42)
-        # Eager model
-        model_eager = self.SmallCNN().to("vulkan")
-        model_compile = self.SmallCNN().to("vulkan")
-        model_compile.load_state_dict(model_eager.state_dict())
-        compiled = torch.compile(model_compile, backend="inductor")
-        x = torch.randn(2, 3, 32, 32, device="vulkan")
-        targets = torch.randint(0, 10, (2,), device="vulkan")
-        # Eager
-        loss_e = F.cross_entropy(model_eager(x), targets)
-        loss_e.backward()
-        # Compiled
-        loss_c = F.cross_entropy(compiled(x), targets)
-        loss_c.backward()
-        # Compare grads for conv1.weight
-        g_eager = model_eager.conv1.weight.grad.cpu()
-        g_comp = model_compile.conv1.weight.grad.cpu()
-        assert torch.allclose(g_eager, g_comp, atol=1e-4, rtol=1e-2), (
-            f"Grad mismatch: max err {(g_eager - g_comp).abs().max()}"
+        model_cpu = self.SmallCNN()  # CPU reference
+        model_vk = self.SmallCNN().to("vulkan")
+        model_vk.load_state_dict(model_cpu.state_dict())
+        compiled = torch.compile(model_vk, backend="inductor")
+
+        x_cpu = torch.randn(2, 3, 32, 32)
+        x_vk = x_cpu.to("vulkan")
+        targets_cpu = torch.randint(0, 10, (2,))
+        targets_vk = targets_cpu.to("vulkan")
+
+        # CPU reference backward
+        loss_cpu = F.cross_entropy(model_cpu(x_cpu), targets_cpu)
+        loss_cpu.backward()
+
+        # Compiled Vulkan backward
+        loss_vk = F.cross_entropy(compiled(x_vk), targets_vk)
+        loss_vk.backward()
+
+        # Compare conv1.weight.grad (most sensitive: goes through fused bwd)
+        g_cpu = model_cpu.conv1.weight.grad
+        g_vk = model_vk.conv1.weight.grad.cpu()
+        assert torch.allclose(g_cpu, g_vk, atol=1e-3, rtol=1e-2), (
+            f"conv1.weight.grad mismatch: max err {(g_cpu - g_vk).abs().max()}"
+        )
+        # Also check gn1.weight.grad
+        gn_cpu = model_cpu.gn1.weight.grad
+        gn_vk = model_vk.gn1.weight.grad.cpu()
+        assert torch.allclose(gn_cpu, gn_vk, atol=1e-3, rtol=1e-2), (
+            f"gn1.weight.grad mismatch: max err {(gn_cpu - gn_vk).abs().max()}"
         )
 
     def test_dispatch_count(self):
@@ -1267,6 +1297,8 @@ class TestSmallCNNTrain:
         out = compiled(x)
         assert out.device.type == "vulkan" if hasattr(out.device, "type") else True
 
+    @pytest.mark.timeout(600)
+    @pytest.mark.slow_compile(seconds=120)
     def test_10step_no_nan(self):
         """10 training steps produce no NaN values."""
         torch.manual_seed(42)

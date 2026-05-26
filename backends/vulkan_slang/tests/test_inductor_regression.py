@@ -40548,23 +40548,24 @@ class TestMPipeline1ConvLoweringReachable:
             "``extern_kernels.conv2d_gn_relu_fused`` (implicit fallback)."
         )
 
-    def test_conv_gn_relu_fusion_pass_fires(self):
-        """Post-fix: ``_fuse_conv_patched_gn_relu`` matches the
-        Conv+GN+ReLU chain and the wrapper invokes
-        ``torch.ops.torch_vulkan.conv2d_gn_relu_fused``.
+    def test_conv_gn_relu_no_pregrad_fusion(self):
+        """Pre-grad fusion is disabled for correctness.
 
-        This is THE load-bearing observation behind the M18.8.b xfail —
-        pre-fix the pass NEVER fired (Dynamo had split the chain across
-        subgraphs), so the fused custom op was dead code.
+        The M18.8.b pre-grad fusion inserted ``conv2d_gn_relu_fused.default``
+        before AOTAutograd, causing AOTAutograd's setup_context rematerialisation
+        to recompute conv without bias, which produced wrong xhat in the GN
+        backward (~22× gradient error).  Fusion is now disabled; Inductor
+        uses native aten lowerings for conv, native_group_norm, and relu.
+        Verify the fused op does NOT appear in the compiled wrapper.
         """
         _, codes = self._compile_smallcnn()
         if not codes:
             pytest.skip("Inductor emitted no wrapper code (downstream blocker).")
         joined = "\n".join(codes)
-        assert "torch.ops.torch_vulkan.conv2d_gn_relu_fused" in joined, (
-            "M-pipeline-1: pre-grad fusion did NOT match Conv+GN+ReLU. "
-            "Expected ``torch.ops.torch_vulkan.conv2d_gn_relu_fused`` in "
-            "the generated wrapper. Wrapper head:\n" + joined[:1500]
+        assert "conv2d_gn_relu_fused" not in joined, (
+            "Pre-grad fusion is disabled — conv2d_gn_relu_fused must NOT appear "
+            "in the compiled wrapper.  If it does, install_conv_patched_gn_relu_fusion "
+            "is being called again somewhere."
         )
 
     def test_eager_patch_register_is_idempotent(self):
@@ -40963,6 +40964,37 @@ class TestM18ShapeOnlyProxiesUseNewEmpty:
         vk_mod = _M().to("vulkan:0")
         self._check(cpu_mod, vk_mod, (1, 3, 8, 8), "group_norm")
 
+    def test_fused_conv_gn_relu_backward_grad_parity(self):
+        """Fused ``conv2d_gn_relu_fused`` backward gradient parity.
+
+        Pre-grad fusion replaces ``conv → GN → ReLU`` with the
+        ``torch_vulkan::conv2d_gn_relu_fused`` custom op.  Its
+        ``_conv2d_gn_relu_backward`` (via ``register_autograd``) must
+        produce conv.weight.grad and gn.weight.grad that match CPU to
+        within 1e-4.
+
+        Regression guard for M-NEW.16: before the setup_context fix,
+        Inductor buffer-planner aliasing caused 0.07–0.21 L_inf errors
+        in conv/gn grad (GN-forward intermediates were assigned to
+        ``conv_out_bwd``'s buffer, corrupting xhat computation).
+        """
+        import torch.nn as nn
+
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.c = nn.Conv2d(3, 8, 3, padding=1)
+                self.gn = nn.GroupNorm(2, 8)
+
+            def forward(self, x):
+                return torch.relu(self.gn(self.c(x)))
+
+        torch.manual_seed(0)
+        cpu_mod = _M()
+        torch.manual_seed(0)
+        vk_mod = _M().to("vulkan:0")
+        self._check(cpu_mod, vk_mod, (2, 3, 8, 8), "conv_gn_relu_fused")
+
     def test_batch_norm_backward_grad_parity(self):
         """`aten.native_batch_norm_backward`."""
         import torch.nn as nn
@@ -41088,13 +41120,17 @@ class TestM188bDynamoSubgraphSplit:
             f"Captured target lists: {captured_targets}"
         )
 
-    def test_fuse_conv_patched_gn_relu_fires(self):
-        """The enhanced fusion pass must be invoked AND match at least one
-        chain when compiling Conv → GN → ReLU under inductor."""
+    def test_fuse_conv_patched_gn_relu_disabled(self):
+        """The pre-grad fusion is disabled for gradient correctness.
+
+        The M18.8.b fusion caused AOTAutograd to rematerialise conv without
+        bias in setup_context, producing wrong xhat in GN backward (~22×
+        gradient error vs CPU).  Verify the counter does NOT increment —
+        confirming the fusion is not inserted before AOTAutograd.
+        """
         import torch
         from torch_vulkan.inductor.fx_passes import post_grad as _pg
 
-        # Snapshot the cumulative counter, run, check delta.
         before = _pg._FUSE_CONV_PATCHED_GN_RELU_COUNTER[0]
 
         mod = self._build_mod()
@@ -41104,41 +41140,38 @@ class TestM188bDynamoSubgraphSplit:
         try:
             compiled(x)
         except Exception:
-            # Downstream runtime may fail (M18.8.c struct.pack bug),
-            # but the pre-grad fusion still runs.
             pass
 
         after = _pg._FUSE_CONV_PATCHED_GN_RELU_COUNTER[0]
-        assert after - before >= 1, (
-            f"_fuse_conv_patched_gn_relu did not match any chains: "
-            f"counter went {before} → {after}.  Verify the matcher in "
-            f"fx_passes/post_grad.py:_fuse_conv_patched_gn_relu still "
-            f"recognises the Dynamo-emitted GN / ReLU forms."
+        assert after - before == 0, (
+            f"Pre-grad fusion fired but should be disabled: counter went "
+            f"{before} → {after}.  Check that install_conv_patched_gn_relu_fusion "
+            f"is NOT called from fx_passes/eager/__init__.py."
         )
 
-    def test_pregrad_graph_contains_fused_op_after_fusion(self):
-        """After the enhanced fusion runs, the pre-grad graph must
-        contain a ``torch_vulkan::conv2d_gn_relu_fused`` node and NOT
-        contain the original separate conv / GN / ReLU chain.
+    def test_pregrad_graph_contains_unfused_ops_after_passes(self):
+        """After pre-grad passes, the graph must use unfused aten ops.
+
+        The M18.8.b pre-grad fusion is disabled (correctness fix: it caused
+        AOTAutograd to produce wrong conv+GN+relu backward gradients).  After
+        pre-grad passes, the graph must still contain individual conv/GN/relu
+        nodes — NOT a fused ``conv2d_gn_relu_fused`` node.
         """
         import torch
         import torch._inductor.compile_fx as _cfx
 
-        captured_after_fusion: list[list[str]] = []
+        captured_after_passes: list[list[str]] = []
 
-        # The fusion pass is installed inside run_pre_grad_passes; we
-        # capture the graph AFTER all pre-grad passes have run.
         _orig = _cfx.run_pre_grad_passes
 
         def _capturing(model_, example_inputs_):
             result = _orig(model_, example_inputs_)
-            # ``result`` is the same graph object, but mutated in place.
             if isinstance(model_, torch.fx.GraphModule):
                 targets = []
                 for n in model_.graph.nodes:
                     if n.op == "call_function":
                         targets.append(getattr(n.target, "__qualname__", str(n.target)))
-                captured_after_fusion.append(targets)
+                captured_after_passes.append(targets)
             return result
 
         _cfx.run_pre_grad_passes = _capturing
@@ -41154,16 +41187,12 @@ class TestM188bDynamoSubgraphSplit:
         finally:
             _cfx.run_pre_grad_passes = _orig
 
-        # At least one captured graph must contain the fused op.
-        found_fused = False
-        for targets in captured_after_fusion:
-            if any("conv2d_gn_relu_fused" in t for t in targets):
-                found_fused = True
-                break
-        assert found_fused, (
-            f"After pre-grad passes, no graph contains "
-            f"conv2d_gn_relu_fused.  Captured: {captured_after_fusion}"
-        )
+        # The fused op must NOT appear — pre-grad fusion is disabled.
+        for targets in captured_after_passes:
+            assert not any("conv2d_gn_relu_fused" in t for t in targets), (
+                f"Pre-grad fusion is disabled but conv2d_gn_relu_fused appeared "
+                f"in pre-grad graph: {targets}"
+            )
 
 
 class TestM185Transformer3DMatmul:

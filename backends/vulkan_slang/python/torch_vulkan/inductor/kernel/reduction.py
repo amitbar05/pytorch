@@ -191,11 +191,18 @@ class ReductionMixin(ReductionLoadMixin):
             self.headers.add("wgreduce2d")
         elif layout_2d is not None and not self.multistage_reduction_entry:
             ty, tx = layout_2d
+            # n_waves must reflect the ACTUAL threadgroup size (ty * tx), not
+            # max_threadgroup_size. When ty * tx < max_threadgroup_size the
+            # header emits numthreads(tx, ty, 1), so only (ty*tx//simd) waves
+            # actually exist. Using max_threadgroup_size//simd causes
+            # wg_reduce_wave to read smem slots that were never written →
+            # garbage accumulates into the reduction output.
+            n_waves_2d = max(1, (ty * tx) // self.simd_group_size)
             linear_tid = f"lid.y * {tx} + lid.x"
             guarded_val = str(val)
             result = self.cse.generate(
                 self.stores,
-                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, {linear_tid}, {n_waves}u, VK_SUBGROUP_SIZE)",
+                f"wg_reduce_wave<{op_tmpl}>({guarded_val}, {linear_tid}, {n_waves_2d}u, VK_SUBGROUP_SIZE)",
                 dtype=DTYPE_TO_COMPUTATION_DTYPE[dtype],
             )
             self.headers.add("wgreduce")

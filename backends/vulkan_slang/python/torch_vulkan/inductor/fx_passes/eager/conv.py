@@ -172,11 +172,10 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                 # groups==1: single dispatch
                 g_inp = torch.zeros_like(inp)
                 g_w = torch.zeros_like(w)
-                g_b = (
-                    torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
-                    if has_bias
-                    else None
-                )
+                # Bias gradient: skip Slang vk_atomic_add path (recycled Vulkan pool
+                # buffers from torch.zeros(..., device='vulkan') are NOT zero-initialized,
+                # so atomic accumulation into them produces wrong results). Compute via
+                # a clean reduce-sum over spatial+batch dims instead.
                 _slang_tile_conv2d_bwd(
                     inp,
                     w,
@@ -186,36 +185,22 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                     stride=tuple(ctx.stride),
                     padding=tuple(ctx.padding),
                     dilation=tuple(ctx.dilation),
-                    bias=saved_b if has_bias else None,
-                    grad_bias=g_b,
+                    bias=None,
+                    grad_bias=None,
                 )
+                g_b = grad_output.sum([0, 2, 3]) if has_bias else None
             else:
                 # M6.6: groups>1 — per-group decomposition
                 C_in_g = w.shape[1]
                 C_out_g = w.shape[0] // groups
                 g_inp_parts = []
                 g_w_parts = []
-                g_b_val = (
-                    torch.zeros(int(w.shape[0]), device=w.device, dtype=w.dtype)
-                    if has_bias
-                    else None
-                )
                 for g in range(groups):
                     inp_s = inp[:, g * C_in_g : (g + 1) * C_in_g, :, :]
                     w_s = w[g * C_out_g : (g + 1) * C_out_g, :, :, :]
                     go_s = grad_output[:, g * C_out_g : (g + 1) * C_out_g, :, :]
-                    b_s = (
-                        saved_b[g * C_out_g : (g + 1) * C_out_g]
-                        if has_bias and saved_b is not None
-                        else None
-                    )
                     gi = torch.zeros_like(inp_s)
                     gw = torch.zeros_like(w_s)
-                    gb_s = (
-                        g_b_val[g * C_out_g : (g + 1) * C_out_g]
-                        if g_b_val is not None
-                        else None
-                    )
                     _slang_tile_conv2d_bwd(
                         inp_s,
                         w_s,
@@ -225,14 +210,15 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                         stride=tuple(ctx.stride),
                         padding=tuple(ctx.padding),
                         dilation=tuple(ctx.dilation),
-                        bias=b_s,
-                        grad_bias=gb_s,
+                        bias=None,
+                        grad_bias=None,
                     )
                     g_inp_parts.append(gi)
                     g_w_parts.append(gw)
                 g_inp = torch.cat(g_inp_parts, dim=1)
                 g_w = torch.cat(g_w_parts, dim=0)
-                g_b = g_b_val
+                # Same bias fix as groups==1: clean reduction, not Slang atomic add
+                g_b = grad_output.sum([0, 2, 3]) if has_bias else None
         else:
             # M17.8.d.2 — IDEAL ROUTING (currently blocked):
             # We would prefer to route through the opaque
@@ -250,11 +236,12 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
             # ``_linear_bwd_meta`` / etc. (now using ``new_empty(shape)``
             # rather than ``empty_like``) keeps this path producing
             # non-zero gradients during AOT trace.
+            bias_sizes = [int(w.shape[0])] if has_bias else None
             result = torch.ops.aten.convolution_backward.default(
                 grad_output,
                 inp,
                 w,
-                None,
+                bias_sizes,
                 ctx.stride,
                 ctx.padding,
                 ctx.dilation,

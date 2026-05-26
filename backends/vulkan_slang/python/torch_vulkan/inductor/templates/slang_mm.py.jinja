@@ -195,24 +195,28 @@ void mma_tile(uint stage, uint k_base, uint local_row, uint local_col, uint3 lid
     [unroll({{ tile_k if tile_k <= 16 else 16 }})]
     for (uint kk = 0; kk < k_end; kk++) {
         // Load M_PER_THREAD A values (one column of the register tile).
+        // N+1.11-fix: use spec-constant M_PER_THREAD/N_PER_THREAD as loop bounds so
+        // [unroll] has a compile-time constant count.  pc.m_per_thread /
+        // pc.n_per_thread are push constants (runtime values) — slangc 2026.7.1
+        // crashes when [unroll] is applied to a loop with a non-constant bound.
         {{ dtype_acc }} a_reg[M_PER_THREAD];
         [unroll]
-        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-            uint local_m = local_row * pc.m_per_thread + mi;
+        for (uint mi = 0; mi < M_PER_THREAD; mi++) {
+            uint local_m = local_row * M_PER_THREAD + mi;
             a_reg[mi] = tile_a[off_a + local_m * TILE_K + kk];
         }
         // Load N_PER_THREAD B values (one row of the register tile).
         {{ dtype_acc }} b_reg[N_PER_THREAD];
         [unroll]
-        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint local_n = local_col * pc.n_per_thread + ni;
+        for (uint ni = 0; ni < N_PER_THREAD; ni++) {
+            uint local_n = local_col * N_PER_THREAD + ni;
             b_reg[ni] = tile_b[off_b + kk * TILE_N + local_n];
         }
         // Outer-product accumulate.
         [unroll]
-        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
+        for (uint mi = 0; mi < M_PER_THREAD; mi++) {
             [unroll]
-            for (uint ni = 0; ni < pc.n_per_thread; ni++) {
+            for (uint ni = 0; ni < N_PER_THREAD; ni++) {
                 acc[mi][ni] += a_reg[mi] * b_reg[ni];
             }
         }
@@ -255,16 +259,18 @@ void computeMain<Epilogue : IDifferentiable>(
     uint local_col = tid % WG_N;
 
     // N+1.11: Early exit for threads outside the runtime workgroup.
-    if (local_row >= pc.tile_m / pc.m_per_thread || local_col >= pc.tile_n / pc.n_per_thread) return;
+    // N+1.11-fix: use spec-constant WG_M/WG_N (= TILE_M/M_PER_THREAD, TILE_N/N_PER_THREAD)
+    // instead of pc.tile_m/pc.m_per_thread so the guard uses compile-time values.
+    if (local_row >= WG_M || local_col >= WG_N) return;
 
     // Per-thread register accumulator: holds an (M_PER_THREAD x N_PER_THREAD)
     // sub-tile of the workgroup's TILE_M x TILE_N output block.
     // N+1.11: Array dimensions use spec-constant M_PER_THREAD, N_PER_THREAD.
     {{ dtype_acc }} acc[M_PER_THREAD][N_PER_THREAD];
     [unroll]
-    for (uint _mi = 0; _mi < pc.m_per_thread; _mi++) {
+    for (uint _mi = 0; _mi < M_PER_THREAD; _mi++) {
         [unroll]
-        for (uint _ni = 0; _ni < pc.n_per_thread; _ni++) {
+        for (uint _ni = 0; _ni < N_PER_THREAD; _ni++) {
             acc[_mi][_ni] = ({{ dtype_acc }})0.0;
         }
     }
@@ -302,14 +308,14 @@ void computeMain<Epilogue : IDifferentiable>(
 
     // Epilogue + store: each thread writes its M_PER_THREAD x N_PER_THREAD
     // register block to the output tensor.
-    // N+1.11: Loop bounds use pc.m_per_thread, pc.n_per_thread.
+    // N+1.11-fix: use spec-constants M_PER_THREAD/N_PER_THREAD as [unroll] bounds.
     [unroll]
-    for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-        uint row = row_base + local_row * pc.m_per_thread + mi;
+    for (uint mi = 0; mi < M_PER_THREAD; mi++) {
+        uint row = row_base + local_row * M_PER_THREAD + mi;
         if (row >= pc.M) continue;
         [unroll]
-        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint col = col_base + local_col * pc.n_per_thread + ni;
+        for (uint ni = 0; ni < N_PER_THREAD; ni++) {
+            uint col = col_base + local_col * N_PER_THREAD + ni;
             if (col >= pc.N) continue;
             {{ dtype_acc }} v = acc[mi][ni];
             // A.6: Epilogue blocks gated by pc.flags at runtime, not Jinja.

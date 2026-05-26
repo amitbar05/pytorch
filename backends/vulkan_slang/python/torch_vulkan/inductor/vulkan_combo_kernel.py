@@ -445,6 +445,10 @@ class VulkanComboKernel:
                 # TRAIN.6-F1: Reduction subkernels use gid.x directly for
                 # workgroup indexing (one workgroup per output element).
                 # Pointwise subkernels use flat _vk_gtid with TGS threads.
+                # Capture inside_reduction ONCE here — don't re-read it later.
+                # kernel.inside_reduction can be transiently mutated by
+                # store_reduction() / codegen_loops() context managers; a
+                # second getattr below would see stale state.
                 inside_reduction = getattr(kernel, "inside_reduction", False)
                 if inside_reduction:
                     cond = (
@@ -464,7 +468,7 @@ class VulkanComboKernel:
                 # when body_src is empty so cross_decls captures the
                 # index variable names for later subkernels.
                 seed = IndentedBuffer()
-                inside_reduction = getattr(kernel, "inside_reduction", False)
+                # Use the captured inside_reduction from above — do NOT re-read.
                 if inside_reduction:
                     seed.writeline(f"uint xindex = gid.x;")
                 else:

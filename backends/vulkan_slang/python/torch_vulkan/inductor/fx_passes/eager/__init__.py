@@ -78,15 +78,14 @@ def register_eager_patch_custom_ops() -> None:
     # tracing through ``torch.empty_like`` sub-ops (which the partitioner
     # collapses to literal zeros).
     _ensure_conv2d_backward_op_registered()
-    # M18.8.b: install the enhanced conv→GN→ReLU fusion pass that matches
-    # the Dynamo-emitted forms of the monkey-patched ``F.group_norm`` and
-    # ``F.relu`` (the legacy fusion in meta_patches/decomposition_passes.py
-    # only matches the post-AOT-decomp form ``aten.native_group_norm`` /
-    # ``aten.relu`` and therefore never fires for the eager-Vulkan
-    # ``nn.Sequential(Conv, GN, ReLU)`` topology).
-    from ..post_grad import install_conv_patched_gn_relu_fusion
-
-    install_conv_patched_gn_relu_fusion()
+    # M18.8.b pre-grad fusion DISABLED (correctness fix):
+    # The fusion inserted ``conv2d_gn_relu_fused.default`` before AOTAutograd,
+    # causing AOTAutograd to use the ``register_autograd`` + ``setup_context``
+    # backward.  AOTAutograd rematerialises setup_context's conv recomputation
+    # without bias, producing wrong xhat = (conv_no_bias - mean_conv_with_bias)
+    # / rstd in the GN backward — ~22× gradient error vs CPU.
+    # Fix: let AOTAutograd trace unfused aten ops (conv, native_group_norm,
+    # relu) so it generates the correct backward through each individually.
     # T4.8 foreach optimizer custom ops — registered lazily by
     # install_external_optimizer() in vulkan_template_caller. They live in
     # this module (below) because eager_patches is the canonical home for

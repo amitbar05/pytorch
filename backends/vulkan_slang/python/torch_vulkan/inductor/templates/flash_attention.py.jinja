@@ -109,7 +109,9 @@ uint _o_offset(uint b, uint h, uint q_pos, uint d) {
 // ── Entry point — one workgroup per (b, h, q_tile) ────────────────────────
 
 [shader("compute")]
-[numthreads(WG_SIZE, 1, 1)]
+// CG.M15-fix: use Jinja-computed literal {{ wg_size }} instead of spec-constant WG_SIZE
+// to avoid slangc E39999 "expression does not evaluate to a compile-time constant".
+[numthreads({{ wg_size }}, 1, 1)]
 void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     uint tid = lid.x;
 
@@ -129,16 +131,19 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
 
     // ── Load Q into shared memory (coalesced along D) ─────────────────
     // CG.M15: local array Qi uses spec-constant BQ.
+    // CG.M15-fix: use spec-constant BQ as [unroll] loop bound — pc.bq is a
+    // push constant (runtime value) and slangc 2026.7.1 crashes when [unroll]
+    // is applied to a loop with a non-constant bound.
     float Qi[BQ];  // one per q_pos in this tile
     [unroll]
-    for (uint qi = 0; qi < pc.bq; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         uint q_pos = q_start + qi;
         float v = 0.0f;
         if (q_pos < pc.N && tid < pc.D) {
             v = (float)args.q[_q_offset(b, h, q_pos, tid)];
         }
         Q_smem[qi * HEAD_DIM + tid] = v;
-        if (qi < BQ) { Qi[qi] = v; }
+        Qi[qi] = v;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -148,7 +153,7 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     float l[BQ];
     float Oi[BQ];
     [unroll]
-    for (uint qi = 0; qi < pc.bq; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         m[qi] = -1e38f;
         l[qi] = 0.0f;
         Oi[qi] = 0.0f;
@@ -188,13 +193,14 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
 
         // T4.9 Defect 3 fix: single-pass online softmax with full-D score.
+        // CG.M15-fix: use spec-constants BQ/BK as [unroll] bounds.
         [unroll]
-        for (uint qi = 0; qi < pc.bq; qi++) {
+        for (uint qi = 0; qi < BQ; qi++) {
             uint q_pos = q_start + qi;
             if (q_pos >= pc.N) break;
 
             [unroll]
-            for (uint ki = 0; ki < pc.bk; ki++) {
+            for (uint ki = 0; ki < BK; ki++) {
                 uint k_pos = kv_start + ki;
                 if (k_pos >= pc.S) break;
 
@@ -224,8 +230,9 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     }
 
     // ── Write output and LSE ─────────────────────────────────────────────
+    // CG.M15-fix: use spec-constant BQ as [unroll] bound.
     [unroll]
-    for (uint qi = 0; qi < pc.bq; qi++) {
+    for (uint qi = 0; qi < BQ; qi++) {
         uint q_pos = q_start + qi;
         if (q_pos >= pc.N) break;
         float inv_l = (l[qi] > 0.0f) ? (1.0f / l[qi]) : 0.0f;

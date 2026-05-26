@@ -511,8 +511,10 @@ def apply() -> None:
     # AOTAutograd functionalization decomposes them into triplets/doublets.
     _patch_pre_grad_passes_for_optimizer_foreach()
 
-    # M17.2 Phase 2: fuse conv → group_norm → relu on the pre-grad graph
-    # BEFORE AOTAutograd decomposition (native_group_norm is still intact).
-    _patch_pre_grad_passes_for_conv_gn_relu_fusion()
+    # M17.2 Phase 2 DISABLED (correctness fix):
+    # Pre-grad fusion caused AOTAutograd to use register_autograd setup_context
+    # backward, which rematerialised conv without bias → wrong GN xhat → 22×
+    # gradient errors.  Unfused aten ops use native Inductor lowerings instead.
+    # _patch_pre_grad_passes_for_conv_gn_relu_fusion()
 
     _patched = True
