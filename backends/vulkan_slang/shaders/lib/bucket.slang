@@ -116,7 +116,7 @@ struct SearchsortedArgs {
     StructuredBuffer<float> values;
     RWStructuredBuffer<uint> output;
 };
-ParameterBlock<SearchsortedArgs> searchsorted_args;
+[[vk::binding(0, 0)]] ParameterBlock<SearchsortedArgs> searchsorted_args;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]

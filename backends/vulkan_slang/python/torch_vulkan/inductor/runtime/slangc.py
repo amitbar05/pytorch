@@ -610,9 +610,18 @@ def batch_compile_slang_to_spirv(
             errors.append(e)
             return None
 
+    # M-NEW.1: mark batch-executor workers as in-pool so the inner
+    # ``compile_slang_to_spirv`` call takes the bypass path at line ~506
+    # instead of re-submitting to ``_ASYNC_POOL``. Without this guard the
+    # batch workers block on ``_ASYNC_POOL.submit().result()`` while
+    # ``_ASYNC_POOL`` is itself busy serving ``_ensure_shader_lib_modules``
+    # (slangc lib-module precompile under a serial lock) — deadlocking the
+    # autotune+prewarm path on the very first compile of any model with
+    # >1 ``addmm``.
+    wrapped_compile_one = _wrap_pool_worker(_compile_one)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_compile_one, src, entry, ck, ip): ck
+            pool.submit(wrapped_compile_one, src, entry, ck, ip): ck
             for src, entry, ck, ip in pending
         }
         for fut in futures:
