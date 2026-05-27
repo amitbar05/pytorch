@@ -26,20 +26,16 @@ _conv_bwd_cache: dict[tuple, str] = {}
 _conv_gn_relu_cache: dict[tuple, str] = {}
 
 
-def _render_conv_gn_relu_slang(
-    has_bias: bool = False,
-) -> str:
+def _render_conv_gn_relu_slang() -> str:
     """Render the conv_gn_relu.slang Jinja2 template.
 
     M17.2 Phase 3: combined Conv2D + GroupNorm + ReLU in a single
-    Slang compute shader.  The template only has one Jinja2 toggle
-    (``has_bias``); all dimensions come through push constants so
-    the same SPIR-V module serves any shape that shares the bias
-    presence.
+    Slang compute shader.  M-SF.4: ``has_bias`` Jinja removed —
+    bias buffer always declared, add is a no-op when bias is zero.
     """
     from jinja2 import Environment
 
-    key = (has_bias,)
+    key = ()
     if key in _conv_gn_relu_cache:
         return _conv_gn_relu_cache[key]
 
@@ -49,7 +45,7 @@ def _render_conv_gn_relu_slang(
 
     env = Environment()
     tmpl = env.from_string(src)
-    rendered = tmpl.render(has_bias=has_bias)
+    rendered = tmpl.render()
     _conv_gn_relu_cache[key] = rendered
     return rendered
 
@@ -132,7 +128,7 @@ def _slang_tile_conv2d_gn_relu(
 
     has_bias = bias is not None
     dtype_s = _dtype_to_slang(input_t.dtype)
-    src = _render_conv_gn_relu_slang(has_bias=has_bias)
+    src = _render_conv_gn_relu_slang()
     # ``_relufix2`` (2026-05-21, Group D): bumped twice in one session —
     # (1) corrected the op-order bug (was ``gn(relu(conv(x)))``,
     #     should be ``relu(gn(conv(x)))``), and
@@ -140,8 +136,8 @@ def _slang_tile_conv2d_gn_relu(
     #     miscompile that dropped Wave 1's stores when Pass 3's
     #     ``d``-stride loop mirrored Pass 1's.
     # Cache-busting tag prevents stale SPIR-V blobs from being reused.
-    # Bumped for M-CG.3 WG 256→64 fix (avoids slangc write-coverage bug).
-    cache_key = f"conv_gn_relu_{dtype_s}{'_bias' if has_bias else ''}_mcg3_wg64"
+    # Bumped for M-CG.3 WG 256→64 fix + M-SF.4 bias de-Jinja.
+    cache_key = f"conv_gn_relu_{dtype_s}_mcg3_wg64_msf4"
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
@@ -250,7 +246,9 @@ def _render_conv2d_slang(
 
     epilogue_struct = _validate_epilogue_struct(epilogue_struct)
 
-    key = (tile_w, tile_h, tile_c, threads_w, threads_h, has_bias, epilogue_struct)
+    # M-SF.4: bias buffer is always declared in the shader;
+    # the runtime gate is stride_bias != 0.
+    key = (tile_w, tile_h, tile_c, threads_w, threads_h, epilogue_struct)
     if key in _conv2d_cache:
         return _conv2d_cache[key]
 
@@ -266,7 +264,6 @@ def _render_conv2d_slang(
         tile_c=tile_c,
         threads_w=threads_w,
         threads_h=threads_h,
-        has_bias=has_bias,
         epilogue=epilogue_struct is not None,
     )
     _conv2d_cache[key] = rendered
@@ -329,8 +326,7 @@ def _slang_tile_conv2d(
     cache_key = (
         f"slang_conv2d_{tile_w}x{tile_h}x{tile_c}"
         f"_t{threads_w}x{threads_h}_{dtype_s}"
-        f"{'_bias' if has_bias else ''}"
-        f"{'_' + epilogue if epilogue else ''}_m17"
+        f"{'_' + epilogue if epilogue else ''}_msf4"
     )
 
     # CG.M15: spec_constants for [[vk::constant_id]] overrides.
@@ -383,25 +379,33 @@ def _slang_tile_conv2d(
         int(tile_h),
         int(tile_c),
     )
-    if has_bias:
-        bias_1d = bias.view(-1)
-        pc = struct.pack(
-            "32I",
-            *common_fields,
-            int(bias_1d.stride(0)),
-            0,  # _pad
-        )
-    else:
-        pc = struct.pack("30I", *common_fields)
+    # M-SF.4: always pack full 32-field PC (stride_bias + _pad always present).
+    # When bias is None, stride_bias=0 and the shader skips the bias add.
+    bias_1d = (
+        bias.view(-1)
+        if has_bias
+        else torch.zeros(1, device=input_t.device, dtype=input_t.dtype)
+    )
+    stride_bias = int(bias_1d.stride(0)) if has_bias else 0
+    pc = struct.pack(
+        "32I",
+        *common_fields,
+        stride_bias,
+        0,  # _pad
+    )
 
     grid_x = (oW + tile_w - 1) // tile_w
     grid_y = (oH + tile_h - 1) // tile_h
     tile_c_count = (C_out + tile_c - 1) // tile_c
     grid_z = N * tile_c_count
 
+    # M-SF.4: always include bias buffer (dummy when no bias).
+    # The shader always declares StructuredBuffer<float> bias in KernelArgs.
     buffers = [input_t, weight_t]
     if has_bias:
         buffers.append(bias.view(-1))
+    else:
+        buffers.append(torch.zeros(1, device=input_t.device, dtype=input_t.dtype))
     buffers.append(out)
 
     # M17.2: Resolve the entry point.  When an epilogue is set, the entry

@@ -71,10 +71,9 @@ struct PC {
     uint tile_w;
     uint tile_h;
     uint tile_c;
-/*{%*/ if has_bias /*%}*/
+    // M-SF.4: always present — gated at runtime by stride_bias != 0
     uint stride_bias;
     uint _pad; // keep struct size aligned
-/*{%*/ endif /*%}*/
 };
 
 [[vk::push_constant]] PC pc;
@@ -92,9 +91,8 @@ import pointwise;
 struct KernelArgs {
     StructuredBuffer<float> input;
     StructuredBuffer<float> weight;
-/*{%*/ if has_bias /*%}*/
+    // M-SF.4: always present — gated at runtime by stride_bias != 0
     StructuredBuffer<float> bias;
-/*{%*/ endif /*%}*/
     RWStructuredBuffer<float> out;
 };
 // M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
@@ -203,9 +201,8 @@ void computeMain<Epilogue : IDifferentiable>(
                          + co * pc.stride_out_c
                          + oh * pc.stride_out_h
                          + ow * pc.stride_out_w;
-/*{%*/ if has_bias /*%}*/
-            sum += args.bias[co * pc.stride_bias];
-/*{%*/ endif /*%}*/
+            // M-SF.4: bias always present, gated at runtime
+            if (pc.stride_bias != 0u) sum += args.bias[co * pc.stride_bias];
 /*{%*/ if epilogue /*%}*/
             sum = Epilogue::apply(sum);
 /*{%*/ endif /*%}*/

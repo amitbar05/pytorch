@@ -40,7 +40,7 @@ def _render_mm_slang(
     has_batch: bool = False,
     m_per_thread: int = 1,
     n_per_thread: int = 1,
-    use_module: bool = False,
+    use_module: bool = True,
 ) -> str:
     """Render the slang_mm Jinja2 template.
 
@@ -288,7 +288,9 @@ def _render_mm_linktime_wrapper_slang(
         lines.append(
             f"[[vk::binding({bias_binding_idx}, 0)]] StructuredBuffer<{dtype_bias}> bias;"
         )
-    lines.append(f"[[vk::binding({out_binding_idx}, 0)]] RWStructuredBuffer<{dtype_c}> c;")
+    lines.append(
+        f"[[vk::binding({out_binding_idx}, 0)]] RWStructuredBuffer<{dtype_c}> c;"
+    )
     lines.append("")
 
     # Entry point — delegates to mm_tile::computeTile<Epilogue>
@@ -534,9 +536,7 @@ def _render_mm_int8_slang(
     lines: list[str] = []
     lines.append("// OP.24 mm_int8 wrapper — auto-generated")
     lines.append(f"// TILE_M={tile_m} TILE_N={tile_n} TILE_K={tile_k}")
-    lines.append(
-        f"// M_PER_THREAD={m_per_thread} N_PER_THREAD={n_per_thread}"
-    )
+    lines.append(f"// M_PER_THREAD={m_per_thread} N_PER_THREAD={n_per_thread}")
     lines.append("")
 
     # Link-time specialization: define constants BEFORE import.

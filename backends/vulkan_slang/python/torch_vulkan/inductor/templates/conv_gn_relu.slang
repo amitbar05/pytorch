@@ -170,10 +170,8 @@ void computeMain(
             }
         }
 
-        // ── Bias ──
-        /*{%*/ if has_bias /*%}*/
+        // ── Bias (always emitted; dummy zero buffer when no bias) ──
         sum += args.bias[co];
-        /*{%*/ endif /*%}*/
 
         // ── Online Welford via shared helper ──
         // Pre-norm value; the fix vs the old shader is that we do NOT
@@ -248,10 +246,8 @@ void computeMain(
             }
         }
 
-        // ── Bias ──
-        /*{%*/ if has_bias /*%}*/
+        // ── Bias (always emitted; dummy zero buffer when no bias) ──
         sum += args.bias[co];
-        /*{%*/ endif /*%}*/
 
         // ── Normalize the raw conv+bias value, then apply GN affine ──
         // Mirrors ``F.group_norm`` exactly: ``(x - mean) * rstd * gamma + beta``.

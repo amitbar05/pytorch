@@ -54115,6 +54115,68 @@ class TestMCG5ConvBackwardHygiene:
             )
 
 
+class TestMSF4JinjaToSlangGenerics:
+    """M-SF.4 (v7) — eliminate Jinja string templates, use Slang generics.
+
+    Anti-goal #6: no string-based template parameters.
+    """
+
+    def test_conv2d_slang_no_has_bias_jinja(self):
+        """slang_conv2d.slang has zero ``{% if has_bias %}`` blocks."""
+        import os
+
+        tmpl_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+        )
+        path = os.path.join(tmpl_dir, "slang_conv2d.slang")
+        src = open(path).read()
+        assert "{% if has_bias %}" not in src, (
+            "M-SF.4: slang_conv2d.slang must not have has_bias Jinja "
+            "conditionals (bias is now always declared, gated at runtime)"
+        )
+        assert "{% endif %}" not in src, (
+            "M-SF.4: slang_conv2d.slang should have zero Jinja blocks "
+            "after has_bias removal"
+        )
+
+    def test_conv_gn_relu_slang_no_has_bias_jinja(self):
+        """conv_gn_relu.slang has zero ``{% if has_bias %}`` blocks."""
+        import os
+
+        tmpl_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+        )
+        path = os.path.join(tmpl_dir, "conv_gn_relu.slang")
+        src = open(path).read()
+        assert "{% if has_bias %}" not in src, (
+            "M-SF.4: conv_gn_relu.slang must not have has_bias Jinja"
+        )
+
+    def test_mm_render_defaults_to_module_path(self):
+        """``_render_mm_slang`` defaults to ``use_module=True``."""
+        import inspect
+
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_slang,
+        )
+
+        sig = inspect.signature(_render_mm_slang)
+        assert sig.parameters["use_module"].default is True, (
+            "M-SF.4: _render_mm_slang must default to use_module=True "
+            "(link-time specialization path, no dtype Jinja)"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 
