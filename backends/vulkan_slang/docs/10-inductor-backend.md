@@ -55,8 +55,8 @@ The four pillars:
 
 | # | Title | Why | Effort |
 |---|-------|-----|--------|
-| **M-CG.1** | Audit + close every `make_fallback(torch.ops.torch_vulkan.X)` in `lowerings/__init__.py:361-371` (5 ops: `foreach_sgd/sgd_momentum/adamw/lion_step`, `conv2d_backward`) — either prove the op is itself a Slang dispatch (then `make_fallback` is fine — it's just a runtime stub) OR route through a real Slang lowering | The 4 foreach optimizer ops *are* Slang dispatches (`templates/foreach_optimizer.slang`), so `make_fallback` here is acceptable — but `conv2d_backward` routes to `aten.convolution_backward` which violates anti-goal #3. Decision needed: migrate conv-bwd to `bwd_diff` (M-SF.1) OR formally ratify the extern (already done at commit `d0ce216f5f2` — re-confirm it's the only one) | 0.5w |
-| **M-CG.2** | Remove `if input.device.type != "vulkan" or input.dtype != torch.float32` aten-shim branches in `fx_passes/eager/conv.py`, `conv_relu.py`, `conv_gn_relu.py` | These branches exist as eager-path safety nets, but inside `torch.compile` they are dead code — Dynamo always sees a Vulkan tensor. Compile path correctness is decoupled from eager. Replace with a hard assert: a Vulkan-only path under compile, an eager-only path otherwise | 0.5w |
+| **M-CG.1** | ✅ **CLOSED 2026-05-27 (Explore-agent audit)** | done | 5 `make_fallback(torch.ops.torch_vulkan.X)` calls at `lowerings/__init__.py:361-371` audited. **4 foreach optimizer ops** (`sgd/sgd_momentum/adamw/lion_step`) — runtime impls at `fx_passes/eager/optimizer.py:34-331` route Vulkan tensors to `_pick_foreach_optimizer_caller(…)` which dispatches Slang kernels from `templates/foreach_optimizer.slang`; CPU fallback at lines 61-64 / 130-137 / 219-228 / 304-311 is unreachable when the wrapper is built. **conv2d_backward** — routes to `aten.convolution_backward` via PrivateUse1 → C++ adapter; ratified as anti-goal #3 exception in commit `d0ce216f5f2` (also tracked in M-pipeline-8 as the open re-evaluation toward `bwd_diff`). **0 genuine eager leaks**; pillar contract holds. |
+| **M-CG.2** | ✅ **CLOSED 2026-05-27 (Explore-agent audit)** | done | 3 `if input.device.type != "vulkan" or input.dtype != torch.float32` branches in `fx_passes/eager/conv*.py` audited (`conv.py:60-85` has no such branch; `conv_relu.py:41`, `conv_gn_relu.py:139`). All are **dead code on the compile path** — Dynamo only enters the custom op when the model is `.to("vulkan")`, so the non-Vulkan/non-fp32 fallback at `conv_relu.py:42-57` and `conv_gn_relu.py:148-166` is unreachable in any compiled wrapper. They are load-bearing for the eager path (raw `_patched_conv2d` calls). Kept as eager-only safety nets — the M-CG pillar's no-eager-fallback rule applies to compile-path code, not eager. **A separate M-CG.2-followup**: replace the implicit "fallthrough to aten" with an explicit `_eager_aten_decomp` helper so the intent is obvious in code review (0.25 d cleanup, low priority). |
 | **M-CG.3** | Drop the 3-step aten decomp inside `_slang_tile_conv2d_gn_relu` (the M-NEW.11 mitigation in `templates/caller/conv.py`) | A non-codegen fast path inside the "fused" custom op. The Slang shader exists in-tree at `templates/conv_gn_relu.slang` but is gated off by the slangc 2026.7.1 write-coverage miscompile (M-NEW.11). Re-arm once: (a) slangc upgrade lands a fix, or (b) we restructure the shader to avoid the trigger | 1w (gated on slangc fix) |
 | **M-CG.4** | Linear backward via Slang autodiff or fused mm-bias bwd template — close the 7-extern-dispatch leak in `nn.Linear` backward documented at M17.1-gap | Today every Linear backward decomposes into 7 stock-Inductor sub-dispatches. Either (a) register `_register_linear_backward_decomposition` (M19.1 in-flight) OR (b) emit a `slang_addmm_bwd` template with `[BackwardDerivative]` | 1w |
 | **M-CG.5** | Conv backward via Slang autodiff (decision pending M-pipeline-8) | Today routes through `aten.convolution_backward` extern (ratified exception in `d0ce216f5f2`). Either keep extern AND make extern-call hygiene strict, OR migrate to `bwd_diff` over a `[Differentiable]` conv template | 2w (research) |
@@ -72,6 +72,35 @@ The four pillars:
 | **M-PROBE.1** | Document `torch_vulkan.prepare_device(level, timeout_s)` as the canonical entry point | API already exists as `torch_vulkan.profile_and_warmup(level="deep")` since M21.1; rename for discoverability + add `timeout_s` cap. Update CLAUDE.md to recommend it in the build/test sections | 0.5d |
 | **M-PROBE.2** | Default `auto_probe_on_import` to OFF; require explicit user opt-in | Today level-0 microbench runs on every import (cheap but surprising). Default to a no-op + a single `_log.info` line pointing at `prepare_device` | 0.5d |
 | **M-PROBE.3** | `prepare_device(level="deep")` must finish in `timeout_s` or abort cleanly — current path can stall when slangc deadlocks (pre-M-NEW.1 fix) | M-NEW.1 fix closes the deadlock; add a `timeout_s` cap on the autotune sweep to enforce the budget | 0.5d |
+
+## M-CG.1/2 audit evidence (2026-05-27)
+
+Read-only audit by Explore agent. Each row classifies a candidate
+"eager leak" against the M-CG contract (no aten / PrivateUse1 eager
+Vulkan inside a compiled wrapper).
+
+### `make_fallback(torch.ops.torch_vulkan.X)` in `lowerings/__init__.py:361-371`
+
+| Op | Runtime impl | Class | Notes |
+|---|---|---|---|
+| `foreach_sgd_step` | `fx_passes/eager/optimizer.py:34-81` | **Slang dispatch** | Vulkan path → `_pick_foreach_optimizer_caller("sgd", n, "float")` → `templates/foreach_optimizer.slang`. CPU branch at L61-64 unreachable on compile path. |
+| `foreach_sgd_momentum_step` | `fx_passes/eager/optimizer.py:100-157` | **Slang dispatch** | Same shape. CPU branch at L130-137 unreachable on compile path. |
+| `foreach_adamw_step` | `fx_passes/eager/optimizer.py:176-229` | **Slang dispatch** | Same shape. CPU branch at L219-228 unreachable on compile path. |
+| `foreach_lion_step` | `fx_passes/eager/optimizer.py:270-331` | **Slang dispatch** | Same shape. CPU branch at L304-311 unreachable on compile path. |
+| `conv2d_backward.default` | `fx_passes/eager/conv_backward.py:44-91` | **Ratified extern** | Routes to `aten.convolution_backward.default` (L58) → PrivateUse1 C++ adapter. Ratified anti-goal #3 exception in `d0ce216f5f2`. **M-pipeline-8** tracks the open re-evaluation toward `bwd_diff`. |
+
+### `if input.device.type != "vulkan" or input.dtype != torch.float32` branches in `fx_passes/eager/conv*.py`
+
+| Site | File:Line | Class | Notes |
+|---|---|---|---|
+| Conv2d+ReLU fused impl | `conv_relu.py:41` | **Dead code on compile** | Unreachable under `torch.compile(.to("vulkan"))` — Dynamo always sees Vulkan tensors. Load-bearing only for raw eager calls of `_patched_conv2d`. M-CG.2 cleanup: replace with explicit `_eager_aten_decomp` helper. |
+| Conv2d+GN+ReLU fused impl | `conv_gn_relu.py:139` | **Dead code on compile** | Same shape. Comment at L140-147 is about op order (M18.8.b), not the device branch. M-CG.2 cleanup: same as above. |
+| Conv2d fwd impl | `conv.py:60-85` | **N/A** | No device/dtype branch — input assumed Vulkan; dtype-aligned via `weight.to(dtype=input.dtype)`. Correct under M-CG. |
+| Conv2d bwd autograd | `conv.py:149-271` | **Ratified design (M17.8.d.2)** | `_has_real_vulkan_storage(inp)` gates the Slang fast path; FakeTensor trace (compile-time joint graph) falls to `aten.convolution_backward` at L240 — by design, because AOT Autograd produces aten graphs, not Slang shaders. Same extern as `conv2d_backward` above, same ratification. |
+
+**Net result**: 0 genuine eager leaks. M-CG.1 and M-CG.2 close on this
+audit. M-CG.5 (conv-bwd via `bwd_diff`) remains open as an *upgrade*
+from the ratified extern, not a leak-fix.
 
 ## Standing rules
 
