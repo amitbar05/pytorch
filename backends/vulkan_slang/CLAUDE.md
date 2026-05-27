@@ -57,12 +57,15 @@ roadmap item.
 * **M-SF.1** ✅ — ParameterBlock<KernelArgs> at 100% coverage on all
   actively-used templates (2026-05-27).  The 2 stale `.py.jinja` files
   with manual bindings were deleted; `.slang` is the canonical format.
+* **M-CG.4** ✅ — M19.1 linear-backward decomposition (2026-05-27).
+  Replaces the 7-8 dispatch C++ eager extern with mm+mm+sum primitives
+  routing through Slang kernels.  Unblocked by M22.13 mm transpose-a fix.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-8 milestones remain. Next-up candidates: **M-CG.4**
-(Linear-bwd ≤2 dispatches), **M-VAL.2** (per-kernel autotune VUID gate),
-**M-SF.2** ([BackwardDerivative] 30% → 80%).
+7 milestones remain. Next-up candidates: **M-VAL.2**
+(per-kernel autotune VUID gate), **M-SF.2** ([BackwardDerivative]
+30% → 80%), **M-SF.3** (spec constants beyond mm).
 
 ## Companion docs
 
