@@ -219,6 +219,9 @@ def _register_bce_with_logits_backward_special(register_lowering, L, aten) -> No
     fallthrough lets the upstream lowering (or the AOT decomposition) handle
     the weighted case correctly.
     """
+    if not hasattr(aten, "binary_cross_entropy_with_logits_backward"):
+        return  # Op not available in this PyTorch version
+
     op = _ensure_binary_loss_bwd_diff_op(
         "aten.binary_cross_entropy_with_logits_backward"
     )

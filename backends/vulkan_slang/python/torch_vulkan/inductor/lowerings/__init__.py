@@ -98,8 +98,6 @@ def _suppress_upstream_decomps() -> None:
         # Slang backward execute instead of 4-6 dispatches of primitives.
         aten.mse_loss_backward.default,
         aten.binary_cross_entropy_backward.default,
-        aten.binary_cross_entropy_with_logits_backward.default,
-        aten.l1_loss_backward.default,
         aten.smooth_l1_loss_backward.default,
         aten.huber_loss_backward.default,
         # PF.26: Upstream decomp rewrites this as ``mask.type_as(grad) *
@@ -159,6 +157,10 @@ def _suppress_upstream_decomps() -> None:
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
     ops_to_suppress.append(aten.matmul.default)
+    # Guard ops that may not exist in all PyTorch versions
+    for _attr in ("binary_cross_entropy_with_logits_backward", "l1_loss_backward"):
+        if hasattr(aten, _attr):
+            ops_to_suppress.append(getattr(aten, _attr).default)
     # OP.26: also pop from the AOT decomp table so AOT autograd does not
     # decompose aten.scaled_dot_product_attention before Inductor sees it.
     _aot_decomps.pop(aten.scaled_dot_product_attention.default, None)
@@ -175,8 +177,6 @@ def _suppress_upstream_decomps() -> None:
     for _op in [
         aten.mse_loss_backward.default,
         aten.binary_cross_entropy_backward.default,
-        aten.binary_cross_entropy_with_logits_backward.default,
-        aten.l1_loss_backward.default,
         aten.smooth_l1_loss_backward.default,
         aten.huber_loss_backward.default,
         # TRAIN.4 (2026-05-27): nll_loss_backward — our lowering in
@@ -186,6 +186,10 @@ def _suppress_upstream_decomps() -> None:
         aten.nll_loss_backward.default,
     ]:
         _aot_decomps.pop(_op, None)
+    # Guard ops that may not exist in all PyTorch versions
+    for _attr in ("binary_cross_entropy_with_logits_backward", "l1_loss_backward"):
+        if hasattr(aten, _attr):
+            _aot_decomps.pop(getattr(aten, _attr).default, None)
     # M18.TB.1 / P12: also pop clamp, clamp_min, clamp_max from the global
     # AOT decomp table. Without this, the upstream torch._refs decomps cause
     # infinite recursion under AOTAutograd tracing:

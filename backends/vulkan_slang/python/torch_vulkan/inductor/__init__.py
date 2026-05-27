@@ -266,9 +266,25 @@ def _install_vulkan_cpu_timer_benchmark() -> None:
                 fn_args = fn_args or ()
                 fn_kwargs = fn_kwargs or {}
                 if not fn_args and not fn_kwargs:
-                    callable_ = fn
+                    _raw_fn = fn
                 else:
-                    callable_ = lambda: fn(*fn_args, **fn_kwargs)
+                    _raw_fn = lambda: fn(*fn_args, **fn_kwargs)
+
+                # TRAIN.10 (2026-05-27): wrap each callable with Vulkan GPU
+                # synchronisation. Vulkan dispatches are asynchronous — without
+                # explicit sync, benchmark_cpu's inner loop (warmup + rep
+                # iterations) fills the command buffer with unflushed dispatches
+                # until vkQueueSubmit blocks or returns VK_ERROR_OUT_OF_DEVICE_MEMORY.
+                # All kernel candidates then return Infinity → autotune fails.
+                import torch_vulkan as _tv
+
+                def _sync():
+                    _tv.synchronize(0)
+
+                def callable_():
+                    _raw_fn()
+                    _sync()
+
                 warmup = kwargs.pop(
                     "warmup",
                     _bm.inductor_config.inductor_default_autotune_warmup,

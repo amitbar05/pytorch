@@ -226,7 +226,9 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
 
     _BINARY_INLINE_OPS = {
         "aten.mse_loss_backward",
+        "aten.l1_loss_backward",
         "aten.binary_cross_entropy_backward",
+        "aten.binary_cross_entropy_with_logits_backward",
         "aten.smooth_l1_loss_backward",
         "aten.huber_loss_backward",
     }

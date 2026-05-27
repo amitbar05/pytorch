@@ -30,6 +30,7 @@ _UNARY_BWD_DIFF_OPS = frozenset(
 _BINARY_LOSS_BWD_DIFF_OPS = frozenset(
     {
         "aten.mse_loss_backward",
+        "aten.l1_loss_backward",
         "aten.binary_cross_entropy_backward",
         "aten.binary_cross_entropy_with_logits_backward",
         "aten.smooth_l1_loss_backward",

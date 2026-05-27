@@ -153,7 +153,11 @@ BWD_DIFF_TABLE: dict[str, BwdDiffEntry] = {
         2,
         no_diff_params=("delta",),
     ),
-    "aten.kl_div_backward": BwdDiffEntry("kl_div_elem", "losses", 2),
+    # TRAIN.1 (2026-05-27): aten.kl_div_backward removed — phantom entry.
+    # PyTorch does not expose kl_div_backward as an aten op. KL divergence
+    # backward is computed through autograd C++ that decomposes into primitives
+    # (exp, sub, mul, etc.) before any aten op is emitted. The entry was dead
+    # code — no graph would ever produce aten.kl_div_backward.
 }
 
 

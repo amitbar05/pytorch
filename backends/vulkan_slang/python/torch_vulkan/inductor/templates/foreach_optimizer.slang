@@ -145,10 +145,13 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     }
 /*{%*/ endif /*%}*/
 
-    // Weight decay (applied to all algorithms).
+/*{%*/ if algorithm in ("sgd", "sgd_momentum") /*%}*/
+    // Weight decay (L2 regularization for SGD variants only).
+    // AdamW/Lion use decoupled weight decay in their update formulas below.
     if (cfg.weight_decay != 0.0f) {
         g += cfg.weight_decay * p;
     }
+/*{%*/ endif /*%}*/
 
 /*{%*/ if algorithm == "sgd" /*%}*/
     // SGD: p = p - lr * g
