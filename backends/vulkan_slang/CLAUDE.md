@@ -78,7 +78,7 @@ roadmap item.
 
 2 milestones remain: **M-SF.4** (Jinja → Slang generics),
 **M-SF.5** (reflection metadata num_atomics).
-(M-CG.3 blocked on slangc fix; M-CG.5 is 2w research).
+(M-CG.5 is 2w research — conv backward autodiff).
 
 ## Companion docs
 

@@ -4,10 +4,11 @@
 //
 // Workgroup decomposition: one WG per (batch, group) row.
 // Grid:  (N * G, 1, 1)   where G = num_groups for GroupNorm
-// numthreads: (256, 1, 1)
+// numthreads: (64, 1, 1) — single wave64 (avoids slangc 2026.7.1
+//   multi-wave write-coverage miscompile, Group-D 2026-05-21).
 //
 // Each WG handles group_size = (C_out / G) * oH * oW output elements.
-// 256 threads stride across the group_size elements.
+// 64 threads stride across the group_size elements.
 //
 // PyTorch semantics being matched (SmallCNN-style):
 //   ``F.relu(F.group_norm(F.conv2d(x, w, bias)))``
@@ -99,7 +100,7 @@ struct KernelArgs {
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 [shader("compute")]
-[numthreads(256, 1, 1)]
+[numthreads(64, 1, 1)]
 void computeMain(
     uint3 gid : SV_GroupID,
     uint3 lid : SV_GroupThreadID)
@@ -135,7 +136,7 @@ void computeMain(
     // element.
     Welford local_wf = { 0.0f, 0.0f, 0.0f };
 
-    for (uint d = tid; d < S; d += 256) {
+    for (uint d = tid; d < S; d += 64) {
         // Decode (co, oh, ow) from flat index within the group row
         uint co_local    = d / spatial_size;
         uint spatial_idx = d % spatial_size;
@@ -187,7 +188,7 @@ void computeMain(
     wf.mean = local_wf.mean;
     wf.m2   = local_wf.m2;
     wf.n    = local_wf.n;
-    WelfordResult<float> stats = wg_welford(wf, tid, 256u, VK_SUBGROUP_SIZE);
+    WelfordResult<float> stats = wg_welford(wf, tid, 64u, VK_SUBGROUP_SIZE);
 
     float mean = stats.mean;
     float var  = (stats.n > 0.0f) ? stats.m2 / stats.n : 0.0f;
@@ -210,8 +211,11 @@ void computeMain(
     // (conv + group_norm + relu) until either the slangc bug is
     // narrowed or a different shader structure is found.  This block
     // is preserved as a regression baseline + documentation.
+    // M-CG.3 (2026-05-27): reduced WG from 256→64 to avoid the slangc
+    // 2026.7.1 multi-wave write-coverage miscompile.  With single-wave,
+    // the store is never dropped.
     // ═══════════════════════════════════════════════════════════════
-    for (uint d = tid; d < S; d += 256) {
+    for (uint d = tid; d < S; d += 64) {
         uint co_local    = d / spatial_size;
         uint spatial_idx = d % spatial_size;
         uint oh          = spatial_idx / pc.oW;

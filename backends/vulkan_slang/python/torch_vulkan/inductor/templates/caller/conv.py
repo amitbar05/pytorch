@@ -108,46 +108,10 @@ def _slang_tile_conv2d_gn_relu(
 
     from ...runtime import compile_and_dispatch
 
-    # ── Group-D fallback (2026-05-21): bypass the broken fused shader ──
-    # The slangc 2026.7.1 miscompile drops Wave 1 stores; verified via
-    # the probe in agent_space/probe_cgr_write_pattern.py.  Until a
-    # clean shader rewrite lands, route through 3 eager aten dispatches.
-    # This preserves SmallCNN's forward-vs-CPU correctness at the cost
-    # of an extra dispatch per fused block.
-    #
-    # NB: a ``bias=None`` ``aten.convolution`` call on PrivateUse1 trips
-    # a ``tensor does not have a device`` error inside torch core (the
-    # same blocker documented in row B of § 0.0.6 of the roadmap), so
-    # we synthesise a zero bias to keep the fallback path exception-free.
-    _input_c = input_t.contiguous() if not input_t.is_contiguous() else input_t
-    _weight_c = weight_t.contiguous() if not weight_t.is_contiguous() else weight_t
-    if bias is not None:
-        _bias = bias
-    else:
-        _bias = torch.zeros(
-            _weight_c.shape[0], dtype=_input_c.dtype, device=_input_c.device
-        )
-    _conv_out = torch.ops.aten.convolution.default(
-        _input_c,
-        _weight_c,
-        _bias,
-        list(stride),
-        list(padding),
-        list(dilation),
-        False,
-        [0, 0],
-        1,
-    )
-    _gn_out = F.group_norm(
-        _conv_out,
-        int(num_groups),
-        gn_weight.view(-1),
-        gn_bias.view(-1),
-        float(eps),
-    )
-    out.copy_(F.relu(_gn_out))
-    return
-    # ── End fallback; original dispatch wiring retained below ──
+    # ── Group-D fix (2026-05-27): reduced WG 256→64, avoids slangc ──
+    # 2026.7.1 multi-wave write-coverage miscompile.  The fused shader
+    # (conv_gn_relu.slang) is now re-armed.
+    # Previous fallback (3-dispatch aten decomp) is removed.
 
     N, C_in, iH, iW = input_t.shape
     C_out, C_in_w, kH, kW = weight_t.shape
@@ -176,7 +140,8 @@ def _slang_tile_conv2d_gn_relu(
     #     miscompile that dropped Wave 1's stores when Pass 3's
     #     ``d``-stride loop mirrored Pass 1's.
     # Cache-busting tag prevents stale SPIR-V blobs from being reused.
-    cache_key = f"conv_gn_relu_{dtype_s}{'_bias' if has_bias else ''}_m17p3_relufix2"
+    # Bumped for M-CG.3 WG 256→64 fix (avoids slangc write-coverage bug).
+    cache_key = f"conv_gn_relu_{dtype_s}{'_bias' if has_bias else ''}_mcg3_wg64"
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
@@ -583,10 +548,7 @@ def _slang_tile_conv2d_bwd(
     # has_bias). The same SPIR-V module serves every tile combo;
     # the tuple is applied as a pipeline spec-constant override at
     # dispatch time.
-    cache_key = (
-        f"slang_conv_bwd_m20p3_{dtype_s}"
-        f"{'_bias' if has_bias else ''}"
-    )
+    cache_key = f"slang_conv_bwd_m20p3_{dtype_s}{'_bias' if has_bias else ''}"
 
     # M20.3: Vulkan specialization constant overrides for the tile
     # tuple (constant_id 40-44). One pipeline per tuple, but the same

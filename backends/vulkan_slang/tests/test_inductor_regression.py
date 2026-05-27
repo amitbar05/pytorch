@@ -54019,6 +54019,62 @@ class TestMProbe2AutoOff:
         )
 
 
+class TestMCG3ConvGnReluFusedShader:
+    """M-CG.3 (v7) — conv_gn_relu fused shader re-armed.
+
+    The slangc 2026.7.1 multi-wave write-coverage miscompile (Group-D)
+    was worked around by reducing workgroup size from 256→64 (single
+    wave64).  The 3-dispatch aten decomp fallback in the Python caller
+    has been removed; the fused shader is the active path.
+    """
+
+    def test_fallback_removed_from_caller(self):
+        """The 3-dispatch aten decomp fallback must NOT be present
+        in ``_slang_tile_conv2d_gn_relu``."""
+        import inspect
+
+        from torch_vulkan.inductor.templates.caller.conv import (
+            _slang_tile_conv2d_gn_relu,
+        )
+
+        src = inspect.getsource(_slang_tile_conv2d_gn_relu)
+        # The old fallback used aten.convolution + F.group_norm + F.relu
+        assert "aten.convolution.default" not in src, (
+            "M-CG.3: aten.convolution fallback must be removed from "
+            "_slang_tile_conv2d_gn_relu"
+        )
+        assert "F.group_norm" not in src, (
+            "M-CG.3: F.group_norm fallback must be removed"
+        )
+        # The fused dispatch must be the active path.
+        assert "compile_and_dispatch" in src, (
+            "M-CG.3: fused dispatch path must be re-armed"
+        )
+
+    def test_shader_uses_single_wave_workgroup(self):
+        """conv_gn_relu.slang uses numthreads(64,1,1) — single wave64."""
+        import os
+
+        tmpl_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+        )
+        path = os.path.join(tmpl_dir, "conv_gn_relu.slang")
+        src = open(path).read()
+        assert "[numthreads(64, 1, 1)]" in src, (
+            "M-CG.3: conv_gn_relu.slang must use numthreads(64,1,1) "
+            "(single wave64) to avoid slangc multi-wave miscompile"
+        )
+        # Must NOT have the old 256
+        assert "[numthreads(256, 1, 1)]" not in src, (
+            "M-CG.3: old numthreads(256,1,1) must be replaced with 64"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 
