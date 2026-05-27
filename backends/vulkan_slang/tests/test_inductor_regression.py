@@ -53451,6 +53451,131 @@ class TestM211cHardwareProbe:
         raise AssertionError("profile_and_warmup level='extreme' should ValueError")
 
 
+class TestMProbe1PrepareDevice:
+    """M-PROBE.1 (v7) — ``torch_vulkan.prepare_device(level, timeout_s)``
+    is the canonical entry point for profiling the GPU and warming up
+    shader/autotune caches before ``torch.compile``.
+
+    The API is a thin wrapper over the existing
+    :func:`torch_vulkan.profile_and_warmup` (M21.1) that adds an explicit
+    wall-clock budget and a v7-aligned name. These tests lock the public
+    API surface so a future rename doesn't silently break documented
+    user code.
+    """
+
+    def test_prepare_device_is_exported(self):
+        """``torch_vulkan.prepare_device`` exists at the top-level package."""
+        import torch_vulkan
+
+        assert hasattr(torch_vulkan, "prepare_device"), (
+            "torch_vulkan.prepare_device must be importable from the "
+            "top-level package (M-PROBE.1 public API contract)"
+        )
+        assert callable(torch_vulkan.prepare_device)
+
+    def test_prepare_device_signature_contract(self):
+        """Locked signature: ``prepare_device(level: str = 'deep', *,
+        timeout_s: float = 900.0, force: bool = False, verbose: bool = True)``.
+        """
+        import inspect
+
+        import torch_vulkan
+
+        sig = inspect.signature(torch_vulkan.prepare_device)
+        params = sig.parameters
+        # Positional-or-keyword: level
+        assert "level" in params
+        assert params["level"].default == "deep", (
+            f"level default should be 'deep', got {params['level'].default!r}"
+        )
+        # Keyword-only: timeout_s, force, verbose
+        for kw in ("timeout_s", "force", "verbose"):
+            assert kw in params, f"missing keyword param {kw!r}"
+            assert (
+                params[kw].kind == inspect.Parameter.KEYWORD_ONLY
+            ), f"{kw} must be keyword-only"
+        assert params["timeout_s"].default == 900.0
+        assert params["force"].default is False
+        assert params["verbose"].default is True
+
+    def test_prepare_device_rejects_invalid_level(self):
+        """Invalid level strings raise ``ValueError`` (matches
+        ``profile_and_warmup``)."""
+        import torch_vulkan
+
+        try:
+            torch_vulkan.prepare_device(level="extreme", timeout_s=1.0)
+        except ValueError as e:
+            assert "level" in str(e).lower()
+            return
+        raise AssertionError(
+            "prepare_device(level='extreme') should ValueError"
+        )
+
+    def test_prepare_device_passes_through_to_profile_and_warmup(self, tmp_path):
+        """``prepare_device`` delegates to ``profile_and_warmup`` (which
+        delegates to ``profile_device``) — verified via mock on the
+        underlying ``profile_device`` worker.
+        """
+        from unittest import mock
+
+        import torch_vulkan
+
+        os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
+        try:
+            with mock.patch(
+                "torch_vulkan.inductor.hardware_probe.profile_device",
+                return_value={
+                    "level": 0,
+                    "cached": False,
+                    "total_ms": 1.0,
+                },
+            ) as m:
+                result = torch_vulkan.prepare_device(
+                    level="quick", timeout_s=0.0, verbose=False
+                )
+        finally:
+            os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
+
+        assert m.called, "prepare_device must delegate to profile_device"
+        # timeout_s=0 takes the fast path (no thread spawn) so the result
+        # is the raw profile_device dict.
+        assert result["level"] == 0
+        assert result["cached"] is False
+
+    def test_prepare_device_returns_timed_out_on_budget_exceeded(self, tmp_path):
+        """When the underlying probe exceeds ``timeout_s``, ``prepare_device``
+        returns a dict with ``timed_out=True`` instead of blocking forever.
+        Background work continues so the next call benefits from warmed
+        caches.
+        """
+        import time as _time
+        from unittest import mock
+
+        import torch_vulkan
+
+        def _slow(level, force, verbose):
+            _time.sleep(2.0)
+            return {"level": level, "cached": False, "total_ms": 2000.0}
+
+        os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
+        try:
+            with mock.patch(
+                "torch_vulkan.profile_and_warmup", side_effect=_slow
+            ):
+                result = torch_vulkan.prepare_device(
+                    level="quick", timeout_s=0.3, verbose=False
+                )
+        finally:
+            os.environ.pop("TORCH_VULKAN_CACHE_DIR", None)
+
+        assert result.get("timed_out") is True, (
+            f"expected timed_out=True, got {result!r}"
+        )
+        assert result.get("timeout_s") == 0.3
+        assert result.get("level") == "quick"
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

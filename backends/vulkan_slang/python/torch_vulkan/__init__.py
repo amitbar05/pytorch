@@ -758,6 +758,110 @@ def profile_and_warmup(
     return profile_device(level=lvl, force=force, verbose=verbose)
 
 
+def prepare_device(
+    level: str = "deep",
+    *,
+    timeout_s: float = 900.0,
+    force: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """Profile the Vulkan device + warm up shader / autotune caches (v7 API).
+
+    Canonical entry point for the v7 ``M-PROBE`` pillar. Recommended
+    one-shot call at process start before any ``torch.compile``: it
+    consolidates the device microbench, shader-lib precompile, and
+    canonical-shape autotune sweep so the first compiled wrapper does
+    not pay slangc cold-compile latency.
+
+    Thin wrapper over :func:`profile_and_warmup` that adds an explicit
+    wall-clock ``timeout_s`` cap and a v7-aligned name. The level
+    semantics, env-var resolution, and on-disk marker behaviour are
+    unchanged.
+
+    Args:
+        level: ``"quick"`` (level 0, ~5 s — microbench only),
+            ``"medium"`` (level 1, ~30 s warm / minutes cold — adds
+            shader-lib + matmul template SPIR-V prewarm), or
+            ``"deep"`` (level 2, ~3 min warm / up to 15 min cold —
+            adds an autotune sweep over canonical mm and conv2d
+            shapes). Default ``"deep"``.
+        timeout_s: wall-clock budget for the whole call. If exceeded,
+            the function returns the partial result with
+            ``"timed_out": True`` rather than blocking forever. Set
+            to ``float("inf")`` to disable. Default 900 s (15 min) —
+            enough for a level-2 cold compile on a 16-CU box.
+        force: re-run even when the on-disk marker says the requested
+            level is already complete. Useful after a driver or
+            slangc upgrade.
+        verbose: print per-stage progress (default ``True``).
+
+    Returns:
+        Dict with ``"level"``, ``"cached"``, per-stage timings, and the
+        underlying probe result. If the call timed out, includes
+        ``"timed_out": True`` and ``"timeout_s": <float>``.
+
+    Example::
+
+        import torch_vulkan
+        torch_vulkan.prepare_device(level="deep", timeout_s=900)
+        # … model + opt setup …
+        compiled = torch.compile(model, backend="inductor")
+        for batch in train_loader:
+            train_step(compiled, batch)
+    """
+    if timeout_s is None or timeout_s <= 0 or timeout_s == float("inf"):
+        return profile_and_warmup(level=level, force=force, verbose=verbose)
+
+    import threading
+    import time as _time
+
+    # Run the underlying probe on a daemon thread so we can return cleanly
+    # on wall-clock timeout. The probe itself can't be cancelled safely
+    # (subprocess.run holds a lock), but the user gets control back and a
+    # clear "timed_out" signal. Background work keeps running and warms
+    # the on-disk cache for the next call.
+    container: dict = {}
+    exc_container: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            container["result"] = profile_and_warmup(
+                level=level, force=force, verbose=verbose
+            )
+        except BaseException as e:  # noqa: BLE001 — surfaced via container
+            exc_container.append(e)
+
+    t = threading.Thread(target=_runner, name="prepare_device", daemon=True)
+    t0 = _time.perf_counter()
+    t.start()
+    t.join(timeout=float(timeout_s))
+    elapsed = _time.perf_counter() - t0
+
+    if t.is_alive():
+        if verbose:
+            print(
+                f"torch_vulkan.prepare_device: timed out after {elapsed:.1f}s "
+                f"(budget {timeout_s:.0f}s) — returning partial result; "
+                f"background warmup continues."
+            )
+        return {
+            "level": level,
+            "cached": False,
+            "timed_out": True,
+            "timeout_s": float(timeout_s),
+            "elapsed_s": elapsed,
+        }
+
+    if exc_container:
+        raise exc_container[0]
+
+    result = container["result"]
+    result["timed_out"] = False
+    result["timeout_s"] = float(timeout_s)
+    result["elapsed_s"] = elapsed
+    return result
+
+
 def _empty_strided_vulkan(size, stride, dtype, lifetime_class: str = "transient"):
     """Allocate a Vulkan tensor with the given size/stride/dtype.
 

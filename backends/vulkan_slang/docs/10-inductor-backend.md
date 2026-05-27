@@ -1,38 +1,102 @@
-# Vulkan-Slang Inductor Backend Roadmap v6.3
+# Vulkan-Slang Inductor Backend Roadmap v7
 
-> **v5 North Star achieved (2026-05-10).** SmallCNN trains end-to-end.
-> **v6.1 closeouts** archived in [10-inductor-backend-history.md](10-inductor-backend-history.md).
-> **v6.2 (2026-05-13)** added M13–M16 from a four-track audit.
+> **v7 (2026-05-27)** — supersedes v6.x. A clean 4-pillar restatement of
+> what the backend must become. Pre-v7 audit logs, milestone closeouts,
+> and reconciliation tables are preserved below the divider as a v6.x
+> reference appendix; do not extend them. **Add new work under § v7
+> only.**
 >
-> **v6.3 (2026-05-18) overhaul** following a five-agent comprehensive
-> audit (FX / lowerings / scheduler+codegen / Slang-lib / runtime+validation).
-> Each agent tested hypotheses against the live pipeline; surfaced **6 P0
-> correctness blockers** (vk_wg_reduce_* undefined; FunctionalTensor
-> 3-copy drift in `conv.py:528,847`; `empty_like` in 8 backward decomps;
-> DTYPE_TO_SLANG element-size mismatches; Transformer 3D-matmul compile
-> crash; DescriptorPool FREE_BIT anti-pattern) and **31 new milestones**
-> across M18–M23. Subsequent full clean rebuild surfaced **4 additional
-> in-tree blockers** filed as M22.8–11 (66 unused meta-kernels in
-> `MetaKernels.cpp` = forgotten registrations or 600 LoC dead code;
-> `vulkan_empty` device-binding gap; etc.). See § 0.6.
->
-> § 0.5.2 reframings (corrections to prior numbers): persistent kernels
-> 40 % → 0 % effective; `[require]` capabilities 0 % → ~80 % already wired;
-> reflection metadata 100 % → 40 %.
->
-**Last updated: 2026-05-19 (session: v6.5 late-session wave — M-NEW.9 zero-grad bwd fix + M-RT.1/2 audit-script repair + M-CPP-AUDIT 1-6 cluster (descriptor cache TOCTOU + fence pool + pool growth + telemetry pybinds + Allocator 2B/2C) + M22.13 Stage 1 tripwires + audit-only plans M-AG5.1 / G.1 / K.2 / M22a-d / M-CV.2-3 / M19.3-5 / M20g SDPA infeasibility decision; roadmap v6.5 — see § 0.0.8 + § 0.0.9)**
+> M-NEW.1/2/6 compile-mode unblock and M18.9-fused-bwd-mask correctness
+> fix landed 2026-05-27. Compile-mode is no longer crashing on
+> ≥2-Linear / Conv2d graphs; the fused conv+gn+relu backward matches
+> CPU to < 1e-4. The v7 plan starts from there.
 
-**v6.5 supersedes v6.3** for cumulative state of audit closeouts. See § 0.0.8 for code-landed items and § 0.0.9 for audit-only / in-flight worktree items.
->
-> **Live state:** 9 model architectures train end-to-end under
-> `torch.compile`; 47 lowerings + 24 explicit decomp suppressions;
-> 57/58 `aten.*_backward` ops route through `bwd_diff_table`; buffer
-> pool at 36 % hit rate on MLP train. **Anti-goal #2 CLOSED** (`model_ops.cpp` deleted M16.3, build gate in `setup.py`). **OP.22 CLOSED** (`is_dynamic_stride()` wired into 8 codegen sites).
->
-> **Feature flags ON by default:** spec_constants, descriptor_indexing,
-> static_specialization, bank_conflict_pad, dynamic_shapes,
-> batch_dispatch, wrapper_fastpath, grid_aware_wg,
-> persistent_pointwise, buffer_pool, prewarm_on_import.
+---
+
+# § v7 — Active plan
+
+## North star
+
+A **codegen-only** Inductor backend on Vulkan/Slang that exploits Slang's
+compiler features, is validated against the Vulkan validation layer
+during autotune, and offers a single long-running `prepare_device` entry
+point so users pay the cold cost up front and `torch.compile` after that
+is fast.
+
+The four pillars:
+
+1. **M-CG — Codegen-only Inductor backend.** Every operator reaching
+   a compiled wrapper goes through a Slang kernel emitted by our
+   codegen. No `extern_kernels.X` shim to aten / PrivateUse1 eager
+   Vulkan inside the compiled wrapper. No "if device != vulkan: fall
+   through to aten" branches inside custom-op impls that the compiler
+   path can hit.
+
+2. **M-SF — Smart Slang feature usage.** Slang is a compiler platform,
+   not a transpiled-HLSL superset. Every kernel template uses
+   ParameterBlock + generics + interfaces + spec constants + reflection
+   metadata + `[BackwardDerivative]` where it pays. String-substituted
+   Jinja is the exception, not the rule.
+
+3. **M-VAL — Validation-driven codegen.** The Vulkan validation layer
+   is mandatory in tests and autotune. A VUID emitted during a
+   candidate compile is a rejected candidate; a VUID emitted during a
+   landed kernel is a test failure. A static Slang-AST validator runs
+   before slangc so codegen mistakes fail in milliseconds rather than
+   subprocess seconds.
+
+4. **M-PROBE — Profile-and-warmup entry point.** `torch_vulkan.prepare_device(level, timeout_s)`
+   profiles the device (launch latency, mem BW, LDS BW, atomic
+   throughput) and warms up shader-lib + matmul/conv autotune caches
+   so the first `torch.compile` after that is fast. Auto-probe-on-import
+   is deferred unless `TORCH_VULKAN_PROFILE_DEVICE=deep` is set.
+
+## v7 milestones
+
+| # | Title | Why | Effort |
+|---|-------|-----|--------|
+| **M-CG.1** | Audit + close every `make_fallback(torch.ops.torch_vulkan.X)` in `lowerings/__init__.py:361-371` (5 ops: `foreach_sgd/sgd_momentum/adamw/lion_step`, `conv2d_backward`) — either prove the op is itself a Slang dispatch (then `make_fallback` is fine — it's just a runtime stub) OR route through a real Slang lowering | The 4 foreach optimizer ops *are* Slang dispatches (`templates/foreach_optimizer.slang`), so `make_fallback` here is acceptable — but `conv2d_backward` routes to `aten.convolution_backward` which violates anti-goal #3. Decision needed: migrate conv-bwd to `bwd_diff` (M-SF.1) OR formally ratify the extern (already done at commit `d0ce216f5f2` — re-confirm it's the only one) | 0.5w |
+| **M-CG.2** | Remove `if input.device.type != "vulkan" or input.dtype != torch.float32` aten-shim branches in `fx_passes/eager/conv.py`, `conv_relu.py`, `conv_gn_relu.py` | These branches exist as eager-path safety nets, but inside `torch.compile` they are dead code — Dynamo always sees a Vulkan tensor. Compile path correctness is decoupled from eager. Replace with a hard assert: a Vulkan-only path under compile, an eager-only path otherwise | 0.5w |
+| **M-CG.3** | Drop the 3-step aten decomp inside `_slang_tile_conv2d_gn_relu` (the M-NEW.11 mitigation in `templates/caller/conv.py`) | A non-codegen fast path inside the "fused" custom op. The Slang shader exists in-tree at `templates/conv_gn_relu.slang` but is gated off by the slangc 2026.7.1 write-coverage miscompile (M-NEW.11). Re-arm once: (a) slangc upgrade lands a fix, or (b) we restructure the shader to avoid the trigger | 1w (gated on slangc fix) |
+| **M-CG.4** | Linear backward via Slang autodiff or fused mm-bias bwd template — close the 7-extern-dispatch leak in `nn.Linear` backward documented at M17.1-gap | Today every Linear backward decomposes into 7 stock-Inductor sub-dispatches. Either (a) register `_register_linear_backward_decomposition` (M19.1 in-flight) OR (b) emit a `slang_addmm_bwd` template with `[BackwardDerivative]` | 1w |
+| **M-CG.5** | Conv backward via Slang autodiff (decision pending M-pipeline-8) | Today routes through `aten.convolution_backward` extern (ratified exception in `d0ce216f5f2`). Either keep extern AND make extern-call hygiene strict, OR migrate to `bwd_diff` over a `[Differentiable]` conv template | 2w (research) |
+| **M-SF.1** | `ParameterBlock<KernelArgs>` for every kernel template (currently 45 % per § 0.5.2; non-mm pointwise/reduction still emit manual `[[vk::binding(N)]]`) | M20.2 already on the list; the M-NEW.1 fix proves the codegen path is stable enough to migrate | 1w |
+| **M-SF.2** | `[BackwardDerivative]` coverage 30 % → 80 % on hot elementals (currently only `pointwise.slang` has 29 ops) | Manual derivatives are 2-5× faster than `bwd_diff()` autodiff for hot leaves. Target: `reduction.slang`, `mm.slang`, `norm.slang` | 1-2w |
+| **M-SF.3** | `[[vk::constant_id(N)]]` spec constants for static shapes (currently 20 %, mm only) | Slang can constant-fold loops + DCE branches when shapes are spec-const. Push into conv, reduction, SDPA templates | 0.5w |
+| **M-SF.4** | Replace Jinja-`{{op_template}}` string templates with Slang `<Op : IPointwise>` / `<R : IReduction>` generics (anti-goal #6) | Reduction codegen still passes `op_template="OpSum"` as string; conv has Jinja `has_bias`/`has_activation` conditionals. Eliminating these unblocks `[Differentiable]` fusion across templates | 1-2w |
+| **M-SF.5** | Reflection metadata: use the parsed `num_atomics` field (currently 7/8 used) + autotune-time scoring of register pressure | M20.5 already wired 6/8 fields into heuristics; finishing the last 2 closes "smart" Slang feature usage at 100 % | 0.5w |
+| **M-VAL.1** | Validation layer ON by default during pytest (already env-controlled, default ON in `csrc/vulkan/Context.cpp:158`; the gap is making it actually fail tests on VUID) | Today validation is enabled but only warns. A VUID under autotune is currently invisible. Wire a `TORCH_VULKAN_VUID_AS_ERROR=1` knob and default it ON in `conftest.py` | 0.5w |
+| **M-VAL.2** | Per-kernel autotune VUID gate: skip candidates that emit a VUID at pipeline-creation | M21.2 in `0.6.4` is the milestone for this. `validation_codegen.py` infrastructure already exists; promote `TORCH_VULKAN_VALIDATE_CODEGEN` default `warn` → `error` in test mode | 0.5w |
+| **M-VAL.3** | Best-practices VUID sweep across 9 catalog models | M21.3 — sweep harness at `agent_space/m21_3_validation_sweep.py` exists, sweep not run. Run it; file each surfaced VUID with a fix or a documented exception | 1w |
+| **M-VAL.4** | Pre-slangc static AST validator for emitted Slang source (already at `runtime/validate*.py`, ratchets in `M22.1.i`) — promote to fail-fast in error mode | 17 → 0 spurious codegen attempts hitting slangc, milliseconds of saved time per autotune iteration | 0.5w |
+| **M-PROBE.1** | Document `torch_vulkan.prepare_device(level, timeout_s)` as the canonical entry point | API already exists as `torch_vulkan.profile_and_warmup(level="deep")` since M21.1; rename for discoverability + add `timeout_s` cap. Update CLAUDE.md to recommend it in the build/test sections | 0.5d |
+| **M-PROBE.2** | Default `auto_probe_on_import` to OFF; require explicit user opt-in | Today level-0 microbench runs on every import (cheap but surprising). Default to a no-op + a single `_log.info` line pointing at `prepare_device` | 0.5d |
+| **M-PROBE.3** | `prepare_device(level="deep")` must finish in `timeout_s` or abort cleanly — current path can stall when slangc deadlocks (pre-M-NEW.1 fix) | M-NEW.1 fix closes the deadlock; add a `timeout_s` cap on the autotune sweep to enforce the budget | 0.5d |
+
+## Standing rules
+
+* **No new work under v6.x sections.** They're frozen as a reference
+  appendix below.
+* **One commit per milestone.** Title format `vulkan: M-CG.2 — drop
+  non-Vulkan aten shims from fused custom-op impls` (no laundry-list
+  multi-purpose commits).
+* **A milestone is closed when a regression test is locked.** Pattern:
+  `tests/test_inductor_regression.py::TestMCG2NoEagerShimsInFusedOps`.
+* **No symptom-patches.** A new `meta_patches/` entry to dodge an
+  Inductor bug must be filed as a separate roadmap item with the
+  upstream cause, not folded into the parent fix.
+* **Closed items move to history.md.** When all sub-items in a
+  pillar close, archive the section and replace it with a one-line
+  pointer.
+
+---
+
+# § v6.x reference appendix (frozen 2026-05-27)
+
+Everything below this divider is the v6.x state at the start of v7. It
+is retained for back-link integrity and historical context but is no
+longer the active plan. Search this appendix for prior decisions; do
+not extend it.
 
 ---
 
