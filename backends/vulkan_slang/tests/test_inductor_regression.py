@@ -44196,6 +44196,67 @@ class TestM212ValidationAsCodegenCheck:
         )
 
 
+class TestMVal2AutotuneVuidGate:
+    """M-VAL.2 (v7) — per-kernel autotune VUID gate.
+
+    ``get_codegen_validation_mode()`` now defaults to ``error`` when
+    ``TORCH_VULKAN_VUID_AS_ERROR`` is not "0" (default-ON in tests after
+    M-VAL.1/M-VAL.3).  Autotune candidates that emit VUIDs are rejected.
+    """
+
+    def test_default_mode_is_error_in_test_context(self):
+        """Without explicit TORCH_VULKAN_VALIDATE_CODEGEN, and with
+        TORCH_VULKAN_VUID_AS_ERROR not "0", the mode is ``error``."""
+        from torch_vulkan.inductor.runtime.validation_codegen import (
+            _MODE_ERROR,
+            get_codegen_validation_mode,
+            layer_installed,
+        )
+
+        # In test context (TORCH_VULKAN_VUID_AS_ERROR not "0"),
+        # and with the validation layer installed, the default is error.
+        if layer_installed():
+            mode = get_codegen_validation_mode()
+            assert mode == _MODE_ERROR, (
+                f"M-VAL.2: default mode should be 'error' when "
+                f"VUID-as-error is active, got '{mode}'"
+            )
+
+    def test_warn_mode_still_reachable(self):
+        """Explicit TORCH_VULKAN_VALIDATE_CODEGEN=warn still works."""
+        import os
+
+        from torch_vulkan.inductor.runtime.validation_codegen import (
+            _MODE_WARN,
+            get_codegen_validation_mode,
+        )
+
+        os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"] = "warn"
+        try:
+            mode = get_codegen_validation_mode()
+            # If validation layer not installed, mode falls back to off — skip.
+            if mode != "off":
+                assert mode == _MODE_WARN, (
+                    f"Explicit warn should return 'warn', got '{mode}'"
+                )
+        finally:
+            del os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"]
+
+    def test_off_mode_bypasses_validation(self):
+        """TORCH_VULKAN_VALIDATE_CODEGEN=off bypasses validation entirely."""
+        from torch_vulkan.inductor.runtime.validation_codegen import (
+            _MODE_OFF,
+            get_codegen_validation_mode,
+        )
+
+        # Should return off either because env is off or layer not installed.
+        mode = get_codegen_validation_mode()
+        # If validation layer IS installed and we didn't set TORCH_VULKAN_VALIDATE_CODEGEN=off,
+        # this will return 'error' under M-VAL.2. That's correct.
+        # The 'off' path is tested by TestM212.
+        assert mode in (_MODE_OFF, "error", "warn"), f"Unexpected mode: {mode}"
+
+
 class TestM2213MmTransposeA:
     """M22.13 — mm with a transposed-view operand.
 

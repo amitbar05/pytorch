@@ -60,12 +60,16 @@ roadmap item.
 * **M-CG.4** ✅ — M19.1 linear-backward decomposition (2026-05-27).
   Replaces the 7-8 dispatch C++ eager extern with mm+mm+sum primitives
   routing through Slang kernels.  Unblocked by M22.13 mm transpose-a fix.
+* **M-VAL.2** ✅ — Per-kernel autotune VUID gate (2026-05-27).
+  `get_codegen_validation_mode()` defaults to `error` when
+  `TORCH_VULKAN_VUID_AS_ERROR` is not "0" — autotune candidates
+  emitting VUIDs are rejected via `RuntimeError`.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-7 milestones remain. Next-up candidates: **M-VAL.2**
-(per-kernel autotune VUID gate), **M-SF.2** ([BackwardDerivative]
-30% → 80%), **M-SF.3** (spec constants beyond mm).
+6 milestones remain. Next-up candidates: **M-SF.2**
+([BackwardDerivative] 30% → 80%), **M-SF.3** (spec constants beyond mm),
+**M-VAL.4** (pre-slangc AST validator).
 
 ## Companion docs
 

@@ -31,6 +31,7 @@ Module is import-safe even when validation layers aren't installed —
 returns a sentinel ``ValidationResult(returncode=0, vuids=[])`` so
 callers can always treat the result the same way.
 """
+
 from __future__ import annotations
 
 import logging
@@ -42,7 +43,6 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
 
 _log = logging.getLogger(__name__)
 
@@ -238,6 +238,11 @@ def get_codegen_validation_mode() -> str:
       spawning subprocesses that can't surface VUIDs).
 
     Returns one of ``{"off", "warn", "error"}``.
+
+    M-VAL.2 (v7): when ``TORCH_VULKAN_VUID_AS_ERROR`` is not "0"
+    (default-ON after M-VAL.1/M-VAL.3), the default mode is ``error``
+    instead of ``warn`` — autotune candidates that emit VUIDs are
+    rejected.  This makes test-mode autotune VUID-clean by default.
     """
     raw = os.environ.get("TORCH_VULKAN_VALIDATE_CODEGEN", "").strip().lower()
     if raw in ("", "0", "off", "false", "no"):
@@ -248,8 +253,13 @@ def get_codegen_validation_mode() -> str:
         return _MODE_OFF
     if raw == "error":
         return _MODE_ERROR
-    # Anything else collapses to warn — safer default than silently off.
-    return _MODE_WARN
+    if raw == "warn":
+        return _MODE_WARN
+    # M-VAL.2: default to error when VUID-as-error is active (test mode),
+    # warn otherwise.
+    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR", "") == "0":
+        return _MODE_WARN
+    return _MODE_ERROR
 
 
 def is_codegen_validation_enabled() -> bool:
