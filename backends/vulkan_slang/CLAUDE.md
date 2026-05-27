@@ -13,14 +13,32 @@ entries. No CPU fallbacks. No Python at deployment.
 
 # Where to work
 
-**The roadmap is `docs/10-inductor-backend.md`.** Read § 0 (active milestones)
-and § 0.5 (latest audit) at session start. Pick the highest-priority unblocked
-item and ship it. After each item: update its checkbox, write a regression
-test, move to the next. **Never stop to ask if you should continue** — work
-autonomously until manually stopped.
+**The roadmap is `docs/10-inductor-backend.md`.** Read **§ v7** at session
+start — that's the active plan. Everything below the divider in the doc
+is the v6.x reference appendix, retained for back-link integrity but no
+longer the active plan. Pick the highest-priority unblocked v7 milestone
+and ship it. After each item: update the status in the v7 table, write a
+regression test, move to the next. **Never stop to ask if you should
+continue** — work autonomously until manually stopped.
 
 If blocked, skip and note why in the roadmap. Don't symptom-patch; if a fix
 needs a new primitive, add a roadmap item for it.
+
+## v7 pillars (snapshot)
+
+1. **M-CG** — codegen-only Inductor backend. No `extern_kernels.X` to
+   aten / PrivateUse1 eager Vulkan inside compiled wrappers. No
+   "if device != vulkan: aten fallback" branches inside custom-op impls
+   that the compile path can hit.
+2. **M-SF** — smart Slang feature usage. ParameterBlock + generics +
+   interfaces + spec constants + `[BackwardDerivative]` + reflection.
+   String-substituted Jinja is the exception.
+3. **M-VAL** — validation-driven codegen. Vulkan validation layer
+   mandatory in tests (`TORCH_VULKAN_VUID_AS_ERROR=1`); VUID during
+   autotune → rejected candidate; VUID on landed kernel → test failure.
+4. **M-PROBE** — `torch_vulkan.prepare_device(level, timeout_s)` is the
+   canonical entry point. Run it once at process start; `torch.compile`
+   after that is fast.
 
 Companion docs:
 
@@ -129,7 +147,46 @@ python -m pytest tests/test_file.py::TestClass::test_name --timeout=30 -p no:fau
 # Force-regenerate Inductor cache
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 python -m pytest …
 rm -rf /tmp/torchinductor_$(whoami)   # clear between runs
+
+# M-VAL.1 (v7): treat any Vulkan VUID emitted during a test as a failure.
+# Opt-in until M-VAL.3 closes the residual best-practices-VUID backlog.
+TORCH_VULKAN_VUID_AS_ERROR=1 python -m pytest tests/test_file.py::test_name \
+    --timeout=30 -p no:faulthandler
 ```
+
+---
+
+# Recommended user pattern (v7 — M-PROBE.1)
+
+`torch_vulkan.prepare_device(level, timeout_s)` is the v7 canonical
+entry point. Run it once at process start before any `torch.compile` to
+pay the cold cost up front:
+
+```python
+import torch
+import torch_vulkan
+
+# Profile the GPU (launch latency, mem BW, LDS BW, atomic throughput) +
+# compile the shader-lib + matmul/conv autotune sweep. Cached at
+# ~/.cache/torch_vulkan/probe_status_<id>.json; second call short-circuits.
+torch_vulkan.prepare_device(level="deep", timeout_s=900)
+
+# … model + optimizer setup …
+compiled = torch.compile(model, backend="inductor")
+for batch in train_loader:
+    train_step(compiled, batch)
+```
+
+Levels: `"quick"` (~5 s, microbench only), `"medium"` (~30 s warm /
+minutes cold, + shader-lib + matmul SPIR-V), `"deep"` (~3 min warm / up
+to 15 min cold, + canonical-shape autotune sweep). Returns a dict with
+per-stage timings and the device profile; sets `timed_out=True` if
+`timeout_s` is exceeded (background warmup keeps running).
+
+Auto-probe-on-import is gated by `TORCH_VULKAN_PROFILE_DEVICE`
+(default `"auto"` → level 0 microbench only on cold import). Set to
+`"off"` in CI / scripted environments where you'd rather call
+`prepare_device` explicitly.
 
 ---
 

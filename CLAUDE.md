@@ -41,30 +41,20 @@ Loop:
    `autograd_registrations.py`, `faketensor_hooks.py`). If a fix needs
    a new primitive, add a roadmap item for the primitive instead.
 
-## v6.3 active milestones (snapshot 2026-05-18)
+## v7 active pillars (snapshot 2026-05-27)
 
-| # | Milestone | What it closes |
-|---|-----------|----------------|
-| **M17** | 🔥 Inductor VK perf parity with CPU | Highest priority. SmallCNN+GN at 3.9× CPU mid-progress; cut dispatch count to ≤5/step; reactivate Slang matmul; fuse conv+GN+relu + linear backward |
-| **M18** | 🔥🔥 Correctness sweep (P0) | M18.1 ✅, M18.4 partial ✅, M18.5 ✅, M18.6 ✅; M18.2 / M18.3 / M22.8 (meta-kernel audit) remain |
-| **M19** | Codegen completeness | Linear backward decomp wiring; persistent kernels; reduction-boundary fusion; vec4 progressive fallback; dynamic-shape conv lifting; foreach generic; complex pointwise C++ bridge |
-| **M20** | Slang feature re-investment (supersedes M13) | RNN cell bwd via autodiff; slang_mm `ParameterBlock` restore; conv_bwd / flash_attn_bwd spec-constant tiles; wave-intrinsic coverage; reflection metadata 40 % → 80 % |
-| **M21** | Hardware-profiling + validation infrastructure | Device-profile-on-import; validation-as-codegen-check; best-practices VUID sweep (M21.3.a debug-utils ✅); kernel-lifecycle stress |
-| **M22** | Anti-goal cleanup follow-on + rebuild blockers (refines M15) | 5 new file-size violators; `alloc_alias.py` IR migration; M22.8 ✅ (meta-kernel audit), M22.9 ✅ (multi-GPU device-binding), M22.10–12 ✅ (warning sweep); M22.4 ✅ (`_replace_sdpa_with_custom_op` deleted) |
-| **M23** | Safety nets | `test_lib_module_no_undefined_symbols` ✅; capability-gate coverage test; render-binding-set assertion; combo-kernel chain-rename resolver |
-| **M9** | Host-overhead reduction | M9.1–M9.5, M9.8–M9.9 ✅; M9.6 / M9.7 remain |
-| **M11** | Occupancy-aware codegen | M11.1–M11.2, M11.9 ✅; refined by M20 (reflection routing now 40 %, target 80 %) |
-| **M12** | Reduction backward via autodiff | 6/8 reduction ops `[Differentiable]`. argmax/argmin correctly excluded (positions, not values) |
-| **M14** | Op coverage gaps (residual) | Sparse + quantized int8. Complex / foreach / dynamic-shape / RNN bwd merged into M19 / M20 |
-| **M15** | Anti-goal #5 / #7 cleanup | M15.1.a–k ✅; M15.2 ✅; followons tracked in M22 |
-| **M6** | Conv generality | Phase 1 + Phase 2 depthwise ✅; Phase 3-4 (3D / transposed) remain |
-| **M7** | Production hardening | Gated on slangc / AOTI / CI |
-| **M8** | Model zoo expansion | Ongoing — 9 architectures train end-to-end |
-| **M16** | ✅ Track 4 finish | CLOSED 2026-05-17. `csrc/ops/model_ops.cpp` deleted; `setup.py` build gate prevents re-introduction. Anti-goal #2 closed. |
+| # | Pillar | Goal |
+|---|--------|------|
+| **M-CG** | Codegen-only Inductor backend | No `extern_kernels.X` to aten / PrivateUse1 eager Vulkan inside compiled wrappers. No "if device != vulkan: aten fallback" branches inside custom-op impls that the compile path can hit. |
+| **M-SF** | Smart Slang feature usage | ParameterBlock + generics + interfaces + `[BackwardDerivative]` + spec consts + reflection metadata. String-substituted Jinja is the exception. |
+| **M-VAL** | Validation-driven codegen | Vulkan validation layer mandatory in tests (`TORCH_VULKAN_VUID_AS_ERROR=1`); VUID during autotune → rejected candidate; VUID on landed kernel → test failure. |
+| **M-PROBE** | Profile-and-warmup canonical entry | `torch_vulkan.prepare_device(level, timeout_s)` once at process start — pay the cold cost up front so `torch.compile` after that is fast. |
 
-Refer to the roadmap doc (`backends/vulkan_slang/docs/10-inductor-backend.md`)
-for the per-item checklist + § 0.6 / § 0.7 audit findings; don't re-derive
-priority here.
+The full v7 milestone table (16 items with file:line references and
+effort estimates) lives in
+`backends/vulkan_slang/docs/10-inductor-backend.md § v7`. Everything
+below the divider in that doc is the frozen v6.x reference appendix —
+do not extend it.
 
 ---
 
