@@ -14,32 +14,33 @@ style / anti-goal rules. Don't conflate the two scopes.
 
 | Doing what? | Read this |
 |-------------|-----------|
-| Any backend (vulkan_slang) work — almost always | **`backends/vulkan_slang/CLAUDE.md`** and **`backends/vulkan_slang/docs/10-inductor-backend.md`** |
-| Triage of a closed milestone | `backends/vulkan_slang/docs/10-inductor-backend-history.md` |
+| Any backend (vulkan_slang) work — almost always | **`backends/vulkan_slang/CLAUDE.md`** and **`backends/vulkan_slang/docs/10-inductor-backend.md § v7`** |
+| Open question on which roadmap item to pick | Roadmap § v7 (4 pillars, 16 milestones, file:line refs) |
+| Triage of a pre-v7 milestone or audit | `backends/vulkan_slang/docs/archive/v6.x-snapshot-2026-05-27.md` (then `10-inductor-backend-history.md` for v6.1 closeouts) |
 | Upstream `torch/_inductor/` change | This file, § *Upstream Inductor reference* below |
-| Open question on which roadmap item to pick | Roadmap § 0 (active milestones) + § 0.5 (audit numbers) |
 
 ---
 
 # Roadmap-driven workflow
 
 **`backends/vulkan_slang/docs/10-inductor-backend.md` is the canonical source
-of truth for what to work on.** Start every session by reading § 0
-(active milestones) and § 0.5 (latest audit). Pick the highest-priority
-unblocked item.
+of truth for what to work on.** Start every session by reading **§ v7** —
+the 4-pillar plan with 16 milestones, file:line references, and
+per-milestone status. Pre-v7 history is archived at
+`backends/vulkan_slang/docs/archive/v6.x-snapshot-2026-05-27.md`; search
+it for prior decisions, don't extend it.
 
 Loop:
-1. Pick the highest unchecked item in the earliest unblocked milestone.
-2. Implement → write a regression test → mark `[x]`. Move to the next item.
+1. Pick the highest-priority unblocked v7 milestone.
+2. Implement → write a regression test → mark ✅ in the v7 milestone
+   table → move to the next.
 3. Work autonomously; don't pause to ask "should I continue".
 4. Blocked? Skip, note the blocker in the roadmap, take the next item.
-5. Found a gap too big for the current change? Add it as a new roadmap
-   item (clear title, what's missing, rough effort) in the right milestone.
-6. Don't symptom-patch in `meta_patches/` (since the M15.1 split this is
-   now a directory: `op_registration.py`, `decomposition_passes.py`,
-   `shape_ops.py`, `joint_graph_passes.py`, `dtype_ops.py`,
-   `autograd_registrations.py`, `faketensor_hooks.py`). If a fix needs
-   a new primitive, add a roadmap item for the primitive instead.
+5. Found a gap too big for the current change? Add it as a new sub-item
+   under the right v7 pillar (clear title, what's missing, rough effort).
+6. Don't symptom-patch in `meta_patches/` — that directory exists as
+   anti-goal #5; if a fix needs a new primitive, file a v7 sub-item for
+   the primitive instead.
 
 ## v7 active pillars (snapshot 2026-05-27)
 
@@ -85,8 +86,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3 python setup.py build_ext --inplace
 See `backends/vulkan_slang/CLAUDE.md` for incremental / clean-build details.
 
 `MAX_JOBS=3` is the project default (per user memory `feedback_build_config`).
-When multiple agents share the box, drop further to `MAX_JOBS=2` per
-M22.16's concurrent-agent caution.
+When multiple agents share the box, drop to `MAX_JOBS=2`.
 
 **Never** mix the two. The upstream build rebuilds libtorch; the backend
 build rebuilds `_C_ext` against the already-installed libtorch in
@@ -172,9 +172,10 @@ compilation cache → returns `CompiledFxGraph` or `CompiledAOTI`.
 
 ## Style — `backends/vulkan_slang/` (backend files)
 - All of the above, **plus** anti-goal #7: **no file in
-  `python/torch_vulkan/inductor/` exceeds 800 lines.** When a file approaches
-  the cap, split — that's the explicit M15 work.
-- See `backends/vulkan_slang/CLAUDE.md` for the full anti-goal / discipline list.
+  `python/torch_vulkan/inductor/` exceeds 800 lines.** When a file
+  approaches the cap, split.
+- See `backends/vulkan_slang/CLAUDE.md` for the full anti-goal /
+  discipline list.
 
 ## Debug logging (upstream)
 ```python

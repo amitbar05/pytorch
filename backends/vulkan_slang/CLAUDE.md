@@ -13,16 +13,18 @@ entries. No CPU fallbacks. No Python at deployment.
 
 # Where to work
 
-**The roadmap is `docs/10-inductor-backend.md`.** Read **§ v7** at session
-start — that's the active plan. Everything below the divider in the doc
-is the v6.x reference appendix, retained for back-link integrity but no
-longer the active plan. Pick the highest-priority unblocked v7 milestone
-and ship it. After each item: update the status in the v7 table, write a
-regression test, move to the next. **Never stop to ask if you should
-continue** — work autonomously until manually stopped.
+**The roadmap is [`docs/10-inductor-backend.md`](docs/10-inductor-backend.md).**
+Read **§ v7** at session start — that's the active plan (16 milestones,
+4 pillars, file:line references). Pre-v7 history lives in
+[`docs/archive/v6.x-snapshot-2026-05-27.md`](docs/archive/v6.x-snapshot-2026-05-27.md);
+search it for prior decisions, don't extend it.
 
-If blocked, skip and note why in the roadmap. Don't symptom-patch; if a fix
-needs a new primitive, add a roadmap item for it.
+Pick the highest-priority unblocked v7 milestone, ship it, lock a
+regression test, mark it ✅ in the v7 table, move to the next.
+**Never stop to ask if you should continue** — work autonomously until
+manually stopped. If blocked, skip and note why in the roadmap. Don't
+symptom-patch; if a fix needs a new primitive, file it as its own
+roadmap item.
 
 ## v7 pillars (snapshot)
 
@@ -40,14 +42,31 @@ needs a new primitive, add a roadmap item for it.
    canonical entry point. Run it once at process start; `torch.compile`
    after that is fast.
 
-Companion docs:
+## What's already closed (v7)
+
+* **M-CG.1, M-CG.2** ✅ — Explore-agent audit (2026-05-27): zero
+  genuine eager-fallback leaks on the compile path. See § v7 audit
+  evidence in the roadmap.
+* **M-VAL.1** ✅ — VUID counter pybind + autouse fixture; opt-in via
+  `TORCH_VULKAN_VUID_AS_ERROR=1`. Flips to default-on when M-VAL.3
+  closes the residual best-practices backlog.
+* **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
+  timeout_s)` public API + timeout enforcement.
+
+11 milestones remain. Next-up candidates: **M-VAL.3** (run the existing
+best-practices VUID sweep across the 9-model catalog), **M-SF.1**
+(ParameterBlock 45 % → 100 %), **M-CG.4** (Linear-bwd ≤2 dispatches).
+
+## Companion docs
 
 | Doc | Purpose |
 |-----|---------|
-| `docs/codegen-optimization-roadmap.md` | Op coverage + Slang feature exploitation tracker |
-| `docs/how-to-compile-and-codegen.md` | Pipeline reference (compile APIs, dispatch tables) |
-| `docs/inductor-pipeline-analysis.md` | Architecture overview, Slang/Vulkan integration |
-| `docs/agent-prompt-implement-plan.md` | Copy-paste prompt for spawning sub-agents |
+| [`docs/10-inductor-backend.md`](docs/10-inductor-backend.md) | **The roadmap.** § v7 is the active plan. |
+| [`docs/archive/v6.x-snapshot-2026-05-27.md`](docs/archive/v6.x-snapshot-2026-05-27.md) | Frozen pre-v7 audit logs, milestone closeouts, reconciliations. |
+| [`docs/codegen-optimization-roadmap.md`](docs/codegen-optimization-roadmap.md) | Op coverage + Slang feature exploitation tracker. |
+| [`docs/how-to-compile-and-codegen.md`](docs/how-to-compile-and-codegen.md) | Pipeline reference (compile APIs, dispatch tables). |
+| [`docs/inductor-pipeline-analysis.md`](docs/inductor-pipeline-analysis.md) | Architecture overview, Slang/Vulkan integration. |
+| [`docs/agent-prompt-implement-plan.md`](docs/agent-prompt-implement-plan.md) | Copy-paste prompt for spawning sub-agents. |
 
 ---
 
@@ -67,11 +86,12 @@ Companion docs:
 6. No string-based template parameters — use Slang `interface` generics
    (e.g. `<Op : IPointwise>`), not Jinja `{{ epilogue }}::apply()`.
 7. No file in `python/torch_vulkan/inductor/` exceeds 800 lines.
-   Current top violators after the M15.1 splits: `runtime/slangc.py`
-   (~2100 L — M-cpp-new-2 candidate), `templates/caller/gemm/install.py`,
-   `fx_passes/eager/conv.py`, `templates/caller/rnn.py`, `kernel/main.py`,
-   `fx_passes/post_grad.py` (700 L post-M22.4, no longer in violation),
-   `kernel/header.py`, `wrapper.py`, `validate.py`.
+   Current state (2026-05-27): one active violator,
+   `kernel/pointwise.py` (820 L). The rest of the historical
+   M15.1 / M22.1 violator list has been split — most of the larger
+   files now sit in the 700-800 L band (`scheduling.py`, `runtime/
+   slangc.py`, `runtime/shader_lib.py`, `lowerings/conv.py`,
+   `kernel/header.py`, `buffer_pool.py`, `__init__.py`).
 8. No CPU fallbacks.
 
 # Discipline (durable)
@@ -80,8 +100,8 @@ Companion docs:
 2. Correctness before performance. Gradient parity with CPU is the exit criterion.
 3. Floor-gate-then-ratchet: land `xfail(strict=True)` first, then flip.
 4. Items that turn out wrong get removed, not annotated.
-5. ✅ Track 4 is **locked**: `csrc/ops/model_ops.cpp` is deleted and
-   `setup.py` enforces it. Anti-goal #2 is closed.
+5. One commit per milestone. Title format
+   `vulkan: M-X.Y — short why`. No laundry-list multi-purpose commits.
 
 ---
 
@@ -117,8 +137,7 @@ python -c "from torch_vulkan.inductor.runtime import precompile_shader_libs; pre
 ```
 
 `MAX_JOBS=3` is the project default per user memory `feedback_build_config`.
-Drop further to `MAX_JOBS=2` when multiple agents share the GPU box
-(M22.16 caution).
+Drop to `MAX_JOBS=2` when multiple agents share the GPU box.
 
 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` keeps a broken in-flight `.so` from blocking
 the import path during rebuild.
@@ -247,7 +266,7 @@ ad-hoc readers in `csrc/`. If you add a new knob, document it here.
 |-----|--------|---------|
 | `TORCH_VULKAN_ASYNC_COMPILE={0,1}` | Run slangc in thread pool | 1 |
 | `TORCH_VULKAN_PARALLEL_COMPILE={0,1}` | Parallel slangc batch compile (`runtime/slangc.py:1966`) | 1 |
-| `TORCH_VULKAN_SLANGC_WORKERS=<n>` | slangc thread pool size (`runtime/slangc.py:221`). M22.16 default = 2 to limit concurrent-agent box pressure | 2 |
+| `TORCH_VULKAN_SLANGC_WORKERS=<n>` | slangc thread pool size (`runtime/common.py:_default_max_workers`). Default capped at `min(2, cpu_count)` to bound concurrent-agent box pressure | 2 |
 | `TORCH_VULKAN_SLANGC_TIMEOUT_S=<n>` | Per-shader slangc timeout | 60 |
 | `TORCH_VULKAN_SPIRV_CACHE=<dir>` | Override SPIR-V cache location | `/tmp/torch_vulkan_spirv_<user>` |
 | `TORCH_VULKAN_SLANG_MODULE_CACHE=<dir>` | Override Slang `.slang-module` precompile cache | adjacent to SPIR-V cache |
@@ -326,16 +345,20 @@ ad-hoc readers in `csrc/`. If you add a new knob, document it here.
 |---------|------------------|-------|
 | Backend registration | `python/torch_vulkan/inductor/__init__.py` | B |
 | Scheduler / fusion | `python/torch_vulkan/inductor/scheduling.py` + `combo_kernel/` | E |
-| Kernel codegen | `python/torch_vulkan/inductor/kernel/` | C |
+| Kernel codegen | `python/torch_vulkan/inductor/kernel/` (`main.py`, `header.py`, `pointwise.py`, `reduction.py`, `threadgroup_sizing.py`, `dispatch_call.py`, …) | C |
 | Lowerings | `python/torch_vulkan/inductor/lowerings/` | B |
-| bwd_diff dispatch / table | `python/torch_vulkan/inductor/bwd_diff/` (dir; `unary.py`, `binary.py`, `emit_helpers.py`) + `bwd_diff_table.py` | B |
-| Meta-patches (anti-goal #5) | `python/torch_vulkan/inductor/meta_patches/` (dir; `op_registration.py`, `decomposition_passes.py`, `shape_ops.py`, `joint_graph_passes.py`, `dtype_ops.py`, `autograd_registrations.py`, `faketensor_hooks.py`) | H |
+| bwd_diff dispatch / table | `python/torch_vulkan/inductor/bwd_diff/` (`unary.py`, `binary.py`, `emit_helpers.py`) + `bwd_diff_table.py` | B |
+| Meta-patches (anti-goal #5) | `python/torch_vulkan/inductor/meta_patches/` (`op_registration.py`, `decomposition_passes.py`, `shape_ops.py`, `joint_graph_passes.py`, `dtype_ops.py`, `autograd_registrations.py`, `faketensor_hooks.py`) | H |
 | FX passes | `python/torch_vulkan/inductor/fx_passes/` (`post_grad.py`, `eager/`) | H |
-| Runtime / slangc | `python/torch_vulkan/inductor/runtime/` (dir; `slangc.py` is the 2100 L M-cpp-new-2 candidate, plus `dispatch.py`, `batcher.py`, `profile.py`, `reflection.py`, `validation_codegen.py`) | F |
+| Runtime / slangc | `python/torch_vulkan/inductor/runtime/` (`slangc.py`, `common.py`, `shader_lib.py`, `reflection_ext.py`, `dispatch.py`, `batcher.py`, `profile.py`, `reflection.py`, `validation_codegen.py`) | F |
+| Hardware probe | `python/torch_vulkan/inductor/hardware_probe.py` (M-PROBE.1: `prepare_device(level, timeout_s)` entry point) | F |
 | Template kernel / caller | `python/torch_vulkan/inductor/vulkan_template{,_caller}.py` + `templates/caller/gemm/` | D |
-| Slang lib modules | `shaders/lib/*.slang` (16 modules: `helpers`, `dtype_pack`, `philox`, `special_math`, `bucket`, `mm`, `mm_tile`, `mm_int8`, `atomics`, `conv`, `norm`, `pointwise`, `pointwise_generic`, `reduction`, `losses`, `tensor_layout`) | G |
+| Slang lib modules | `shaders/lib/*.slang` (18 modules) | G |
 | Slang templates | `python/torch_vulkan/inductor/templates/*.{jinja,slang}` | D |
 | C++ autograd registration | `csrc/backend/Registration.cpp` | A |
 | C++ runtime dispatch | `csrc/ops/dispatch.{cpp,h}` (deferred cmd-buf, descriptor cache, barrier tracking) | A |
-| C++ legacy eager ops | `csrc/ops/legacy_eager.cpp` (5 residual ops post-M16; not `model_ops.cpp` — deleted) | A |
+| C++ Vulkan context | `csrc/vulkan/Context.{cpp,h}` (instance + debug messenger + M-VAL.1 VUID counter) | A |
+| C++ pybinds | `csrc/init.cpp` (`_validation_errors_count`, `_storage_device_index`, etc.) | A |
+| C++ legacy eager ops | `csrc/ops/legacy_eager.cpp` (5 residual ops post-M16; `model_ops.cpp` is deleted) | A |
+| pytest conftest (incl. M-VAL.1 fixture) | `conftest.py` | — |
 | Regression tests | `tests/test_inductor_regression.py` | — |
