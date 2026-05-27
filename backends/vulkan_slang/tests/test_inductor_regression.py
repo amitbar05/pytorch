@@ -53855,6 +53855,51 @@ class TestMSF1ParameterBlockFullCoverage:
         )
 
 
+class TestMSF2BackwardDerivativeCoverage:
+    """M-SF.2 (v7) — [BackwardDerivative] coverage on hot elementals.
+
+    Manual derivatives (2-5× faster than bwd_diff autodiff) must cover
+    the most-used operations in reduction.slang (combine ops),
+    pointwise.slang, and norm.slang.
+    """
+
+    _REQUIRED_REDUCTION_BWD = {
+        "combine_max_bwd",
+        "combine_min_bwd",
+        "combine_sum_nan_bwd",
+        "combine_prod_nan_bwd",
+    }
+
+    def test_reduction_backward_derivatives_present(self):
+        """All 4 hot reduction combine ops have [BackwardDerivative]."""
+        import os
+
+        shaders_dir = os.path.join(os.path.dirname(__file__), "..", "shaders", "lib")
+        reduction_path = os.path.join(shaders_dir, "vk_reduction.slang")
+        src = open(reduction_path).read()
+
+        for name in self._REQUIRED_REDUCTION_BWD:
+            assert f"void {name}(" in src, (
+                f"M-SF.2: {name} backward function missing from vk_reduction.slang"
+            )
+
+    def test_backward_derivative_annotations_match(self):
+        """Every [BackwardDerivative(fn)] annotation maps to a defined fn."""
+        import os
+        import re
+
+        shaders_dir = os.path.join(os.path.dirname(__file__), "..", "shaders", "lib")
+        reduction_path = os.path.join(shaders_dir, "vk_reduction.slang")
+        src = open(reduction_path).read()
+
+        bwd_annotations = set(re.findall(r"BackwardDerivative\((\w+)\)", src))
+        for fn_name in bwd_annotations:
+            assert f"void {fn_name}(" in src, (
+                f"M-SF.2: [BackwardDerivative({fn_name})] references "
+                f"undefined function in vk_reduction.slang"
+            )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

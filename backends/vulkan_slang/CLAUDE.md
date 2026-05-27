@@ -64,12 +64,15 @@ roadmap item.
   `get_codegen_validation_mode()` defaults to `error` when
   `TORCH_VULKAN_VUID_AS_ERROR` is not "0" — autotune candidates
   emitting VUIDs are rejected via `RuntimeError`.
+* **M-SF.2** ✅ — [BackwardDerivative] on combine_sum_nan +
+  combine_prod_nan in vk_reduction.slang (2026-05-27).  Reduction
+  coverage: 2→4 ops; total 45 manual derivatives across hot elementals.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-6 milestones remain. Next-up candidates: **M-SF.2**
-([BackwardDerivative] 30% → 80%), **M-SF.3** (spec constants beyond mm),
-**M-VAL.4** (pre-slangc AST validator).
+5 milestones remain. Next-up candidates: **M-SF.3**
+(spec constants beyond mm), **M-VAL.4** (pre-slangc AST validator),
+**M-SF.4** (Jinja → Slang generics).
 
 ## Companion docs
 

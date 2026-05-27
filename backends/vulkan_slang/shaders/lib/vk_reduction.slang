@@ -36,7 +36,10 @@ public interface IWaveReduction : IReduction {
 
 // ── NaN-aware combine helpers ──────────────────────────────────────
 
+// CG.M11: Closed-form backward for combine_sum_nan.
+// da = (isnan(b) ? 0 : dout), db = (isnan(a) ? 0 : dout).
 [Differentiable]
+[BackwardDerivative(combine_sum_nan_bwd)]
 [ForceInline]
 public float combine_sum_nan(float a, float b) {
     if (isnan(a)) return a;
@@ -44,12 +47,53 @@ public float combine_sum_nan(float a, float b) {
     return a + b;
 }
 
+public void combine_sum_nan_bwd(
+    inout DifferentialPair<float> dpa,
+    inout DifferentialPair<float> dpb,
+    float dout)
+{
+    float a = dpa.p;
+    float b = dpb.p;
+    if (isnan(a)) {
+        dpa = diffPair(a, dpa.d + dout);
+        dpb = diffPair(b, dpb.d);
+    } else if (isnan(b)) {
+        dpa = diffPair(a, dpa.d);
+        dpb = diffPair(b, dpb.d + dout);
+    } else {
+        dpa = diffPair(a, dpa.d + dout);
+        dpb = diffPair(b, dpb.d + dout);
+    }
+}
+
+// CG.M11: Closed-form backward for combine_prod_nan.
+// da = (isnan(b) ? 0 : b * dout), db = (isnan(a) ? 0 : a * dout).
 [Differentiable]
+[BackwardDerivative(combine_prod_nan_bwd)]
 [ForceInline]
 public float combine_prod_nan(float a, float b) {
     if (isnan(a)) return a;
     if (isnan(b)) return b;
     return a * b;
+}
+
+public void combine_prod_nan_bwd(
+    inout DifferentialPair<float> dpa,
+    inout DifferentialPair<float> dpb,
+    float dout)
+{
+    float a = dpa.p;
+    float b = dpb.p;
+    if (isnan(a)) {
+        dpa = diffPair(a, dpa.d + dout);
+        dpb = diffPair(b, dpb.d);
+    } else if (isnan(b)) {
+        dpa = diffPair(a, dpa.d);
+        dpb = diffPair(b, dpb.d + dout);
+    } else {
+        dpa = diffPair(a, dpa.d + b * dout);
+        dpb = diffPair(b, dpb.d + a * dout);
+    }
 }
 
 // CG.M16: Capability-gated wave-intrinsic wrappers.
