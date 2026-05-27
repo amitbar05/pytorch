@@ -60307,3 +60307,102 @@ class TestTrain8ConvTrainingSweep:
         assert all(torch.isfinite(torch.tensor(l)) for l in vk_losses), (
             f"TRAIN.8: Loss contains NaN/Inf: {vk_losses}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.7 — Conv backward pure Slang codegen (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain7ConvBackwardPureSlang:
+    """TRAIN.7 — Conv backward routes through _slang_tile_conv2d_bwd.
+
+    Before TRAIN.7: the compile path emitted extern_kernels.conv2d_backward
+    which called aten.convolution_backward → C++ adapter → Vulkan→CPU→Vulkan.
+
+    After TRAIN.7: fp32 Vulkan groups==1 routes through _slang_tile_conv2d_bwd
+    (single Slang compute dispatch via bwd_diff(conv_inner_madd)).
+    """
+
+    def test_slang_path_used_for_fp32_groups1(self):
+        """Verify the Slang path is taken — no aten.convolution_backward call."""
+        import inspect
+        from torch_vulkan.inductor.fx_passes.eager.conv_backward import (
+            _ensure_conv2d_backward_op_registered,
+        )
+
+        _ensure_conv2d_backward_op_registered()
+
+        # The impl now has a use_slang_bwd branch
+        source_file = inspect.getfile(_ensure_conv2d_backward_op_registered)
+        with open(source_file) as f:
+            src = f.read()
+        assert "_slang_tile_conv2d_bwd" in src, (
+            "TRAIN.7: conv_backward impl must call _slang_tile_conv2d_bwd"
+        )
+        assert "use_slang_bwd" in src, (
+            "TRAIN.7: conv_backward impl must have use_slang_bwd guard"
+        )
+
+    def test_conv_backward_gradient_parity(self):
+        """Conv backward gradients match CPU reference for groups==1."""
+        import torch.nn as nn
+
+        torch.manual_seed(42)
+        conv = nn.Conv2d(3, 16, 3, padding=1, bias=False)
+        x_cpu = torch.randn(2, 3, 8, 8, requires_grad=True)
+        out_cpu = conv(x_cpu)
+        grad_cpu = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_cpu)
+
+        # Vulkan path
+        conv_vk = nn.Conv2d(3, 16, 3, padding=1, bias=False).to("vulkan:0")
+        with torch.no_grad():
+            conv_vk.weight.copy_(conv.weight)
+        x_vk = x_cpu.detach().clone().to("vulkan:0")
+        x_vk.requires_grad_(True)
+        out_vk = conv_vk(x_vk)
+        grad_vk = grad_cpu.to("vulkan:0")
+        out_vk.backward(grad_vk)
+
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4,
+        )
+        torch.testing.assert_close(
+            conv_vk.weight.grad.cpu(), conv.weight.grad, atol=1e-4, rtol=1e-4,
+        )
+
+    def test_conv_backward_through_compile(self):
+        """Conv backward via torch.compile produces correct gradients."""
+        import torch.nn as nn
+
+        torch.manual_seed(42)
+        conv_cpu = nn.Conv2d(3, 8, 3, padding=1, bias=False)
+        x_cpu = torch.randn(2, 3, 8, 8, requires_grad=True)
+        out_cpu = conv_cpu(x_cpu)
+        grad_cpu = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_cpu)
+
+        # Vulkan compiled path
+        conv_vk = nn.Conv2d(3, 8, 3, padding=1, bias=False).to("vulkan:0")
+        with torch.no_grad():
+            conv_vk.weight.copy_(conv_cpu.weight)
+        x_vk = x_cpu.detach().clone().to("vulkan:0")
+        x_vk.requires_grad_(True)
+
+        @torch.compile(backend="vulkan_fuse")
+        def fwd_bwd(x, grad_out):
+            out = conv_vk(x)
+            out.backward(grad_out)
+            return out
+
+        grad_vk = grad_cpu.to("vulkan:0")
+        fwd_bwd(x_vk, grad_vk)
+        torch_vulkan._c_ext._synchronize(0)
+
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4,
+        )
+        torch.testing.assert_close(
+            conv_vk.weight.grad.cpu(), conv_cpu.weight.grad, atol=1e-4, rtol=1e-4,
+        )

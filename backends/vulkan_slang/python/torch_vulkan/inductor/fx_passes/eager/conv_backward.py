@@ -3,6 +3,11 @@
 Contains ``_ensure_conv2d_backward_op_registered`` — the M17.8.d.2 opaque
 non-autograd custom op that prevents AOTAutograd from decomposing the conv
 backward into ``empty_like`` sub-ops that the partitioner collapses to zeros.
+
+TRAIN.7 (2026-05-27): The eager impl now routes fp32 Vulkan groups==1 through
+``_slang_tile_conv2d_bwd`` (single Slang compute dispatch via
+``bwd_diff(conv_inner_madd)``), eliminating the prior CPU roundtrip through
+``aten.convolution_backward`` → C++ ``vulkan_convolution_backward_overrideable``.
 """
 
 from __future__ import annotations
@@ -51,10 +56,47 @@ def _ensure_conv2d_backward_op_registered() -> "object":
         groups: int,
         has_bias: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Eager impl: route fp32 Vulkan to ``aten.convolution_backward.default``
-        directly (which hits the working C++ ``vulkan_convolution_backward_overrideable``
-        adapter). For non-Vulkan/non-f32 we fall back to plain aten too.
+        """Eager impl: route fp32 Vulkan groups==1 through _slang_tile_conv2d_bwd
+        (TRAIN.7, 2026-05-27) — single Slang compute dispatch, no CPU roundtrip.
+        Falls back to aten.convolution_backward for groups>1 or non-fp32.
         """
+        use_slang_bwd = (
+            int(groups) == 1
+            and input.device.type == "vulkan"
+            and input.dtype == torch.float32
+            and grad_output.dtype == torch.float32
+            and weight.dtype == torch.float32
+        )
+
+        if use_slang_bwd:
+            from ..templates.caller.conv import _slang_tile_conv2d_bwd
+
+            sH, sW = int(stride[0]), int(stride[-1] if len(stride) > 1 else stride[0])
+            pH, pW = int(padding[0]), int(padding[-1] if len(padding) > 1 else padding[0])
+            dH, dW = int(dilation[0]), int(dilation[-1] if len(dilation) > 1 else dilation[0])
+
+            # Pre-allocate output tensors (zero-initialized for scatter_add)
+            grad_input = torch.zeros_like(input)
+            grad_weight = torch.zeros_like(weight)
+            grad_bias = (
+                torch.zeros(weight.shape[0], device=input.device, dtype=input.dtype)
+                if has_bias
+                else None
+            )
+
+            _slang_tile_conv2d_bwd(
+                input, weight, grad_output,
+                grad_input, grad_weight,
+                stride=(sH, sW),
+                padding=(pH, pW),
+                dilation=(dH, dW),
+                grad_bias=grad_bias,
+            )
+
+            if not has_bias:
+                grad_bias = grad_output.new_empty((0,))
+            return grad_input, grad_weight, grad_bias
+
         result = torch.ops.aten.convolution_backward.default(
             grad_output,
             input,
