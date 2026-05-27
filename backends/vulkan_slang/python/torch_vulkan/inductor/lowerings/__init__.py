@@ -152,6 +152,9 @@ def _suppress_upstream_decomps() -> None:
         aten.avg_pool2d_backward.default,
         aten.max_pool2d_with_indices.default,
         aten.max_pool2d_with_indices_backward.default,
+        # TRAIN.4 (2026-05-27): suppress upstream nll_loss_backward decomposition
+        # so our lowering in lowerings/loss.py can intercept it.
+        aten.nll_loss_backward.default,
     ]
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
@@ -176,6 +179,11 @@ def _suppress_upstream_decomps() -> None:
         aten.l1_loss_backward.default,
         aten.smooth_l1_loss_backward.default,
         aten.huber_loss_backward.default,
+        # TRAIN.4 (2026-05-27): nll_loss_backward — our lowering in
+        # lowerings/loss.py decomposes into scatter + pointwise directly
+        # at the Inductor IR level, avoiding the upstream decomposition
+        # which may produce problematic IR nodes.
+        aten.nll_loss_backward.default,
     ]:
         _aot_decomps.pop(_op, None)
     # M18.TB.1 / P12: also pop clamp, clamp_min, clamp_max from the global

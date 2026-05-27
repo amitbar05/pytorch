@@ -341,3 +341,103 @@ def _register_loss_lowerings() -> None:
             ignore_index=int(ignore_index),
         )
         return result
+
+    # ── TRAIN.4: nll_loss_backward ─────────────────────────────────────
+
+    @register_lowering(aten.nll_loss_backward, type_promotion_kind=None)
+    def _vulkan_nll_loss_backward(
+        grad_output,
+        self,
+        target,
+        weight,
+        reduction,
+        ignore_index,
+        total_weight,
+    ):
+        """TRAIN.4 — ``aten.nll_loss_backward`` decomposition into Vulkan-safe primitives.
+
+        Mirrors the upstream decomposition but operates at the Inductor IR
+        level so it works even when AOT decomposition is bypassed.  All
+        scatters use the existing Vulkan lowerings.
+
+        Algorithm:
+            1.  Scale grad_output by 1/total_weight for mean reduction.
+            2.  Create a -1.0 scatter mask at (n, target[n]) positions.
+            3.  Multiply scatter mask by scaled grad_output (and weight).
+            4.  Zero out ignore_index positions.
+        """
+        if not _is_vulkan(self):
+            return NotImplemented
+
+        n_dims = len(self.get_size())
+        if n_dims < 2:
+            channel_dim = 0
+        else:
+            channel_dim = 1
+
+        reduction_val = int(reduction)
+        ignore_index_val = int(ignore_index)
+
+        # 1. Scale grad_output for mean reduction.
+        if reduction_val == 1:  # mean
+            grad_output = L.lowerings[aten.div.Tensor](grad_output, total_weight)
+
+        # 2. Create scatter mask: -1.0 at (n, target[n]).
+        target_unsq = L.lowerings[aten.unsqueeze.default](target, channel_dim)
+
+        # Safe target: replace ignore_index with 0 so scatter stays in bounds.
+        ignore_mask = L.lowerings[aten.ne.Scalar](
+            target_unsq, ignore_index_val
+        )
+        zero_target = L.lowerings[aten.mul.Scalar](target_unsq, 0)
+        safe_target = L.lowerings[aten.where.self](
+            ignore_mask, target_unsq, zero_target
+        )
+
+        # grad_input = zeros_like(self).
+        grad_input = L.lowerings[aten.full.default](
+            list(self.get_size()),
+            0.0,
+            dtype=self.get_dtype(),
+            device=self.get_device(),
+            pin_memory=False,
+        )
+
+        # Scatter -1.0 along channel_dim at safe_target positions.
+        minus_one_shape = (
+            list(grad_output.get_size())
+            if len(grad_output.get_size()) > 0
+            else [1]
+        )
+        minus_one = L.lowerings[aten.full.default](
+            minus_one_shape,
+            -1.0,
+            dtype=self.get_dtype(),
+            device=self.get_device(),
+            pin_memory=False,
+        )
+        grad_input = L.lowerings[aten.scatter.src](
+            grad_input, channel_dim, safe_target, minus_one
+        )
+
+        # 3. Multiply: grad_input * grad_output.
+        # Unsqueeze grad_output to match grad_input dims if needed.
+        if len(grad_input.get_size()) > len(grad_output.get_size()) > 0:
+            grad_output = L.lowerings[aten.unsqueeze.default](
+                grad_output, channel_dim
+            )
+
+        # Apply per-class weight if given.
+        if weight is not None:
+            w_shape = [1] * n_dims
+            w_shape[channel_dim] = int(weight.get_size()[0])
+            w_reshaped = L.lowerings[aten.view.default](weight, w_shape)
+            grad_output = L.lowerings[aten.mul.Tensor](grad_output, w_reshaped)
+
+        # Zero out ignore_index positions.
+        zero_grad = L.lowerings[aten.mul.Scalar](grad_output, 0.0)
+        grad_output_masked = L.lowerings[aten.where.self](
+            ignore_mask, grad_output, zero_grad
+        )
+
+        return L.lowerings[aten.mul.Tensor](grad_input, grad_output_masked)

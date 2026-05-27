@@ -59737,6 +59737,155 @@ class TestTrain10BenchmarkSync:
 
 
 # ---------------------------------------------------------------------------
+# TRAIN.4 — Cross-entropy (nll_loss) backward (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain4CrossEntropyBackward:
+    """TRAIN.4 — nll_loss_backward lowered for Vulkan.
+
+    Cross-entropy backward produces aten.nll_loss_backward, which is now
+    decomposed into Vulkan-safe primitives (scatter + where + pointwise)
+    via lowerings/loss.py rather than relying on the upstream decomposition
+    that may use ops.indirect_indexing.
+    """
+
+    def test_nll_loss_backward_eager(self):
+        """Direct nll_loss_backward parity with CPU."""
+        import torch
+
+        torch.manual_seed(42)
+        N, C = 4, 10
+        log_probs_cpu = torch.randn(N, C, requires_grad=True)
+        target_cpu = torch.randint(0, C, (N,), dtype=torch.long)
+        total_weight_cpu = torch.tensor(float(N), dtype=torch.float32)
+
+        # Compute loss and backward on CPU.
+        loss_cpu = torch.nn.functional.nll_loss(log_probs_cpu, target_cpu)
+        loss_cpu.backward()
+
+        # Compute on Vulkan using our custom op chain.
+        log_probs_vk = log_probs_cpu.detach().clone().to("vulkan:0")
+        target_vk = target_cpu.to("vulkan:0")
+        total_weight_vk = total_weight_cpu.to("vulkan:0")
+        grad_output_vk = torch.tensor(1.0, device="vulkan:0")
+
+        # Register and call the lowering function directly.
+        from torch_vulkan.inductor.lowerings.loss import _register_loss_lowerings
+        _register_loss_lowerings()
+
+        result_vk = torch.ops.aten.nll_loss_backward.default(
+            grad_output_vk, log_probs_vk, target_vk,
+            None, 1, -100, total_weight_vk,
+        )
+
+        torch.testing.assert_close(
+            result_vk.cpu(), log_probs_cpu.grad, atol=1e-5, rtol=1e-5,
+        )
+
+    def test_cross_entropy_compile_path(self):
+        """torch.compile path: F.cross_entropy backward through Inductor."""
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        N, C = 4, 10
+        x_cpu = torch.randn(N, C, requires_grad=True)
+        target_cpu = torch.randint(0, C, (N,), dtype=torch.long)
+
+        loss_cpu = F.cross_entropy(x_cpu, target_cpu)
+        loss_cpu.backward()
+
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        @torch.compile(backend="vulkan_fuse")
+        def fn(x, target):
+            return F.cross_entropy(x, target)
+
+        loss_vk = fn(x_vk, target_cpu.to("vulkan:0"))
+        loss_vk.backward()
+
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4,
+        )
+
+    def test_cross_entropy_with_weight(self):
+        """Weighted cross_entropy backward parity."""
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(99)
+        N, C = 8, 5
+        x_cpu = torch.randn(N, C, requires_grad=True)
+        target_cpu = torch.randint(0, C, (N,), dtype=torch.long)
+        weight_cpu = torch.rand(C)
+
+        loss_cpu = F.cross_entropy(x_cpu, target_cpu, weight=weight_cpu)
+        loss_cpu.backward()
+
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        weight_vk = weight_cpu.to("vulkan:0")
+
+        @torch.compile(backend="vulkan_fuse")
+        def fn(x, target, weight):
+            return F.cross_entropy(x, target, weight=weight)
+
+        loss_vk = fn(x_vk, target_cpu.to("vulkan:0"), weight_vk)
+        loss_vk.backward()
+
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-3, rtol=1e-3,
+        )
+
+    def test_cross_entropy_conv_model(self):
+        """Conv model with cross-entropy loss: fwd+bwd through torch.compile."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        class MiniModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.fc = nn.Linear(16 * 4 * 4, 10)
+
+            def forward(self, x):
+                x = F.relu(self.conv(x))
+                x = self.pool(x)
+                return self.fc(x.flatten(1))
+
+        torch.manual_seed(42)
+        model_cpu = MiniModel()
+        x_cpu = torch.randn(2, 3, 8, 8)
+        target_cpu = torch.randint(0, 10, (2,))
+
+        out_cpu = model_cpu(x_cpu)
+        loss_cpu = F.cross_entropy(out_cpu, target_cpu)
+        loss_cpu.backward()
+
+        model_vk = MiniModel().to("vulkan:0")
+        model_vk.load_state_dict(model_cpu.state_dict())
+        [p.requires_grad_(True) for p in model_vk.parameters()]
+
+        x_vk = x_cpu.to("vulkan:0")
+        target_vk = target_cpu.to("vulkan:0")
+
+        @torch.compile(backend="vulkan_fuse")
+        def run(model, x, target):
+            return F.cross_entropy(model(x), target)
+
+        loss_vk = run(model_vk, x_vk, target_vk)
+        loss_vk.backward()
+
+        for p_cpu, p_vk in zip(model_cpu.parameters(), model_vk.parameters()):
+            if p_cpu.grad is not None:
+                torch.testing.assert_close(
+                    p_vk.grad.cpu(), p_cpu.grad, atol=5e-2, rtol=5e-2,
+                )
+
+
+# ---------------------------------------------------------------------------
 # TRAIN.2 — MaxPool2d backward codegen path via scatter template (2026-05-27)
 # ---------------------------------------------------------------------------
 
