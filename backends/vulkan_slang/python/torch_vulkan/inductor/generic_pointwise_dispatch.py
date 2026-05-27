@@ -89,9 +89,16 @@ def _entry_name(entry: PointwiseEntry) -> str:
 
 
 def _make_cache_key(entry: PointwiseEntry, numel: int, complex_valued: bool) -> str:
-    """Return a stable cache key for the (op, arity, numel) combination."""
+    """Return a stable cache key for the (op, arity) combination.
+
+    TRAIN.6: numel is removed from the cache key — the generic pointwise
+    template uses numel as a push constant (``struct PC { uint numel; }``),
+    so the SPIR-V binary is shape-agnostic. Including numel previously
+    fragmented the slangc cache, causing redundant shader compilations
+    when only the tensor size changed (e.g. variable-batch training).
+    """
     return hashlib.sha256(
-        f"cgm12_{entry.op_struct}_{entry.arity}_{complex_valued}_{numel}".encode()
+        f"cgm12_{entry.op_struct}_{entry.arity}_{complex_valued}".encode()
     ).hexdigest()[:12]
 
 

@@ -663,8 +663,16 @@ class HeaderMixin(CallKernelMixin):
             code.writeline(f"static const uint {name_} = {value_};")
 
         if use_spec_constants:
-            for i, (name_, _value_) in enumerate(static_numel):
-                code.writeline(f"[[vk::constant_id({i})]] const uint {name_};")
+            for i, (name_, value_) in enumerate(static_numel):
+                # TRAIN.6: Emit spec constants WITH default values so the
+                # SPIR-V binary specializes correctly even when no
+                # VkSpecializationInfo override is provided (the common
+                # case for fully-static Inductor codegen). The default
+                # value is the traced concrete int; pipeline creation
+                # can override via VkSpecializationInfo for dynamic batch.
+                code.writeline(
+                    f"[[vk::constant_id({i})]] const uint {name_} = {value_};"
+                )
         else:
             for name_, value_ in static_numel:
                 code.writeline(f"static const uint {name_} = {value_};")

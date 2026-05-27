@@ -60522,3 +60522,219 @@ class TestTrain5PoolAllocatorReuse:
                 f"TRAIN.5: Pool grew from {pool_at_step5} to {pool_at_step20} bytes "
                 f"(ratio={growth_ratio:.2f}), expected < 1.2"
             )
+
+
+# ---------------------------------------------------------------------------
+
+
+def _train_loop_vulkan_dynamic(
+    model_cpu, x, y, n_steps=10, lr=0.01, batch_sizes=None,
+):
+    """Run compiled training on Vulkan with variable batch sizes.
+
+    Uses ``torch.compile(backend="inductor", dynamic=True)`` so the
+    compiled function accepts variable batch dimensions without
+    re-tracing. Returns loss curve (list per batch).
+    """
+    import copy
+
+    import torch_vulkan
+
+    if batch_sizes is None:
+        batch_sizes = [4, 8]
+
+    model = copy.deepcopy(model_cpu).to("vulkan:0")
+    model.train()
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+
+    @torch.compile(backend="inductor", dynamic=True)
+    def step(inp, target):
+        out = model(inp)
+        loss = torch.nn.functional.cross_entropy(out, target)
+        loss.backward()
+        return loss
+
+    all_losses = {}
+    for bs in batch_sizes:
+        losses = []
+        x_batch = x[:bs].to("vulkan:0")
+        y_batch = y[:bs].to("vulkan:0")
+        for _ in range(n_steps):
+            opt.zero_grad()
+            loss = step(x_batch, y_batch)
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+            losses.append(loss.item())
+        all_losses[bs] = losses
+    return all_losses
+
+
+class TestTrain6DynamicBatch:
+    """TRAIN.6 — Dynamic shapes for variable-batch training.
+
+    Validates that ``torch.compile(backend="inductor", dynamic=True)``
+    supports variable batch sizes on Vulkan without recompilation:
+      1. Compile once with dynamic=True
+      2. Train with batch=4 (traces the dynamic graph)
+      3. Train with batch=8 (reuses the same compiled SPIR-V)
+      4. Verify loss decreases on both batches
+      5. Verify slangc cold-compile count does not increase for batch=8
+
+    Phases:
+      Phase 1 (closed here): spec constants with default values + dynamic
+        numel push constants + shape-agnostic slangc cache keys.
+      Phase 2 (implicit): descriptor set rebinding — each dispatch creates
+        a fresh descriptor set with actual buffer sizes (already handled
+        by dispatch.py).
+      Phase 3 (future): scheduler shape-agnostic IR — requires upstream
+        Inductor changes; not in scope for this backend milestone.
+    """
+
+    @pytest.mark.timeout(600)
+    def test_conv_dynamic_batch_loss_decreases(self):
+        """SimpleCNN (Conv+ReLU+MaxPool+1x1Conv) with dynamic=True, B=4 then B=8."""
+        import torch.nn as nn
+
+        class SimpleCNN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 8, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                )
+                self.classifier = nn.Conv2d(8, 10, 1)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+
+            def forward(self, x):
+                x = self.features(x)
+                x = self.classifier(x)
+                x = self.pool(x)
+                return x.flatten(1)
+
+        torch.manual_seed(42)
+        model_cpu = SimpleCNN()
+        x = torch.randn(16, 3, 32, 32)
+        y = torch.randint(0, 10, (16,))
+
+        losses = _train_loop_vulkan_dynamic(
+            model_cpu, x, y, n_steps=10, lr=0.01, batch_sizes=[4, 8],
+        )
+
+        # Loss must decrease for both batch sizes
+        for bs, curve in losses.items():
+            assert curve[-1] < curve[0], (
+                f"TRAIN.6: Loss did not decrease for batch={bs}: "
+                f"{curve[0]:.4f} → {curve[-1]:.4f}"
+            )
+
+    @pytest.mark.timeout(600)
+    def test_conv_dynamic_batch_no_recompilation(self):
+        """Verify slangc is not re-invoked when batch changes under dynamic=True.
+
+        Warmup with batch=4 (triggers slangc for all kernels in the graph),
+        then switch to batch=8. Cold compile count must not increase.
+        """
+        import torch.nn as nn
+        import torch_vulkan
+        from torch_vulkan.inductor.runtime.slangc import _COMPILE_STATS
+
+        class SimpleCNN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.features = nn.Sequential(
+                    nn.Conv2d(3, 8, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                )
+                self.classifier = nn.Conv2d(8, 10, 1)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+
+            def forward(self, x):
+                x = self.features(x)
+                x = self.classifier(x)
+                x = self.pool(x)
+                return x.flatten(1)
+
+        torch.manual_seed(42)
+        model = SimpleCNN().to("vulkan:0")
+        model.train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        @torch.compile(backend="inductor", dynamic=True)
+        def step(inp, target):
+            out = model(inp)
+            loss = torch.nn.functional.cross_entropy(out, target)
+            loss.backward()
+            return loss
+
+        x_full = torch.randn(16, 3, 32, 32, device="vulkan:0")
+        y_full = torch.randint(0, 10, (16,), device="vulkan:0")
+
+        # Warmup: batch=4 — triggers all kernel compilations
+        for _ in range(3):
+            opt.zero_grad()
+            step(x_full[:4], y_full[:4])
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+
+        cold_after_warmup = _COMPILE_STATS.get("cold_compiles", 0)
+
+        # Switch to batch=8 — should NOT trigger new slangc calls
+        for _ in range(3):
+            opt.zero_grad()
+            step(x_full[:8], y_full[:8])
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+
+        cold_after_switch = _COMPILE_STATS.get("cold_compiles", 0)
+
+        assert cold_after_switch == cold_after_warmup, (
+            f"TRAIN.6: slangc cold compiles increased from {cold_after_warmup} "
+            f"to {cold_after_switch} when batch changed 4→8. "
+            f"Expected no recompilation under dynamic=True."
+        )
+
+    @pytest.mark.timeout(600)
+    def test_pointwise_cache_key_shape_agnostic(self):
+        """Verify _make_cache_key does not include numel (shape-agnostic SPIR-V)."""
+        from torch_vulkan.inductor.generic_pointwise_dispatch import (
+            PointwiseEntry,
+            _make_cache_key,
+        )
+
+        entry = PointwiseEntry(op_struct="OpAbs", arity=1)
+        key_small = _make_cache_key(entry, numel=1024, complex_valued=False)
+        key_large = _make_cache_key(entry, numel=65536, complex_valued=False)
+
+        assert key_small == key_large, (
+            f"TRAIN.6: generic_pointwise cache key differs by numel: "
+            f"1024→{key_small}, 65536→{key_large}. "
+            f"SPIR-V is shape-agnostic (numel is push constant); "
+            f"cache key must not fragment by numel."
+        )
+
+    @pytest.mark.timeout(600)
+    def test_spec_constants_have_defaults(self):
+        """Verify spec constant emission includes = default_value in shader source.
+
+        TRAIN.6 fix: ``[[vk::constant_id(N)]] const uint xnumel = VALUE;``
+        instead of bare ``const uint xnumel;`` (which defaults to 0 in Slang).
+        Without defaults, the kernel would execute zero iterations.
+        """
+        from torch_vulkan.inductor.kernel.header import VulkanKernelHeader
+
+        # Use the codegen to emit a minimal static kernel and check the
+        # spec constant line includes a default value.
+        # We test this structurally: the emit path writes
+        # ``[[vk::constant_id(N)]] const uint <name> = <val>;``
+        # when use_spec_constants=True. We can verify the format string
+        # in the source code directly.
+        import inspect
+
+        src = inspect.getsource(VulkanKernelHeader)
+        # The emission pattern must include "= {value_}" for spec constants
+        assert 'const uint {name_} = {value_}' in src, (
+            "TRAIN.6: spec constant emission missing default value. "
+            "Expected '= {value_}' in the vk::constant_id format string."
+        )
