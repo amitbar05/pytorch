@@ -54075,6 +54075,46 @@ class TestMCG3ConvGnReluFusedShader:
         )
 
 
+class TestMCG5ConvBackwardHygiene:
+    """M-CG.5 (v7) — conv backward extern hygiene.
+
+    Conv backward has a dual-path ratification:
+    1. Eager path: Slang autodiff (_slang_tile_conv2d_bwd via bwd_diff).
+    2. Compile path: opaque extern_kernels.conv2d_backward (ratified).
+    """
+
+    def test_slang_bwd_template_exists_and_active(self):
+        """``_slang_tile_conv2d_bwd`` is importable and references
+        the compiled Slang template."""
+        import inspect
+
+        from torch_vulkan.inductor.templates.caller.conv import (
+            _slang_tile_conv2d_bwd,
+        )
+
+        assert callable(_slang_tile_conv2d_bwd), (
+            "M-CG.5: _slang_tile_conv2d_bwd must be importable"
+        )
+        src = inspect.getsource(_slang_tile_conv2d_bwd)
+        assert "compile_and_dispatch" in src, (
+            "M-CG.5: _slang_tile_conv2d_bwd must use the compiled "
+            "Slang template (not fall through to aten)"
+        )
+
+    def test_make_fallback_registered_for_opaque_conv_bwd(self):
+        """``torch_vulkan.conv2d_backward`` has a make_fallback in
+        the Inductor lowering table (compile path ratification)."""
+        import torch
+        from torch._inductor.lowering import lowerings
+
+        op = getattr(torch.ops.torch_vulkan, "conv2d_backward", None)
+        if op is not None and hasattr(op, "default"):
+            assert op.default in lowerings, (
+                "M-CG.5: conv2d_backward must have a make_fallback "
+                "lowering registered for the compile path"
+            )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 
