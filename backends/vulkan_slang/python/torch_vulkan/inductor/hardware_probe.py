@@ -31,6 +31,7 @@ Auto-run on import is gated by ``TORCH_VULKAN_PROFILE_DEVICE``:
 * ``"off"``          — skip entirely. ``current()`` from ``device_profile``
                        still returns ``None``.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -40,7 +41,6 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Optional
-
 
 _log = logging.getLogger(__name__)
 
@@ -279,9 +279,7 @@ def profile_device(
         ``{"level": int, "cached": bool, ...stage results}``.
     """
     if level not in (LEVEL_QUICK, LEVEL_MEDIUM, LEVEL_DEEP):
-        raise ValueError(
-            f"profile_device level must be 0, 1, or 2 (got {level!r})"
-        )
+        raise ValueError(f"profile_device level must be 0, 1, or 2 (got {level!r})")
 
     if not force:
         status = _read_probe_status()
@@ -347,7 +345,7 @@ def profile_device(
 
     if verbose:
         print(
-            f"torch_vulkan.profile_device: done ({result['total_ms']/1000.0:.1f} s)"
+            f"torch_vulkan.profile_device: done ({result['total_ms'] / 1000.0:.1f} s)"
         )
     return result
 
@@ -355,15 +353,13 @@ def profile_device(
 def _resolve_auto_level(mode: str) -> Optional[int]:
     """Map ``TORCH_VULKAN_PROFILE_DEVICE`` to a level, or None for skip.
 
-    Default (env unset / ``auto``) runs the level-0 microbench only — about
-    5 seconds on RDNA1.  The compile + autotune sweeps (levels 1/2) take
-    minutes on a cold slangc cache so we don't run them implicitly on
-    every fresh install.  Users who want the full warm-up should call
-    :func:`torch_vulkan.profile_and_warmup` explicitly, or set
-    ``TORCH_VULKAN_PROFILE_DEVICE=deep`` to opt in for auto-import.
+    M-PROBE.2 (v7): Default (env unset / ``auto``) is OFF — no implicit
+    probe on import.  Users should call ``torch_vulkan.prepare_device()``
+    explicitly.  Set ``TORCH_VULKAN_PROFILE_DEVICE=quick`` to restore the
+    pre-v7 implicit level-0 microbench.
     """
     m = (mode or "auto").lower()
-    if m in ("0", "off", "no", "false"):
+    if m in ("0", "off", "no", "false", "auto"):
         return None
     if m in ("quick", "1"):
         return LEVEL_QUICK
@@ -371,10 +367,8 @@ def _resolve_auto_level(mode: str) -> Optional[int]:
         return LEVEL_MEDIUM
     if m in ("deep", "3", "force"):
         return LEVEL_DEEP
-    # "auto" / "true" / "yes" / unknown — default to QUICK so first
-    # import populates the device-profile cache without paying for
-    # shader compile or autotune. The marker prevents re-running.
-    return LEVEL_QUICK
+    # Unknown value — default to off (safer than surprising auto-benchmark).
+    return None
 
 
 def auto_probe_on_import() -> Optional[dict[str, Any]]:

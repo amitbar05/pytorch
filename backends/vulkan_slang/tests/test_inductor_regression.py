@@ -53980,6 +53980,45 @@ class TestMVal4PreSlangcValidator:
         )
 
 
+class TestMProbe2AutoOff:
+    """M-PROBE.2 (v7) — auto_probe_on_import defaults to OFF.
+
+    ``_resolve_auto_level()`` returns ``None`` for default "auto"/unset.
+    Users must call ``torch_vulkan.prepare_device()`` explicitly.
+    """
+
+    def test_auto_level_defaults_to_none(self):
+        """When TORCH_VULKAN_PROFILE_DEVICE is unset or 'auto',
+        _resolve_auto_level returns None (skip)."""
+        import os
+
+        from torch_vulkan.inductor.hardware_probe import _resolve_auto_level
+
+        # Unset: default to off.
+        old = os.environ.pop("TORCH_VULKAN_PROFILE_DEVICE", None)
+        try:
+            assert _resolve_auto_level("auto") is None, (
+                "M-PROBE.2: 'auto' must resolve to None (off)"
+            )
+            assert _resolve_auto_level("") is None, (
+                "M-PROBE.2: unset must resolve to None (off)"
+            )
+        finally:
+            if old is not None:
+                os.environ["TORCH_VULKAN_PROFILE_DEVICE"] = old
+
+    def test_quick_still_opt_in(self):
+        """Explicit TORCH_VULKAN_PROFILE_DEVICE=quick still works."""
+        from torch_vulkan.inductor.hardware_probe import (
+            LEVEL_QUICK,
+            _resolve_auto_level,
+        )
+
+        assert _resolve_auto_level("quick") == LEVEL_QUICK, (
+            "M-PROBE.2: 'quick' must still resolve to LEVEL_QUICK"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

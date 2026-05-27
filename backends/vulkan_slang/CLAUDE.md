@@ -73,12 +73,12 @@ roadmap item.
 * **M-VAL.4** ✅ — Pre-slangc static AST validator (2026-05-27).
   Already integrated at slangc.py:161 (M22.1.i); raises RuntimeError
   on any codegen mistake before subprocess invocation.
-* **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
-  timeout_s)` public API + timeout enforcement.
+* **M-PROBE.1, M-PROBE.2, M-PROBE.3** ✅ — prepare_device() API,
+  auto_probe_on_import off, timeout enforcement (2026-05-27).
 
-3 milestones remain. Next-up candidates: **M-SF.4**
-(Jinja → Slang generics), **M-SF.5** (reflection metadata),
-**M-PROBE.2** (auto_probe_on_import off).
+2 milestones remain: **M-SF.4** (Jinja → Slang generics),
+**M-SF.5** (reflection metadata num_atomics).
+(M-CG.3 blocked on slangc fix; M-CG.5 is 2w research).
 
 ## Companion docs
 
