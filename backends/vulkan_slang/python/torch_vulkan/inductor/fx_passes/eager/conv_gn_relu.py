@@ -285,12 +285,25 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
         N = inp.shape[0]
         C = int(w.shape[0])
         HxW = int(conv_out.shape[2]) * int(conv_out.shape[3])
-        _, gn_save_mean, gn_save_rstd = torch.ops.aten.native_group_norm.default(
+        # M18.9: capture the aten-computed GN output here too, instead of
+        # discarding it. The ReLU mask MUST be derived from this aten
+        # gn_out — not from the Slang fused custom op's output. The Slang
+        # path can flip the sign of elements that are numerically near
+        # zero (different reduction order in Welford vs aten), so a mask
+        # taken from the Slang output disagrees with the
+        # ``native_group_norm_backward(grad_gn_out, conv_out, mean, rstd, ...)``
+        # call below — which is run against this same aten conv_out / stats.
+        # The mask/stats mismatch produced a ~10 % offset on
+        # ``conv.bias.grad`` (sum reduction over [N,H,W] amplifies even
+        # small per-element flips), failing
+        # ``test_fused_conv_gn_relu_backward_grad_parity`` with
+        # ``L_inf=0.885`` vs CPU.
+        gn_out, gn_save_mean, gn_save_rstd = torch.ops.aten.native_group_norm.default(
             conv_out, gn_w.detach(), gn_b.detach(), N, C, HxW, ctx.num_groups, ctx.eps
         )
         ctx.save_for_backward(
             inp, w, b if has_bias else None,   # NON-detached: needed by custom backward
-            gn_w, gn_b, output,                # output = relu output (for mask)
+            gn_w, gn_b, gn_out,                # aten gn_out (for ReLU mask consistent w/ bwd)
             conv_out, gn_save_mean, gn_save_rstd,  # detached: no extra grad paths
         )
 
@@ -299,7 +312,7 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
     _ensure_conv2d_backward_op_registered()
 
     def _conv2d_gn_relu_backward(ctx, grad_output):
-        (inp, w, saved_b, gn_w, gn_b, saved_output,
+        (inp, w, saved_b, gn_w, gn_b, saved_gn_out,
          conv_out, gn_save_mean, gn_save_rstd) = ctx.saved_tensors
         has_bias = ctx.has_bias
 
@@ -308,8 +321,14 @@ def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
         G = ctx.num_groups
         HxW = int(conv_out.shape[2]) * int(conv_out.shape[3])
 
-        # ReLU backward: use the exact forward relu output for the mask.
-        relu_mask = (saved_output > 0).to(dtype=grad_output.dtype)
+        # M18.9: ReLU mask from the aten-computed GN pre-relu output.
+        # ``relu(x) > 0`` is equivalent to ``x > 0``, so taking the mask
+        # from ``gn_out`` is functionally identical to taking it from
+        # ``relu(gn_out)`` — and keeps the mask numerically consistent
+        # with the ``conv_out`` / ``mean`` / ``rstd`` triple that
+        # ``native_group_norm_backward`` operates on (all computed by
+        # aten in setup_context).
+        relu_mask = (saved_gn_out > 0).to(dtype=grad_output.dtype)
         grad_gn_out = grad_output * relu_mask
 
         # GN backward: conv_out / mean / rstd are saved tensors (backward graph
