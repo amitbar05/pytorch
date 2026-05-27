@@ -60150,11 +60150,6 @@ class TestTrain8ConvTrainingSweep:
         cross_entropy fwd + nll_loss bwd (TRAIN.4), flatten.
         Uses 1x1 Conv instead of Linear to avoid addmm autotune blocker.
         """
-        pytest.xfail(
-            "Known blocker: cross_entropy backward produces 'div' node "
-            "that Inductor can't resolve (BackendCompilerFailed: Node div "
-            "was invalid, but is output). Pre-existing Inductor lowering issue."
-        )
         import torch.nn as nn
 
         class SimpleCNN(nn.Module):
@@ -60178,10 +60173,6 @@ class TestTrain8ConvTrainingSweep:
 
         Exercises: conv2d, group_norm, relu, max_pool2d, cross_entropy.
         """
-        pytest.xfail(
-            "Known blocker: cross_entropy backward div node. "
-            "See test_simple_cnn_conv_maxpool_fc for details."
-        )
         import torch.nn as nn
 
         class SmallCNN(nn.Module):
@@ -60210,10 +60201,6 @@ class TestTrain8ConvTrainingSweep:
         Exercises: conv2d, group_norm, relu, add (residual),
         adaptive_avg_pool2d, cross_entropy.
         """
-        pytest.xfail(
-            "Known blocker: cross_entropy backward div node. "
-            "See test_simple_cnn_conv_maxpool_fc for details."
-        )
         import torch.nn as nn
 
         class ResBlock(nn.Module):
@@ -60256,10 +60243,6 @@ class TestTrain8ConvTrainingSweep:
         Validates TRAIN.3 (decoupled weight decay) in a full training loop.
         Uses 1x1 Conv instead of Linear to avoid addmm autotune blocker.
         """
-        pytest.xfail(
-            "Known blocker: cross_entropy backward div node. "
-            "See test_simple_cnn_conv_maxpool_fc for details."
-        )
         import copy
         import torch.nn as nn
         import torch_vulkan
@@ -60313,10 +60296,6 @@ class TestTrain8ConvTrainingSweep:
         Uses 1x1 Conv + AdaptiveAvgPool instead of Linear to avoid addmm.
         Uses xfail for the known cross_entropy backward div node issue.
         """
-        pytest.xfail(
-            "Known blocker: cross_entropy backward div node. "
-            "See test_simple_cnn_conv_maxpool_fc for details."
-        )
         import torch.nn as nn
 
         class ArchA(nn.Module):
@@ -60493,10 +60472,6 @@ class TestTrain5PoolAllocatorReuse:
         Runs 20 training steps and checks that the pool's total retained
         bytes plateau (doesn't grow by more than 20% from step 5 to step 20).
         """
-        pytest.xfail(
-            "Known blocker: training loop hits cross_entropy backward div node. "
-            "See test_simple_cnn_conv_maxpool_fc for details."
-        )
         import copy
         import torch.nn as nn
         import torch_vulkan
