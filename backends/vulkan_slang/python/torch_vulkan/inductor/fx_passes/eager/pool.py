@@ -152,6 +152,123 @@ def _ensure_max_pool2d_op_registered() -> "object":
     return torch.ops.torch_vulkan.max_pool2d.default
 
 
+def _ensure_max_pool2d_scatter_bwd_op_registered() -> "object":
+    """Register ``torch_vulkan::max_pool2d_scatter_bwd`` (TRAIN.2).
+
+    GPU-only max_pool2d backward via the ``scatter_atomic`` Slang template.
+
+    Replaces the FallbackKernel path that required a CPU roundtrip for
+    int64→uint32 index conversion (``backward_ops.cpp:436-445``).  The
+    custom op implementation:
+
+    1. Allocates ``grad_input = zeros(N, C, iH, iW)`` on Vulkan.
+    2. Converts int64 per-plane indices to int32 (GPU pointwise).
+    3. Computes global flat indices (= plane_offset + local_idx) on GPU.
+    4. Dispatches ``scatter_add`` via ``_dispatch_scatter_atomic`` — the
+       battle-tested ``scatter_atomic.slang`` template handles the
+       scatter write with atomic float-add semantics so overlapping
+       windows accumulate gradients correctly.
+
+    Returns the ``grad_input`` tensor.
+    """
+    import torch
+
+    op_name = "torch_vulkan::max_pool2d_scatter_bwd"
+    existing = getattr(torch.ops.torch_vulkan, "max_pool2d_scatter_bwd", None)
+    if existing is not None and hasattr(existing, "default"):
+        return existing.default
+
+    Tensor = torch.Tensor
+
+    def _max_pool2d_scatter_bwd_impl(
+        grad_output: Tensor,
+        indices: Tensor,
+        N: int,
+        C: int,
+        iH: int,
+        iW: int,
+    ) -> Tensor:
+        from ...vulkan_template_caller import _dispatch_scatter_atomic
+
+        # 1. Zero-initialized grad_input matching the original input shape.
+        grad_input = torch.zeros(
+            (N, C, iH, iW), dtype=grad_output.dtype, device=grad_output.device
+        )
+
+        output_numel = grad_output.numel()
+        input_numel = N * C * iH * iW
+        if output_numel == 0:
+            return grad_input
+
+        input_spatial = iH * iW
+        oH = grad_output.shape[2]
+        oW = grad_output.shape[3]
+        output_spatial = oH * oW
+
+        # 2. Flatten grad_output and indices for the scatter dispatch.
+        go_flat = grad_output.reshape(-1).contiguous()
+        idx_flat = indices.reshape(-1)
+
+        # 3. Convert int64 indices → int32 (GPU pointwise cast).
+        idx_i32 = idx_flat.to(torch.int32)
+
+        # 4. Compute global flat indices:
+        #    For each output position i ∈ [0, NC*oH*oW):
+        #      plane_id = i // (oH * oW)
+        #      global_idx = plane_id * (iH * iW) + local_idx_i32[i]
+        plane_ids = (
+            torch.arange(
+                output_numel, dtype=torch.int32, device=grad_output.device
+            )
+            // output_spatial
+        )
+        global_idx = plane_ids * input_spatial + idx_i32
+
+        # Ensure global_idx is contiguous for the scatter dispatch.
+        global_idx = global_idx.contiguous()
+
+        # 5. Scatter-add: grad_input_flat[global_idx[i]] += go_flat[i].
+        #    Using scatter_add (not plain scatter) because with overlapping
+        #    pool windows the same input position may be the max for
+        #    multiple output positions — gradients must accumulate.
+        grad_input_flat = grad_input.reshape(-1)
+        _dispatch_scatter_atomic(
+            operation="scatter_add",
+            numel=output_numel,
+            src_numel=output_numel,
+            out_numel=input_numel,
+            output=grad_input_flat,
+            src=go_flat,
+            indices=global_idx,
+            dtype="float",
+            index_dtype="int",
+            cache_key="slang_scatter_maxpool2d_bwd_float_int",
+        )
+        # grad_input_flat is a view; the scatter wrote to the same storage.
+        return grad_input
+
+    _max_pool2d_scatter_bwd_impl.__annotations__ = {
+        "grad_output": Tensor,
+        "indices": Tensor,
+        "N": int,
+        "C": int,
+        "iH": int,
+        "iW": int,
+        "return": Tensor,
+    }
+    op = torch.library.custom_op(op_name, mutates_args=())(
+        _max_pool2d_scatter_bwd_impl
+    )
+
+    def _max_pool2d_scatter_bwd_fake(
+        grad_output, indices, N, C, iH, iW,
+    ):
+        return grad_output.new_empty((N, C, iH, iW))
+
+    op.register_fake(_max_pool2d_scatter_bwd_fake)
+    return torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default
+
+
 def _ensure_adaptive_avg_pool2d_op_registered() -> "object":
     """Register ``torch_vulkan::adaptive_avg_pool2d`` as a custom_op.
 

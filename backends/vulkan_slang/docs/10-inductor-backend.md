@@ -109,7 +109,7 @@ from the ratified extern, not a leak-fix.
 
 * **No new work under v6.x sections.** They're archived in
   [`archive/v6.x-snapshot-2026-05-27.md`](archive/v6.x-snapshot-2026-05-27.md);
-  do not extend the archive — new work goes in the v7 table above.
+  do not extend the archive — new work goes in the v8 table below.
 * **One commit per milestone.** Title format `vulkan: M-CG.2 — drop
   non-Vulkan aten shims from fused custom-op impls` (no laundry-list
   multi-purpose commits).
@@ -121,6 +121,56 @@ from the ratified extern, not a leak-fix.
 * **Closed items move to history.md.** When all sub-items in a
   pillar close, archive the section and replace it with a one-line
   pointer.
+
+---
+
+# § v8 — Conv Training Completeness (2026-05-27)
+
+> **v8 (2026-05-27)** — v7 closed all 16 milestones (M-CG, M-SF, M-VAL,
+> M-PROBE). v8 addresses the remaining blockers for **training conv
+> models end-to-end through `torch.compile(backend="inductor")`**. The
+> focus is on ops reachable from common CNN architectures (Conv2d +
+> normalization + activation + pooling + classifier + loss + optimizer)
+> that still have gaps.
+
+## North star
+
+A conv model trained with `torch.compile(backend="inductor")` on Vulkan
+must support: any combination of Conv2d (fwd+bwd), BatchNorm/GroupNorm,
+ReLU/GELU/SiLU, MaxPool2d/AvgPool2d, Linear (fwd+bwd), common losses
+(MSE, BCE, BCE-with-logits, L1, SmoothL1, Huber, CrossEntropy via
+log_softmax+nll_loss), and SGD/AdamW/Lion optimizers — all through
+Slang codegen kernels with no aten eager fallback on the compile path.
+
+## v8 milestones
+
+| # | Title | Why | Effort | Status |
+|---|-------|-----|--------|--------|
+| **TRAIN.1** | Loss backward reachability | 7 loss bwd ops in BWD_DIFF_TABLE were unreachable: 4 decomposed by upstream before Inductor, 2 had custom_op but no @register_lowering, 1 was phantom (aten op doesn't exist). | 0.5 d | ✅ **CLOSED 2026-05-27.** Suppressed upstream decomps for 6 loss bwd ops (`_suppress_upstream_decomps` + `_aot_decomps.pop`). Added `aten.l1_loss_backward` to `_BINARY_LOSS_BWD_DIFF_OPS` + `_BINARY_BWD_DIFF_LOWERING_OPS` + `_BINARY_INLINE_OPS`. Added `aten.binary_cross_entropy_with_logits_backward` to lowering + inline + special weight handler. Removed phantom `aten.kl_div_backward` from BWD_DIFF_TABLE. Test: `TestTrain1LossBackwardReachability`. |
+| **TRAIN.2** | MaxPool2d backward codegen path | Current backward uses FallbackKernel → C++ kernel with int64→uint32 CPU roundtrip (`backward_ops.cpp:410-473`). Not M-CG compliant. Scatter template (`scatter_atomic.slang`) exists but not wired for pool backward. | 1 d | ✅ **CLOSED 2026-05-27.** Registered custom op `torch_vulkan::max_pool2d_scatter_bwd` that computes global int32 indices on GPU (no CPU roundtrip) and dispatches `scatter_add` via `scatter_atomic.slang`. Replaced FallbackKernel in `bwd_lowerings.py` with `fallback_handler` on the custom op + shape extraction. Regression test: `TestTrain2MaxPoolBackwardCodegen` (5 tests: op registration, eager direct, compile path, overlapping windows scatter_add, no-CPU-roundtrip assertion). Files: `fx_passes/eager/pool.py`, `bwd_lowerings.py:660-690`, `lowerings/__init__.py:398-404`. |
+| **TRAIN.3** | AdamW/Lion decoupled weight decay | `foreach_optimizer.slang` applied L2 weight decay (`g += wd*p`) for ALL algorithms, contaminating moment estimates for AdamW. AdamW's update formula ALSO applied wd, causing double-counting. | 0.25 d | ✅ **CLOSED 2026-05-27.** Wrapped generic weight decay in `{% if algorithm in ("sgd", "sgd_momentum") %}` so only SGD variants use L2 regularization. AdamW and Lion now use only their decoupled wd paths. Test: `TestTrain3AdamWDecoupledWd`. |
+| **TRAIN.4** | Cross-entropy (nll_loss) backward | `F.cross_entropy` decomposes to `log_softmax + nll_loss`. The backward produces `aten.nll_loss_backward` which is NOT in bwd_diff_table or any lowering. Most common classification loss. | 1 d | 🔲 OPEN. Options: (a) add nll_loss_backward to bwd_diff_table as a scatter+broadcast op, or (b) handle it as a decomposition into `scatter_add(grad, target, -1/N)` in `decomposition_passes.py`. Blocked by TRAIN.5 (scatter template wiring). |
+| **TRAIN.5** | Pool allocator / extern-kernel buffer reuse | 6 GB VRAM GPU will OOM on multi-step training without buffer reuse. TRAIN.8 (pool allocator hook) and TRAIN.9 (50-step memory plateau) not started. | 2 d | 🔲 OPEN. Wire `buffer_pool.py` into the scheduler's memory planner so extern kernels (conv backward, pool backward) share allocation pools with compiled kernels. Currently compiled kernels get dedicated allocations that are never freed between training steps. |
+| **TRAIN.6** | Dynamic shapes for variable-batch training | Current codegen hardcodes batch size in push constants and spec constants. Variable batch → full recompilation. D.1 (symbolic shape foundation), D.2 (dynamic dispatch grid), D.3 (dynamic buffer binding) not started. | 3 d | 🔲 OPEN. Phase 1: spec constants for N/H/W in kernel launch (avoids recompilation). Phase 2: dynamic descriptor set binding. Phase 3: scheduler shape-agnostic IR. |
+| **TRAIN.7** | Conv backward pure Slang codegen (upgrade from extern) | M-pipeline-8 tracks upgrading conv backward from the ratified `extern_kernels.conv2d_backward` to a pure `bwd_diff(conv_inner_madd)` Slang codegen path. The eager path already has this (`_slang_tile_conv2d_bwd`). | 2 d | 🔲 OPEN. Wire the compile path to use the same `bwd_diff(conv_inner_madd)` Slang shader as the eager path, eliminating the PrivateUse1 C++ adapter dependency. |
+| **TRAIN.8** | Conv training correctness sweep | End-to-end correctness validation for 3 conv model classes under torch.compile: (A) Conv+BN+FC (ResNet-mini), (B) Conv+GN+ReLU+FC (SmallCNN), (C) Conv+MaxPool+FC (SimpleCNN). Each must match CPU loss curve within rtol=0.5 over 10 training steps. | 0.5 d | 🔲 OPEN. Blocked by TRAIN.2 (MaxPool codegen) and TRAIN.4 (CE loss). Once those are done, run sweep harness on RDNA1 GPU under Vulkan validation. |
+| **TRAIN.9** | Missing training-critical eager ops (reciprocal) | `clip_grad_norm_()` calls `max_norm / (total_norm + 1e-6)` → `__rdiv__` → `self.reciprocal()` → `aten::reciprocal.out`. Not registered in PrivateUse1 backend → RuntimeError. Blocks any training loop with gradient clipping. | 0.25 d | ✅ **CLOSED 2026-05-27.** Added `vulkan_reciprocal()` + `vulkan_reciprocal_out()` using `unary_reciprocal_fwd` shader (already in generated/shaders.h). Registered both `reciprocal` and `reciprocal.out` in Registration.cpp. Test: `TestTrain9ReciprocalOp`. |
+| **TRAIN.10** | Benchmark async dispatch sync | `_vulkan_benchmark` routes to `benchmark_cpu()` whose inner loop calls `callable_()` warmup+rep times without GPU sync. Vulkan dispatches are async → command buffer fills → `VK_ERROR_OUT_OF_DEVICE_MEMORY` → ALL candidates return Infinity. Blocks addmm/mm autotune — SmallCNN North Star crashes with `best_time: Infinity`. | 0.25 d | ✅ **CLOSED 2026-05-27.** Wrapped benchmark callable with `torch_vulkan.synchronize(0)` (calls `vkDeviceWaitIdle`) after each dispatch in the inner loop. File: `inductor/__init__.py:_vulkan_benchmark`. Test: `TestTrain10BenchmarkSync`. |
+
+## v8 status tracking
+
+| Milestone | Status | Blocked by | Regression test |
+|-----------|--------|------------|-----------------|
+| TRAIN.1 | ✅ CLOSED | — | `TestTrain1LossBackwardReachability` |
+| TRAIN.2 | ✅ CLOSED | — | `TestTrain2MaxPoolBackwardCodegen` |
+| TRAIN.3 | ✅ CLOSED | — | `TestTrain3AdamWDecoupledWd` |
+| TRAIN.4 | 🔲 OPEN | — (TRAIN.2 unblocked) | `TestTrain4CrossEntropyBackward` |
+| TRAIN.5 | 🔲 OPEN | — | `TestTrain5MultiStepMemory` |
+| TRAIN.6 | 🔲 OPEN | — | `TestTrain6DynamicBatch` |
+| TRAIN.7 | 🔲 OPEN | — | `TestTrain7ConvBackwardPureSlang` |
+| TRAIN.8 | 🔲 OPEN | TRAIN.2, TRAIN.4 | `TestTrain8ConvTrainingSweep` |
+| TRAIN.9 | ✅ CLOSED | — | `TestTrain9ReciprocalOp` |
+| TRAIN.10 | ✅ CLOSED | — | `TestTrain10BenchmarkSync` |
 
 ---
 

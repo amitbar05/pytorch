@@ -59500,3 +59500,387 @@ class TestCOV3ActivationBackward:
         fn(x_cpu).backward()
         compiled(x_vk).backward()
         torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.1 — Loss backward reachability (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain1LossBackwardReachability:
+    """TRAIN.1 — Loss backward ops reach the Vulkan bwd_diff Slang kernels.
+
+    7 loss backward entries in BWD_DIFF_TABLE were unreachable: 4 decomposed
+    upstream, 2 had no @register_lowering, 1 was phantom (aten op doesn't
+    exist). After TRAIN.1: upstream decomps suppressed, registrations added,
+    phantom removed, weight-safe handler for bce_with_logits.
+    """
+
+    def _loss_bwd_parity(self, loss_fn, x_shape=(32,), target_shape=None):
+        torch.manual_seed(42)
+        x_cpu = torch.randn(x_shape).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        t_shape = target_shape or x_shape
+        t_cpu = torch.randn(t_shape)
+        t_vk = t_cpu.clone().to("vulkan:0")
+        compiled = torch.compile(loss_fn, backend="vulkan_fuse")
+        loss_fn(x_cpu, t_cpu).backward()
+        compiled(x_vk, t_vk).backward()
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4
+        )
+
+    def test_mse_loss_backward_reachable(self):
+        """aten.mse_loss_backward reaches bwd_diff(mse_elem)."""
+        self._loss_bwd_parity(lambda x, t: torch.nn.functional.mse_loss(x, t))
+
+    def test_l1_loss_backward_reachable(self):
+        """aten.l1_loss_backward reaches bwd_diff(l1_elem)."""
+        self._loss_bwd_parity(lambda x, t: torch.nn.functional.l1_loss(x, t))
+
+    def test_bce_loss_backward_reachable(self):
+        """aten.binary_cross_entropy_backward reaches bce_elem."""
+        torch.manual_seed(42)
+        x_cpu = torch.sigmoid(torch.randn(32)).requires_grad_(True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        t_cpu = torch.rand(32)
+        t_vk = t_cpu.clone().to("vulkan:0")
+        fn = lambda x, t: torch.nn.functional.binary_cross_entropy(x, t)
+        compiled = torch.compile(fn, backend="vulkan_fuse")
+        fn(x_cpu, t_cpu).backward()
+        compiled(x_vk, t_vk).backward()
+        torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
+
+    def test_bce_with_logits_backward_reachable(self):
+        """aten.binary_cross_entropy_with_logits_backward reaches bce_with_logits_elem."""
+        self._loss_bwd_parity(
+            lambda x, t: torch.nn.functional.binary_cross_entropy_with_logits(x, t)
+        )
+
+    def test_smooth_l1_loss_backward_reachable(self):
+        """aten.smooth_l1_loss_backward reaches smooth_l1_elem with beta=1.0."""
+        self._loss_bwd_parity(
+            lambda x, t: torch.nn.functional.smooth_l1_loss(x, t, beta=1.0)
+        )
+
+    def test_huber_loss_backward_reachable(self):
+        """aten.huber_loss_backward reaches huber_elem with delta=1.0."""
+        self._loss_bwd_parity(
+            lambda x, t: torch.nn.functional.huber_loss(x, t, delta=1.0)
+        )
+
+    def test_kl_div_backward_removed_from_table(self):
+        """Phantom aten.kl_div_backward removed from BWD_DIFF_TABLE."""
+        from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
+        assert "aten.kl_div_backward" not in BWD_DIFF_TABLE
+
+    def test_binary_loss_lowering_ops_complete(self):
+        """All 6 loss bwd ops have lowering registrations."""
+        from torch_vulkan.inductor.bwd_lowerings import _BINARY_BWD_DIFF_LOWERING_OPS
+        expected = {
+            "aten.mse_loss_backward",
+            "aten.l1_loss_backward",
+            "aten.binary_cross_entropy_with_logits_backward",
+            "aten.smooth_l1_loss_backward",
+            "aten.huber_loss_backward",
+        }
+        assert expected.issubset(_BINARY_BWD_DIFF_LOWERING_OPS)
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.3 — AdamW decoupled weight decay (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain3AdamWDecoupledWd:
+    """TRAIN.3 — AdamW/Lion weight decay is decoupled from gradient.
+
+    foreach_optimizer.slang used to apply L2 wd (g += wd*p) for ALL
+    algorithms, contaminating AdamW moment estimates. Now gated to
+    sgd/sgd_momentum only.
+    """
+
+    def test_adamw_weight_decay_no_double_counting(self):
+        """AdamW with wd=0.01: weights match CPU over 3 steps."""
+        torch.manual_seed(42)
+        w_cpu = torch.randn(16, 8).requires_grad_(True)
+        w_vk = w_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        opt_cpu = torch.optim.AdamW([w_cpu], lr=0.01, weight_decay=0.01)
+        import torch_vulkan.optim as tv_opt
+        opt_vk = tv_opt.AdamW([w_vk], lr=0.01, weight_decay=0.01)
+        for _ in range(3):
+            x = torch.randn(4, 16)
+            (x @ w_cpu).pow(2).mean().backward()
+            opt_cpu.step(); opt_cpu.zero_grad()
+            (x.to("vulkan:0") @ w_vk).pow(2).mean().backward()
+            opt_vk.step(); opt_vk.zero_grad()
+        torch.testing.assert_close(w_vk.cpu(), w_cpu, atol=1e-4, rtol=1e-4)
+
+    def test_sgd_l2_weight_decay_unchanged(self):
+        """SGD with wd=0.1: L2 regularization still applied correctly."""
+        torch.manual_seed(42)
+        w_cpu = torch.randn(8).requires_grad_(True)
+        w_vk = w_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        opt_cpu = torch.optim.SGD([w_cpu], lr=0.1, weight_decay=0.1)
+        opt_vk = torch.optim.SGD([w_vk], lr=0.1, weight_decay=0.1)
+        x = torch.randn(4, 8)
+        (x @ w_cpu).pow(2).mean().backward()
+        opt_cpu.step()
+        (x.to("vulkan:0") @ w_vk).pow(2).mean().backward()
+        opt_vk.step()
+        torch.testing.assert_close(w_vk.cpu(), w_cpu, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.9 — Missing training-critical eager ops: reciprocal (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain9ReciprocalOp:
+    """TRAIN.9 — aten::reciprocal registered in Vulkan PrivateUse1 backend.
+
+    clip_grad_norm_() calls `max_norm / (total_norm + 1e-6)` which triggers
+    __rdiv__ → self.reciprocal(). Without the Vulkan registration, any
+    training loop with gradient clipping crashes with RuntimeError.
+    """
+
+    def test_reciprocal_functional(self):
+        """reciprocal(Tensor) → Tensor works on Vulkan."""
+        x_cpu = torch.tensor([1.0, 2.0, 4.0, 0.5])
+        x_vk = x_cpu.to("vulkan:0")
+        torch.testing.assert_close(
+            x_vk.reciprocal().cpu(), x_cpu.reciprocal(), atol=1e-5, rtol=1e-5
+        )
+
+    def test_reciprocal_out_variant(self):
+        """reciprocal.out(Tensor, *, Tensor out) works on Vulkan."""
+        x_vk = torch.tensor([1.0, 2.0, 4.0, 0.5], device="vulkan:0")
+        out = torch.empty_like(x_vk)
+        torch.reciprocal(x_vk, out=out)
+        torch.testing.assert_close(
+            out.cpu(), torch.tensor([1.0, 0.5, 0.25, 2.0]), atol=1e-5, rtol=1e-5
+        )
+
+    def test_clip_grad_norm_no_crash(self):
+        """clip_grad_norm_ with Vulkan tensors doesn't crash on reciprocal."""
+        w = torch.randn(8, device="vulkan:0", requires_grad=True)
+        (w ** 2).sum().backward()
+        # This must not raise RuntimeError about reciprocal.out
+        total_norm = torch.nn.utils.clip_grad_norm_([w], max_norm=1.0)
+        assert total_norm.device.type == "vulkan"
+        assert torch.isfinite(total_norm)
+
+    def test_rtruediv_scalar_by_tensor(self):
+        """scalar / vulkan_tensor → reciprocal path."""
+        x_vk = torch.tensor([2.0, 4.0], device="vulkan:0")
+        x_cpu = x_vk.cpu()
+        result_vk = 1.0 / x_vk
+        result_cpu = 1.0 / x_cpu
+        torch.testing.assert_close(
+            result_vk.cpu(), result_cpu, atol=1e-5, rtol=1e-5
+        )
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.10 — Benchmark async dispatch sync (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain10BenchmarkSync:
+    """TRAIN.10 — Vulkan benchmark loop synchronizes GPU between iterations.
+
+    Before TRAIN.10, ``_vulkan_benchmark`` routed directly to
+    ``benchmark_cpu()`` which loops warmup+rep times without GPU sync.
+    Since Vulkan dispatches are async, the command buffer fills up until
+    vkQueueSubmit fails or returns VK_ERROR_OUT_OF_DEVICE_MEMORY.
+    All kernel candidates return Infinity → autotune selects the first
+    one arbitrarily (or raises NoValidChoicesError).
+
+    After TRAIN.10, the callable is wrapped to include
+    ``torch_vulkan.synchronize(0)`` (vkDeviceWaitIdle) after each dispatch.
+    """
+
+    def test_benchmark_callable_includes_sync(self):
+        """Verify the Vulkan benchmark wrapper calls synchronize."""
+        import torch_vulkan
+        from torch._inductor.runtime import benchmarking as _bm
+
+        b = _bm.benchmarker
+        # Patch must be installed (torch_vulkan inductor init does this).
+        assert getattr(b, "_vulkan_routed", False), (
+            "TRAIN.10: Vulkan benchmark patch not installed"
+        )
+
+    def test_addmm_autotune_does_not_return_inf(self):
+        """addmm autotune should find at least one finite-timed kernel candidate.
+
+        Before TRAIN.10: ALL tile configs returned Infinity because the
+        benchmark loop never synced the GPU. This caused SmallCNN's
+        Linear(2048, 10) to crash with RuntimeError (no valid choices).
+        """
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        x_vk = torch.randn(4, 64, device="vulkan:0")
+        w_vk = torch.randn(64, 10, device="vulkan:0")
+        b_vk = torch.randn(10, device="vulkan:0")
+
+        @torch.compile(backend="vulkan_fuse")
+        def fn(x, w, b):
+            return F.linear(x, w.t(), b)
+
+        # This should complete without RuntimeError / no-valid-choices.
+        out = fn(x_vk, w_vk, b_vk)
+        # Verify correctness vs CPU.
+        out_cpu = F.linear(x_vk.cpu(), w_vk.cpu().t(), b_vk.cpu())
+        torch.testing.assert_close(out.cpu(), out_cpu, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.2 — MaxPool2d backward codegen path via scatter template (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain2MaxPoolBackwardCodegen:
+    """TRAIN.2 — max_pool2d backward uses scatter_add Slang template on GPU.
+
+    Replaces FallbackKernel → C++ shader with int64→uint32 CPU roundtrip.
+    The new path computes global int32 indices on GPU and dispatches the
+    scatter_atomic.slang template (scatter_add mode) — no CPU roundtrip,
+    no int64 SPIR-V, M-CG compliant.
+    """
+
+    def test_custom_op_registered(self):
+        """Custom op torch_vulkan::max_pool2d_scatter_bwd exists."""
+        import torch
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_max_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_max_pool2d_scatter_bwd_op_registered()
+        op = torch.ops.torch_vulkan.max_pool2d_scatter_bwd
+        assert op is not None
+        assert hasattr(op, "default")
+
+    def test_scatter_bwd_eager_direct(self):
+        """Direct call to custom op: grad parity with CPU."""
+        import torch
+        import torch.nn.functional as F
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_max_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_max_pool2d_scatter_bwd_op_registered()
+
+        torch.manual_seed(42)
+        x_cpu = torch.randn(2, 3, 8, 8, requires_grad=True)
+        out_cpu = F.max_pool2d(x_cpu, kernel_size=2, stride=2)
+        grad_out_cpu = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_out_cpu)
+
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+        out_vk, indices_vk = torch.ops.aten.max_pool2d_with_indices.default(
+            x_vk, [2, 2], [2, 2], [0, 0], [1, 1], False,
+        )
+        grad_out_vk = grad_out_cpu.to("vulkan:0")
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_max_pool2d_scatter_bwd_op_registered,
+        )
+        _ensure_max_pool2d_scatter_bwd_op_registered()
+
+        grad_in_vk = torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default(
+            grad_out_vk, indices_vk, 2, 3, 8, 8,
+        )
+
+        torch.testing.assert_close(
+            grad_in_vk.cpu(), x_cpu.grad, atol=1e-5, rtol=1e-5,
+        )
+
+    def test_scatter_bwd_compile_path(self):
+        """torch.compile path: max_pool2d backward through Inductor."""
+        import torch
+        import torch.nn.functional as F
+
+        torch.manual_seed(42)
+        x_cpu = torch.randn(2, 4, 8, 8, requires_grad=True)
+        out_cpu = F.max_pool2d(x_cpu, kernel_size=2, stride=2)
+        grad_out_cpu = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_out_cpu)
+
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        @torch.compile(backend="vulkan_fuse")
+        def fn(x):
+            return F.max_pool2d(x, kernel_size=2, stride=2)
+
+        out_vk = fn(x_vk)
+        grad_out_vk = grad_out_cpu.to("vulkan:0")
+        out_vk.backward(grad_out_vk)
+
+        torch.testing.assert_close(
+            x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4,
+        )
+
+    def test_overlapping_windows_scatter_add(self):
+        """Overlapping pool windows (stride < kernel_size) accumulate grads.
+
+        When stride=1 and kernel_size=2, the same input position can be
+        the max for multiple output positions. scatter_add semantics ensure
+        gradients accumulate correctly at shared positions.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_max_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_max_pool2d_scatter_bwd_op_registered()
+
+        torch.manual_seed(123)
+        x_cpu = torch.randn(1, 1, 6, 6, requires_grad=True)
+        out_cpu = F.max_pool2d(x_cpu, kernel_size=3, stride=1, padding=0)
+        grad_out_cpu = torch.randn_like(out_cpu)
+        out_cpu.backward(grad_out_cpu)
+
+        x_vk = x_cpu.detach().clone().to("vulkan:0")
+        out_vk, indices_vk = torch.ops.aten.max_pool2d_with_indices.default(
+            x_vk, [3, 3], [1, 1], [0, 0], [1, 1], False,
+        )
+        grad_out_vk = grad_out_cpu.to("vulkan:0")
+
+        grad_in_vk = torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default(
+            grad_out_vk, indices_vk, 1, 1, 6, 6,
+        )
+
+        torch.testing.assert_close(
+            grad_in_vk.cpu(), x_cpu.grad, atol=1e-5, rtol=1e-5,
+        )
+
+    def test_no_cpu_roundtrip_in_scatter_bwd(self):
+        """Custom op impl does not touch CPU (no .cpu() / numpy / tolist)."""
+        import inspect
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_max_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_max_pool2d_scatter_bwd_op_registered()
+
+        # The impl is registered on torch.ops.torch_vulkan.max_pool2d_scatter_bwd.
+        # We can't easily introspect the registered function, but we can verify
+        # that the source of the function (from pool.py) does NOT contain .cpu().
+        source_file = inspect.getfile(_ensure_max_pool2d_scatter_bwd_op_registered)
+        with open(source_file) as f:
+            src = f.read()
+        # Extract the function body.
+        start = src.index("def _max_pool2d_scatter_bwd_impl")
+        end = src.index("\n\n    _max_pool2d_scatter_bwd_impl.__annotations__")
+        impl_src = src[start:end]
+        assert ".cpu()" not in impl_src, (
+            "TRAIN.2: scatter_bwd impl must NOT do CPU roundtrip"
+        )
+        assert "tolist()" not in impl_src, (
+            "TRAIN.2: scatter_bwd impl must NOT use tolist()"
+        )

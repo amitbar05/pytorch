@@ -89,6 +89,19 @@ def _suppress_upstream_decomps() -> None:
         aten.hardsigmoid_backward.default,
         aten.softplus_backward.default,
         aten.mish_backward.default,
+        # TRAIN.1 (2026-05-27): Suppress upstream decompositions for loss
+        # backward ops. Without these, AOT Autograd decomposes mse_loss_backward,
+        # binary_cross_entropy_backward, smooth_l1_loss_backward, huber_loss_backward
+        # into primitive ops (mul, sub, where, abs) before Inductor sees them.
+        # Our bwd_diff Slang kernels in BWD_DIFF_TABLE + _BINARY_BWD_DIFF_LOWERING_OPS
+        # never fire — dead code. Suppressing lets the fused single-dispatch
+        # Slang backward execute instead of 4-6 dispatches of primitives.
+        aten.mse_loss_backward.default,
+        aten.binary_cross_entropy_backward.default,
+        aten.binary_cross_entropy_with_logits_backward.default,
+        aten.l1_loss_backward.default,
+        aten.smooth_l1_loss_backward.default,
+        aten.huber_loss_backward.default,
         # PF.26: Upstream decomp rewrites this as ``mask.type_as(grad) *
         # scale * grad`` which fuses into a single pointwise kernel whose
         # bool LOAD path assumes 1-uint-per-element storage.  External
@@ -153,6 +166,18 @@ def _suppress_upstream_decomps() -> None:
     # before AOT autograd produces the FX graph that Inductor lowers.
     # Remove it there too so the op survives to our register_lowering.
     _aot_decomps.pop(aten.native_dropout_backward.default, None)
+    # TRAIN.1: also pop loss backward ops from the AOT decomp table.
+    # Without this, AOTAutograd decomposes them before Inductor sees them,
+    # even though we suppressed in the Inductor decompositions dict.
+    for _op in [
+        aten.mse_loss_backward.default,
+        aten.binary_cross_entropy_backward.default,
+        aten.binary_cross_entropy_with_logits_backward.default,
+        aten.l1_loss_backward.default,
+        aten.smooth_l1_loss_backward.default,
+        aten.huber_loss_backward.default,
+    ]:
+        _aot_decomps.pop(_op, None)
     # M18.TB.1 / P12: also pop clamp, clamp_min, clamp_max from the global
     # AOT decomp table. Without this, the upstream torch._refs decomps cause
     # infinite recursion under AOTAutograd tracing:
@@ -369,6 +394,13 @@ def register() -> None:
     # Registered by fx_passes/eager/conv.py::_ensure_conv2d_backward_op_registered.
     if hasattr(torch.ops.torch_vulkan, "conv2d_backward"):
         make_fallback(torch.ops.torch_vulkan.conv2d_backward.default)
+
+    # TRAIN.2: GPU-only max_pool2d backward via scatter_add template.
+    # The custom op is registered by fx_passes/eager/pool.py during
+    # register_eager_patch_custom_ops(); register it as a known extern
+    # kernel for Inductor codegen.
+    if hasattr(torch.ops.torch_vulkan, "max_pool2d_scatter_bwd"):
+        make_fallback(torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default)
 
     # TRAIN.7: autocast boundary ops — identity dtype casts that must not
     # break fusion.  aten._autocast_to_reduced_precision (fp32→fp16/bf16)

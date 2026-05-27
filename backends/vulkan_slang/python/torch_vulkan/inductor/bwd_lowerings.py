@@ -85,7 +85,13 @@ _UNARY_BWD_DIFF_LOWERING_OPS: set[str] = {
 
 _BINARY_BWD_DIFF_LOWERING_OPS: set[str] = {
     "aten.mse_loss_backward",
-    "aten.binary_cross_entropy_backward",
+    "aten.l1_loss_backward",
+    # TRAIN.1 (2026-05-27): binary_cross_entropy_with_logits_backward was
+    # missing from lowering registration. The custom_op factory in bwd_diff.py
+    # creates torch_vulkan::binary_cross_entropy_with_logits_backward_bwd_diff,
+    # but no @register_lowering was installed to route aten op -> custom op.
+    # Adding here fixes reachability for multi-label classification training.
+    "aten.binary_cross_entropy_with_logits_backward",
     "aten.smooth_l1_loss_backward",
     "aten.huber_loss_backward",
 }
@@ -119,6 +125,9 @@ def _register_bwd_diff_lowerings() -> None:
     # ── Special: binary_cross_entropy_backward with weight=None only ────
     # Registered separately because the weight≠None case falls through.
     _register_bce_backward_special(register_lowering, L, aten)
+    # TRAIN.1 (2026-05-27): same pattern for BCE with logits backward —
+    # weight/pos_weight kwargs must trigger NotImplemented fallthrough.
+    _register_bce_with_logits_backward_special(register_lowering, L, aten)
 
 
 def _make_unary_bwd_diff_lowering(
@@ -198,6 +207,38 @@ def _register_bce_backward_special(register_lowering, L, aten) -> None:
         return L.fallback_handler(op)(grad_output, self, target)
 
     _vulkan_bce_backward.__name__ = "_vulkan_binary_cross_entropy_backward_bwd_diff"
+
+
+def _register_bce_with_logits_backward_special(register_lowering, L, aten) -> None:
+    """BCE-with-logits backward with optional weight/pos_weight — bwd_diff only
+    when both weight and pos_weight are None.
+
+    TRAIN.1 (2026-05-27): Without this special handler, the generic lowering in
+    _make_binary_bwd_diff_lowering silently drops weight/pos_weight arguments,
+    producing incorrect gradients when they are non-None. The NotImplemented
+    fallthrough lets the upstream lowering (or the AOT decomposition) handle
+    the weighted case correctly.
+    """
+    op = _ensure_binary_loss_bwd_diff_op(
+        "aten.binary_cross_entropy_with_logits_backward"
+    )
+
+    @register_lowering(
+        aten.binary_cross_entropy_with_logits_backward,
+        type_promotion_kind=None,
+    )
+    def _vulkan_bce_logits_backward(
+        grad_output, self, target, weight=None, reduction=1, pos_weight=None
+    ):
+        if not _is_vulkan(self):
+            return NotImplemented
+        if weight is not None or pos_weight is not None:
+            return NotImplemented
+        return L.fallback_handler(op)(grad_output, self, target)
+
+    _vulkan_bce_logits_backward.__name__ = (
+        "_vulkan_binary_cross_entropy_with_logits_backward_bwd_diff"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -536,8 +577,8 @@ def _register_softmax_backward() -> None:
 
 
 def _register_pool_backward() -> None:
-    """M22.15 — pool backward ops and max_pool2d_with_indices forward via
-    FallbackKernel.
+    """M22.15 + TRAIN.2 — pool backward ops and max_pool2d_with_indices forward
+    via FallbackKernel / scatter custom op.
 
     avg_pool2d_backward: upstream lowering uses ops.indirect_indexing which
     generates incorrect SPIR-V on Vulkan; route through FallbackKernel.
@@ -548,17 +589,19 @@ def _register_pool_backward() -> None:
     the index output; route through FallbackKernel so the remat produces
     correct int64 flat indices.
 
-    max_pool2d_with_indices_backward: the upstream Pointwise lowering uses
-    ops.indirect_indexing for bounded pool-window iteration.  For the common
-    2×2/stride-2 case window_size=1 so the indirect-indexing is trivial and
-    generates correct SPIR-V.  Do NOT override — let the upstream lowering
-    handle this op so PF.25 (TestMaxPool2dWithIndicesBackwardLowering) passes.
+    max_pool2d_with_indices_backward (TRAIN.2): replaced the old FallbackKernel
+    path (C++ GPU shader + int64→uint32 CPU roundtrip) with a GPU-only scatter
+    custom op ``torch_vulkan::max_pool2d_scatter_bwd``.  The custom op computes
+    int32 global flat indices on GPU and dispatches ``scatter_add`` via the
+    ``scatter_atomic.slang`` template.  No CPU roundtrip, no int64 SPIR-V.
     """
     import torch
     from torch._inductor.lowering import (
         fallback_handler,
         register_lowering,
     )
+
+    from .fx_passes.eager.pool import _ensure_max_pool2d_scatter_bwd_op_registered
 
     aten = torch.ops.aten
 
@@ -616,13 +659,16 @@ def _register_pool_backward() -> None:
             x, kernel_size, stride, padding, dilation, ceil_mode
         )
 
-    # Backward: max_pool2d_with_indices_backward — the upstream Pointwise
-    # lowering uses ops.indirect_indexing AND int64 index loads; int64 ops
-    # in Slang/SPIR-V don't work on RDNA1 (and likely other Vulkan devices).
-    # Route through FallbackKernel so index conversion (int64→uint32) happens
-    # on the C++ host before dispatching our uint32-based scatter shader.
-    _vk_max_pool_bwd_fallback = fallback_handler(
-        aten.max_pool2d_with_indices_backward.default,
+    # Backward: max_pool2d_with_indices_backward — TRAIN.2.
+    #
+    # Replaced the FallbackKernel path (C++ GPU shader with int64→uint32
+    # CPU roundtrip in backward_ops.cpp:436-445) with a GPU-only scatter
+    # custom op (``torch_vulkan::max_pool2d_scatter_bwd``).  The custom op
+    # computes global int32 indices on GPU and dispatches the scatter_add
+    # Slang template — no CPU roundtrip, no int64 SPIR-V, M-CG compliant.
+    _ensure_max_pool2d_scatter_bwd_op_registered()
+    _vk_max_pool_scatter_bwd_fb = fallback_handler(
+        torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default,
         add_to_fallback_set=False,
     )
 
@@ -632,8 +678,13 @@ def _register_pool_backward() -> None:
     ):
         if not _is_vulkan(grad_output):
             return NotImplemented
-        return _vk_max_pool_bwd_fallback(
-            grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices
+        # Extract static shapes from IR tensors for the custom op scalars.
+        x_shape = list(x.get_size())
+        if len(x_shape) != 4:
+            return NotImplemented  # only 4D NCHW supported
+        _N, _C, _iH, _iW = (int(s) for s in x_shape)
+        return _vk_max_pool_scatter_bwd_fb(
+            grad_output, indices, _N, _C, _iH, _iW,
         )
 
 
