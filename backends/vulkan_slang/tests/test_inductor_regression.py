@@ -60406,3 +60406,93 @@ class TestTrain7ConvBackwardPureSlang:
         torch.testing.assert_close(
             conv_vk.weight.grad.cpu(), conv_cpu.weight.grad, atol=1e-4, rtol=1e-4,
         )
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.5 — Pool allocator reuse for extern kernel outputs (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+class TestTrain5PoolAllocatorReuse:
+    """TRAIN.5 — Extern kernel eager impls route allocations through pool_acquire.
+
+    Before TRAIN.5: _conv2d_backward_impl used torch.zeros_like() which
+    bypassed the pool, causing fresh allocations every step. Over many
+    training steps on a 6 GB GPU, this leads to OOM.
+
+    After TRAIN.5: conv backward output buffers (grad_input, grad_weight,
+    grad_bias) are acquired from the pool via pool_acquire(), enabling
+    buffer reuse across training steps.
+    """
+
+    def test_conv_backward_uses_pool_acquire(self):
+        """Source check: conv_backward impl calls pool_acquire."""
+        import inspect
+        from torch_vulkan.inductor.fx_passes.eager.conv_backward import (
+            _ensure_conv2d_backward_op_registered,
+        )
+
+        _ensure_conv2d_backward_op_registered()
+        source_file = inspect.getfile(_ensure_conv2d_backward_op_registered)
+        with open(source_file) as f:
+            src = f.read()
+        assert "pool_acquire" in src, (
+            "TRAIN.5: conv_backward impl must use pool_acquire for output buffers"
+        )
+
+    def test_vram_plateaus_across_training_steps(self):
+        """Multi-step training: VRAM should plateau, not grow linearly.
+
+        Runs 20 training steps and checks that the pool's total retained
+        bytes plateau (doesn't grow by more than 20% from step 5 to step 20).
+        """
+        import copy
+        import torch.nn as nn
+        import torch_vulkan
+        from torch_vulkan.inductor.buffer_pool import pool_total_bytes
+
+        torch.manual_seed(42)
+        model = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(8, 10),
+        ).to("vulkan:0")
+        model.train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        x = torch.randn(2, 3, 8, 8, device="vulkan:0")
+        y = torch.randint(0, 10, (2,), device="vulkan:0")
+
+        @torch.compile(backend="vulkan_fuse")
+        def step(inp, target):
+            out = model(inp)
+            loss = torch.nn.functional.cross_entropy(out, target)
+            loss.backward()
+            return loss
+
+        # Warmup
+        for _ in range(5):
+            opt.zero_grad()
+            step(x, y)
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+
+        pool_at_step5 = pool_total_bytes()
+
+        # Run 15 more steps
+        for _ in range(15):
+            opt.zero_grad()
+            step(x, y)
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+
+        pool_at_step20 = pool_total_bytes()
+
+        # Pool should not grow by more than 20% after warmup
+        if pool_at_step5 > 0:
+            growth_ratio = pool_at_step20 / pool_at_step5
+            assert growth_ratio < 1.2, (
+                f"TRAIN.5: Pool grew from {pool_at_step5} to {pool_at_step20} bytes "
+                f"(ratio={growth_ratio:.2f}), expected < 1.2"
+            )

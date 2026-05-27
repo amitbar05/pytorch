@@ -75,14 +75,22 @@ def _ensure_conv2d_backward_op_registered() -> "object":
             pH, pW = int(padding[0]), int(padding[-1] if len(padding) > 1 else padding[0])
             dH, dW = int(dilation[0]), int(dilation[-1] if len(dilation) > 1 else dilation[0])
 
-            # Pre-allocate output tensors (zero-initialized for scatter_add)
-            grad_input = torch.zeros_like(input)
-            grad_weight = torch.zeros_like(weight)
-            grad_bias = (
-                torch.zeros(weight.shape[0], device=input.device, dtype=input.dtype)
-                if has_bias
-                else None
-            )
+            # TRAIN.5: route through pool_acquire for buffer reuse across steps
+            from ...buffer_pool import pool_acquire
+
+            _gi = pool_acquire(tuple(input.shape), input.dtype, input.device)
+            grad_input = _gi.zero_() if _gi is not None else torch.zeros_like(input)
+            _gw = pool_acquire(tuple(weight.shape), weight.dtype, weight.device)
+            grad_weight = _gw.zero_() if _gw is not None else torch.zeros_like(weight)
+            if has_bias:
+                _gb = pool_acquire(
+                    (weight.shape[0],), input.dtype, input.device,
+                )
+                grad_bias = _gb.zero_() if _gb is not None else torch.zeros(
+                    weight.shape[0], device=input.device, dtype=input.dtype,
+                )
+            else:
+                grad_bias = None
 
             _slang_tile_conv2d_bwd(
                 input, weight, grad_output,
