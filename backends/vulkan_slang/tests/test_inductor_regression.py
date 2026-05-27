@@ -54177,6 +54177,44 @@ class TestMSF4JinjaToSlangGenerics:
         )
 
 
+class TestMSF5NumAtomicsHeuristic:
+    """M-SF.5 (v7) — num_atomics reflection field wired into WG sizing.
+
+    The 8th and final reflection metadata field (num_atomics) is now
+    used in the pointwise threadgroup-size heuristic to reduce WG size
+    for kernels with atomic operations (lower contention).
+    """
+
+    def test_num_atomics_getter_exists(self):
+        """``_get_cached_num_atomics`` is defined and callable."""
+        from torch_vulkan.inductor.kernel.threadgroup_sizing import (
+            ThreadgroupSizingMixin,
+        )
+
+        assert hasattr(ThreadgroupSizingMixin, "_get_cached_num_atomics"), (
+            "M-SF.5: ThreadgroupSizingMixin must have _get_cached_num_atomics method"
+        )
+
+    def test_num_atomics_penalty_in_wg_picker(self):
+        """``_pick_threadgroup_size_pointwise`` calls
+        ``_get_cached_num_atomics`` and applies a penalty."""
+        import inspect
+
+        from torch_vulkan.inductor.kernel.threadgroup_sizing import (
+            ThreadgroupSizingMixin,
+        )
+
+        src = inspect.getsource(ThreadgroupSizingMixin._pick_threadgroup_size_pointwise)
+        assert "_get_cached_num_atomics" in src, (
+            "M-SF.5: _pick_threadgroup_size_pointwise must call "
+            "_get_cached_num_atomics for the atomics penalty"
+        )
+        assert "num_atomics" in src and ("sgs * 2" in src or "sgs * 4" in src), (
+            "M-SF.5: _pick_threadgroup_size_pointwise must apply "
+            "sgs-based atomics penalty"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

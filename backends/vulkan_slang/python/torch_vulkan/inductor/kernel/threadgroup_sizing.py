@@ -269,6 +269,30 @@ class ThreadgroupSizingMixin:
         except (TypeError, ValueError):
             return None
 
+    def _get_cached_num_atomics(self) -> Optional[int]:
+        """M-SF.5: Retrieve atomic operation count from cached reflection.
+
+        Atomics are expensive (global memory ordering).  A non-zero
+        count triggers a workgroup-size penalty to reduce contention.
+        """
+        from .. import config as _cfg
+
+        if not _cfg.reflection_enabled():
+            return None
+        config_key = self._compute_config_key()
+        from torch_vulkan.inductor.runtime import get_cached_metrics_for_key
+
+        metrics = get_cached_metrics_for_key(config_key)
+        if metrics is None:
+            return None
+        raw = metrics.get("num_atomics")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
     def _get_cached_subgroup_size(self) -> Optional[int]:
         """M20.5: Retrieve per-kernel subgroup size from cached reflection metrics.
 
@@ -463,6 +487,16 @@ class ThreadgroupSizingMixin:
         io_pressure = self._get_cached_io_pressure()
         if io_pressure is not None and io_pressure > 128:
             max_wg = min(1024, max(max_wg, sgs * 4))
+
+        # M-SF.5: Atomics penalty — atomic ops cause global memory
+        # contention that increases with workgroup size.  Reduce by
+        # one occupancy tier for any atomics, two for heavy atomic use.
+        num_atomics = self._get_cached_num_atomics()
+        if num_atomics is not None and num_atomics > 0:
+            if num_atomics > 16:
+                max_wg = min(max_wg, sgs * 2)  # heavy: max 2 waves
+            else:
+                max_wg = min(max_wg, sgs * 4)  # moderate: max 4 waves
 
         # ── Numel-driven sizing ────────────────────────────────────
         # Pointwise WG-size cap by VGPR pressure class.

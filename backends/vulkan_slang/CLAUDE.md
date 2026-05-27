@@ -73,11 +73,14 @@ roadmap item.
 * **M-VAL.4** ✅ — Pre-slangc static AST validator (2026-05-27).
   Already integrated at slangc.py:161 (M22.1.i); raises RuntimeError
   on any codegen mistake before subprocess invocation.
+* **M-SF.4** ✅ — Jinja has_bias eliminated from conv templates;
+  mm render defaults to link-time module path (2026-05-27).
+* **M-SF.5** ✅ — num_atomics reflection field wired into WG sizing
+  heuristic; 8/8 fields now used for smart Slang features (2026-05-27).
 * **M-PROBE.1, M-PROBE.2, M-PROBE.3** ✅ — prepare_device() API,
   auto_probe_on_import off, timeout enforcement (2026-05-27).
 
-2 milestones remain: **M-SF.4** (Jinja → Slang generics),
-**M-SF.5** (reflection metadata num_atomics).
+🎉 **All 16 v7 milestones closed.** The v7 roadmap is complete.
 
 ## Companion docs
 
