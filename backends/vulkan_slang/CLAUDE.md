@@ -70,12 +70,15 @@ roadmap item.
 * **M-SF.3** ✅ — Spec constants + ParameterBlock now compatible
   (2026-05-27).  Removed CG.M14 constraint in kernel/header.py; all
   pointwise/reduction kernels can now use `[[vk::constant_id(N)]]`.
+* **M-VAL.4** ✅ — Pre-slangc static AST validator (2026-05-27).
+  Already integrated at slangc.py:161 (M22.1.i); raises RuntimeError
+  on any codegen mistake before subprocess invocation.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-4 milestones remain. Next-up candidates: **M-VAL.4**
-(pre-slangc AST validator), **M-SF.4** (Jinja → Slang generics),
-**M-SF.5** (reflection metadata num_atomics).
+3 milestones remain. Next-up candidates: **M-SF.4**
+(Jinja → Slang generics), **M-SF.5** (reflection metadata),
+**M-PROBE.2** (auto_probe_on_import off).
 
 ## Companion docs
 

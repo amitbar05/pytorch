@@ -53935,6 +53935,51 @@ class TestMSF3SpecConstWithParameterBlock:
         )
 
 
+class TestMVal4PreSlangcValidator:
+    """M-VAL.4 (v7) — pre-slangc static AST validator.
+
+    The validator runs at ``slangc.py:161`` BEFORE any slangc subprocess,
+    catching codegen mistakes in milliseconds rather than subprocess seconds.
+    Already integrated as M22.1.i; this test locks the invariant.
+    """
+
+    def test_validator_importable_and_callable(self):
+        """``validate_slang_source`` is importable and returns a list."""
+        from torch_vulkan.inductor.validate import validate_slang_source
+
+        # Valid empty shader should produce no issues.
+        empty = '[shader("compute")] [numthreads(64,1,1)] void main() {}'
+        issues = validate_slang_source(empty)
+        assert isinstance(issues, list), (
+            f"validate_slang_source must return list, got {type(issues)}"
+        )
+        assert len(issues) == 0, (
+            f"Valid empty shader should have 0 issues, got {len(issues)}"
+        )
+
+    def test_validator_catches_brace_mismatch(self):
+        """Unbalanced braces must be caught before slangc."""
+        from torch_vulkan.inductor.validate import validate_slang_source
+
+        bad = '[shader("compute")] [numthreads(64,1,1)] void main() { '
+        issues = validate_slang_source(bad)
+        assert len(issues) > 0, "Unbalanced braces must produce validation issues"
+        assert any(i.category == "brace" for i in issues), "Brace mismatch not detected"
+
+    def test_validator_integrated_in_slangc_compile(self):
+        """``slangc.py:_compile_slang`` calls the validator before
+        spawning slangc subprocess."""
+        import inspect
+
+        from torch_vulkan.inductor.runtime import slangc
+
+        src = inspect.getsource(slangc._compile_slang)
+        assert "validate_slang_source" in src, (
+            "M-VAL.4: _compile_slang must call validate_slang_source "
+            "before any slangc subprocess invocation"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 
