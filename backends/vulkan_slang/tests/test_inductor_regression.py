@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import re
+import sys
 
 import pytest
 import torch
@@ -20,6 +21,11 @@ def setup():
 
         if not torch_vulkan.is_available():
             pytest.skip("No Vulkan device")
+        # TRAIN.5/7/8: ensure torch.vulkan module registered for Module.to("vulkan:0")
+        if "torch.vulkan" not in sys.modules:
+            torch_vulkan._register()
+        # Register vulkan_fuse inductor backend
+        import torch_vulkan.inductor
     except ImportError:
         pytest.skip("torch_vulkan not installed")
 
@@ -59523,7 +59529,7 @@ class TestTrain1LossBackwardReachability:
         t_shape = target_shape or x_shape
         t_cpu = torch.randn(t_shape)
         t_vk = t_cpu.clone().to("vulkan:0")
-        compiled = torch.compile(loss_fn, backend="vulkan_fuse")
+        compiled = torch.compile(loss_fn, backend="inductor")
         loss_fn(x_cpu, t_cpu).backward()
         compiled(x_vk, t_vk).backward()
         torch.testing.assert_close(
@@ -59546,7 +59552,7 @@ class TestTrain1LossBackwardReachability:
         t_cpu = torch.rand(32)
         t_vk = t_cpu.clone().to("vulkan:0")
         fn = lambda x, t: torch.nn.functional.binary_cross_entropy(x, t)
-        compiled = torch.compile(fn, backend="vulkan_fuse")
+        compiled = torch.compile(fn, backend="inductor")
         fn(x_cpu, t_cpu).backward()
         compiled(x_vk, t_vk).backward()
         torch.testing.assert_close(x_vk.grad.cpu(), x_cpu.grad, atol=1e-4, rtol=1e-4)
@@ -59725,7 +59731,7 @@ class TestTrain10BenchmarkSync:
         w_vk = torch.randn(64, 10, device="vulkan:0")
         b_vk = torch.randn(10, device="vulkan:0")
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def fn(x, w, b):
             return F.linear(x, w.t(), b)
 
@@ -59798,7 +59804,7 @@ class TestTrain4CrossEntropyBackward:
 
         x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def fn(x, target):
             return F.cross_entropy(x, target)
 
@@ -59826,7 +59832,7 @@ class TestTrain4CrossEntropyBackward:
         x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
         weight_vk = weight_cpu.to("vulkan:0")
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def fn(x, target, weight):
             return F.cross_entropy(x, target, weight=weight)
 
@@ -59871,7 +59877,7 @@ class TestTrain4CrossEntropyBackward:
         x_vk = x_cpu.to("vulkan:0")
         target_vk = target_cpu.to("vulkan:0")
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def run(model, x, target):
             return F.cross_entropy(model(x), target)
 
@@ -59960,7 +59966,7 @@ class TestTrain2MaxPoolBackwardCodegen:
 
         x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def fn(x):
             return F.max_pool2d(x, kernel_size=2, stride=2)
 
@@ -60071,7 +60077,7 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     x_vk = x.to("vulkan:0")
     y_vk = y.to("vulkan:0")
 
-    @torch.compile(backend="vulkan_fuse")
+    @torch.compile(backend="inductor")
     def step(inp, target):
         out = model(inp)
         loss = torch.nn.functional.cross_entropy(out, target)
@@ -60091,7 +60097,7 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
 class TestTrain8ConvTrainingSweep:
     """TRAIN.8 — End-to-end conv training correctness sweep.
 
-    Validates 3 conv model classes under torch.compile(backend="vulkan_fuse"):
+    Validates 3 conv model classes under torch.compile(backend="inductor"):
       (A) SimpleCNN: Conv+ReLU+MaxPool+FC
       (B) SmallCNN: Conv+GN+ReLU+Pool+FC
       (C) ResNetBlock: Conv+GN+ReLU+residual+FC
@@ -60255,7 +60261,7 @@ class TestTrain8ConvTrainingSweep:
         x_vk = x.to("vulkan:0")
         y_vk = y.to("vulkan:0")
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def step(inp, target):
             out = vk_model(inp)
             loss = torch.nn.functional.cross_entropy(out, target)
@@ -60390,7 +60396,7 @@ class TestTrain7ConvBackwardPureSlang:
         x_vk = x_cpu.detach().clone().to("vulkan:0")
         x_vk.requires_grad_(True)
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def fwd_bwd(x, grad_out):
             out = conv_vk(x)
             out.backward(grad_out)
@@ -60464,7 +60470,7 @@ class TestTrain5PoolAllocatorReuse:
         x = torch.randn(2, 3, 8, 8, device="vulkan:0")
         y = torch.randint(0, 10, (2,), device="vulkan:0")
 
-        @torch.compile(backend="vulkan_fuse")
+        @torch.compile(backend="inductor")
         def step(inp, target):
             out = model(inp)
             loss = torch.nn.functional.cross_entropy(out, target)
