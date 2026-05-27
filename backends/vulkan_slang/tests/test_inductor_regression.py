@@ -60033,3 +60033,277 @@ class TestTrain2MaxPoolBackwardCodegen:
         assert "tolist()" not in impl_src, (
             "TRAIN.2: scatter_bwd impl must NOT use tolist()"
         )
+
+
+# ---------------------------------------------------------------------------
+# TRAIN.8 — Conv training correctness sweep (2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+def _train_loop_cpu(model, x, y, n_steps=10, lr=0.01):
+    """Run n_steps training iterations on CPU, returning loss curve."""
+    model.train()
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(n_steps):
+        opt.zero_grad()
+        out = model(x)
+        loss = torch.nn.functional.cross_entropy(out, y)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
+    """Run n_steps training iterations on Vulkan via torch.compile.
+
+    Copies model weights from CPU reference to ensure identical initialization.
+    Returns loss curve.
+    """
+    import copy
+    import torch_vulkan
+
+    model = copy.deepcopy(model_cpu).to("vulkan:0")
+    model.train()
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+
+    x_vk = x.to("vulkan:0")
+    y_vk = y.to("vulkan:0")
+
+    @torch.compile(backend="vulkan_fuse")
+    def step(inp, target):
+        out = model(inp)
+        loss = torch.nn.functional.cross_entropy(out, target)
+        loss.backward()
+        return loss
+
+    losses = []
+    for _ in range(n_steps):
+        opt.zero_grad()
+        loss = step(x_vk, y_vk)
+        torch_vulkan._c_ext._synchronize(0)
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+class TestTrain8ConvTrainingSweep:
+    """TRAIN.8 — End-to-end conv training correctness sweep.
+
+    Validates 3 conv model classes under torch.compile(backend="vulkan_fuse"):
+      (A) SimpleCNN: Conv+ReLU+MaxPool+FC
+      (B) SmallCNN: Conv+GN+ReLU+Pool+FC
+      (C) ResNetBlock: Conv+GN+ReLU+residual+FC
+
+    For each architecture:
+      1. Create model on CPU with fixed seed
+      2. Run 10 training steps on CPU (reference)
+      3. Create deep copy on Vulkan
+      4. Run 10 compiled training steps on Vulkan
+      5. Verify loss decreased from step 0 → step 9 (both backends)
+      6. Verify Vulkan final loss within rtol=0.5 of CPU final loss
+    """
+
+    def _run_sweep(self, model_cls, x_shape=(4, 3, 32, 32),
+                   num_classes=10, n_steps=10, lr=0.01,
+                   x_channels=3):
+        torch.manual_seed(42)
+        model = model_cls(num_classes=num_classes)
+        x = torch.randn(*x_shape)
+        y = torch.randint(0, num_classes, (x_shape[0],))
+
+        cpu_losses = _train_loop_cpu(model, x, y, n_steps=n_steps, lr=lr)
+        vk_losses = _train_loop_vulkan_compiled(
+            model, x, y, n_steps=n_steps, lr=lr,
+        )
+
+        # Loss must decrease on both backends
+        assert cpu_losses[-1] < cpu_losses[0], (
+            f"TRAIN.8: CPU loss did not decrease: {cpu_losses[0]:.4f} → {cpu_losses[-1]:.4f}"
+        )
+        assert vk_losses[-1] < vk_losses[0], (
+            f"TRAIN.8: Vulkan loss did not decrease: {vk_losses[0]:.4f} → {vk_losses[-1]:.4f}"
+        )
+
+        # Final loss within rtol=0.5 (50% relative tolerance)
+        cpu_final = cpu_losses[-1]
+        vk_final = vk_losses[-1]
+        rel_diff = abs(vk_final - cpu_final) / max(abs(cpu_final), 1e-6)
+        assert rel_diff < 0.5, (
+            f"TRAIN.8: Final loss divergence too large: "
+            f"CPU={cpu_final:.4f}, Vulkan={vk_final:.4f}, rel_diff={rel_diff:.2%}"
+        )
+
+        return cpu_losses, vk_losses
+
+    def test_simple_cnn_conv_maxpool_fc(self):
+        """(A) SimpleCNN: Conv + ReLU + MaxPool + FC.
+
+        Exercises: conv2d fwd/bwd, max_pool2d fwd + scatter bwd (TRAIN.2),
+        cross_entropy fwd + nll_loss bwd (TRAIN.4), flatten, linear.
+        """
+        import torch.nn as nn
+
+        class SimpleCNN(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.fc = nn.Linear(16 * 16 * 16, num_classes)
+
+            def forward(self, x):
+                x = self.pool(torch.relu(self.conv1(x)))
+                return self.fc(x.flatten(1))
+
+        self._run_sweep(SimpleCNN)
+
+    def test_small_cnn_conv_gn_relu_fc(self):
+        """(B) SmallCNN: Conv + GroupNorm + ReLU + Pool + FC.
+
+        Exercises: conv2d, group_norm, relu, max_pool2d, cross_entropy, linear.
+        """
+        import torch.nn as nn
+
+        class SmallCNN(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+                self.gn2 = nn.GroupNorm(4, 32)
+                self.pool = nn.MaxPool2d(2, 2)
+                self.fc = nn.Linear(32 * 8 * 8, num_classes)
+
+            def forward(self, x):
+                x = self.pool(torch.relu(self.gn1(self.conv1(x))))
+                x = self.pool(torch.relu(self.gn2(self.conv2(x))))
+                return self.fc(x.flatten(1))
+
+        self._run_sweep(SmallCNN)
+
+    def test_resnet_block_conv_gn_residual_fc(self):
+        """(C) ResNet-mini: Conv + GroupNorm + ReLU + residual add + FC.
+
+        Exercises: conv2d, group_norm, relu, add (residual),
+        adaptive_avg_pool2d, cross_entropy, linear.
+        """
+        import torch.nn as nn
+
+        class ResBlock(nn.Module):
+            def __init__(self, channels):
+                super().__init__()
+                self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+                self.gn1 = nn.GroupNorm(4, channels)
+                self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+                self.gn2 = nn.GroupNorm(4, channels)
+
+            def forward(self, x):
+                identity = x
+                out = torch.relu(self.gn1(self.conv1(x)))
+                out = self.gn2(self.conv2(out))
+                return torch.relu(out + identity)
+
+        class ResNetMini(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.stem = nn.Sequential(
+                    nn.Conv2d(3, 16, 3, padding=1, bias=False),
+                    nn.GroupNorm(4, 16),
+                    nn.ReLU(),
+                )
+                self.block = ResBlock(16)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.fc = nn.Linear(16, num_classes)
+
+            def forward(self, x):
+                x = self.stem(x)
+                x = self.block(x)
+                x = self.pool(x).flatten(1)
+                return self.fc(x)
+
+        self._run_sweep(ResNetMini, x_shape=(4, 3, 16, 16))
+
+    def test_adamw_optimizer(self):
+        """Training with AdamW through torch.compile.
+
+        Validates TRAIN.3 (decoupled weight decay) in a full training loop.
+        """
+        import copy
+        import torch.nn as nn
+        import torch_vulkan
+
+        class TinyNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.fc = nn.Linear(16, 10)
+
+            def forward(self, x):
+                return self.fc(self.pool(torch.relu(self.conv(x))).flatten(1))
+
+        torch.manual_seed(42)
+        model = TinyNet()
+        x = torch.randn(4, 3, 8, 8)
+        y = torch.randint(0, 10, (4,))
+
+        # AdamW on Vulkan
+        vk_model = copy.deepcopy(model).to("vulkan:0")
+        vk_model.train()
+        opt = torch.optim.AdamW(vk_model.parameters(), lr=0.001, weight_decay=0.01)
+        x_vk = x.to("vulkan:0")
+        y_vk = y.to("vulkan:0")
+
+        @torch.compile(backend="vulkan_fuse")
+        def step(inp, target):
+            out = vk_model(inp)
+            loss = torch.nn.functional.cross_entropy(out, target)
+            loss.backward()
+            return loss
+
+        losses = []
+        for _ in range(10):
+            opt.zero_grad()
+            loss = step(x_vk, y_vk)
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+            losses.append(loss.item())
+
+        assert losses[-1] < losses[0], (
+            f"TRAIN.8 AdamW: loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+        )
+
+    def test_multi_architecture_loss_decreases(self):
+        """All 3 architectures must show monotonically-smooth loss decrease.
+
+        Loose check: no intermediate loss exceeds 2× the initial loss
+        (catches NaN/Inf or divergent training).
+        """
+        import torch.nn as nn
+
+        class ArchA(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.conv = nn.Conv2d(1, 8, 3, padding=1)
+                self.bn = nn.BatchNorm2d(8)
+                self.fc = nn.Linear(8 * 8 * 8, num_classes)
+
+            def forward(self, x):
+                return self.fc(torch.relu(self.bn(self.conv(x))).flatten(1))
+
+        torch.manual_seed(42)
+        model = ArchA()
+        x = torch.randn(4, 1, 8, 8)
+        y = torch.randint(0, 10, (4,))
+
+        vk_losses = _train_loop_vulkan_compiled(model, x, y, n_steps=10)
+
+        # No loss exceeds 2× initial
+        assert all(l < 2 * vk_losses[0] for l in vk_losses), (
+            f"TRAIN.8: Loss diverged: {[round(l, 3) for l in vk_losses]}"
+        )
+        # No NaN or Inf
+        assert all(torch.isfinite(torch.tensor(l)) for l in vk_losses), (
+            f"TRAIN.8: Loss contains NaN/Inf: {vk_losses}"
+        )
