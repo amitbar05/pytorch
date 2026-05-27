@@ -3,7 +3,7 @@
 Provides `VulkanTemplateKernel` (generates Slang template source via Jinja2)
 and `SlangTemplate` (template registration analogous to `TritonTemplate`).
 
-The matmul template lives in `templates/slang_mm.py.jinja` and is parameterized
+The matmul template lives in `templates/slang_mm.slang` and is parameterized
 by tile sizes (TILE_M, TILE_N, TILE_K) with optional epilogue fusion (bias,
 relu, gelu, silu, sigmoid, tanh, clamp, scale, dtype cast).
 

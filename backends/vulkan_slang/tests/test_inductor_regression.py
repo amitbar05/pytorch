@@ -53726,6 +53726,74 @@ class TestMVal3SweepZeroVuids:
         )
 
 
+class TestMSF1ParameterBlockFullCoverage:
+    """M-SF.1 (v7) — ParameterBlock<KernelArgs> at 100% coverage.
+
+    Every actively-used Slang kernel template must emit
+    ``ParameterBlock<KernelArgs>`` instead of manual
+    ``[[vk::binding(N, 0)]]`` per-buffer decorations.  The canonical
+    sources are ``.slang`` files (loaded first by the template resolver);
+    ``.py.jinja`` duplicates were deleted 2026-05-27.
+
+    The only ``vk::binding`` annotations allowed post M-SF.1 are:
+      - ``[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;``
+      - Comments referencing the binding form for documentation.
+    """
+
+    _MM_TEMPLATES = ("slang_mm", "slang_mm_bwd")
+
+    def test_mm_template_uses_parameter_block(self):
+        """Both matmul templates (fwd + bwd) use ParameterBlock."""
+        import re
+
+        from torch_vulkan.inductor.vulkan_template import _load_slang_template
+
+        for name in self._MM_TEMPLATES:
+            src = _load_slang_template(name)
+            assert src, f"{name} template failed to load (missing .slang?)"
+            assert "ParameterBlock<KernelArgs>" in src, (
+                f"{name} missing ParameterBlock<KernelArgs>"
+            )
+            # Walk non-comment lines looking for vk::binding.
+            # The ONLY allowed binding is on the ParameterBlock itself.
+            for line in src.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("//"):
+                    continue
+                if "vk::binding" in stripped:
+                    assert "ParameterBlock" in stripped, (
+                        f"{name}: non-ParameterBlock binding line: {stripped[:120]}"
+                    )
+
+    def test_no_py_jinja_fallback_for_mm(self):
+        """The dead-code .py.jinja files (manual bindings) are deleted."""
+        import os
+
+        template_dir = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "python",
+            "torch_vulkan",
+            "inductor",
+            "templates",
+        )
+        for name in ("slang_mm.py.jinja", "slang_mm_bwd.py.jinja"):
+            path = os.path.join(template_dir, name)
+            assert not os.path.exists(path), (
+                f"Stale {name} with manual bindings must be deleted — "
+                f"the canonical .slang uses ParameterBlock."
+            )
+
+    def test_header_codegen_defaults_to_parameter_block(self):
+        """``kernel/header.py`` defaults to ParameterBlock mode."""
+        import torch_vulkan.inductor.config as _cfg
+
+        assert _cfg.parameter_block(), (
+            "M-SF.1: parameter_block() must return True by default. "
+            "Set TORCH_VULKAN_PARAMETER_BLOCK=0 to opt out."
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

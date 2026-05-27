@@ -54,12 +54,15 @@ roadmap item.
   (2026-05-27). Sweep harness at `agent_space/m21_3_validation_sweep.py`.
   Result: zero VUIDs, all prior P0/P1 VUIDs (M21.3.01, M21.3.02,
   EAGER.1.b, M-cpp-new-6) fully closed.
+* **M-SF.1** ✅ — ParameterBlock<KernelArgs> at 100% coverage on all
+  actively-used templates (2026-05-27).  The 2 stale `.py.jinja` files
+  with manual bindings were deleted; `.slang` is the canonical format.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-9 milestones remain. Next-up candidates: **M-SF.1**
-(ParameterBlock 45 % → 100 %), **M-CG.4** (Linear-bwd ≤2 dispatches),
-**M-VAL.2** (per-kernel autotune VUID gate).
+8 milestones remain. Next-up candidates: **M-CG.4**
+(Linear-bwd ≤2 dispatches), **M-VAL.2** (per-kernel autotune VUID gate),
+**M-SF.2** ([BackwardDerivative] 30% → 80%).
 
 ## Companion docs
 
