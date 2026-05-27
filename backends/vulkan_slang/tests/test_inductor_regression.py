@@ -53900,6 +53900,41 @@ class TestMSF2BackwardDerivativeCoverage:
             )
 
 
+class TestMSF3SpecConstWithParameterBlock:
+    """M-SF.3 (v7) — spec constants compatible with ParameterBlock.
+
+    After M-SF.3, pointwise/reduction codegen can use
+    ``[[vk::constant_id(N)]]`` spec constants even when ParameterBlock
+    is active — the M21.3.01 ``[[vk::binding(0, 0)]]`` fix pins the
+    descriptor table to Set 0 regardless.
+    """
+
+    def test_spec_constants_enabled_by_default(self):
+        """``config.spec_constants()`` returns True by default."""
+        import torch_vulkan.inductor.config as _cfg
+
+        assert _cfg.spec_constants(), (
+            "M-SF.3: spec_constants() must return True by default. "
+            "Set TORCH_VULKAN_SPEC_CONSTANTS=0 to disable."
+        )
+
+    def test_use_spec_constants_no_longer_gated_by_parameter_block(self):
+        """The CG.M14 constraint ``not self._use_parameter_block``
+        has been removed from the ``use_spec_constants`` expression
+        in ``kernel/header.py``."""
+        import inspect
+
+        from torch_vulkan.inductor.kernel import header as _h
+
+        # Source inspection: the constraint must NOT be present.
+        src = inspect.getsource(_h.VulkanKernel)
+        assert "not self._use_parameter_block" not in src, (
+            "M-SF.3: kernel/header.py must not gate spec constants "
+            "on `not self._use_parameter_block` — the CG.M14 constraint "
+            "was removed for M-SF.3."
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

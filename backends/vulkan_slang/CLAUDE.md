@@ -67,12 +67,15 @@ roadmap item.
 * **M-SF.2** ✅ — [BackwardDerivative] on combine_sum_nan +
   combine_prod_nan in vk_reduction.slang (2026-05-27).  Reduction
   coverage: 2→4 ops; total 45 manual derivatives across hot elementals.
+* **M-SF.3** ✅ — Spec constants + ParameterBlock now compatible
+  (2026-05-27).  Removed CG.M14 constraint in kernel/header.py; all
+  pointwise/reduction kernels can now use `[[vk::constant_id(N)]]`.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-5 milestones remain. Next-up candidates: **M-SF.3**
-(spec constants beyond mm), **M-VAL.4** (pre-slangc AST validator),
-**M-SF.4** (Jinja → Slang generics).
+4 milestones remain. Next-up candidates: **M-VAL.4**
+(pre-slangc AST validator), **M-SF.4** (Jinja → Slang generics),
+**M-SF.5** (reflection metadata num_atomics).
 
 ## Companion docs
 

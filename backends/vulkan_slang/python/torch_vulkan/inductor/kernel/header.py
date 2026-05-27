@@ -328,15 +328,12 @@ class HeaderMixin(CallKernelMixin):
                     thread_y, thread_x = layout_2d
                     if len(red_vars) == 1:
                         body_code.writeline(
-                            f"uint {red_vars[0].name} = "
-                            f"lid.y * {thread_x}u + lid.x;"
+                            f"uint {red_vars[0].name} = lid.y * {thread_x}u + lid.x;"
                         )
                     else:
                         for i, v in enumerate(red_vars[:2]):
                             axis = "y" if i == 0 else "x"
-                            body_code.writeline(
-                                f"uint {v.name} = lid.{axis};"
-                            )
+                            body_code.writeline(f"uint {v.name} = lid.{axis};")
                     # Tracker for indexing.py: don't re-declare these in
                     # the per-entry code path. The hoist set is the
                     # canonical "already declared at function scope" map.
@@ -565,9 +562,7 @@ class HeaderMixin(CallKernelMixin):
                 "// M21.3.01: explicit Set 0 binding "
                 "(slangc 2026.7.1 defaults to Set 1)"
             )
-            code.writeline(
-                "[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;"
-            )
+            code.writeline("[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;")
             slot = 0  # unused; keep for compatibility
         else:
             # Blocker E: explicit Set 0 (`, 0`) on every binding.  slangc
@@ -599,17 +594,13 @@ class HeaderMixin(CallKernelMixin):
         # Slangc constant-folds loop bounds and eliminates dead branches
         # at SPIR-V emission time.
         #
-        # CG.M14: Disable spec constants when ParameterBlock is active.
-        # Slang places ParameterBlock in descriptor set 1 when
-        # [[vk::constant_id]] is present anywhere in the module, but the
-        # Vulkan pipeline layout expects all storage buffers at set 0.
-        # Using ``static const uint`` instead avoids the set mismatch.
-        use_spec_constants = (
-            config.spec_constants()
-            and not self._use_parameter_block
-            and not dyn_numel
-            and not sv_decls
-        )
+        # M-SF.3: Spec constants are now compatible with ParameterBlock.
+        # The M21.3.01 fix (``[[vk::binding(0, 0)]] ParameterBlock<KernelArgs>``)
+        # pins the descriptor table to Set 0 regardless of slangc's default
+        # Set-1 assignment when ``[[vk::constant_id]]`` is present.
+        # Pointwise/reduction kernels can now constant-fold loop bounds
+        # and DCE branches while still using ParameterBlock.
+        use_spec_constants = config.spec_constants() and not dyn_numel and not sv_decls
 
         if pc_fields:
             code.writeline("struct PC {")
@@ -695,11 +686,7 @@ class HeaderMixin(CallKernelMixin):
                 _actual_vgprs = self._get_actual_vgprs()
             except Exception:
                 _actual_vgprs = None
-            if (
-                _actual_vgprs is not None
-                and _actual_vgprs > 128
-                and thread_count > 64
-            ):
+            if _actual_vgprs is not None and _actual_vgprs > 128 and thread_count > 64:
                 thread_count = 64
             code.writeline(f'[shader("compute")] [numthreads({thread_count}, 1, 1)]')
         code.writeline(
@@ -722,4 +709,3 @@ class HeaderMixin(CallKernelMixin):
         code.splice(body_code)
         code.writeline("}")
         return code.getvalue()
-
