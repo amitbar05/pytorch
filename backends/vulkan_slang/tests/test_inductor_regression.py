@@ -53576,6 +53576,60 @@ class TestMProbe1PrepareDevice:
         assert result.get("level") == "quick"
 
 
+class TestMVal1VuidAsError:
+    """M-VAL.1 (v7) — VUID-as-error knob + counter contract.
+
+    The Vulkan validation layer is wired in ``csrc/vulkan/Context.cpp::
+    debug_callback``; it counts every WARNING+ VALIDATION/PERFORMANCE
+    message in ``g_validation_errors_count``. The counter is exposed via
+    two pybinds:
+
+      * ``_c_ext._validation_errors_count() -> int``
+      * ``_c_ext._reset_validation_errors_count() -> None``
+
+    The pytest autouse fixture in ``conftest.py`` snapshots the counter
+    before each test when ``TORCH_VULKAN_VUID_AS_ERROR=1`` and fails the
+    test if the counter ticks up. This makes a VUID a hard failure
+    instead of a silent stderr line — the v7 M-VAL pillar contract.
+
+    These tests verify the counter pybind exists and behaves; the
+    fixture itself is exercised implicitly by every other test in the
+    suite when the env var is set.
+    """
+
+    def test_counter_pybind_exists(self):
+        """Both pybinds must be importable from ``torch_vulkan._c_ext``."""
+        from torch_vulkan import _c_ext
+
+        assert hasattr(_c_ext, "_validation_errors_count"), (
+            "M-VAL.1: _c_ext._validation_errors_count() pybind missing — "
+            "did the C++ rebuild skip Context.cpp / init.cpp?"
+        )
+        assert hasattr(_c_ext, "_reset_validation_errors_count"), (
+            "M-VAL.1: _c_ext._reset_validation_errors_count() pybind missing"
+        )
+
+    def test_counter_returns_int(self):
+        """Counter reads return a Python int (uint64_t in C++)."""
+        from torch_vulkan import _c_ext
+
+        n = _c_ext._validation_errors_count()
+        assert isinstance(n, int)
+        assert n >= 0
+
+    def test_reset_zeros_counter(self):
+        """``_reset_validation_errors_count()`` zeros the counter
+        immediately. Subsequent reads (with no GPU work in between)
+        return 0."""
+        from torch_vulkan import _c_ext
+
+        _c_ext._reset_validation_errors_count()
+        n = _c_ext._validation_errors_count()
+        assert n == 0, (
+            f"counter should be 0 right after reset, got {n}"
+        )
+
+
 class TestM221OrphanIntegration:
     """M22.1.f/g — orphan mixin integration.
 

@@ -28,6 +28,21 @@ uint64_t Context::descriptor_pool_reset_validation_errors() {
         std::memory_order_relaxed);
 }
 
+// M-VAL.1 (v7) — generic VUID counter for the validation-driven codegen
+// pillar. Incremented for every WARNING+ validation message the layer
+// emits. ``reset_validation_errors_count()`` lets the pytest autouse
+// fixture (gated by ``TORCH_VULKAN_VUID_AS_ERROR=1``) snapshot a
+// per-test baseline so a VUID surfaced during the test fails it.
+static std::atomic<uint64_t> g_validation_errors_count{0};
+
+uint64_t Context::validation_errors_count() {
+    return g_validation_errors_count.load(std::memory_order_relaxed);
+}
+
+void Context::reset_validation_errors_count() {
+    g_validation_errors_count.store(0, std::memory_order_relaxed);
+}
+
 // ── Debug callback ───────────────────────────────────────────────
 VkBool32 VKAPI_CALL Context::debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -79,6 +94,15 @@ VkBool32 VKAPI_CALL Context::debug_callback(
         std::cerr << "[Vulkan VUID] " << sev_tag << " " << type_tag << " "
                   << (data && data->pMessage ? data->pMessage : "")
                   << std::endl;
+    }
+    // M-VAL.1: count every WARNING+ validation/performance message so the
+    // VUID-as-error pytest fixture can assert zero VUIDs per test. We
+    // count VALIDATION + PERFORMANCE types only (GENERAL is loader noise
+    // like "device created" — not a spec violation).
+    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT &&
+        (type & (VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                 VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT))) {
+        g_validation_errors_count.fetch_add(1, std::memory_order_relaxed);
     }
     return VK_FALSE;
 }

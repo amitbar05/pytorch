@@ -111,6 +111,15 @@ public:
     // tests can assert == 0.
     static uint64_t descriptor_pool_reset_validation_errors();
 
+    // M-VAL.1 (v7) — generic count of WARNING+ VALIDATION /
+    // PERFORMANCE messages observed by the debug-utils messenger since
+    // process start (or the last ``reset_validation_errors_count()``).
+    // The pytest autouse fixture in ``conftest.py`` (gated by
+    // ``TORCH_VULKAN_VUID_AS_ERROR=1``) snapshots a baseline before
+    // each test and asserts no new VUIDs after.
+    static uint64_t validation_errors_count();
+    static void reset_validation_errors_count();
+
     // Release all Vulkan resources held by other singletons before
     // destroying VkDevice. Called automatically from the destructor.
     void shutdown();

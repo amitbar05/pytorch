@@ -432,6 +432,17 @@ PYBIND11_MODULE(_C, m) {
         return vulkan::Context::descriptor_pool_reset_validation_errors();
     });
 
+    // M-VAL.1 (v7) — generic VUID counter (every WARNING+ VALIDATION /
+    // PERFORMANCE message the debug-utils messenger has seen). Read-only
+    // accessor + a reset for the pytest autouse fixture that snapshots
+    // before each test and asserts no new VUIDs after.
+    m.def("_validation_errors_count", []() -> uint64_t {
+        return vulkan::Context::validation_errors_count();
+    });
+    m.def("_reset_validation_errors_count", []() {
+        vulkan::Context::reset_validation_errors_count();
+    });
+
     // M-NEW.4: cumulative ``vkQueueSubmit`` calls from the M9.2
     // batched-flush hot path on the current device's Stream. The
     // canonical M9.2 win telemetry — post-fix the ratio

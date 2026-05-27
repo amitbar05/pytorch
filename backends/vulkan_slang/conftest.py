@@ -61,10 +61,71 @@ def pytest_configure(config):
 
 def pytest_report_header(config):
     val = getattr(config, "_slangc_resolved", None)
+    msgs = []
     if val:
-        return f"SLANGC auto-resolved → {val}"
-    if not os.environ.get("SLANGC"):
-        return "SLANGC unset (audit-family tests will skip)"
-    return None
+        msgs.append(f"SLANGC auto-resolved → {val}")
+    elif not os.environ.get("SLANGC"):
+        msgs.append("SLANGC unset (audit-family tests will skip)")
+    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") == "1":
+        msgs.append("M-VAL.1: TORCH_VULKAN_VUID_AS_ERROR=1 (VUID emitted "
+                    "during a test fails it)")
+    return "\n".join(msgs) if msgs else None
+
+
+# ── M-VAL.1 (v7) — VUID-as-error pytest autouse fixture ────────────────
+#
+# When ``TORCH_VULKAN_VUID_AS_ERROR=1`` is set, snapshot the cumulative
+# Vulkan validation-error count (counts every WARNING+ VALIDATION /
+# PERFORMANCE message the debug-utils messenger has seen — wired in
+# ``csrc/vulkan/Context.cpp::debug_callback``) before each test, then
+# fail the test if the counter ticks up. This makes a VUID a hard test
+# failure rather than a silent stderr line.
+#
+# Opt-in (not default-on) because:
+#   (a) The Vulkan validation layer must be installed and enabled; on
+#       boxes without it the counter sticks at 0 and the fixture is a
+#       no-op.
+#   (b) Existing tests have undocumented best-practices VUIDs that we
+#       haven't swept yet (M-VAL.3 is the sweep milestone). Default-on
+#       would turn that backlog into ~dozens of pre-existing failures.
+#
+# To run a single test with VUID-as-error::
+#
+#     TORCH_VULKAN_VUID_AS_ERROR=1 pytest tests/test_X.py::test_Y
+#
+# CI / nightly sweep should set the env var globally once M-VAL.3 closes
+# the residual VUID backlog.
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _mval1_vuid_as_error_fixture(request):
+    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") != "1":
+        yield
+        return
+
+    try:
+        from torch_vulkan import _c_ext  # type: ignore[attr-defined]
+    except Exception:
+        # Backend not loaded yet (e.g. unit-test that doesn't import
+        # torch_vulkan). Nothing to assert against.
+        yield
+        return
+
+    if not hasattr(_c_ext, "_validation_errors_count"):
+        # C++ pre-M-VAL.1 build — counter not yet pybinded.
+        yield
+        return
+
+    before = _c_ext._validation_errors_count()
+    yield
+    after = _c_ext._validation_errors_count()
+    delta = after - before
+    if delta > 0:
+        pytest.fail(
+            f"M-VAL.1: {delta} Vulkan VUID(s) emitted during "
+            f"{request.node.nodeid} (counter {before} → {after}). "
+            f"Inspect stderr for [Vulkan VUID] lines."
+        )
 
 
