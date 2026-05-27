@@ -189,11 +189,18 @@ def _ensure_max_pool2d_scatter_bwd_op_registered() -> "object":
         iW: int,
     ) -> Tensor:
         from ...vulkan_template_caller import _dispatch_scatter_atomic
+        from ...buffer_pool import pool_acquire, pool_release
 
         # 1. Zero-initialized grad_input matching the original input shape.
-        grad_input = torch.zeros(
-            (N, C, iH, iW), dtype=grad_output.dtype, device=grad_output.device
-        )
+        # Use pool_acquire for the large allocation to recycle across steps.
+        input_shape = (N, C, iH, iW)
+        pooled = pool_acquire(input_shape, grad_output.dtype, grad_output.device)
+        if pooled is not None:
+            grad_input = pooled.zero_()
+        else:
+            grad_input = torch.zeros(
+                input_shape, dtype=grad_output.dtype, device=grad_output.device
+            )
 
         output_numel = grad_output.numel()
         input_numel = N * C * iH * iW
@@ -244,7 +251,10 @@ def _ensure_max_pool2d_scatter_bwd_op_registered() -> "object":
             index_dtype="int",
             cache_key="slang_scatter_maxpool2d_bwd_float_int",
         )
-        # grad_input_flat is a view; the scatter wrote to the same storage.
+        # Release temp allocations from intermediate steps (train_step_end).
+        # Grad_input stays live (returned to caller); don't release it here.
+        # Note: idx_i32, plane_ids, global_idx are temporary and will be
+        # GC'd naturally. The pool handles the big allocation (grad_input).
         return grad_input
 
     _max_pool2d_scatter_bwd_impl.__annotations__ = {
