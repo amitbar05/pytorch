@@ -1369,8 +1369,8 @@ class TestM12ReductionBackward:
     def test_m12_registry_entries_present(self):
         """BWD_TEMPLATE_REGISTRY has CG.M3 reduction backward entries."""
         from torch_vulkan.inductor.bwd_template_registry import (
-            BackwardKind,
             BWD_TEMPLATE_REGISTRY,
+            BackwardKind,
         )
 
         expected = {
@@ -2592,9 +2592,9 @@ class TestCG12PointwiseGenericDispatch:
         """Unary generic source must declare a Slang generic, not a Jinja var."""
         from torch_vulkan.inductor.generic_dispatch_table import PointwiseEntry
         from torch_vulkan.inductor.generic_pointwise_dispatch import (
+            _UNARY_GENERIC_SRC,
             _entry_name,
             _generic_src,
-            _UNARY_GENERIC_SRC,
         )
 
         # The source must declare a Slang generic entry point.
@@ -3069,7 +3069,7 @@ class TestBlockerDBoolOrderingCompare:
         """Float / int comparisons must NOT get a spurious uint cast —
         that would corrupt signed/float ordering."""
         import torch as _torch
-        from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
+        from torch_vulkan.inductor.overrides import VulkanOverrides, _SlangExpr
 
         a = _SlangExpr("tmp3", dtype=_torch.float32)
         b = _SlangExpr("tmp4", dtype=_torch.float32)
@@ -3093,7 +3093,7 @@ class TestBlockerDBoolOrderingCompare:
 
     def test_mixed_bool_and_float_casts_only_bool(self):
         import torch as _torch
-        from torch_vulkan.inductor.overrides import _SlangExpr, VulkanOverrides
+        from torch_vulkan.inductor.overrides import VulkanOverrides, _SlangExpr
 
         a = self._bool_expr("flag")
         b = _SlangExpr("val", dtype=_torch.float32)
@@ -7175,8 +7175,8 @@ class TestT55TokenRenaming:
         ``VulkanComboKernel`` produces the same result as ``_rewrite_body``
         with an empty name map."""
         from torch_vulkan.inductor.vulkan_combo_kernel import (
-            _rewrite_body,
             VulkanComboKernel,
+            _rewrite_body,
         )
 
         combo = VulkanComboKernel()
@@ -11039,9 +11039,9 @@ class TestBufferPool:
         """M17.7: when LIFO reaches _LIFO_MAX, the oldest entry evicts to
         its per-class bucket."""
         from torch_vulkan.inductor.buffer_pool import (
+            _LIFO_MAX,
             _buckets,
             _lifo,
-            _LIFO_MAX,
             reset_pool,
             vulkan_pool_release,
         )
@@ -17866,9 +17866,9 @@ class TestCodegenEmitsImport:
             precompile_shader_libs,
         )
         from torch_vulkan.inductor.slang_helpers import (
+            HELPERS_MODULE_HEADERS,
             _reset_emit_helpers_cache,
             emit_helpers,
-            HELPERS_MODULE_HEADERS,
         )
 
         assert "digamma" in HELPERS_MODULE_HEADERS
@@ -19662,8 +19662,8 @@ class TestCodegenSmellRatchet:
 
     def test_locked_ceilings_match_measured_state(self):
         from torch_vulkan.inductor.codegen_audit import (
-            codegen_smell_counts,
             LOCKED_CEILINGS,
+            codegen_smell_counts,
         )
 
         actual = codegen_smell_counts()
@@ -19749,8 +19749,8 @@ class TestComboKernelViaModuleImport:
 
     def test_combo_string_concat_under_locked_ceiling(self):
         from torch_vulkan.inductor.codegen_audit import (
-            codegen_smell_counts,
             LOCKED_CEILINGS,
+            codegen_smell_counts,
         )
 
         actual = codegen_smell_counts()["combo_string_concat"]
@@ -20961,10 +20961,10 @@ class TestColdCompileTimeBudget:
             sys.path.insert(0, bench_dir)
         import inductor_train as it
         from torch_vulkan.inductor.runtime import (
-            _cache_by_hash,
-            _cache_by_key,
             _COMPILE_STATS,
             _DISK_CACHE_DIR,
+            _cache_by_hash,
+            _cache_by_key,
             precompile_shader_libs,
             reset_compile_stats,
         )
@@ -21776,10 +21776,10 @@ class TestCompileTimeNoColdOutlier:
             sys.path.insert(0, bench_dir)
         import inductor_train as it
         from torch_vulkan.inductor.runtime import (
-            _cache_by_hash,
-            _cache_by_key,
             _COMPILE_STATS,
             _DISK_CACHE_DIR,
+            _cache_by_hash,
+            _cache_by_key,
             precompile_shader_libs,
             reset_compile_stats,
         )
@@ -22395,7 +22395,7 @@ class TestFxTimePrewarmPass:
         # Build a small FX graph with two known ops; assert the
         # registry walk finds both and ``prewarm_submits`` increases.
         from torch_vulkan.inductor.fx_passes import prewarm_from_fx_graph
-        from torch_vulkan.inductor.runtime import _cache_by_key, _COMPILE_STATS
+        from torch_vulkan.inductor.runtime import _COMPILE_STATS, _cache_by_key
 
         # Drop any existing cached entries for the prewarm keys so the
         # submit count is deterministic.
@@ -23429,7 +23429,13 @@ class TestSlangCppTargetCompileGate:
         found: list[str] = []
         for root in (repo_root, backend_root):
             pattern = os.path.join(
-                root, "third_party", "slang", "build", "slang-*-linux-x86_64", "bin", "slangc"
+                root,
+                "third_party",
+                "slang",
+                "build",
+                "slang-*-linux-x86_64",
+                "bin",
+                "slangc",
             )
             found.extend(glob.glob(pattern))
 
@@ -23439,8 +23445,13 @@ class TestSlangCppTargetCompileGate:
 
         # Absolute fallback (will trigger pytest.skip if not found).
         return os.path.join(
-            repo_root, "third_party", "slang", "build",
-            "slang-2026.7.1-linux-x86_64", "bin", "slangc",
+            repo_root,
+            "third_party",
+            "slang",
+            "build",
+            "slang-2026.7.1-linux-x86_64",
+            "bin",
+            "slangc",
         )
 
     @staticmethod
@@ -24610,7 +24621,8 @@ class TestPermuteZeroCopyLowering:
         # permuted size + stride. We bypass the full FX → Inductor
         # pipeline so this test runs without a Slang cold compile.
         import torch_vulkan  # noqa: F401
-        from torch._inductor import ir, lowering as L
+        from torch._inductor import ir
+        from torch._inductor import lowering as L
         from torch._inductor.graph import GraphLowering
         from torch._inductor.ir import FixedLayout, TensorBox
         from torch._inductor.virtualized import V
@@ -24656,7 +24668,8 @@ class TestPermuteZeroCopyLowering:
         # Non-Vulkan tensors must keep the upstream ``PermuteView`` path
         # — our override should be device-gated.
         import torch_vulkan  # noqa: F401
-        from torch._inductor import ir, lowering as L
+        from torch._inductor import ir
+        from torch._inductor import lowering as L
         from torch._inductor.graph import GraphLowering
         from torch._inductor.ir import FixedLayout, TensorBox
         from torch._inductor.virtualized import V
@@ -26125,7 +26138,9 @@ class TestBwdDiffCoverageGate:
             i = 0
             while i < len(lines):
                 line = lines[i].strip()
-                if line.startswith("[Differentiable]") or line.startswith("[BackwardDerivative"):
+                if line.startswith("[Differentiable]") or line.startswith(
+                    "[BackwardDerivative"
+                ):
                     # Walk forward across additional attributes
                     # (`[BackwardDerivative(...)]`, `[Differentiable]`, etc.)
                     # to find the next non-attribute, non-blank line — which
@@ -27376,7 +27391,7 @@ class TestDR8CppWrapper:
             collect_aoti_spv_bundle,
             emit_aoti_spv_header,
         )
-        from torch_vulkan.inductor.runtime import _disk_cache_write, _KERNEL_SPIRV_HASH
+        from torch_vulkan.inductor.runtime import _KERNEL_SPIRV_HASH, _disk_cache_write
 
         # Seed the cache with a minimal test entry
         test_key = "_test_dr8_spv_bundle"
@@ -27439,8 +27454,8 @@ class TestCP12AOTITrainingStep:
         """Verify C++ wrapper + SPIR-V bundle infrastructure."""
         from torch._inductor.codegen.common import device_codegens
         from torch_vulkan.inductor.cpp_wrapper_gpu import (
-            collect_aoti_spv_bundle,
             VulkanCppWrapperGpu,
+            collect_aoti_spv_bundle,
         )
 
         dcg = device_codegens.get("vulkan")
@@ -28795,8 +28810,8 @@ class TestStepEndReleaseHook:
         containing a ``zero_.default`` op tagged as gradient lifetime."""
         import torch.fx as fx
         from torch_vulkan.inductor.lifetime import (
-            _install_zero_grad_release_hook,
             _LIFETIME_KEY,
+            _install_zero_grad_release_hook,
         )
 
         graph = fx.Graph()
@@ -31395,8 +31410,8 @@ class TestTrackT2TemplateWiring:
     @pytest.mark.xfail(
         strict=True,
         reason="aten.bitwise_or not yet implemented for Vulkan backend "
-               "(philox_dispatch.py mask uses | operator). "
-               "Remove xfail once bitwise_or lowering is added.",
+        "(philox_dispatch.py mask uses | operator). "
+        "Remove xfail once bitwise_or lowering is added.",
     )
     def test_philox_fused_dropout_compiled(self):
         """Compiled `F.dropout(…, training=True)` produces output with
@@ -35989,8 +36004,8 @@ class TestCGM5MatmulBackward:
     def test_cgm5_bwd_template_registry_entries(self):
         """BWD_TEMPLATE_REGISTRY has CG.M5 entries for mm/bmm/addmm."""
         from torch_vulkan.inductor.bwd_template_registry import (
-            BackwardKind,
             BWD_TEMPLATE_REGISTRY,
+            BackwardKind,
         )
 
         for key in ("mm_default", "bmm_default", "addmm_default"):
@@ -36216,8 +36231,8 @@ class TestCGM5MatmulBackward:
 
     def test_cgm5_bwd_template_registry_entries(self):
         from torch_vulkan.inductor.bwd_template_registry import (
-            BackwardKind,
             BWD_TEMPLATE_REGISTRY,
+            BackwardKind,
         )
 
         for key in ("mm_default", "bmm_default", "addmm_default"):
@@ -40582,6 +40597,8 @@ class TestMPipeline1ConvLoweringReachable:
         """
         from torch_vulkan.inductor.fx_passes import (
             eager as _eager,
+        )
+        from torch_vulkan.inductor.fx_passes import (
             register_eager_patch_custom_ops,
         )
 
@@ -40816,11 +40833,13 @@ class TestM18ShapeOnlyProxiesUseNewEmpty:
 
     def setup_method(self, method):
         import os
+
         self._orig_mm_tiles = os.environ.get("TORCH_VULKAN_MM_TILES")
         os.environ["TORCH_VULKAN_MM_TILES"] = "64x64x16"
 
     def teardown_method(self, method):
         import os
+
         if self._orig_mm_tiles is None:
             os.environ.pop("TORCH_VULKAN_MM_TILES", None)
         else:
@@ -42042,8 +42061,8 @@ class TestM23LibModuleSanity:
         import subprocess
 
         from torch_vulkan.inductor.runtime.slangc import (
-            _get_slangc,
             _SHADERS_LIB_DIR,
+            _get_slangc,
             _slangc_available,
         )
 
@@ -42708,7 +42727,9 @@ void computeMain(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
             "wave_active_any fast-path call (M20.4.b). "
             "Source inspection failed."
         )
-        assert "red_size <= simd" in src or "red_size<= simd" in src or "<= simd" in src, (
+        assert (
+            "red_size <= simd" in src or "red_size<= simd" in src or "<= simd" in src
+        ), (
             "kernel/reduction.py:_any_reduction must guard the fast path "
             "with a red_size <= simd_group_size check (M20.4.b)."
         )
@@ -43531,14 +43552,18 @@ class TestM201RNNCellAutodiff:
         # process) doesn't leak rendered SPV between them.
         from torch_vulkan.inductor.runtime import reset_per_test_caches
         from torch_vulkan.inductor.templates.caller import rnn as _rnn_caller
-        from torch_vulkan.inductor.templates.caller import rnn_backward as _rnn_bwd_caller
+        from torch_vulkan.inductor.templates.caller import (
+            rnn_backward as _rnn_bwd_caller,
+        )
 
         reset_per_test_caches()
         _rnn_caller._rnn_cell_cache.clear()
         _rnn_bwd_caller._rnn_cell_bwd_cache.clear()
         torch._dynamo.reset()
 
-        from torch_vulkan.inductor.templates.caller.rnn_backward import _SlangTileRNNBackward
+        from torch_vulkan.inductor.templates.caller.rnn_backward import (
+            _SlangTileRNNBackward,
+        )
 
         is_lstm = cell_type == "lstm"
         # hidden_size must be a multiple of the wave size (64) — the
@@ -43757,14 +43782,18 @@ class TestM201CBatchSafeRNNBackward:
 
         from torch_vulkan.inductor.runtime import reset_per_test_caches
         from torch_vulkan.inductor.templates.caller import rnn as _rnn_caller
-        from torch_vulkan.inductor.templates.caller import rnn_backward as _rnn_bwd_caller
+        from torch_vulkan.inductor.templates.caller import (
+            rnn_backward as _rnn_bwd_caller,
+        )
 
         reset_per_test_caches()
         _rnn_caller._rnn_cell_cache.clear()
         _rnn_bwd_caller._rnn_cell_bwd_cache.clear()
         torch._dynamo.reset()
 
-        from torch_vulkan.inductor.templates.caller.rnn_backward import _SlangTileRNNBackward
+        from torch_vulkan.inductor.templates.caller.rnn_backward import (
+            _SlangTileRNNBackward,
+        )
 
         is_lstm = cell_type == "lstm"
         hidden_size = 64
@@ -44145,7 +44174,9 @@ class TestM212ValidationAsCodegenCheck:
 
         captured: list[tuple[str, str]] = []
 
-        def _fake_dispatch(body, *, kernel_name="<unknown>", env_extra=None, timeout_s=60):
+        def _fake_dispatch(
+            body, *, kernel_name="<unknown>", env_extra=None, timeout_s=60
+        ):
             captured.append((kernel_name, body))
             return vc.ValidationResult(returncode=0, stdout="", stderr="", vuids=[])
 
@@ -45188,20 +45219,24 @@ class TestM202SlangMMParameterBlock:
 
         src = self._get_template_src("slang_mm")
         # Render with minimal kwargs to get the concrete Slang text.
-        rendered = Environment().from_string(src).render(
-            tile_m=64,
-            tile_n=64,
-            tile_k=16,
-            m_per_thread=1,
-            n_per_thread=1,
-            dtype_a="float",
-            dtype_b="float",
-            dtype_c="float",
-            dtype_bias="float",
-            dtype_acc="float",
-            num_stages=1,
-            has_bias=False,
-            epilogue=False,
+        rendered = (
+            Environment()
+            .from_string(src)
+            .render(
+                tile_m=64,
+                tile_n=64,
+                tile_k=16,
+                m_per_thread=1,
+                n_per_thread=1,
+                dtype_a="float",
+                dtype_b="float",
+                dtype_c="float",
+                dtype_bias="float",
+                dtype_acc="float",
+                num_stages=1,
+                has_bias=False,
+                epilogue=False,
+            )
         )
         assert "ParameterBlock<KernelArgs>" in rendered, (
             "slang_mm template missing ParameterBlock<KernelArgs> after M20.2 "
@@ -45237,17 +45272,21 @@ class TestM202SlangMMParameterBlock:
         from jinja2 import Environment
 
         src = self._get_template_src("slang_mm_bwd")
-        rendered = Environment().from_string(src).render(
-            tile_m=64,
-            tile_n=64,
-            tile_k=16,
-            m_per_thread=1,
-            n_per_thread=1,
-            dtype_a="float",
-            dtype_b="float",
-            dtype_c="float",
-            dtype_acc="float",
-            has_batch=False,
+        rendered = (
+            Environment()
+            .from_string(src)
+            .render(
+                tile_m=64,
+                tile_n=64,
+                tile_k=16,
+                m_per_thread=1,
+                n_per_thread=1,
+                dtype_a="float",
+                dtype_b="float",
+                dtype_c="float",
+                dtype_acc="float",
+                has_batch=False,
+            )
         )
         assert "ParameterBlock<KernelArgs>" in rendered, (
             "slang_mm_bwd template missing ParameterBlock<KernelArgs> after M20.2 "
@@ -45262,20 +45301,24 @@ class TestM202SlangMMParameterBlock:
 
         src = self._get_template_src("slang_mm")
         # Render a bias variant to exercise the has_bias branch.
-        rendered = Environment().from_string(src).render(
-            tile_m=64,
-            tile_n=64,
-            tile_k=16,
-            m_per_thread=1,
-            n_per_thread=1,
-            dtype_a="float",
-            dtype_b="float",
-            dtype_c="float",
-            dtype_bias="float",
-            dtype_acc="float",
-            num_stages=1,
-            has_bias=True,
-            epilogue=False,
+        rendered = (
+            Environment()
+            .from_string(src)
+            .render(
+                tile_m=64,
+                tile_n=64,
+                tile_k=16,
+                m_per_thread=1,
+                n_per_thread=1,
+                dtype_a="float",
+                dtype_b="float",
+                dtype_c="float",
+                dtype_bias="float",
+                dtype_acc="float",
+                num_stages=1,
+                has_bias=True,
+                epilogue=False,
+            )
         )
         # Both ParameterBlock and args.bias must appear in has_bias render.
         assert "ParameterBlock<KernelArgs>" in rendered
@@ -46631,8 +46674,8 @@ class TestMNew3bInt8WaveAlignment:
             _get_device_subgroup_size,
         )
         from torch_vulkan.inductor.templates.caller.gemm.install import (
-            _int8_config_wg_threads,
             _INT8_TILE_CONFIGS,
+            _int8_config_wg_threads,
         )
 
         sgs = _get_device_subgroup_size()
@@ -46716,9 +46759,9 @@ class TestMNew3bInt8WaveAlignment:
             _get_device_subgroup_size,
         )
         from torch_vulkan.inductor.templates.caller.gemm.install import (
+            _INT8_TILE_CONFIGS,
             _filter_int8_configs_wave_aligned,
             _int8_config_wg_threads,
-            _INT8_TILE_CONFIGS,
         )
 
         sgs = _get_device_subgroup_size()
@@ -47209,6 +47252,7 @@ class TestCov4MmInt8:
         Verify by patching _ensure_mm_int8_module with a sentinel and checking
         it fires when the source contains the import."""
         from unittest.mock import patch
+
         from torch_vulkan.inductor.runtime import slangc as _slangc
 
         fired = []
@@ -49762,7 +49806,13 @@ class TestMCppNew6EagerReluChain:
         """
         x_cpu = self._make_input()
         x_vk = x_cpu.to("vulkan:0")
-        for op_name in ("relu", "abs", "neg", "tanh", "sigmoid"):  # torch.gelu N/A in 2.11
+        for op_name in (
+            "relu",
+            "abs",
+            "neg",
+            "tanh",
+            "sigmoid",
+        ):  # torch.gelu N/A in 2.11
             f = getattr(torch, op_name)
             y_cpu = f(f(x_cpu))
             y_vk = f(f(x_vk))
@@ -53337,8 +53387,8 @@ class TestM211cHardwareProbe:
         entry point.
         """
         from torch_vulkan.inductor.hardware_probe import (
-            _resolve_auto_level,
             LEVEL_QUICK,
+            _resolve_auto_level,
         )
 
         assert _resolve_auto_level("auto") == LEVEL_QUICK
@@ -53491,9 +53541,9 @@ class TestMProbe1PrepareDevice:
         # Keyword-only: timeout_s, force, verbose
         for kw in ("timeout_s", "force", "verbose"):
             assert kw in params, f"missing keyword param {kw!r}"
-            assert (
-                params[kw].kind == inspect.Parameter.KEYWORD_ONLY
-            ), f"{kw} must be keyword-only"
+            assert params[kw].kind == inspect.Parameter.KEYWORD_ONLY, (
+                f"{kw} must be keyword-only"
+            )
         assert params["timeout_s"].default == 900.0
         assert params["force"].default is False
         assert params["verbose"].default is True
@@ -53508,9 +53558,7 @@ class TestMProbe1PrepareDevice:
         except ValueError as e:
             assert "level" in str(e).lower()
             return
-        raise AssertionError(
-            "prepare_device(level='extreme') should ValueError"
-        )
+        raise AssertionError("prepare_device(level='extreme') should ValueError")
 
     def test_prepare_device_passes_through_to_profile_and_warmup(self, tmp_path):
         """``prepare_device`` delegates to ``profile_and_warmup`` (which
@@ -53560,9 +53608,7 @@ class TestMProbe1PrepareDevice:
 
         os.environ["TORCH_VULKAN_CACHE_DIR"] = str(tmp_path)
         try:
-            with mock.patch(
-                "torch_vulkan.profile_and_warmup", side_effect=_slow
-            ):
+            with mock.patch("torch_vulkan.profile_and_warmup", side_effect=_slow):
                 result = torch_vulkan.prepare_device(
                     level="quick", timeout_s=0.3, verbose=False
                 )
@@ -53625,8 +53671,58 @@ class TestMVal1VuidAsError:
 
         _c_ext._reset_validation_errors_count()
         n = _c_ext._validation_errors_count()
-        assert n == 0, (
-            f"counter should be 0 right after reset, got {n}"
+        assert n == 0, f"counter should be 0 right after reset, got {n}"
+
+
+class TestMVal3SweepZeroVuids:
+    """M-VAL.3 (v7) — best-practices VUID sweep regression gate.
+
+    The sweep harness at ``agent_space/m21_3_validation_sweep.py`` runs
+    all 9 catalog models under Vulkan validation layers.  After the
+    2026-05-27 sweep found zero VUIDs, this test locks the invariant:
+    the MLP model (simplest representative) must produce zero VUIDs on
+    every commit.  If a VUID regresses, this test catches it.
+    """
+
+    def test_mlp_zero_vuids(self):
+        """MLP model forward+backward+optimizer produces zero VUIDs."""
+        import sys
+
+        # Add agent_space to path to import the sweep helpers.
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        agent_dir = os.path.join(test_dir, "..", "agent_space")
+        if agent_dir not in sys.path:
+            sys.path.insert(0, agent_dir)
+
+        try:
+            from m21_3_validation_sweep import _loss_fn, _mlp, _vuid_count  # noqa: F401
+        except ImportError:
+            pytest.skip("Sweep harness not found in agent_space/")
+
+        from torch_vulkan import _c_ext
+
+        baseline = _vuid_count(_c_ext)
+
+        model, x, target = _mlp()
+        import torch_vulkan
+
+        torch_vulkan.synchronize()
+
+        output = model(x)
+        torch_vulkan.synchronize()
+
+        _loss_fn(output, target).backward()
+        torch_vulkan.synchronize()
+
+        import torch
+
+        torch.optim.SGD(model.parameters(), lr=0.01).step()
+        torch_vulkan.synchronize()
+
+        delta = _vuid_count(_c_ext) - baseline
+        assert delta == 0, (
+            f"M-VAL.3: MLP model emitted {delta} VUID(s). "
+            f"Run agent_space/m21_3_validation_sweep.py for full sweep."
         )
 
 
@@ -53746,7 +53842,9 @@ class TestM226BwdLoweringsNormSplit:
 
     def test_register_norm_lowerings_importable(self):
         """register_norm_backward_lowerings must be importable from bwd_lowerings."""
-        from torch_vulkan.inductor.bwd_lowerings import register_norm_backward_lowerings  # noqa: F401
+        from torch_vulkan.inductor.bwd_lowerings import (
+            register_norm_backward_lowerings,  # noqa: F401
+        )
 
 
 class TestM22WrapperHelpersSplit:
@@ -53785,8 +53883,11 @@ class TestM22WrapperHelpersSplit:
         assert "from .wrapper_helpers import" in src, (
             "wrapper.py must import from wrapper_helpers"
         )
-        for name in ("_batch_dispatch_enabled", "_lifetime_class_for_name",
-                     "_normalize_strides_to_row_major"):
+        for name in (
+            "_batch_dispatch_enabled",
+            "_lifetime_class_for_name",
+            "_normalize_strides_to_row_major",
+        ):
             assert name in src, f"wrapper.py must import {name} from wrapper_helpers"
 
     def test_helpers_not_defined_in_wrapper(self):
@@ -53795,16 +53896,20 @@ class TestM22WrapperHelpersSplit:
 
         with open(mod.__file__) as f:
             src = f.read()
-        for fn in ("def _install_vulkan_skip_alignment_clone",
-                   "def _batch_dispatch_enabled",
-                   "def _lifetime_class_for_name"):
+        for fn in (
+            "def _install_vulkan_skip_alignment_clone",
+            "def _batch_dispatch_enabled",
+            "def _lifetime_class_for_name",
+        ):
             assert fn not in src, (
                 f"wrapper.py still defines {fn!r} — should be in wrapper_helpers.py"
             )
 
     def test_normalize_strides_correctness(self):
         """_normalize_strides_to_row_major produces correct row-major strides."""
-        from torch_vulkan.inductor.wrapper_helpers import _normalize_strides_to_row_major
+        from torch_vulkan.inductor.wrapper_helpers import (
+            _normalize_strides_to_row_major,
+        )
 
         assert _normalize_strides_to_row_major([4], [1]) == [1]
         assert _normalize_strides_to_row_major([3, 4], [4, 1]) == [4, 1]
@@ -54031,8 +54136,7 @@ class TestMAG51Tier2Softplus:
         loss = fn(x_v)
         loss.backward()
         assert x_v.grad is not None, (
-            f"M-AG5.1 Tier-2: x.grad is None for beta={beta}, "
-            f"threshold={threshold}"
+            f"M-AG5.1 Tier-2: x.grad is None for beta={beta}, threshold={threshold}"
         )
         torch.testing.assert_close(x_v.grad.cpu(), grad_ref, rtol=1e-4, atol=1e-5)
 
@@ -54694,7 +54798,9 @@ class TestM22_5DeadLoweringCleanup:
         counts: dict[str, int] = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name.startswith("_register_") and node.name.endswith("_backward"):
+                if node.name.startswith("_register_") and node.name.endswith(
+                    "_backward"
+                ):
                     counts[node.name] = counts.get(node.name, 0) + 1
 
         duplicates = {name: cnt for name, cnt in counts.items() if cnt > 1}
@@ -54730,7 +54836,9 @@ class TestM22_5DeadLoweringCleanup:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if not (node.name.startswith("_register_") and node.name.endswith("_backward")):
+            if not (
+                node.name.startswith("_register_") and node.name.endswith("_backward")
+            ):
                 continue
             # Look for @register_lowering decorator usage anywhere in the body.
             func_src = ast.get_source_segment(src, node) or ""
@@ -54824,7 +54932,9 @@ class TestM195DynamicShapeConvLifting:
         # Module params are always static: weight.size() returns a tuple of ints.
         # Symbolic batch/spatial only appears on *input* tensors.
         kH = sympy.Integer(3)
-        assert isinstance(kH, sympy.Integer), "weight kernel dim should be concrete Integer"
+        assert isinstance(kH, sympy.Integer), (
+            "weight kernel dim should be concrete Integer"
+        )
         # int() on sympy.Integer works fine (no TypeError).
         assert int(kH) == 3
 
@@ -54935,7 +55045,6 @@ class TestM195DynamicShapeConvLifting:
         expressions (not raises). Used in conv.py for channel-count guards.
         """
         import sympy
-
         from torch_vulkan.inductor.kernel.symbolic import get_static_numel
 
         C_in_sym = sympy.Symbol("C_in", positive=True, integer=True)
@@ -54970,9 +55079,7 @@ class TestM22bConvSplit:
         """conv.py must not exceed 800 lines after the M22b split."""
         path = self._EAGER_DIR / "conv.py"
         lines = path.read_text().count("\n")
-        assert lines <= 800, (
-            f"M22b: conv.py is {lines} lines (anti-goal #7 cap is 800)"
-        )
+        assert lines <= 800, f"M22b: conv.py is {lines} lines (anti-goal #7 cap is 800)"
 
     def test_conv_relu_py_under_800_lines(self):
         """conv_relu.py must not exceed 800 lines."""
@@ -55007,6 +55114,7 @@ class TestM22bConvSplit:
             _ensure_conv1d_with_optional_bias_op_registered,
             _ensure_conv2d_with_optional_bias_op_registered,
         )
+
         assert callable(_ensure_conv2d_with_optional_bias_op_registered)
         assert callable(_ensure_conv1d_with_optional_bias_op_registered)
 
@@ -55015,6 +55123,7 @@ class TestM22bConvSplit:
         from torch_vulkan.inductor.fx_passes.eager.conv_relu import (
             _ensure_conv2d_relu_fused_op_registered,
         )
+
         assert callable(_ensure_conv2d_relu_fused_op_registered)
 
     def test_gn_relu_importable_from_conv_gn_relu(self):
@@ -55023,6 +55132,7 @@ class TestM22bConvSplit:
             _dispatch_group_norm_slang,
             _ensure_conv2d_gn_relu_fused_op_registered,
         )
+
         assert callable(_ensure_conv2d_gn_relu_fused_op_registered)
         assert callable(_dispatch_group_norm_slang)
 
@@ -55031,6 +55141,7 @@ class TestM22bConvSplit:
         from torch_vulkan.inductor.fx_passes.eager.conv_backward import (
             _ensure_conv2d_backward_op_registered,
         )
+
         assert callable(_ensure_conv2d_backward_op_registered)
 
     def test_backward_compat_imports_from_conv(self):
@@ -55040,6 +55151,7 @@ class TestM22bConvSplit:
             _ensure_conv2d_gn_relu_fused_op_registered,
             _ensure_conv2d_relu_fused_op_registered,
         )
+
         assert callable(_ensure_conv2d_relu_fused_op_registered)
         assert callable(_ensure_conv2d_gn_relu_fused_op_registered)
         assert callable(_ensure_conv2d_backward_op_registered)
@@ -55056,12 +55168,8 @@ class TestM22bConvSplit:
             "_ensure_conv2d_backward_op_registered",
         ]
         for name in required:
-            assert hasattr(pkg, name), (
-                f"M22b: eager __init__ missing export {name!r}"
-            )
-            assert callable(getattr(pkg, name)), (
-                f"M22b: {name!r} is not callable"
-            )
+            assert hasattr(pkg, name), f"M22b: eager __init__ missing export {name!r}"
+            assert callable(getattr(pkg, name)), f"M22b: {name!r} is not callable"
 
 
 class TestM22cSchedulingSplit:
@@ -55158,9 +55266,7 @@ class TestM22dRNNSplit:
         """rnn.py must not exceed 800 lines after the M22d split."""
         path = self._CALLER_DIR / "rnn.py"
         lines = path.read_text().count("\n")
-        assert lines <= 800, (
-            f"M22d: rnn.py is {lines} lines (anti-goal #7 cap is 800)"
-        )
+        assert lines <= 800, f"M22d: rnn.py is {lines} lines (anti-goal #7 cap is 800)"
 
     def test_rnn_backward_py_exists(self):
         """rnn_backward.py must exist as the extracted backward module."""
@@ -55191,6 +55297,7 @@ class TestM22dRNNSplit:
         from torch_vulkan.inductor.templates.caller.rnn_backward import (
             _SlangTileRNNBackward,
         )
+
         assert callable(_SlangTileRNNBackward)
 
     def test_forward_symbols_still_in_rnn(self):
@@ -55205,6 +55312,7 @@ class TestM22dRNNSplit:
             _SlangTileRNNFused,
             install_external_rnn,
         )
+
         assert callable(install_external_rnn)
         assert callable(_dispatch_rnn_cell)
 
@@ -55283,7 +55391,9 @@ class TestM198AutotuneEmptyChoices:
             )
 
         m198_warns = [w for w in caught if "M19.8" in str(w.message)]
-        assert not m198_warns, f"M19.8: unexpected warning for non-empty wg_sizes: {m198_warns}"
+        assert not m198_warns, (
+            f"M19.8: unexpected warning for non-empty wg_sizes: {m198_warns}"
+        )
         assert result == 256
 
 
@@ -55332,7 +55442,9 @@ class TestM227SparseTensorStub:
 
         w = torch.randn(10, 4).to("vulkan")
         i = torch.tensor([0, 1, 2]).to("vulkan")
-        out = torch.nn.functional.embedding(w, i, sparse=False, scale_grad_by_freq=False)
+        out = torch.nn.functional.embedding(
+            w, i, sparse=False, scale_grad_by_freq=False
+        )
         assert out.shape == (3, 4)
 
     def test_embedding_python_lowering_returns_not_implemented_for_sparse(self):
@@ -55349,15 +55461,17 @@ class TestM227SparseTensorStub:
         # behave correctly for a non-Vulkan tensor so we can reach the
         # ``scale_grad_by_freq`` guard.
         import torch
-        from torch._inductor.lowering import lowerings as _lowerings
         import torch._inductor.ir as _ir
+        from torch._inductor.lowering import lowerings as _lowerings
 
         aten = torch.ops.aten
 
         # Ensure the lowering is registered (safe to call multiple times).
         import importlib
+
         # Import via the package path so relative imports inside the module work.
         import torch_vulkan.inductor.lowerings.embedding as _emb_mod
+
         _emb_mod._register_embedding_dense_backward()
 
         lowering_fn = _lowerings.get(aten.embedding_dense_backward.default)
@@ -55371,6 +55485,7 @@ class TestM227SparseTensorStub:
         # that the function exists, is registered, and has the guard in its
         # source body (verified by source inspection below).
         import inspect
+
         src = inspect.getsource(lowering_fn)
         assert "scale_grad_by_freq" in src, (
             "scale_grad_by_freq guard missing from _vulkan_embedding_dense_backward"
@@ -55448,10 +55563,15 @@ class TestM233RenderBindingSetRatchet:
         violations = []
         header = self._HEADER_DIR / "header.py"
         import re
+
         bare = re.compile(r"\[\[vk::binding\(\d+\)\]\]")
         for i, raw in enumerate(header.read_text().splitlines(), 1):
             stripped = raw.lstrip()
-            if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'"):
+            if (
+                stripped.startswith("#")
+                or stripped.startswith('"""')
+                or stripped.startswith("'")
+            ):
                 continue
             if "vk::binding" in raw and bare.search(raw):
                 violations.append(f"header.py:{i}: {raw.rstrip()!r}")
@@ -55472,9 +55592,7 @@ class TestM233RenderBindingSetRatchet:
         """
         import re
 
-        lib_dir = (
-            __import__("pathlib").Path(__file__).parent.parent / "shaders/lib"
-        )
+        lib_dir = __import__("pathlib").Path(__file__).parent.parent / "shaders/lib"
         pb_re = re.compile(r"ParameterBlock\s*<")
         binding_re = re.compile(r"\[\[vk::binding\(\s*0\s*,\s*0\s*\)\]\]")
         violations = []
@@ -55508,6 +55626,7 @@ class TestM234ComboChainRenameResolver:
 
     def _resolve(self, name, freed, old_to_new):
         from torch_vulkan.inductor.kernel.dispatch_call import resolve_alias_chain
+
         return resolve_alias_chain(name, freed, old_to_new)
 
     def test_single_step_resolution(self):
@@ -55545,8 +55664,14 @@ class TestM234ComboChainRenameResolver:
     def test_combo_kernel_and_dispatch_call_use_same_function(self):
         """Both call sites import from the same module-level function."""
         import inspect
-        from torch_vulkan.inductor.kernel.dispatch_call import resolve_alias_chain as dc_fn
-        from torch_vulkan.inductor.vulkan_combo_kernel import resolve_alias_chain as vck_fn
+
+        from torch_vulkan.inductor.kernel.dispatch_call import (
+            resolve_alias_chain as dc_fn,
+        )
+        from torch_vulkan.inductor.vulkan_combo_kernel import (
+            resolve_alias_chain as vck_fn,
+        )
+
         assert dc_fn is vck_fn, "Both modules must use the same resolve_alias_chain"
 
 
@@ -55595,7 +55720,9 @@ class TestM235ForeachOutsideCompileRatchet:
         torch._foreach_add_(ts, others)
         for t, ref, ro in zip(ts, refs, ref_others):
             assert t.device.type == "vulkan", "result moved to CPU"
-            torch.testing.assert_close(t.cpu(), ref + ro, rtol=self._RTOL, atol=self._ATOL)
+            torch.testing.assert_close(
+                t.cpu(), ref + ro, rtol=self._RTOL, atol=self._ATOL
+            )
 
     def test_foreach_mul_scalar_stays_vulkan(self):
         """_foreach_mul_.Scalar keeps tensors on Vulkan."""
@@ -55604,7 +55731,9 @@ class TestM235ForeachOutsideCompileRatchet:
         torch._foreach_mul_(ts, 0.5)
         for t, ref in zip(ts, refs):
             assert t.device.type == "vulkan", "result moved to CPU"
-            torch.testing.assert_close(t.cpu(), ref * 0.5, rtol=self._RTOL, atol=self._ATOL)
+            torch.testing.assert_close(
+                t.cpu(), ref * 0.5, rtol=self._RTOL, atol=self._ATOL
+            )
 
     def test_foreach_div_scalar_stays_vulkan(self):
         """_foreach_div_.Scalar keeps tensors on Vulkan."""
@@ -55613,7 +55742,9 @@ class TestM235ForeachOutsideCompileRatchet:
         torch._foreach_div_(ts, 3.0)
         for t, ref in zip(ts, refs):
             assert t.device.type == "vulkan", "result moved to CPU"
-            torch.testing.assert_close(t.cpu(), ref / 3.0, rtol=self._RTOL, atol=self._ATOL)
+            torch.testing.assert_close(
+                t.cpu(), ref / 3.0, rtol=self._RTOL, atol=self._ATOL
+            )
 
     def test_foreach_sqrt_stays_vulkan(self):
         """_foreach_sqrt returns Vulkan tensors."""
@@ -55672,14 +55803,17 @@ class TestM196ForeachPointwiseLowerings:
         from torch_vulkan.inductor.lowerings.foreach_pointwise import (
             register_foreach_pointwise_lowerings,
         )
+
         assert callable(register_foreach_pointwise_lowerings)
 
     def test_foreach_pointwise_all_ops_in_lowerings(self):
         """All 16 M19.6 target ops are in Inductor's lowering table after register()."""
         import torch_vulkan.inductor
+
         torch_vulkan.inductor.register()
 
         from torch._inductor.lowering import lowerings
+
         aten = torch.ops.aten
 
         required = [
@@ -55706,6 +55840,7 @@ class TestM196ForeachPointwiseLowerings:
 
     def test_foreach_add_list_compile(self):
         """_foreach_add.List under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, others):
             return torch._foreach_add(ts, others)
@@ -55721,12 +55856,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_add.List compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_add.List compile mismatch",
             )
 
     def test_foreach_add_scalar_compile(self):
         """_foreach_add.Scalar under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, alpha):
             return torch._foreach_add(ts, alpha)
@@ -55740,12 +55879,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_add.Scalar compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_add.Scalar compile mismatch",
             )
 
     def test_foreach_sub_list_compile(self):
         """_foreach_sub.List under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, others):
             return torch._foreach_sub(ts, others)
@@ -55761,12 +55904,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_sub.List compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_sub.List compile mismatch",
             )
 
     def test_foreach_mul_list_compile(self):
         """_foreach_mul.List under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, others):
             return torch._foreach_mul(ts, others)
@@ -55782,12 +55929,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_mul.List compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_mul.List compile mismatch",
             )
 
     def test_foreach_mul_scalar_compile(self):
         """_foreach_mul.Scalar under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, scalar):
             return torch._foreach_mul(ts, scalar)
@@ -55801,12 +55952,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_mul.Scalar compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_mul.Scalar compile mismatch",
             )
 
     def test_foreach_div_scalar_compile(self):
         """_foreach_div.Scalar under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts, scalar):
             return torch._foreach_div(ts, scalar)
@@ -55820,12 +55975,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_div.Scalar compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_div.Scalar compile mismatch",
             )
 
     def test_foreach_neg_compile(self):
         """_foreach_neg.default under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts):
             return torch._foreach_neg(ts)
@@ -55839,12 +55998,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_neg compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_neg compile mismatch",
             )
 
     def test_foreach_abs_compile(self):
         """_foreach_abs.default under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts):
             return torch._foreach_abs(ts)
@@ -55860,12 +56023,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_abs compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_abs compile mismatch",
             )
 
     def test_foreach_sqrt_compile(self):
         """_foreach_sqrt.default under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts):
             return torch._foreach_sqrt(ts)
@@ -55880,12 +56047,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=1e-3, atol=1e-3,
-                msg="M19.6 _foreach_sqrt compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=1e-3,
+                atol=1e-3,
+                msg="M19.6 _foreach_sqrt compile mismatch",
             )
 
     def test_foreach_reciprocal_compile(self):
         """_foreach_reciprocal.default under torch.compile matches CPU reference."""
+
         @torch.compile(backend="inductor")
         def fn(ts):
             return torch._foreach_reciprocal(ts)
@@ -55900,12 +56071,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=1e-3, atol=1e-3,
-                msg="M19.6 _foreach_reciprocal compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=1e-3,
+                atol=1e-3,
+                msg="M19.6 _foreach_reciprocal compile mismatch",
             )
 
     def test_foreach_add_inplace_list_compile(self):
         """_foreach_add_.List under torch.compile mutates correctly vs CPU."""
+
         @torch.compile(backend="inductor")
         def fn(ts, others):
             torch._foreach_add_(ts, others)
@@ -55922,12 +56097,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ts_cpu):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_add_.List compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_add_.List compile mismatch",
             )
 
     def test_foreach_mul_inplace_scalar_compile(self):
         """_foreach_mul_.Scalar under torch.compile mutates correctly vs CPU."""
+
         @torch.compile(backend="inductor")
         def fn(ts, scalar):
             torch._foreach_mul_(ts, scalar)
@@ -55942,12 +56121,16 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ts_cpu):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 _foreach_mul_.Scalar compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 _foreach_mul_.Scalar compile mismatch",
             )
 
     def test_foreach_mixed_chain_compile(self):
         """Chain of foreach ops (neg→mul→add) under compile matches CPU."""
+
         @torch.compile(backend="inductor")
         def fn(ts, others):
             neg_ts = torch._foreach_neg(ts)
@@ -55967,8 +56150,11 @@ class TestM196ForeachPointwiseLowerings:
 
         for r, r_cpu in zip(result, ref):
             torch.testing.assert_close(
-                r.cpu(), r_cpu, rtol=self._RTOL, atol=self._ATOL,
-                msg="M19.6 foreach chain compile mismatch"
+                r.cpu(),
+                r_cpu,
+                rtol=self._RTOL,
+                atol=self._ATOL,
+                msg="M19.6 foreach chain compile mismatch",
             )
 
 
@@ -56001,11 +56187,13 @@ class TestM223PatternStats:
         """After apply_all on a graph containing aten.relu.default, the
         relu_to_clamp_min counter must be non-zero (stats gate on)."""
         import torch_vulkan.inductor.config as _cfg
+        from torch_vulkan.inductor.fx_passes.patterns.registry import (
+            FX_PATTERN_REGISTRY,
+        )
         from torch_vulkan.inductor.fx_passes.post_grad import (
             _PatternStats,
             reset_pattern_stats,
         )
-        from torch_vulkan.inductor.fx_passes.patterns.registry import FX_PATTERN_REGISTRY
 
         # Temporarily enable stats by patching the module-level flag.
         _orig = _cfg._PATTERN_STATS
@@ -56075,6 +56263,7 @@ class TestM223PatternStats:
             # Redirect stderr and verify dump_pattern_stats() writes nothing.
             buf = io.StringIO()
             import sys
+
             _old_stderr = sys.stderr
             sys.stderr = buf
             try:
@@ -56171,9 +56360,8 @@ class TestM222AllocAliasIRMigration:
     def test_wrapper_generate_no_regex_artifact(self):
         """The old regex-pass comment '# (pool-release elided:' must NOT appear
         in the compiled wrapper source — confirms the regex pass is bypassed."""
-        from torch._inductor.utils import run_and_get_code
-
         import torch._dynamo
+        from torch._inductor.utils import run_and_get_code
 
         torch._dynamo.reset()
 
@@ -56220,8 +56408,11 @@ class TestM222AllocAliasIRMigration:
         ref = buf_a_cpu + buf_b_cpu
 
         torch.testing.assert_close(
-            result, ref, rtol=1e-4, atol=1e-4,
-            msg="M22.2: IR alias pass broke numerical correctness"
+            result,
+            ref,
+            rtol=1e-4,
+            atol=1e-4,
+            msg="M22.2: IR alias pass broke numerical correctness",
         )
 
     def test_wrapper_py_under_800_lines(self):
@@ -56230,7 +56421,10 @@ class TestM222AllocAliasIRMigration:
 
         path = (
             Path(__file__).parent.parent
-            / "python" / "torch_vulkan" / "inductor" / "wrapper.py"
+            / "python"
+            / "torch_vulkan"
+            / "inductor"
+            / "wrapper.py"
         )
         lines = path.read_text().count("\n")
         assert lines < 800, (
@@ -56243,8 +56437,11 @@ class TestM222AllocAliasIRMigration:
 
         path = (
             Path(__file__).parent.parent
-            / "python" / "torch_vulkan" / "inductor"
-            / "fx_passes" / "alloc_alias_ir.py"
+            / "python"
+            / "torch_vulkan"
+            / "inductor"
+            / "fx_passes"
+            / "alloc_alias_ir.py"
         )
         lines = path.read_text().count("\n")
         assert lines < 800, (
@@ -56645,10 +56842,14 @@ void computeMain(uint3 sv_tid: SV_DispatchThreadID)
         from torch_vulkan.inductor.runtime.common import _get_disk_cache_dir
 
         cache_dir = _get_disk_cache_dir()
-        files = glob.glob(os.path.join(cache_dir, "**", "*.metrics.json"), recursive=True)
+        files = glob.glob(
+            os.path.join(cache_dir, "**", "*.metrics.json"), recursive=True
+        )
 
         if len(files) < 10:
-            pytest.skip(f"Too few cached metrics ({len(files)}); run more kernels first")
+            pytest.skip(
+                f"Too few cached metrics ({len(files)}); run more kernels first"
+            )
 
         total = len(files)
         counts = {
@@ -56785,18 +56986,23 @@ void computeMain(uint3 sv_tid: SV_DispatchThreadID)
 
         # Patch: reflection reports wave32 (subgroup_size=32).
         # The WG size should be a multiple of 32 (not 64).
-        with patch(
-            "torch_vulkan.inductor.runtime.get_cached_metrics_for_key",
-            return_value={"subgroup_size": 32, "vgprs": 16},
-        ), patch(
-            "torch_vulkan.inductor.config.no_wg_tune",
-            return_value=False,
-        ), patch(
-            "torch_vulkan.inductor.config.reflection_enabled",
-            return_value=True,
-        ), patch(
-            "torch._dynamo.device_interface.get_interface_for_device",
-            side_effect=Exception("no device"),
+        with (
+            patch(
+                "torch_vulkan.inductor.runtime.get_cached_metrics_for_key",
+                return_value={"subgroup_size": 32, "vgprs": 16},
+            ),
+            patch(
+                "torch_vulkan.inductor.config.no_wg_tune",
+                return_value=False,
+            ),
+            patch(
+                "torch_vulkan.inductor.config.reflection_enabled",
+                return_value=True,
+            ),
+            patch(
+                "torch._dynamo.device_interface.get_interface_for_device",
+                side_effect=Exception("no device"),
+            ),
         ):
             sgs = kernel.simd_group_size or kernel._get_cached_subgroup_size() or 64
             assert sgs == 32, (
@@ -57010,7 +57216,7 @@ class TestM209CooperativeReductionReflectionAware:
         k_at = _M209MockKernel(
             range_trees=self._make_range_trees(rnumel=4096, numel_hint=32),
             io_pressure=150,  # > 128 → ×2.0 boost
-            num_sgprs=80,    # > 64 → ×0.5 penalty; net = 1.0
+            num_sgprs=80,  # > 64 → ×0.5 penalty; net = 1.0
         )
         assert k_at.should_use_cooperative_reduction() is True, (
             "M20.9: combined SGPR×0.5 + I/O×2.0 = net×1.0; "
@@ -57078,7 +57284,10 @@ class TestM208ScatterIScatterGenerics:
             "shaders/lib/atomics.slang (anti-goal #6 — generics, not strings)."
         )
         # combine method must be part of the interface
-        assert "static void combine(RWStructuredBuffer<uint> out, uint idx, float val)" in src, (
+        assert (
+            "static void combine(RWStructuredBuffer<uint> out, uint idx, float val)"
+            in src
+        ), (
             "M20.8: IScatter interface must declare "
             "`static void combine(RWStructuredBuffer<uint> out, uint idx, float val)`."
         )
@@ -57922,8 +58131,7 @@ class TestTestCov1UntestedLowerings:
         """
         try:
             vk_args = tuple(
-                a.to("vulkan:0") if isinstance(a, torch.Tensor) else a
-                for a in cpu_args
+                a.to("vulkan:0") if isinstance(a, torch.Tensor) else a for a in cpu_args
             )
             compiled = torch.compile(fn, backend="inductor")
             got = compiled(*vk_args)
@@ -58143,9 +58351,7 @@ class TestTestCov1UntestedLowerings:
 
         torch.manual_seed(0)
         x = torch.randn(16)
-        self._compile_bwd_parity(
-            lambda t: F.leaky_relu(t, negative_slope=0.1).sum(), x
-        )
+        self._compile_bwd_parity(lambda t: F.leaky_relu(t, negative_slope=0.1).sum(), x)
 
     # ── 6. rot90.default ─────────────────────────────────────────────────
 
@@ -58177,9 +58383,7 @@ class TestTestCov1UntestedLowerings:
         """
         torch.manual_seed(0)
         x = torch.randn(4, 6)
-        self._compile_parity(
-            lambda t: torch.rot90(t, k, [0, 1]), x, atol=0.0, rtol=0.0
-        )
+        self._compile_parity(lambda t: torch.rot90(t, k, [0, 1]), x, atol=0.0, rtol=0.0)
 
     # ── 7. foreach_lion_step ─────────────────────────────────────────────
 
@@ -58387,8 +58591,7 @@ class TestM214PerKernelVUIDLifecycleStress:
         # load_known_vuids() returns a set; it must not raise.
         known = load_known_vuids()
         assert isinstance(known, set), (
-            "M21.4: load_known_vuids() must return a set, got "
-            f"{type(known).__name__}"
+            f"M21.4: load_known_vuids() must return a set, got {type(known).__name__}"
         )
 
     def test_run_with_validation_api_exists(self):
@@ -58423,9 +58626,7 @@ class TestM214PerKernelVUIDLifecycleStress:
         for vuid in samples:
             line = f"Validation Error: [ {vuid} ]"
             found = VUID_RE.findall(line)
-            assert vuid in found, (
-                f"M21.4: VUID_RE failed to match {vuid!r} in {line!r}"
-            )
+            assert vuid in found, f"M21.4: VUID_RE failed to match {vuid!r} in {line!r}"
 
     def test_layer_installed_returns_bool(self):
         """``layer_installed()`` must return a bool (not None / str).
@@ -58658,8 +58859,11 @@ class TestM189FollowupStridedCopy:
         result = vx.t().cpu()
         expected = x.t()
         torch.testing.assert_close(
-            result, expected, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: transposed Vulkan→CPU mismatch"
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: transposed Vulkan→CPU mismatch",
         )
 
     def test_sliced_tensor_cpu_copy_correct(self):
@@ -58669,19 +58873,25 @@ class TestM189FollowupStridedCopy:
         result = vx[::2].cpu()
         expected = x[::2]
         torch.testing.assert_close(
-            result, expected, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: sliced Vulkan→CPU mismatch"
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: sliced Vulkan→CPU mismatch",
         )
 
     def test_permuted_tensor_cpu_copy_correct(self):
         """permute() materialises a contiguous Vulkan buffer in the target layout."""
         x = torch.randn(2, 3, 4, 4)
         vx = x.vulkan()
-        result = vx.permute(0, 2, 3, 1).cpu()   # NCHW -> NHWC
+        result = vx.permute(0, 2, 3, 1).cpu()  # NCHW -> NHWC
         expected = x.permute(0, 2, 3, 1).contiguous()
         torch.testing.assert_close(
-            result, expected, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: permuted Vulkan→CPU mismatch"
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: permuted Vulkan→CPU mismatch",
         )
 
     def test_view_reshape_cpu_copy_correct(self):
@@ -58693,8 +58903,11 @@ class TestM189FollowupStridedCopy:
         result = vview.cpu()
         expected = x.view(4, 4)
         torch.testing.assert_close(
-            result, expected, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: view Vulkan→CPU mismatch"
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: view Vulkan→CPU mismatch",
         )
 
     def test_contiguous_baseline_unaffected(self):
@@ -58703,8 +58916,11 @@ class TestM189FollowupStridedCopy:
         vx = x.vulkan()
         result = vx.cpu()
         torch.testing.assert_close(
-            result, x, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: contiguous baseline Vulkan→CPU mismatch"
+            result,
+            x,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: contiguous baseline Vulkan→CPU mismatch",
         )
 
     def test_dtype_conversion_with_strided_src(self):
@@ -58714,12 +58930,15 @@ class TestM189FollowupStridedCopy:
         # Transpose: materialises new Vulkan buffer
         vx_t = vx_f32.t()
         # Force the dtype-conversion branch in vulkan_copy_: dst is f64, src is f32
-        dst = torch.empty(vx_t.shape, dtype=torch.float64, device='cpu')
+        dst = torch.empty(vx_t.shape, dtype=torch.float64, device="cpu")
         dst.copy_(vx_t)
         expected = x.t().to(torch.float64)
         torch.testing.assert_close(
-            dst, expected, atol=1e-5, rtol=1e-5,
-            msg="M18.9-followup: dtype-conversion strided Vulkan→CPU mismatch"
+            dst,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            msg="M18.9-followup: dtype-conversion strided Vulkan→CPU mismatch",
         )
 
 

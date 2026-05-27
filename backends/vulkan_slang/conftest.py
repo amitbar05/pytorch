@@ -17,6 +17,7 @@ Search order (first hit wins):
 Fail-soft: when nothing resolves, leave SLANGC unset so existing
 ``pytest.skip("slangc unavailable …")`` paths fire as before.
 """
+
 from __future__ import annotations
 
 import glob
@@ -66,41 +67,30 @@ def pytest_report_header(config):
         msgs.append(f"SLANGC auto-resolved → {val}")
     elif not os.environ.get("SLANGC"):
         msgs.append("SLANGC unset (audit-family tests will skip)")
-    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") == "1":
-        msgs.append("M-VAL.1: TORCH_VULKAN_VUID_AS_ERROR=1 (VUID emitted "
-                    "during a test fails it)")
+    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") == "0":
+        msgs.append("M-VAL.1: TORCH_VULKAN_VUID_AS_ERROR=0 (VUID-as-error DISABLED)")
     return "\n".join(msgs) if msgs else None
 
 
-# ── M-VAL.1 (v7) — VUID-as-error pytest autouse fixture ────────────────
+# ── M-VAL.1 (v7) — default-ON VUID-as-error pytest autouse fixture ──
 #
-# When ``TORCH_VULKAN_VUID_AS_ERROR=1`` is set, snapshot the cumulative
-# Vulkan validation-error count (counts every WARNING+ VALIDATION /
-# PERFORMANCE message the debug-utils messenger has seen — wired in
-# ``csrc/vulkan/Context.cpp::debug_callback``) before each test, then
-# fail the test if the counter ticks up. This makes a VUID a hard test
-# failure rather than a silent stderr line.
+# After M-VAL.3 closed the residual best-practices VUID backlog (zero
+# VUIDs across 9 catalog models), this fixture is DEFAULT-ON: any
+# Vulkan validation error that increments the counter between test
+# start and test end fails the test.
 #
-# Opt-in (not default-on) because:
-#   (a) The Vulkan validation layer must be installed and enabled; on
-#       boxes without it the counter sticks at 0 and the fixture is a
-#       no-op.
-#   (b) Existing tests have undocumented best-practices VUIDs that we
-#       haven't swept yet (M-VAL.3 is the sweep milestone). Default-on
-#       would turn that backlog into ~dozens of pre-existing failures.
+# Opt-out:
 #
-# To run a single test with VUID-as-error::
+#     TORCH_VULKAN_VUID_AS_ERROR=0 pytest tests/test_X.py::test_Y
 #
-#     TORCH_VULKAN_VUID_AS_ERROR=1 pytest tests/test_X.py::test_Y
-#
-# CI / nightly sweep should set the env var globally once M-VAL.3 closes
-# the residual VUID backlog.
+# On boxes without the validation layer, the counter sticks at 0 and
+# the fixture is a harmless no-op.
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def _mval1_vuid_as_error_fixture(request):
-    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") != "1":
+    if os.environ.get("TORCH_VULKAN_VUID_AS_ERROR") == "0":
         yield
         return
 
@@ -127,5 +117,3 @@ def _mval1_vuid_as_error_fixture(request):
             f"{request.node.nodeid} (counter {before} → {after}). "
             f"Inspect stderr for [Vulkan VUID] lines."
         )
-
-

@@ -47,15 +47,19 @@ roadmap item.
 * **M-CG.1, M-CG.2** ✅ — Explore-agent audit (2026-05-27): zero
   genuine eager-fallback leaks on the compile path. See § v7 audit
   evidence in the roadmap.
-* **M-VAL.1** ✅ — VUID counter pybind + autouse fixture; opt-in via
-  `TORCH_VULKAN_VUID_AS_ERROR=1`. Flips to default-on when M-VAL.3
-  closes the residual best-practices backlog.
+* **M-VAL.1** ✅ — VUID counter pybind + autouse fixture; **default-on**
+  after M-VAL.3 closed the residual best-practices backlog (zero VUIDs
+  across 9 catalog models). Opt-out: `TORCH_VULKAN_VUID_AS_ERROR=0`.
+* **M-VAL.3** ✅ — Best-practices VUID sweep across 9 catalog models
+  (2026-05-27). Sweep harness at `agent_space/m21_3_validation_sweep.py`.
+  Result: zero VUIDs, all prior P0/P1 VUIDs (M21.3.01, M21.3.02,
+  EAGER.1.b, M-cpp-new-6) fully closed.
 * **M-PROBE.1, M-PROBE.3** ✅ — `torch_vulkan.prepare_device(level,
   timeout_s)` public API + timeout enforcement.
 
-11 milestones remain. Next-up candidates: **M-VAL.3** (run the existing
-best-practices VUID sweep across the 9-model catalog), **M-SF.1**
-(ParameterBlock 45 % → 100 %), **M-CG.4** (Linear-bwd ≤2 dispatches).
+9 milestones remain. Next-up candidates: **M-SF.1**
+(ParameterBlock 45 % → 100 %), **M-CG.4** (Linear-bwd ≤2 dispatches),
+**M-VAL.2** (per-kernel autotune VUID gate).
 
 ## Companion docs
 
