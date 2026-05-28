@@ -60109,9 +60109,7 @@ def _train_loop_cpu(model, x, y, n_steps=10, lr=0.01):
     for _ in range(n_steps):
         opt.zero_grad()
         out = model(x)
-        # Manual cross_entropy with sum reduction (matches Vulkan compiled path).
-        log_probs = torch.nn.functional.log_softmax(out, dim=1)
-        loss = -log_probs.gather(1, y.unsqueeze(1)).squeeze(1).sum()
+        loss = torch.nn.functional.cross_entropy(out, y, reduction="sum")
         loss.backward()
         opt.step()
         losses.append(loss.item())
@@ -60126,9 +60124,14 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
 
     Uses full AOT compilation: forward + loss + backward compiled through
     Slang codegen via torch.compile(backend="inductor"). The compiled
-    function computes logits, loss (manual cross-entropy via log_softmax +
-    gather + sum), and calls .backward() — all inside the compiled graph.
-    Optimizer step stays outside the compiled boundary (parameter update ops).
+    function computes logits, loss (F.cross_entropy with sum reduction),
+    and calls .backward() — all inside the compiled graph. Optimizer step
+    stays outside the compiled boundary (parameter update ops).
+
+    F.cross_entropy routes through the patched nll_loss_forward (constant
+    total_weight in aot_cross_entropy.py) which avoids the AOT partitioner
+    "Node invalid" error. Manual log_softmax+gather decomposition triggers
+    the partitioner issue because target becomes a backward-only dependency.
 
     Replaces the forward-only pattern (Option C) from 2026-05-27. Full AOT
     backward now works for GroupNorm models (57 dispatches, ~15s warm compile
@@ -60148,10 +60151,10 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     @torch.compile(backend="inductor")
     def train_step(inp, target):
         out = model(inp)
-        # Manual cross-entropy (log_softmax + gather + neg + sum)
-        # to avoid nll_loss_forward partitioner issues
-        log_probs = torch.nn.functional.log_softmax(out, dim=1)
-        loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+        # F.cross_entropy routes through the patched nll_loss_forward
+        # (constant total_weight) which avoids the partitioner "Node invalid"
+        # error. See aot_cross_entropy.py for the fix.
+        loss = torch.nn.functional.cross_entropy(out, target, reduction="sum")
         loss.backward()
         return loss
 
@@ -60360,8 +60363,7 @@ class TestTrain8ConvTrainingSweep:
         @torch.compile(backend="inductor")
         def train_step(inp, target):
             out = vk_model(inp)
-            log_probs = torch.nn.functional.log_softmax(out, dim=1)
-            loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+            loss = torch.nn.functional.cross_entropy(out, target, reduction="sum")
             loss.backward()
             return loss
 

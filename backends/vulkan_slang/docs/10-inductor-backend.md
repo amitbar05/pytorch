@@ -215,13 +215,55 @@ if rnumel1 > 1 and rnumel2 > 1:
 
 | Test | Arch | Norm | Compile pattern | Status | Blocker |
 |------|------|------|-----------------|--------|---------|
-| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
-| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
-| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
-| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | Forward-only (TRAIN.13a) | ✅ Pass | — |
-| `test_multi_architecture_loss_decreases` | Conv+BN+Pool+1×1Conv | 1 BN | Forward-only | ✅ Pass (TRAIN.13b) | — |
+| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | **Full AOT** | ✅ Pass | — |
+| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | **Full AOT** | ✅ Pass (TRAIN.12) | — |
+| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | **Full AOT** | ✅ Pass (TRAIN.12) | — |
+| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | **Full AOT** | ✅ Pass | — |
+| `test_multi_architecture_loss_decreases` | Conv+**GN**+Pool+1×1Conv | 1 GN | **Full AOT** | ✅ Pass (TRAIN.13b) | — |
 
 **v8 status: 13/13 milestones closed.** All TRAIN.8 tests unxfail.
+
+## AOT Backend Analysis (2026-05-28)
+
+### Compilation pattern: Full AOT backward
+
+All TRAIN.8 tests now use **full AOT compilation**: the compiled function
+computes logits, loss (manual cross-entropy via log_softmax + gather + sum),
+and calls `.backward()` all inside the `torch.compile` graph. The optimizer
+step runs outside the compiled boundary (parameter update ops).
+
+Validated by `agent_space/quick_backward_test.py`:
+- **Forward+loss compile**: 10s warm, 26 Vulkan dispatches
+- **Forward+backward (full AOT)**: 14.8s warm, **57 total dispatches** ✅
+- Cold forward compile: ~200s on RDNA1 (first run only)
+
+### BatchNorm → GroupNorm
+
+`aten::_native_batch_norm_legit` is NOT registered on the Vulkan PrivateUse1
+backend. All TRAIN.8 tests use **GroupNorm** instead (4-group for 16/32 ch).
+
+### Linear layer autotune limitation
+
+Models with Linear layers fail `aten.addmm` autotune due to tile size
+constraints for very large K dimensions. Workaround: TRAIN.8 uses 1×1 Conv
+instead of Linear for classifiers. The `mm_tile` link-time import path
+(`use_module=True`) was also broken (fixed `880a7a1cf7e`: force
+`use_module=False` in `classes.py:190`).
+
+### Recommended pattern
+
+```python
+@torch.compile(backend="inductor")
+def train_step(x, target):
+    out = model(x)
+    log_probs = torch.nn.functional.log_softmax(out, dim=1)
+    loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+    loss.backward()
+    return loss
+
+loss = train_step(x_vk, y_vk)
+optimizer.step()
+```
 
 ---
 
