@@ -157,6 +157,41 @@ Slang codegen kernels with no aten eager fallback on the compile path.
 | **TRAIN.9** | Missing training-critical eager ops (reciprocal) | `clip_grad_norm_()` calls `max_norm / (total_norm + 1e-6)` → `__rdiv__` → `self.reciprocal()` → `aten::reciprocal.out`. Not registered in PrivateUse1 backend → RuntimeError. Blocks any training loop with gradient clipping. | 0.25 d | ✅ **CLOSED 2026-05-27.** Added `vulkan_reciprocal()` + `vulkan_reciprocal_out()` using `unary_reciprocal_fwd` shader (already in generated/shaders.h). Registered both `reciprocal` and `reciprocal.out` in Registration.cpp. Test: `TestTrain9ReciprocalOp`. |
 | **TRAIN.10** | Benchmark async dispatch sync | `_vulkan_benchmark` routes to `benchmark_cpu()` whose inner loop calls `callable_()` warmup+rep times without GPU sync. Vulkan dispatches are async → command buffer fills → `VK_ERROR_OUT_OF_DEVICE_MEMORY` → ALL candidates return Infinity. Blocks addmm/mm autotune — SmallCNN North Star crashes with `best_time: Infinity`. | 0.25 d | ✅ **CLOSED 2026-05-27.** Wrapped benchmark callable with `torch_vulkan.synchronize(0)` (calls `vkDeviceWaitIdle`) after each dispatch in the inner loop. File: `inductor/__init__.py:_vulkan_benchmark`. Test: `TestTrain10BenchmarkSync`. |
 | **TRAIN.11** | mm_tile.slang precompilation | Autotune fails with `mm_tile.slang-module not found after precompilation` for all addmm choices → `best_time: Infinity` → NoValidChoicesError. Root cause: M-NEW.5 level filtering (default level=1) skips mm_tile during prewarm, and the old `_ensure_mm_tile_module()` relied on the level-filtered `_ensure_shader_lib_modules()` which never compiled it. | 0.5 d | ✅ **CLOSED 2026-05-28.** Added `_compile_single_module(name)` that compiles a single shader-lib module on-demand, bypassing the M-NEW.5 level filter. Both `_ensure_mm_tile_module` and `_ensure_mm_int8_module` now use it. Linear layers now work through `torch.compile` without requiring `TORCH_VULKAN_PREWARM_LEVEL=2`. Verified: `mm_tile.slang-module` (124 KB) compiles and caches correctly on first use. Test: `debug_mm_tile_compile.py`. |
+| **TRAIN.12** | Multi-norm backward tiling assertion | Models with 2+ GroupNorm/BatchNorm layers crash in upstream Inductor's `tiling_utils.get_pw_red_splits()` assertion (line 271): `assert get_hint(prod(sizes[0])) == get_hint(pw_numel * red_numel)`. The scheduler fuses backward reduction nodes from different norm layers (with different reduction dims) into one `FusedSchedulerNode`. `analyze_reads_and_writes` then calls `get_pw_red_splits` w/o `none_if_not_divisible=True`, hitting the assertion. Blocks SmallCNN (2 GN) and ResNet-mini (3 GN). | 1 d | ❌ OPEN (xfail on 2 tests) |
+| **TRAIN.13** | Test infra: AdamW full-compile pattern + BN backward | (a) `test_adamw_optimizer` compiles backward INSIDE `torch.compile` (loss+backward in inner function), risking AOT partitioner "Node invalid" error. Should use forward-only pattern. (b) `test_multi_architecture_loss_decreases` uses BatchNorm2d — need to verify all BN eager backward sub-ops have Vulkan PrivateUse1 registration (welford backward, normalize backward, scale/shift backward). | 0.5 d | ❌ OPEN |
+
+## TRAIN.12 analysis — multi-norm backward tiling assertion
+
+**Error path** (reproduced on SmallCNN/ResNet-mini with forward-only compile):
+```
+tiling_utils.py:271  AssertionError
+assert get_hint(sympy_product(n._body.sizes[0])) == get_hint(pointwise_numel * red_numel)
+```
+
+**Root chain**:
+1. Model has 2+ norm layers (e.g. GN(4,16) + GN(4,32))
+2. Backward graph has reduction nodes from each norm: different `(numel, rnumel)` pairs
+3. Upstream `SIMDScheduling.can_fuse()` considers them fusible (same group tag or compatible iteration vars)
+4. The scheduler creates a `FusedSchedulerNode` with mixed group `(pw_numel_1, red_numel_1)` containing a sub-node from group `(pw_numel_2, red_numel_2)`
+5. `NodeSplitGetter.__init__` (line 327) uses `none_if_not_divisible=True` — safe
+6. `analyze_reads_and_writes` (line 552) calls without it — **assertion fires**
+
+**Fix strategies** (ranked by effort/risk):
+
+1. **Vulkan `can_fuse` guard** (0.5 d) — In `scheduling.py:can_fuse`, check that when both nodes are reductions (`rnumel > 1`), their `(numel, rnumel)` groups match. If not, reject fusion. This prevents the problematic case upstream of the assertion. Risk: misses legitimate fusion opportunities.
+
+2. **Upstream patch** (0.25 d) — Patch `tiling_utils.py:552` to use `none_if_not_divisible=True` + handle the `None` return. Cleanest fix but modifies upstream code.
+
+3. **`torch._inductor.config.max_fusion_size = 1`** (0.01 d) — Blunt instrument: disables multi-node fusion entirely. Correct but kills all fusion benefits. Useful as a diagnostic.
+
+**Recommended**: Strategy 1 (Vulkan `can_fuse` guard). It's a 2-line check that only affects the Vulkan backend, doesn't modify upstream, and is the semantically correct thing — two reductions with different reduction dims should not be fused on Vulkan anyway.
+
+```python
+# In scheduling.py:can_fuse, before calling super().can_fuse():
+if rnumel1 > 1 and rnumel2 > 1:
+    if (numel1, rnumel1) != (numel2, rnumel2):
+        return False  # Don't fuse reductions with incompatible shapes
+```
 
 ## v8 status tracking
 
@@ -173,6 +208,18 @@ Slang codegen kernels with no aten eager fallback on the compile path.
 | TRAIN.9 | ✅ CLOSED | — | `TestTrain9ReciprocalOp` |
 | TRAIN.10 | ✅ CLOSED | — | `TestTrain10BenchmarkSync` |
 | TRAIN.11 | ✅ CLOSED | — | `debug_mm_tile_compile.py` |
+| TRAIN.12 | ❌ OPEN | upstream Inductor | `test_small_cnn_*`, `test_resnet_block_*` (xfail) |
+| TRAIN.13 | ❌ OPEN | — | `test_adamw_optimizer`, `test_multi_architecture_*` |
+
+## TRAIN.8 test coverage matrix (current state)
+
+| Test | Arch | Norm | Compile pattern | Status | Blocker |
+|------|------|------|-----------------|--------|---------|
+| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
+| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | Forward-only | ❌ xfail | TRAIN.12 |
+| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | Forward-only | ❌ xfail | TRAIN.12 |
+| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | **Full compile** ⚠️ | ⚠️ At risk | TRAIN.13a |
+| `test_multi_architecture_loss_decreases` | Conv+BN+Pool+1×1Conv | 1 BN | Forward-only | ⚠️ Untested | TRAIN.13b |
 
 ---
 
