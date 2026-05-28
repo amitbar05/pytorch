@@ -60384,12 +60384,12 @@ class TestTrain8ConvTrainingSweep:
             def __init__(self, num_classes=10):
                 super().__init__()
                 self.conv = nn.Conv2d(1, 8, 3, padding=1)
-                self.bn = nn.BatchNorm2d(8)
+                self.gn = nn.GroupNorm(4, 8)
                 self.pool = nn.AdaptiveAvgPool2d(1)
                 self.classifier = nn.Conv2d(8, num_classes, 1)
 
             def forward(self, x):
-                return self.classifier(self.pool(torch.relu(self.bn(self.conv(x))))).flatten(1)
+                return self.classifier(self.pool(torch.relu(self.gn(self.conv(x))))).flatten(1)
 
         torch.manual_seed(42)
         model = ArchA()

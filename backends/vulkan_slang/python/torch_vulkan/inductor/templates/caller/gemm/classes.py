@@ -187,7 +187,7 @@ class _SlangTileGEMM:
         if self.epilogue is not None:
             render_kwargs["epilogue_struct"] = self.epilogue
 
-        src = _render_mm_slang(self.tile_m, self.tile_n, self.tile_k, **render_kwargs)
+        src = _render_mm_slang(self.tile_m, self.tile_n, self.tile_k, use_module=False, **render_kwargs)
 
         # DR.3 / N+1.12: Include subgroup_size and loop_depth in the
         # cache key so wave32 vs wave64 SPIR-V variants and kernels with
