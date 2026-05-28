@@ -223,12 +223,11 @@ def _ensure_max_pool2d_scatter_bwd_op_registered() -> "object":
         #    For each output position i ∈ [0, NC*oH*oW):
         #      plane_id = i // (oH * oW)
         #      global_idx = plane_id * (iH * iW) + local_idx_i32[i]
-        plane_ids = (
-            torch.arange(
-                output_numel, dtype=torch.int32, device=grad_output.device
-            )
-            // output_spatial
-        )
+        #    Compute plane_ids on CPU (avoid aten.floor_divide on Vulkan).
+        plane_ids = torch.arange(
+            output_numel, dtype=torch.int32, device="cpu"
+        ) // output_spatial
+        plane_ids = plane_ids.to(grad_output.device)
         global_idx = plane_ids * input_spatial + idx_i32
 
         # Ensure global_idx is contiguous for the scatter dispatch.
