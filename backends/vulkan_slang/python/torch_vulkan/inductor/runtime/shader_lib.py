@@ -720,6 +720,104 @@ _LT_SPEC_CONST_RE = _re.compile(
 )
 
 
+def _compile_single_module(name: str) -> str:
+    """Compile a single shader-lib module on demand, bypassing the level filter.
+
+    Called when a kernel explicitly imports a module (e.g., ``import mm_tile;``)
+    and the cached module doesn't exist. This can happen when:
+    - TORCH_VULKAN_PREWARM_LEVEL=1 (CORE only, mm_tile skipped)
+    - TORCH_VULKAN_PREWARM_LEVEL=0 (nothing precompiled)
+    - Cache was cleared or invalidated
+
+    Returns the path to the compiled module.
+
+    Raises RuntimeError if slangc is unavailable or compilation fails.
+    """
+    mod_path = os.path.join(_SHADER_LIB_MODULE_CACHE_DIR, name + ".slang-module")
+    if os.path.isfile(mod_path):
+        return mod_path
+
+    src_path = os.path.join(_SHADERS_LIB_DIR, name + ".slang")
+    if not os.path.isfile(src_path):
+        raise RuntimeError(
+            f"Shader lib source not found: {src_path}. "
+            f"Cannot compile {name}.slang-module."
+        )
+
+    if not _slangc_available():
+        raise RuntimeError(
+            "slangc not found. Set SLANGC=/path/to/slangc; needed to "
+            f"compile {name}.slang-module on demand."
+        )
+
+    os.makedirs(_SHADER_LIB_MODULE_CACHE_DIR, exist_ok=True)
+
+    # Compute hash for cache validation
+    slangc_fp = _slangc_fingerprint()
+    with open(src_path, "rb") as f:
+        src_bytes = f.read()
+    src_hash = hashlib.sha256(
+        src_bytes + b"\x00" + slangc_fp.encode("utf-8")
+    ).hexdigest()
+
+    # Use atomic write pattern (same as precompile_shader_libs)
+    import threading
+    tmp_mod_path = (
+        mod_path[: -len(".slang-module")]
+        + f".tmp.{os.getpid()}.{threading.get_ident()}.slang-module"
+    )
+
+    argv = [_get_slangc(), src_path, "-emit-ir", "-o", tmp_mod_path, "-ignore-capabilities"]
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_SLANGC_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        try:
+            os.remove(tmp_mod_path)
+        except OSError:
+            pass
+        raise SlangCompileTimeout(
+            key=f"shader_lib_{name}_ondemand",
+            argv=argv,
+            partial_stdout=(e.stdout or b"").decode("utf-8", errors="replace")
+            if isinstance(e.stdout, bytes)
+            else (e.stdout or ""),
+            partial_stderr=(e.stderr or b"").decode("utf-8", errors="replace")
+            if isinstance(e.stderr, bytes)
+            else (e.stderr or ""),
+        ) from None
+
+    if proc.returncode != 0:
+        try:
+            os.remove(tmp_mod_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"slangc failed compiling {name}.slang on demand:\n{proc.stderr}"
+        )
+
+    # Atomic publish
+    try:
+        os.replace(tmp_mod_path, mod_path)
+    except OSError as e:
+        raise RuntimeError(f"slangc atomic rename failed for {name}: {e}")
+
+    # Write hash for cache validation
+    hash_path = os.path.join(_SHADER_LIB_MODULE_CACHE_DIR, name + ".hash")
+    try:
+        with open(hash_path, "w") as f:
+            f.write(src_hash)
+    except OSError:
+        pass  # Non-fatal; cache will recompile next time
+
+    _SHADER_LIB_MODULE_STATS["compiles"] += 1
+    return mod_path
+
+
 def _mm_tile_module_path() -> str:
     """Return the path to the precompiled mm_tile.slang-module."""
     return os.path.join(_SHADER_LIB_MODULE_CACHE_DIR, "mm_tile.slang-module")
@@ -733,22 +831,12 @@ def _mm_tile_module_available() -> bool:
 def _ensure_mm_tile_module() -> str:
     """Ensure mm_tile.slang-module is precompiled. Returns the module path.
 
-    P3.2 / M14: The mm_tile module is compiled once (per slangc version)
-    and cached on disk. This function is called before any link-time
-    specialized matmul kernel compilation to guarantee the module is
-    available for linking.
+    TRAIN.11: The mm_tile module is required for link-time matmul specialization.
+    With M-NEW.5 level filtering (default level=1), mm_tile is skipped during
+    prewarm. This function compiles it on-demand when a kernel explicitly
+    imports it.
     """
-    mod_path = _mm_tile_module_path()
-    if os.path.isfile(mod_path):
-        return mod_path
-    # Trigger precompilation of all shader libs (including mm_tile)
-    _ensure_shader_lib_modules()
-    if not os.path.isfile(mod_path):
-        raise RuntimeError(
-            "mm_tile.slang-module not found after precompilation. "
-            "Ensure shaders/lib/mm_tile.slang exists and slangc is available."
-        )
-    return mod_path
+    return _compile_single_module("mm_tile")
 
 
 def _mm_int8_module_path() -> str:
@@ -758,22 +846,11 @@ def _mm_int8_module_path() -> str:
 def _ensure_mm_int8_module() -> str:
     """Ensure mm_int8.slang-module is precompiled. Returns the module path.
 
-    OP.24 / M14: Mirrors ``_ensure_mm_tile_module``; the int8 kernel wrapper
-    uses ``import mm_int8;`` for link-time tile-size specialization, so the
-    precompiled module must be on the -I path before slangc is invoked.
-    Without this the import succeeds but slangc reports E30600 "not accessible"
-    because the module was compiled from a different directory context.
+    TRAIN.11: Mirrors ``_ensure_mm_tile_module``; compiles on-demand to bypass
+    M-NEW.5 level filtering. The int8 kernel wrapper uses ``import mm_int8;``
+    for link-time tile-size specialization.
     """
-    mod_path = _mm_int8_module_path()
-    if os.path.isfile(mod_path):
-        return mod_path
-    _ensure_shader_lib_modules()
-    if not os.path.isfile(mod_path):
-        raise RuntimeError(
-            "mm_int8.slang-module not found after precompilation. "
-            "Ensure shaders/lib/mm_int8.slang exists and slangc is available."
-        )
-    return mod_path
+    return _compile_single_module("mm_int8")
 
 
 _IMPORT_STMT_RE = _re.compile(r"^\s*import\s+(\w+)\s*;", _re.MULTILINE)
