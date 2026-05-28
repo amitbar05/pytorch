@@ -60124,10 +60124,10 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     Copies model weights from CPU reference to ensure identical initialization.
     Returns loss curve.
 
-    Uses full AOT compilation (forward + backward in compiled graph). The
-    custom nll_loss_forward decomposition makes AOT partitioner safe for
-    cross-entropy loss. See docs/plans/option-c-forward-only-architecture.md
-    and validation results in agent_space/validate_full_aot.py.
+    Uses forward-only compilation pattern: the compiled function returns only
+    the logits, while loss computation and backward happen outside the
+    compiled boundary. This bypasses the AOT partitioner entirely (no joint
+    graph = no partitioner error). See docs/plans/option-c-forward-only-architecture.md.
     """
     import copy
     import torch_vulkan
@@ -60139,14 +60139,16 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     x_vk = x.to("vulkan:0")
     y_vk = y.to("vulkan:0")
 
+    # Forward-only compile: no backward inside the compiled function
     @torch.compile(backend="inductor")
-    def train_step(inp, target):
+    def forward_only(inp):
         return model(inp)
 
     losses = []
     for _ in range(n_steps):
         opt.zero_grad()
-        out = train_step(x_vk)
+        out = forward_only(x_vk)
+        # Loss and backward outside compiled function (eager autograd)
         log_probs = torch.nn.functional.log_softmax(out, dim=1)
         loss = -log_probs.gather(1, y_vk.unsqueeze(1)).squeeze(1).sum()
         loss.backward()
