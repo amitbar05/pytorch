@@ -215,6 +215,22 @@ class VulkanScheduling(SIMDScheduling):
         # Check if both nodes are pointwise (rnumel == 1 means no reduction)
         both_pointwise = rnumel1 == 1 and rnumel2 == 1
 
+        # TRAIN.12 (2026-05-28): Don't fuse two reductions with different
+        # (numel, rnumel) groups.  Upstream `analyze_reads_and_writes`
+        # (tiling_utils.py:552) calls `get_pw_red_splits` WITHOUT
+        # ``none_if_not_divisible=True``, so if the fused node contains a
+        # sub-node whose body sizes don't decompose into the group's
+        # pointwise × reduction split, an assertion fires:
+        #   assert prod(sizes[0]) == pw_numel * red_numel
+        # This happens when 2+ norm layers (GroupNorm, BatchNorm) produce
+        # backward reduction nodes with different reduction dimensions that
+        # the scheduler considers compatible.  Rejecting the fusion at the
+        # backend level is correct: on Vulkan, two reductions with different
+        # rnumel can't share a workgroup reduction strategy anyway.
+        if not both_pointwise and rnumel1 != 1 and rnumel2 != 1:
+            if (numel1, rnumel1) != (numel2, rnumel2):
+                return False
+
         combined_nodes = list(node1.get_nodes()) + list(node2.get_nodes())
         unique_bufs = set()
         for n in combined_nodes:
