@@ -60124,10 +60124,15 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     Copies model weights from CPU reference to ensure identical initialization.
     Returns loss curve.
 
-    Uses forward-only compilation pattern: the compiled function returns only
-    the logits, while loss computation and backward happen outside the
-    compiled boundary. This bypasses the AOT partitioner entirely (no joint
-    graph = no partitioner error). See docs/plans/option-c-forward-only-architecture.md.
+    Uses full AOT compilation: forward + loss + backward compiled through
+    Slang codegen via torch.compile(backend="inductor"). The compiled
+    function computes logits, loss (manual cross-entropy via log_softmax +
+    gather + sum), and calls .backward() — all inside the compiled graph.
+    Optimizer step stays outside the compiled boundary (parameter update ops).
+
+    Replaces the forward-only pattern (Option C) from 2026-05-27. Full AOT
+    backward now works for GroupNorm models (57 dispatches, ~15s warm compile
+    per step). See quick_backward_test.py for validation.
     """
     import copy
     import torch_vulkan
@@ -60139,19 +60144,21 @@ def _train_loop_vulkan_compiled(model_cpu, x, y, n_steps=10, lr=0.01):
     x_vk = x.to("vulkan:0")
     y_vk = y.to("vulkan:0")
 
-    # Forward-only compile: no backward inside the compiled function
+    # Full AOT compile: forward + loss + backward inside compiled graph
     @torch.compile(backend="inductor")
-    def forward_only(inp):
-        return model(inp)
+    def train_step(inp, target):
+        out = model(inp)
+        # Manual cross-entropy (log_softmax + gather + neg + sum)
+        # to avoid nll_loss_forward partitioner issues
+        log_probs = torch.nn.functional.log_softmax(out, dim=1)
+        loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+        loss.backward()
+        return loss
 
     losses = []
     for _ in range(n_steps):
         opt.zero_grad()
-        out = forward_only(x_vk)
-        # Loss and backward outside compiled function (eager autograd)
-        log_probs = torch.nn.functional.log_softmax(out, dim=1)
-        loss = -log_probs.gather(1, y_vk.unsqueeze(1)).squeeze(1).sum()
-        loss.backward()
+        loss = train_step(x_vk, y_vk)
         torch_vulkan._c_ext._synchronize(0)
         opt.step()
         losses.append(loss.item())
@@ -60166,11 +60173,14 @@ class TestTrain8ConvTrainingSweep:
       (B) SmallCNN: Conv+GN+ReLU+Pool+FC
       (C) ResNetBlock: Conv+GN+ReLU+residual+FC
 
+    All models use GroupNorm (not BatchNorm) since aten::_native_batch_norm_legit
+    is not registered on Vulkan PrivateUse1.
+
     For each architecture:
       1. Create model on CPU with fixed seed
       2. Run 10 training steps on CPU (reference)
       3. Create deep copy on Vulkan
-      4. Run 10 compiled training steps on Vulkan
+      4. Run 10 full AOT compiled training steps on Vulkan
       5. Verify loss decreased from step 0 → step 9 (both backends)
       6. Verify Vulkan final loss within rtol=0.5 of CPU final loss
     """
@@ -60312,14 +60322,13 @@ class TestTrain8ConvTrainingSweep:
         self._run_sweep(ResNetMini, x_shape=(4, 3, 16, 16))
 
     def test_adamw_optimizer(self):
-        """Training with AdamW through torch.compile.
+        """Training with AdamW through torch.compile (full AOT).
 
         Validates TRAIN.3 (decoupled weight decay) in a full training loop.
         Uses 1x1 Conv instead of Linear to avoid addmm autotune blocker.
 
-        TRAIN.13a (2026-05-28): switched to forward-only compile pattern.
-        Loss and backward run in eager autograd (outside compiled boundary)
-        to avoid AOT partitioner "Node invalid" error.
+        Full AOT compilation: forward + loss + backward all through Slang
+        codegen. Replaces the forward-only compile pattern (TRAIN.13a).
         """
         import copy
         import torch.nn as nn
@@ -60340,26 +60349,26 @@ class TestTrain8ConvTrainingSweep:
         x = torch.randn(4, 3, 8, 8)
         y = torch.randint(0, 10, (4,))
 
-        # AdamW on Vulkan
+        # AdamW on Vulkan with full AOT compilation
         vk_model = copy.deepcopy(model).to("vulkan:0")
         vk_model.train()
         opt = torch.optim.AdamW(vk_model.parameters(), lr=0.001, weight_decay=0.01)
         x_vk = x.to("vulkan:0")
         y_vk = y.to("vulkan:0")
 
-        # Forward-only compile (TRAIN.13a): no backward inside torch.compile
+        # Full AOT compile: forward + loss + backward through codegen
         @torch.compile(backend="inductor")
-        def forward_only(inp):
-            return vk_model(inp)
+        def train_step(inp, target):
+            out = vk_model(inp)
+            log_probs = torch.nn.functional.log_softmax(out, dim=1)
+            loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+            loss.backward()
+            return loss
 
         losses = []
         for _ in range(10):
             opt.zero_grad()
-            out = forward_only(x_vk)
-            # Loss and backward in eager autograd
-            log_probs = torch.nn.functional.log_softmax(out, dim=1)
-            loss = -log_probs.gather(1, y_vk.unsqueeze(1)).squeeze(1).sum()
-            loss.backward()
+            loss = train_step(x_vk, y_vk)
             torch_vulkan._c_ext._synchronize(0)
             opt.step()
             losses.append(loss.item())
@@ -60369,15 +60378,14 @@ class TestTrain8ConvTrainingSweep:
         )
 
     def test_multi_architecture_loss_decreases(self):
-        """All 3 architectures must show monotonically-smooth loss decrease.
+        """All architectures must show monotonically-smooth loss decrease.
 
         Loose check: no intermediate loss exceeds 2× the initial loss
         (catches NaN/Inf or divergent training).
         Uses 1x1 Conv + AdaptiveAvgPool instead of Linear to avoid addmm.
-        Uses xfail for the known cross_entropy backward div node issue.
+        Full AOT compilation via _train_loop_vulkan_compiled.
         """
-        # TRAIN.8 (2026-05-27): cross_entropy mean reduction partitioner
-        # blocker fixed by constant-total_weight AOT decomposition.
+        # TRAIN.8 (2026-05-28): Full AOT compilation via _train_loop_vulkan_compiled.
         import torch.nn as nn
 
         class ArchA(nn.Module):
