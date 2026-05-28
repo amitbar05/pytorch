@@ -33,25 +33,35 @@ This happens because Dynamo's graph break at `loss.backward()` causes `target` t
 
 ## Option C: Three-Phase Hybrid
 
-### Phase 1: Forward-Only Compile (Immediate)
+### Key Finding (2026-05-28): Forward-Only Compile Works!
+
+**✓ Validated**: `torch.compile(backend="inductor")` on a forward-only function bypasses the AOT partitioner entirely. Tested with a Conv-only model (no Linear/addmm):
+- ✓ Forward compilation succeeds (Slang codegen works)
+- ✓ Eager loss computation (`F.cross_entropy`) works after compiled forward
+- ✓ Eager backward (`loss.backward()`) works, gradients flow to parameters
+- No "Node X was invalid" partitioner error
+
+**Remaining blocker**: `aten.addmm` autotune fails with `mm_tile.slang-module not found` (separate issue from partitioner). Workaround: use 1×1 Conv2d instead of Linear (already done in SimpleCNN test).
+
+### Phase 1: Forward-Only Compile (Ready to Implement)
 **Goal**: Bypass AOT autograd entirely by compiling only the forward pass
 
 **Implementation**:
 ```python
-@torch.compile(backend='vulkan_inductor')
-def forward_only(x, target):
-    # Forward pass only - no gradients
-    logits = model(x)
-    return F.cross_entropy(logits, target)
+@torch.compile(backend="inductor")
+def forward_only(model, x):
+    return model(x)
 
-# Training loop
+# Training loop (backward outside compiled function)
 for batch in dataloader:
     x, target = batch
     
-    # Compiled forward
-    with torch.no_grad():  # Explicit no_grad to avoid autograd tracing
-        logits = forward_only(x, target)
-    
+    optimizer.zero_grad()
+    logits = forward_only(model, x)     # Compiled forward
+    loss = F.cross_entropy(logits, target)  # Eager loss  
+    loss.backward()                         # Eager backward
+    optimizer.step()                        # Eager optimizer
+```
     # Eager loss + backward
     loss = F.cross_entropy(logits, target)
     loss.backward()
