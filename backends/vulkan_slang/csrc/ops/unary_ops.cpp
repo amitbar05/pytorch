@@ -64,6 +64,16 @@ at::Tensor vulkan_rsqrt(const at::Tensor& self) {
     return unary_op(self, "unary_rsqrt_fwd", shaders::unary_rsqrt_fwd, shaders::unary_rsqrt_fwd_size);
 }
 
+at::Tensor vulkan_reciprocal(const at::Tensor& self) {
+    return unary_op(self, "unary_reciprocal_fwd", shaders::unary_reciprocal_fwd, shaders::unary_reciprocal_fwd_size);
+}
+
+at::Tensor& vulkan_reciprocal_out(const at::Tensor& self, at::Tensor& out) {
+    // Copy functional result into the pre-allocated out tensor.
+    out.copy_(vulkan_reciprocal(self));
+    return out;
+}
+
 at::Tensor vulkan_ceil(const at::Tensor& self) {
     return unary_op(self, "unary_ceil_fwd", shaders::unary_ceil_fwd, shaders::unary_ceil_fwd_size);
 }

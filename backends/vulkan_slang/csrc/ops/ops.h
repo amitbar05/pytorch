@@ -38,6 +38,8 @@ at::Tensor vulkan_exp(const at::Tensor& self);
 at::Tensor vulkan_log(const at::Tensor& self);
 at::Tensor vulkan_sqrt(const at::Tensor& self);
 at::Tensor vulkan_rsqrt(const at::Tensor& self);
+at::Tensor vulkan_reciprocal(const at::Tensor& self);
+at::Tensor& vulkan_reciprocal_out(const at::Tensor& self, at::Tensor& out);
 at::Tensor vulkan_ceil(const at::Tensor& self);
 at::Tensor vulkan_floor(const at::Tensor& self);
 at::Tensor vulkan_round(const at::Tensor& self);

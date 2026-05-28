@@ -59890,6 +59890,56 @@ class TestTrain4CrossEntropyBackward:
                     p_vk.grad.cpu(), p_cpu.grad, atol=5e-2, rtol=5e-2,
                 )
 
+    def test_cross_entropy_sgd_training_compile(self):
+        """TRAIN.4 compile-path regression: cross_entropy fwd+bwd+SGD via Inductor.
+
+        Verifies the scatter-free nll_loss_backward decomposition (arange
+        via IR Pointwise + eq + where) works end-to-end through torch.compile,
+        producing convergence over 3 SGD steps.  Previously failed due to
+        aten.scatter_ overload resolution in nested lowering calls.
+        """
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan
+
+        torch.manual_seed(42)
+
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.head = nn.Conv2d(16, 10, 1)
+
+            def forward(self, x):
+                return self.head(self.pool(self.conv(x))).flatten(1)
+
+        model = TinyModel().to("vulkan:0")
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        x = torch.randn(4, 3, 8, 8, device="vulkan:0")
+        y = torch.randint(0, 10, (4,), device="vulkan:0")
+
+        @torch.compile(backend="inductor")
+        def step(inp, target):
+            out = model(inp)
+            loss = F.cross_entropy(out, target)
+            loss.backward()
+            return loss
+
+        losses = []
+        for _ in range(3):
+            opt.zero_grad()
+            loss = step(x, y)
+            torch_vulkan._c_ext._synchronize(0)
+            opt.step()
+            losses.append(loss.item())
+
+        # Loss should decrease (convergence).
+        assert losses[-1] < losses[0], (
+            f"TRAIN.4 compile: SGD did not converge: {losses}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # TRAIN.2 — MaxPool2d backward codegen path via scatter template (2026-05-27)

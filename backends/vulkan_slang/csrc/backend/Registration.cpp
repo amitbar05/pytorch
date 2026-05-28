@@ -860,6 +860,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("log", ops::vulkan_log);
     m.impl("sqrt", ops::vulkan_sqrt);
     m.impl("rsqrt", ops::vulkan_rsqrt);
+    // TRAIN.9 (2026-05-27): reciprocal required by clip_grad_norm_ which
+    // calls `max_norm / (total_norm + 1e-6)` → __rdiv__ → self.reciprocal()
+    // Without this, any training loop with gradient clipping crashes.
+    m.impl("reciprocal", ops::vulkan_reciprocal);
+    m.impl("reciprocal.out", ops::vulkan_reciprocal_out);
     m.impl("ceil", ops::vulkan_ceil);
     m.impl("floor", ops::vulkan_floor);
     m.impl("round", ops::vulkan_round);
