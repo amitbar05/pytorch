@@ -726,6 +726,15 @@ def _legacy_register() -> None:
     # @torch.compiler.disable and graph-break Dynamo at every call.
     register_eager_patch_custom_ops()
 
+    # Mark custom ops as registered so _ensure_patch_custom_ops() in
+    # __init__.py's lazy path returns immediately without re-registering.
+    # Without this, Dynamo traces see different bytecode paths on
+    # first-trace (re-register → CALL at ip=15) vs retrace (skip →
+    # CALL at ip=19), causing SpeculationLogDivergence (2026-05-28 fix).
+    import torch
+
+    torch._torch_vulkan_patch_custom_ops_done = True
+
     # Fire off the slangc pre-warm in the background. The pool finishes
     # before the user's first compiled dispatch in the common case; if not,
     # the in-flight compile hits the same cache key and shares the result.
