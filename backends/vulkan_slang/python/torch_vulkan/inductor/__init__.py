@@ -704,6 +704,20 @@ def _legacy_register() -> None:
 
     _lowerings.register()
 
+    # TRAIN.8 (2026-05-27): Apply the nll_loss_forward monkey-patch now that
+    # the lowerings module has initialized and the decomp tables are set up.
+    # This ensures the constant-total_weight path is active before any
+    # cross_entropy_loss graphs are traced.
+    try:
+        from torch_vulkan.inductor.aot_cross_entropy import patch_nll_loss_forward
+
+        patch_nll_loss_forward()
+    except Exception as e:
+        import sys
+        print(f"[TRAIN.8] ERROR applying patch: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+
     # Register fused-op custom_ops eagerly so the FX rewrites and any
     # downstream lowering have a stable OpOverload to reference.
     from .fx_passes import (

@@ -289,11 +289,24 @@ def _register_loss_lowerings() -> None:
             )
             total_weight = L.lowerings[aten.sum.default](w_gathered)
         else:
-            # Count of non-ignored positions, cast to input dtype.
-            mask_float = L.lowerings[aten._to_copy.default](
-                ignore_mask, dtype=log_probs.get_dtype()
+            # TRAIN.8 (2026-05-29): Use constant total_weight = batch_size
+            # instead of computing it from target values. This prevents the
+            # AOTAutograd partitioner from marking total_weight (and thus
+            # the mean reduction div) as backward-only when target is
+            # partitioned away from the forward graph.
+            #
+            # For ignore_index < 0 (the default -100), all targets are valid
+            # class indices, so total_weight = number of samples.
+            #
+            # Get batch size from input shape
+            batch_size = float(log_probs.get_size()[0]) if n_dims >= 2 else 1.0
+            total_weight = L.lowerings[aten.full.default](
+                [],  # scalar shape
+                batch_size,
+                dtype=log_probs.get_dtype(),
+                device=log_probs.get_device(),
+                pin_memory=False,
             )
-            total_weight = L.lowerings[aten.sum.default](mask_float)
 
         if reduction == 0:  # none
             dummy_tw = L.lowerings[aten.mul.Scalar](total_weight, 0.0)

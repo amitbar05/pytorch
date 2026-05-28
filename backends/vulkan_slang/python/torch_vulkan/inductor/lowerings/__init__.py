@@ -291,6 +291,26 @@ def _suppress_upstream_decomps() -> None:
     decompositions[aten.hardsigmoid_backward.default] = _hardsigmoid_bwd_for_aot
     _aot_decomps[aten.hardsigmoid_backward.default] = _hardsigmoid_bwd_for_aot
 
+    # TRAIN.8 (2026-05-27): Monkey-patch the upstream ``_nll_loss_forward``
+    # function to use compile-time-constant total_weight = target.numel().
+    # This prevents the AOTAutograd partitioner from marking the
+    # div(sum_loss, total_weight) forward output as InvalidNode when target
+    # is assigned to the backward partition.
+    #
+    # cross_entropy_loss is a CIA op → decomposed at C++ dispatch level into
+    # _log_softmax + nll_loss_forward BEFORE AOT tracing. The nll_loss_forward
+    # decomposition (from core_aten_decompositions) produces the problematic
+    # div node. Our monkey-patch of _nll_loss_forward removes target from the
+    # target-dependency chain.
+    #
+    # NOTE: Don't call patch_nll_loss_forward() here during _suppress_upstream_decomps
+    # as it causes import hangs. The patch is applied later when the inductor
+    # backend is actually initialized (see inductor/__init__.py).
+    # Also suppress cross_entropy_loss from our decomp tables as a belt-and-suspenders
+    # measure (won't help with CIA dispatch but prevents redundant decomp lookup).
+    _aot_decomps.pop(aten.cross_entropy_loss.default, None)
+    decompositions.pop(aten.cross_entropy_loss.default, None)
+
     # OP.23: Clear the fast_random_decomps cache so subsequent calls
     # to select_decomp_table() pick up our decomposition additions.
     fast_random_decomps.cache_clear()
