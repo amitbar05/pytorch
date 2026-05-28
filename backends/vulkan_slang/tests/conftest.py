@@ -92,17 +92,21 @@ def _reset_inductor_caches():
     suite under ``pytest -n 4`` because in-memory SPIR-V caches
     (``_cache_by_key``, ``_cache_by_hash``) and compile stats leak across
     tests within the same xdist worker.
+
+    NOTE (2026-05-28): ``torch._dynamo.reset()`` is intentionally NOT called
+    here.  Calling it after ``torch_vulkan.inductor`` has been auto-registered
+    (via importing ``torch_vulkan.inductor.runtime`` for ``_COMPILE_STATS``)
+    breaks the AOT autograd partitioner — the 0-d ``div`` node from
+    ``cross_entropy`` mean reduction becomes "invalid, but is output" because
+    ``torch._dynamo`` clears internal state the partitioner depends on.
+    The ``setup()`` fixture in the test file calls ``torch._dynamo.reset()``
+    AFTER ``torch_vulkan.inductor`` is freshly imported and registered,
+    which is the correct order.
     """
     try:
         from torch_vulkan.inductor.runtime import reset_per_test_caches
 
         reset_per_test_caches()
-    except Exception:
-        pass
-    try:
-        import torch._dynamo
-
-        torch._dynamo.reset()
     except Exception:
         pass
     yield

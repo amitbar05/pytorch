@@ -26,6 +26,12 @@ def setup():
             torch_vulkan._register()
         # Register vulkan_fuse inductor backend
         import torch_vulkan.inductor
+
+        # Reset dynamo state AFTER Inductor registration.
+        # Must not be called BEFORE registration (conftest used to do this,
+        # which caused "Node div was invalid, but is output" in the AOT
+        # partitioner for cross_entropy training tests — 2026-05-28 fix).
+        torch._dynamo.reset()
     except ImportError:
         pytest.skip("torch_vulkan not installed")
 
@@ -60200,11 +60206,6 @@ class TestTrain8ConvTrainingSweep:
         cross_entropy fwd + nll_loss bwd (TRAIN.4), flatten.
         Uses 1x1 Conv instead of Linear to avoid addmm autotune blocker.
         """
-        pytest.xfail(
-            "Compile-path blocker: 0-d scalar pointwise kernel (div from "
-            "cross_entropy mean reduction) crashes slangc. Slang codegen "
-            "template doesn't handle numel=1 ndim=0 outputs. Needs TRAIN.11."
-        )
         import torch.nn as nn
         import torch_vulkan
 
@@ -60229,7 +60230,12 @@ class TestTrain8ConvTrainingSweep:
 
         Exercises: conv2d, group_norm, relu, max_pool2d, cross_entropy.
         """
-        pytest.xfail("Same blocker as test_simple_cnn: 0-d scalar div.")
+        pytest.xfail(
+            "Upstream Inductor blocker: 2+ GroupNorm layers in backward graph "
+            "trigger tiling_utils AssertionError in get_pw_red_splits — reduction "
+            "body sizes don't match for fused multi-layer norm backward. "
+            "Single-layer GN (TestA) passes. Tracked as upstream Inductor issue."
+        )
         import torch.nn as nn
 
         class SmallCNN(nn.Module):
@@ -60258,7 +60264,10 @@ class TestTrain8ConvTrainingSweep:
         Exercises: conv2d, group_norm, relu, add (residual),
         adaptive_avg_pool2d, cross_entropy.
         """
-        pytest.xfail("Same blocker as test_simple_cnn: 0-d scalar div.")
+        pytest.xfail(
+            "Upstream Inductor blocker: 2+ GroupNorm layers (same as SmallCNN). "
+            "tiling_utils get_pw_red_splits assertion on fused norm backward."
+        )
         import torch.nn as nn
 
         class ResBlock(nn.Module):
