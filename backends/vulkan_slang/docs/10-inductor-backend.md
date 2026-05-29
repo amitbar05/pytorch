@@ -262,6 +262,41 @@ blockers that are out-of-scope for the milestone they were filed against:
 
 ---
 
+# § v10 — End-to-End Verification & Quality Gates (2026-05-29)
+
+> **v10 (2026-05-29)** — v7/v8/v9 closed all 12 milestones. v10 is a
+> **verification-focused** pass: confirm that the feature-complete
+> backend actually works end-to-end on RDNA1. Gap analysis (41
+> suppressed ops → all have lowerings) passed on 2026-05-29.
+>
+> Focus: end-to-end correctness on real GPU, not static analysis.
+
+## v10 pillars
+
+| # | Pillar | Goal |
+|---|--------|------|
+| **V10-GAP** | Ops-suppress invariant | Every op in `ops_to_suppress` must have a Vulkan lowering at runtime. Already true (41/41) — lock with a compile-time test. |
+| **V10-BN** | BatchNorm compile | End-to-end compile of a model using BatchNorm2d (not GroupNorm workaround). |
+| **V10-DYN** | Dynamic shapes | Variable batch size through `torch.compile` for Conv+Norm+Act models. |
+| **V10-FP16** | Float16 packed16 | Verify packed16 pointwise kernels produce correct results on RDNA1. |
+| **V10-RNN** | LSTM/GRU compile | End-to-end compile of LSTM/GRU cells through `torch.compile`. |
+
+## v10 milestones
+
+| # | Pillar | Title | Effort | Status |
+|---|--------|-------|--------|--------|
+| **GAP.1** | V10-GAP | Runtime suppress→lowering invariant test | 0.25 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_gap_analysis.py` passed (41/41). |
+| **BN.1** | V10-BN | BatchNorm2d forward through compile | 0.5 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_bn1_compile.py` — Conv+BN+ReLU forward compiled on Vulkan. running_mean/running_var on vulkan:0. |
+| **BN.2** | V10-BN | BatchNorm2d fwd+bwd through compile | 1 d | 🔲 OPEN |
+| **DYN.1** | V10-DYN | Conv+GN+ReLU dynamic batch compile | 0.5 d | 🔲 OPEN |
+| **DYN.2** | V10-DYN | Conv+BN+ReLU dynamic batch compile | 1 d | 🔲 OPEN |
+| **FP16.1** | V10-FP16 | Packed16 pointwise add/mul correctness | 0.5 d | 🔲 OPEN |
+| **FP16.2** | V10-FP16 | F16 matmul via mm_tile correctness | 1 d | 🔲 OPEN |
+| **RNN.1** | V10-RNN | LSTM cell forward through compile | 0.5 d | 🔲 OPEN |
+| **RNN.2** | V10-RNN | GRU cell forward through compile | 0.5 d | 🔲 OPEN |
+
+---
+
 # § v8 closeout analysis (archived)
 
 ## TRAIN.8 test coverage matrix
