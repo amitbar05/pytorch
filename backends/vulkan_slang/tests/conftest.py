@@ -84,6 +84,33 @@ def _slangc_cold_budget(request):
         )
 
 
+"""AOT backward fix for pytest: re-apply nll_loss_forward patch after dynamo.reset().
+
+torch._dynamo.reset() restores Inductor's decomp table, which re-adds
+aten.nll_loss_forward.default. This breaks the AOT partitioner (div node
+"invalid, but is output"). We monkey-patch _dynamo.reset to always
+re-apply our cross_entropy fix after every reset call.
+"""
+import torch._dynamo
+
+_original_dynamo_reset = torch._dynamo.reset
+
+
+def _dynamo_reset_with_repatch():
+    _original_dynamo_reset()
+    # Re-apply nll_loss_forward decomp pop so AOT stays clean.
+    try:
+        from torch_vulkan.inductor import aot_cross_entropy as _ace
+
+        _ace._patched = False  # allow re-patch
+        _ace.patch_nll_loss_forward()
+    except Exception:
+        pass
+
+
+torch._dynamo.reset = _dynamo_reset_with_repatch
+
+
 @pytest.fixture(autouse=True)
 def _reset_inductor_caches():
     """GAP 7.3 — reset per-test mutable caches for deterministic dispatch counts.
@@ -93,15 +120,9 @@ def _reset_inductor_caches():
     (``_cache_by_key``, ``_cache_by_hash``) and compile stats leak across
     tests within the same xdist worker.
 
-    NOTE (2026-05-28): ``torch._dynamo.reset()`` is intentionally NOT called
-    here.  Calling it after ``torch_vulkan.inductor`` has been auto-registered
-    (via importing ``torch_vulkan.inductor.runtime`` for ``_COMPILE_STATS``)
-    breaks the AOT autograd partitioner — the 0-d ``div`` node from
-    ``cross_entropy`` mean reduction becomes "invalid, but is output" because
-    ``torch._dynamo`` clears internal state the partitioner depends on.
-    The ``setup()`` fixture in the test file calls ``torch._dynamo.reset()``
-    AFTER ``torch_vulkan.inductor`` is freshly imported and registered,
-    which is the correct order.
+    NOTE (2026-05-29): torch._dynamo.reset() IS called in teardown, but
+    it's monkey-patched above to re-apply aot_cross_entropy.patch_nll_loss_forward()
+    after every reset — fixing the "Node was invalid" AOT partitioner error.
     """
     try:
         from torch_vulkan.inductor.runtime import reset_per_test_caches
@@ -111,9 +132,7 @@ def _reset_inductor_caches():
         pass
     yield
     try:
-        import torch._dynamo
-
-        torch._dynamo.reset()
+        torch._dynamo.reset()  # patched — re-applies nll_loss_forward fix
     except Exception:
         pass
 
