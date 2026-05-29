@@ -161,9 +161,10 @@ register_codegen_strategy(
         autotune=False,
     ),
 )
-# Scatter: TODO(T4.5) — scatter/gather/index_put template not yet
-# implemented.  No scatter_atomic.py.jinja template exists.  This entry
-# is a placeholder for when T4.5 delivers the template.
+# Scatter: scatter_atomic.py.jinja covers 9 ops (gather, scatter, scatter_add,
+# index_put, index_put_accumulate, scatter_reduce_amax/amin/prod/mean).
+# Sum-mode goes through ir.Scatter + PointwiseMixin (vk_atomic_add codegen);
+# non-sum modes go through ScatterFallback → _dispatch_scatter_atomic.
 register_codegen_strategy(
     OpClass.SCATTER,
     CodegenStrategy(

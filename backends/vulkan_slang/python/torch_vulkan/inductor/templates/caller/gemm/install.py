@@ -237,7 +237,9 @@ def install_external_bmm() -> None:
                 choices.append(aten_bmm.bind(kernel_inputs.nodes(), layout_))
 
         if out_dtype is None:
-            for fn in bmm_tile_fns:
+            # Filter tiles by K iteration count (same logic as addmm).
+            candidate_fns = _filter_tiles_by_k(bmm_tile_fns, k)
+            for fn in candidate_fns:
                 # M-NEW.1: choices are constructed once at install time
                 # via ``_ensure_extern_choices``. Re-lookup so subsequent
                 # ``aten.bmm`` lowerings reuse the singleton.
@@ -266,6 +268,44 @@ def install_external_bmm() -> None:
         else:
             node = result
         return node
+
+
+# ── K-iteration-aware tile filtering ──────────────────────────────────
+# On RDNA1 (wave64, 16 CUs), small tile_k configs paired with large K produce
+# excessive K-loop iterations per workgroup, triggering GPU TDR timeouts or
+# simply dominating autotune benchmark wall-clock unfairly.  Filtering here
+# is safer than letting the autotuner time out and picking a broken fallback.
+_MAX_K_ITERS: int = 128  # max ceil(K / tile_k) iterations per dispatch
+
+
+def _filter_tiles_by_k(
+    tile_fns: list, k: object, *, max_iters: int = _MAX_K_ITERS
+) -> list:
+    """Drop tile configs whose K-loop iteration count exceeds *max_iters*.
+
+    When *k* is not a concrete int (dynamic shapes, SymInt), returns
+    *tile_fns* unchanged — we cannot filter without knowing K.
+
+    Always retains at least the tile with the largest tile_k so we never
+    return an empty list.
+    """
+    # Only filter when K is a concrete int.
+    try:
+        k_int = int(k)  # type: ignore[arg-type]
+    except (TypeError, ValueError, RuntimeError):
+        return tile_fns
+    if k_int <= 0:
+        return tile_fns
+
+    survived = [
+        fn
+        for fn in tile_fns
+        if (k_int + fn.tile_k - 1) // fn.tile_k <= max_iters
+    ]
+    if not survived:
+        # Keep the tile with the largest tile_k as a last resort.
+        survived = [max(tile_fns, key=lambda fn: fn.tile_k)]
+    return survived
 
 
 def install_external_addmm() -> None:
@@ -352,14 +392,18 @@ def install_external_addmm() -> None:
         )
         choices = []
 
+        # Filter tiles by K iteration count to avoid GPU TDR on large K
+        # with small tile_k (e.g. K=4096 / tile_k=8 = 512 iters → slow).
+        candidate_fns = _filter_tiles_by_k(addmm_tile_fns, k)
+
         if use_aten_gemm_kernels():
             # M17.5: Only include aten_addmm as fallback when Slang tiles
             # are not available. For Vulkan fp32, Slang tiles are
             # preferred (single fused dispatch vs 2 eager C++ dispatches).
-            if not addmm_tile_fns:
+            if not candidate_fns:
                 choices.append(aten_addmm.bind(kernel_inputs.nodes(), layout_))
 
-        for fn in addmm_tile_fns:
+        for fn in candidate_fns:
             # M-NEW.1: choices are constructed once at install time via
             # ``_ensure_extern_choices``. Re-lookup so subsequent
             # ``aten.addmm`` lowerings reuse the singleton.

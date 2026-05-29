@@ -3585,6 +3585,35 @@ class TestRegisterTileMatmul:
         out = addmm(bias, a, b).cpu()
         torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-4)
 
+    def test_correctness_addmm_large_k_filter(self):
+        """Large-K addmm should not fail due to small-tile_k TDR/timeout.
+
+        Regression: previously K=4096 with tile_k=8 produced 512 K-loop
+        iterations, causing GPU TDR or autotune timeout.  The
+        `_filter_tiles_by_k` guard in install.py drops configs where
+        ceil(K/tile_k) > 128, leaving only tile_k >= 32.
+        """
+        from torch_vulkan.inductor.templates.caller.gemm.install import (
+            _filter_tiles_by_k,
+        )
+        from types import SimpleNamespace
+
+        tiles = [
+            SimpleNamespace(tile_k=8, __name__="t8"),
+            SimpleNamespace(tile_k=16, __name__="t16"),
+            SimpleNamespace(tile_k=32, __name__="t32"),
+            SimpleNamespace(tile_k=64, __name__="t64"),
+        ]
+        # K=4096: ceil(4096/8)=512 > 128 → drop t8,t16; keep t32,t64
+        res = _filter_tiles_by_k(tiles, 4096)
+        assert {f.__name__ for f in res} == {"t32", "t64"}
+        # K=512: ceil(512/8)=64 ≤ 128 → all kept
+        res = _filter_tiles_by_k(tiles, 512)
+        assert len(res) == 4
+        # Dynamic K (non-int) → no filter applied
+        res = _filter_tiles_by_k(tiles, "s0")
+        assert len(res) == 4
+
     def test_arange_linspace_fuse_to_one_dispatch(self):
         """P10 — `aten.arange.*` and `aten.linspace` factory ops chained with
         a pointwise op compile to a single dispatch via stock Inductor codegen.
