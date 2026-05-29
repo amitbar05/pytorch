@@ -106,6 +106,13 @@ def _dynamo_reset_with_repatch():
         _ace.patch_nll_loss_forward()
     except Exception:
         pass
+    # Reset Philox state so re-seeded tests get fresh seeds (PF.27.b).
+    try:
+        from torch_vulkan.inductor.philox_state import reset_philox_state
+
+        reset_philox_state()
+    except Exception:
+        pass
 
 
 torch._dynamo.reset = _dynamo_reset_with_repatch

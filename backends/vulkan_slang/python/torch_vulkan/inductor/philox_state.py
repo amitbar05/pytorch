@@ -95,6 +95,7 @@ class PhiloxState:
 # ── Global session state ──────────────────────────────────────────────────
 
 _global_philox_state: Optional[PhiloxState] = None
+_last_initial_seed: Optional[int] = None  # torch.default_generator.initial_seed()
 
 
 def _derive_seed_from_torch() -> tuple[int, int]:
@@ -119,16 +120,35 @@ def _derive_seed_from_torch() -> tuple[int, int]:
 
 
 def get_philox_state() -> PhiloxState:
-    """Return the session-scoped PhiloxState, creating it if necessary.
+    """Return the session-scoped PhiloxState, creating/re-deriving as needed.
 
-    The seed is derived from ``torch.default_generator`` on first access.
-    Call ``reset_philox_state()`` to re-derive the seed (e.g. after
-    ``torch.manual_seed()``).
+    The seed is derived from ``torch.default_generator`` on first access and
+    re-derived whenever ``torch.manual_seed()`` (or equivalent) changes the
+    generator's initial seed.  This ensures PF.27.b correctness: different
+    seeds produce different Philox output.
+
+    PF.27.c correctness: the offset advances monotonically across calls, so
+    consecutive calls with the same seed produce different output.
     """
-    global _global_philox_state
+    global _global_philox_state, _last_initial_seed
+
+    # Detect torch.manual_seed() re-call by checking initial_seed().
+    # This is cheap (just reading an int field on the generator).
+    try:
+        cur_seed = torch.default_generator.initial_seed()
+    except (AttributeError, RuntimeError):
+        cur_seed = None
+
+    if cur_seed is not None and cur_seed != _last_initial_seed:
+        # Generator was re-seeded — force re-creation with fresh seed + offset=0.
+        _global_philox_state = None
+        _last_initial_seed = cur_seed
+
     if _global_philox_state is None:
         seed_lo, seed_hi = _derive_seed_from_torch()
         _global_philox_state = PhiloxState(seed_lo=seed_lo, seed_hi=seed_hi, offset=0)
+        if cur_seed is not None:
+            _last_initial_seed = cur_seed
     return _global_philox_state
 
 
