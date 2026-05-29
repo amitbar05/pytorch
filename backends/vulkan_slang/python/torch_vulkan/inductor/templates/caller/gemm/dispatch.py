@@ -178,6 +178,7 @@ def _slang_tile_mm(
             m_per_thread=m_per_thread,
             n_per_thread=n_per_thread,
             epilogue_struct=epilogue_struct,
+            use_module=False,
         )
         # N+1.11: _n111 prevents stale cache hits with old PC layout.
         cache_key = (
@@ -286,6 +287,7 @@ def _slang_tile_addmm(
             m_per_thread=m_per_thread,
             n_per_thread=n_per_thread,
             epilogue_struct=epilogue_struct,
+            use_module=False,
         )
         cache_key = (
             f"slang_addmm_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
@@ -392,6 +394,7 @@ def _slang_tile_addmm_gelu(
             epilogue_struct="OpGELU",
             m_per_thread=m_per_thread,
             n_per_thread=n_per_thread,
+            use_module=False,
         )
         # A.6: ``_a6`` tag — monolithic PC layout (closes the 10I undercount).
         cache_key = (
@@ -485,6 +488,7 @@ def _slang_tile_bmm(
             n_per_thread=n_per_thread,
             epilogue_struct=epilogue_struct,
             has_batch=True,
+            use_module=False,
         )
         # v2: cache key bumped because PC layout changed (added 3 batch
         # strides). Without this, stale SPIR-V from before the batch fix
