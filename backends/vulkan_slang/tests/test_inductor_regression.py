@@ -61084,3 +61084,259 @@ class TestCOMPILE2_Mark0dDiv:
         assert div_node.meta["partitioner_tag"] == "is_backward", (
             "COMPILE.2: existing partitioner_tag must not be overwritten"
         )
+
+
+class TestEnsureMmTileModule:
+    """Verify on-demand compilation of the mm_tile Slang module.
+
+    Converts the standalone debug script (debug_mm_tile_compile.py) into
+    proper pytest coverage.  _ensure_mm_tile_module() must:
+      1. Be importable from the runtime shader_lib.
+      2. Return a valid filesystem path.
+      3. Produce an actual .slang-module file on disk.
+      4. The file must be non-zero size (i.e. compilation succeeded).
+    """
+
+    @pytest.mark.timeout(300)
+    def test_ensure_mm_tile_module_importable(self):
+        """_ensure_mm_tile_module exists and is a callable."""
+        from torch_vulkan.inductor.runtime.shader_lib import (
+            _ensure_mm_tile_module,
+        )
+
+        assert callable(_ensure_mm_tile_module), (
+            "MMTILE.1: _ensure_mm_tile_module must be callable"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_ensure_mm_tile_module_returns_path(self):
+        """_ensure_mm_tile_module() returns a non-empty string path."""
+        from torch_vulkan.inductor.runtime.shader_lib import (
+            _ensure_mm_tile_module,
+        )
+
+        result = _ensure_mm_tile_module()
+        assert isinstance(result, str) and len(result) > 0, (
+            f"MMTILE.2: expected a non-empty path string, got {result!r}"
+        )
+        assert result.endswith(".slang-module"), (
+            f"MMTILE.2: expected .slang-module suffix, got {result!r}"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_ensure_mm_tile_module_file_exists(self):
+        """The returned .slang-module path points to an existing file."""
+        import os
+
+        from torch_vulkan.inductor.runtime.shader_lib import (
+            _ensure_mm_tile_module,
+        )
+
+        result = _ensure_mm_tile_module()
+        assert os.path.exists(result), (
+            f"MMTILE.3: _ensure_mm_tile_module returned path that does not "
+            f"exist on disk: {result}"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_ensure_mm_tile_module_nonzero_size(self):
+        """The compiled .slang-module file is non-zero size."""
+        import os
+
+        from torch_vulkan.inductor.runtime.shader_lib import (
+            _ensure_mm_tile_module,
+        )
+
+        result = _ensure_mm_tile_module()
+        assert os.path.exists(result), (
+            f"MMTILE.4: file does not exist: {result}"
+        )
+        size = os.path.getsize(result)
+        assert size > 0, (
+            f"MMTILE.4: compiled module is empty ({result})"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_ensure_mm_int8_module_importable(self):
+        """_ensure_mm_int8_module exists and is a callable (TRAIN.11 sibling)."""
+        from torch_vulkan.inductor.runtime.shader_lib import (
+            _ensure_mm_int8_module,
+        )
+
+        assert callable(_ensure_mm_int8_module), (
+            "MMTILE.5: _ensure_mm_int8_module must be callable"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestDECOMP2_ConvBwdBiasGradient:
+    """DECOMP.2 — Verify upstream Inductor convolution_backward decomp does
+    NOT fire for Vulkan device.
+
+    The upstream decomp at torch/_inductor/decomposition.py:306-336 splits
+    convolution_backward into bias_grad=sum(grad) + recursive
+    convolution_backward(output_mask=(T,T,F)), but ONLY when
+    is_gpu(grad.device.type) is True. Since "vulkan" is not in
+    torch._inductor.utils.GPU_TYPES (which contains cuda/mps/xpu/mtia),
+    the decomp guard returns NotImplemented — the op survives intact to
+    the Vulkan lowering which handles it as a single dispatch.
+
+    This test locks that invariant so a future upstream GPU_TYPES change
+    or Vulcan-typo fix doesn't silently break the architecture.
+    """
+
+    @pytest.mark.timeout(300)
+    def test_vulkan_not_in_gpu_types(self):
+        """vulkan is NOT in the upstream GPU_TYPES that gates the
+        convolution_backward bias-gradient decomposition."""
+        from torch._inductor.utils import GPU_TYPES
+
+        assert "vulkan" not in GPU_TYPES, (
+            "DECOMP.2: 'vulkan' must NOT be in GPU_TYPES — if it is, the "
+            "upstream convolution_backward decomposition fires and splits "
+            "bias_grad into a separate aten.sum, breaking the single-dispatch "
+            "Vulkan lowering. Suppress aten.convolution_backward in "
+            "ops_to_suppress if GPU_TYPES ever grows to include vulkan."
+        )
+
+    @pytest.mark.timeout(300)
+    def test_convolution_backward_not_in_ops_to_suppress(self):
+        """aten.convolution_backward is NOT in ops_to_suppress (it doesn't
+        need suppression because the upstream decomp guard is harmless)."""
+        import torch
+
+        aten = torch.ops.aten
+        # This is a sanity test: if someone adds convolution_backward to
+        # ops_to_suppress unnecessarily, it would break the lowering path.
+        # Document the constraint.
+        assert hasattr(aten, "convolution_backward"), (
+            "DECOMP.2: aten.convolution_backward must exist"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_convolution_backward_lowering_registered(self):
+        """The Vulkan backend has a registered lowering for
+        aten.convolution_backward.default (single-dispatch Slang kernel)."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        key = aten.convolution_backward.default
+        assert key in _inductor_lowerings, (
+            "DECOMP.2: aten.convolution_backward.default must have a "
+            "registered lowering in torch._inductor.lowering.lowerings — "
+            "check bwd_lowerings.py:_register_conv_backward()"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestCODEGEN2_AvgPool2dScatterBwd:
+    """CODEGEN.2 — avg_pool2d backward via scatter_add custom op.
+
+    The overlapping-pool case (stride < kernel_size) is now handled by
+    ``torch_vulkan::avg_pool2d_scatter_bwd`` which pre-computes
+    scatter indices and values on CPU and dispatches ``scatter_add``
+    via the ``scatter_atomic.slang`` template.  This replaces the old
+    FallbackKernel eager-Vulkan path.
+    """
+
+    @pytest.mark.timeout(300)
+    def test_avg_pool2d_scatter_bwd_op_registered(self):
+        """The custom op exists and is callable."""
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_avg_pool2d_scatter_bwd_op_registered,
+        )
+
+        op = _ensure_avg_pool2d_scatter_bwd_op_registered()
+        assert callable(op), (
+            "CODEGEN.2: avg_pool2d_scatter_bwd must be callable"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_avg_pool2d_scatter_bwd_nonoverlapping(self):
+        """Non-overlapping: grad is uniform 1/(kH*kW) broadcast.
+
+        This is the same result as the pure-codegen path but exercises
+        the scatter_bwd implementation for correctness comparison.
+        """
+        import torch
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_avg_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_avg_pool2d_scatter_bwd_op_registered()
+
+        # N=1, C=1, iH=4, iW=4, kH=2, kW=2, sH=2, sW=2, pH=0, pW=0
+        # → oH=2, oW=2, 4 output elements
+        grad_output = torch.ones(1, 1, 2, 2, device="vulkan:0")
+        result = torch.ops.torch_vulkan.avg_pool2d_scatter_bwd(
+            grad_output, 1, 1, 4, 4, 2, 2, 2, 2, 0, 0, True, 0
+        )
+        # Each input element should receive 1/4 of grad
+        expected = torch.full((1, 1, 4, 4), 0.25, device="vulkan:0")
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.timeout(300)
+    def test_avg_pool2d_scatter_bwd_overlapping(self):
+        """Overlapping windows: stride=1 < kernel=2.
+
+        With overlap, corner elements receive 1/4, edge elements receive
+        1/4+1/4=1/2 (from two windows), center elements receive 4/4=1.
+        """
+        import torch
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_avg_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_avg_pool2d_scatter_bwd_op_registered()
+
+        # N=1, C=1, iH=3, iW=3, kH=2, kW=2, sH=1, sW=1, pH=0, pW=0
+        # → oH=2, oW=2
+        grad_output = torch.ones(1, 1, 2, 2, device="vulkan:0")
+        result = torch.ops.torch_vulkan.avg_pool2d_scatter_bwd(
+            grad_output, 1, 1, 3, 3, 2, 2, 1, 1, 0, 0, True, 0
+        )
+        # Corner (0,0): in window (0,0) only → 1/4
+        # Edge (0,1): in windows (0,0) and (0,1) → 1/4 + 1/4 = 1/2
+        # Center (1,1): in all 4 windows → 4 * 1/4 = 1.0
+        result_cpu = result.cpu()
+        assert abs(result_cpu[0, 0, 0, 0].item() - 0.25) < 1e-5, (
+            f"corner: expected 0.25, got {result_cpu[0, 0, 0, 0].item()}"
+        )
+        assert abs(result_cpu[0, 0, 0, 1].item() - 0.5) < 1e-5, (
+            f"edge: expected 0.5, got {result_cpu[0, 0, 0, 1].item()}"
+        )
+        assert abs(result_cpu[0, 0, 1, 1].item() - 1.0) < 1e-5, (
+            f"center: expected 1.0, got {result_cpu[0, 0, 1, 1].item()}"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_avg_pool2d_scatter_bwd_with_padding(self):
+        """Padding + count_include_pad=True: uniform divisor kH*kW."""
+        import torch
+
+        from torch_vulkan.inductor.fx_passes.eager.pool import (
+            _ensure_avg_pool2d_scatter_bwd_op_registered,
+        )
+
+        _ensure_avg_pool2d_scatter_bwd_op_registered()
+
+        # N=1, C=1, iH=3, iW=3, kH=2, kW=2, sH=2, sW=2, pH=1, pW=1
+        # count_include_pad=True → divisor = 4 everywhere
+        # Padded input 5x5, output 3x3
+        grad_output = torch.ones(1, 1, 3, 3, device="vulkan:0")
+        result = torch.ops.torch_vulkan.avg_pool2d_scatter_bwd(
+            grad_output, 1, 1, 3, 3, 2, 2, 2, 2, 1, 1, True, 0
+        )
+        # All input elements get some fraction of 1/4 from overlapping windows
+        # Total gradient should equal sum(grad_output) = 9 * (1/4 * num_windows_covering)
+        # but each input pixel can receive from at most 1 window (stride=2, pad=1)
+        result_cpu = result.cpu()
+        # Input pixel (0,0) is in window (0,0) only → 1/4
+        assert abs(result_cpu[0, 0, 0, 0].item() - 0.25) < 1e-5

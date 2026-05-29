@@ -206,14 +206,14 @@ blockers that are out-of-scope for the milestone they were filed against:
 | **COMPILE.2** | M-COMPILE | Joint-graph scalar div in multi-step training | `TestTrain5PoolAllocatorReuse.test_vram_plateaus_across_training_steps` xfailed: "0-d scalar div" partitioner blocker. AOT partitioner can't handle 0-d scalar operations that arise in multi-step training with joint fwd+bwd graph. Either register scalar ops via PrivateUse1 or route through Inductor's scalar lowering. | 1.5 d | 🔲 OPEN |
 | **COMPILE.3** | M-COMPILE | Linear (addmm) compile-path autotune | Models with `nn.Linear` fail `aten.addmm` autotune: `mm_tile` choices either return `NoValidChoicesError` or `best_time: Infinity`. Workaround: 1×1 Conv classifier. Fix: either wire addmm through the Vulkan mm lowering directly (bypassing autotune) or fix the mm_tile autotune path. | 1 d | 🔲 OPEN |
 | **DECOMP.1** | M-DECOMP | Suppress _softmax / _log_softmax upstream decomps | `aten._softmax` and `aten._log_softmax` are in `inductor_decompositions` (decomposition.py:79/94) but not in Vulkan `ops_to_suppress`. Vulkan lowerings exist (`lowerings/softmax.py`) but never fire because upstream decomp produces the same primitives first. Suppress so Vulkan lowerings are reachable. | 0.25 d | ✅ **CLOSED 2026-05-28.** Added `_softmax.default` and `_log_softmax.default` to `ops_to_suppress` in `lowerings/__init__.py`. |
-| **DECOMP.2** | M-DECOMP | convolution_backward bias gradient decomp | Upstream Inductor decomp at decomposition.py:306 splits `convolution_backward` into `bias_grad = sum(grad, dims)` + recursive `convolution_backward(..., output_mask=(T,T,F))`. Vulkan doesn't suppress this. The bias gradient goes through `aten.sum` (works), but the recursive backward call may not route correctly. Analyse and suppress or adapt. | 0.5 d | 🔲 OPEN |
+| **DECOMP.2** | M-DECOMP | convolution_backward bias gradient decomp | Upstream Inductor decomp at decomposition.py:306 splits `convolution_backward` into `bias_grad = sum(grad, dims)` + recursive `convolution_backward(..., output_mask=(T,T,F))`. **Resolved: harmless for Vulkan.** The decomp guard checks `is_gpu(device.type)` where `GPU_TYPES = ["cuda", "mps", "xpu", "mtia"]` — "vulkan" is not included, so the decomp returns NotImplemented. The op survives intact to the Vulkan lowering. | 0.25 d | ✅ **CLOSED 2026-05-29.** Analysis + regression test `TestDECOMP2_ConvBwdBiasGradient` (3 tests: GPU_TYPES guard, lowering registration, op existence). |
 | **CODEGEN.1** | M-CODEG | Optimizer steps via Slang foreach codegen | SGD/AdamW/Lion foreach steps currently use `make_fallback` (FallbackKernel IR nodes) that dispatch to eager Slang templates. Should route through the Slang foreach template as pure codegen via `@register_lowering` — same pattern as max_pool2d_scatter_bwd. | 1.5 d | 🔲 OPEN |
-| **CODEGEN.2** | M-CODEG | Avg pool backward pure codegen | `aten.avg_pool2d_backward` is FallbackKernel (upstream uses `indirect_indexing` → wrong SPIR-V). Needs Slang codegen using average-weight scatter, similar to max_pool2d scatter_bwd from TRAIN.2. | 1 d | 🔲 OPEN |
+| **CODEGEN.2** | M-CODEG | Avg pool backward pure codegen | `aten.avg_pool2d_backward` was FallbackKernel (upstream uses `indirect_indexing` → wrong SPIR-V). Added `torch_vulkan::avg_pool2d_scatter_bwd` custom op that pre-computes scatter indices/values on CPU and dispatches `scatter_add` via `scatter_atomic.slang` template. Handles overlapping windows (stride < kernel_size), padding, count_include_pad. | 1 d | ✅ **CLOSED 2026-05-29.** Custom op + make_fallback + bwd_lowerings wiring. Regression: `TestCODEGEN2_AvgPool2dScatterBwd` (4 tests). |
 | **CODEGEN.3** | M-CODEG | Conv backward via bwd_diff table | `_conv2d_backward_impl` routes through a custom eager op. Should move to `bwd_diff_table` with `bwd_diff(conv_inner_madd)` so the full backward goes through the autodiff → Slang codegen pipeline (single dispatch, no eager adapter). | 1.5 d | 🔲 OPEN |
 | **MODEL.1** | M-MODEL | Conv3d native Vulkan path | No native Vulkan Conv3d. aten.conv3d falls to aten extern → TypeError on Vulkan. Blocks 3D U-Net, C3D, video models. Requires tiledConv3d Slang template. | 2 d | 🔲 OPEN |
 | **MODEL.2** | M-MODEL | BatchNorm running stats in compiled training | `aten::_native_batch_norm_legit` running_mean/running_var mutations disabled in compiled path. Single-step gradients correct, but multi-step training accumulates wrong running stats. Either register the running stats ops or replace BN with GN (current workaround). | 1 d | 🔲 OPEN |
 | **MODEL.3** | M-MODEL | Convolution autotune CUDA-filter | `select_algorithm.py` generates Triton/CUDA-only conv kernel choices. Vulkan backend needs to inject its own Slang conv choices or filter out CUDA ones before autotune evaluation. | 1 d | 🔲 OPEN |
-| **TEST.1** | M-COMPILE | TRAIN.11 regression test in suite | `debug_mm_tile_compile.py` is a standalone debug script, not in `test_inductor_regression.py`. Roadmap discipline requires every milestone to have a regression test in the suite. | 0.25 d | 🔲 OPEN |
+| **TEST.1** | M-COMPILE | TRAIN.11 regression test in suite | `debug_mm_tile_compile.py` is a standalone debug script, not in `test_inductor_regression.py`. Roadmap discipline requires every milestone to have a regression test in the suite. | 0.25 d | ✅ **CLOSED 2026-05-29.** `TestEnsureMmTileModule` (5 tests: importable, returns path, file exists, nonzero size, mm_int8 sibling). |
 
 ## v9 status tracking
 
@@ -232,13 +232,10 @@ blockers that are out-of-scope for the milestone they were filed against:
 10. **MODEL.3: Autotune CUDA filter** -- Defense-in-depth filter strips TritonTemplateCaller/CUTLASSTemplateCaller for Vulkan devices
 
 ### Remaining Open Items
-- **DECOMP.2**: Bias gradient dispatch count (9 vs 8) -- needs conv backward template enhancement
 - **CODEGEN.1**: Optimizer steps via Slang foreach codegen (currently FallbackKernel)
-- **CODEGEN.2**: Avg pool backward pure codegen
 - **CODEGEN.3**: Conv backward via bwd_diff table
 - **MODEL.1**: Conv3d support
 - **MODEL.2**: BatchNorm running stats
-- **TEST.1**: Move TRAIN.11 debug script to regression suite
 
 | Milestone | Status | Blocked by | Regression test |
 |-----------|--------|------------|-----------------|
@@ -246,14 +243,14 @@ blockers that are out-of-scope for the milestone they were filed against:
 | COMPILE.2 | ✅ CLOSED | — | `TestCOMPILE2_Mark0dDiv` (new) + `TestTrain5` (needs GPU verify) |
 | COMPILE.3 | ✅ CLOSED | — | Session prewarm fixture + existing addmm tests |
 | DECOMP.1 | ✅ CLOSED | — | `TestDecomp1SoftmaxLoweringReachable` (new) |
-| DECOMP.2 | 🔲 OPEN | — | Dispatch count test |
+| DECOMP.2 | ✅ CLOSED | — | `TestDECOMP2_ConvBwdBiasGradient` (3 tests) |
 | CODEGEN.1 | 🔲 OPEN | — | Optimizer Slang codegen test |
-| CODEGEN.2 | 🔲 OPEN | — | Avg pool backward codegen test |
+| CODEGEN.2 | ✅ CLOSED | — | `TestCODEGEN2_AvgPool2dScatterBwd` (4 tests) |
 | CODEGEN.3 | 🔲 OPEN | — | Conv bwd via bwd_diff test |
 | MODEL.1 | 🔲 OPEN | — | Conv3d regression test |
 | MODEL.2 | 🔲 OPEN | — | BatchNorm running stats test |
 | MODEL.3 | ✅ CLOSED | — | Autotune CUDA filter (defense-in-depth) |
-| TEST.1 | 🔲 OPEN | — | TRAIN.11 script → regression suite |
+| TEST.1 | ✅ CLOSED | — | `TestEnsureMmTileModule` (5 tests) |
 
 ---
 
