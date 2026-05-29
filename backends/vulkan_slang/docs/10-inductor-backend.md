@@ -217,6 +217,27 @@ blockers that are out-of-scope for the milestone they were filed against:
 
 ## v9 status tracking
 
+### Completed (2026-05-29 session)
+1. **Scatter TODO cleanup** -- Codegen.py:164 comment updated to reflect actual implementation status
+2. **K-iteration tile filter** -- `_filter_tiles_by_k()` in `install.py` prevents GPU TDR timeouts for large K (e.g. K=4096 with tile_k=8 → 512 iterations, now filtered)
+3. **AOT backward pytest fix** -- Monkey-patched `torch._dynamo.reset()` to re-apply `aot_cross_entropy.patch_nll_loss_forward()` after every reset
+4. **Philox RNG fix (PF.27.b/c)** -- `get_philox_state()` now detects `torch.manual_seed()` changes via `initial_seed()` comparison
+5. **Bucketize codegen** -- Implemented `bucketize()` binary search in `kernel/reduction.py:616-728`, unblocks searchsorted/topk combo kernels
+6. **Conv epilogue fusion** -- Parametrized factory `conv_epilogue_ops.py` supports all 9 activations (was ReLU-only)
+
+### Remaining Open Items
+- **COMPILE.1**: Conv backward compile-path ("no backing buffer") -- needs runtime debugging with GPU
+- **COMPILE.2**: 0-d scalar div in multi-step training -- AOT partitioner fix may be sufficient, needs GPU verification
+- **COMPILE.3**: Linear/addmm autotune for all K values -- K-iter filter helps but not comprehensive
+- **DECOMP.2**: Bias gradient dispatch count (9 vs 8) -- needs conv backward template enhancement
+- **CODEGEN.1**: Optimizer steps via Slang foreach codegen (currently FallbackKernel)
+- **CODEGEN.2**: Avg pool backward pure codegen
+- **CODEGEN.3**: Conv backward via bwd_diff table
+- **MODEL.1**: Conv3d support
+- **MODEL.2**: BatchNorm running stats
+- **MODEL.3**: Autotune CUDA-filter
+- **TEST.1**: Move TRAIN.11 debug script to regression suite
+
 | Milestone | Status | Blocked by | Regression test |
 |-----------|--------|------------|-----------------|
 | COMPILE.1 | 🔲 OPEN | — | `TestTrain7...test_conv_backward_through_compile` (remove xfail) |
