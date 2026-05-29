@@ -74,6 +74,12 @@ def register_eager_patch_custom_ops() -> None:
     _ensure_adaptive_avg_pool2d_op_registered()
     # M17.2 Phase 1: conv+ReLU fused custom op
     _ensure_conv2d_relu_fused_op_registered()
+    # v9: conv+epilogue fusion for all 9 activations (GELU, SiLU, etc.)
+    # The factory registers conv2d_{name}_fused for each; conv2d_relu_fused
+    # is already registered above so the factory's idempotent guard skips it.
+    from .conv_epilogue_ops import register_all_conv_epilogue_ops
+
+    register_all_conv_epilogue_ops()
     # M17.2 Phase 2: conv+GN+ReLU triple-fusion custom op
     _ensure_conv2d_gn_relu_fused_op_registered()
     # M17.8.d.2 / M18.2: opaque non-autograd conv2d_backward custom op so

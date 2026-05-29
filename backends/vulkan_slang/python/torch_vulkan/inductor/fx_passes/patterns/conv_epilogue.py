@@ -105,28 +105,26 @@ def _match_conv_epilogue(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]
 def _rewrite_conv_epilogue(
     gm: GraphModule, root: Node, ctx: dict[str, Any]
 ) -> GraphModule:
-    """Replace conv + activation with ``torch_vulkan::conv2d_relu_fused``.
+    """Replace conv + activation with a fused ``torch_vulkan::conv2d_{name}_fused`` op.
 
-    For activations other than ReLU, the general fused template path
-    is a stub for now (the custom-op dispatch table only has ReLU).
-    Other activations fall back to the original graph unchanged.
+    All 9 supported epilogues (ReLU, GELU, SiLU, Sigmoid, Tanh,
+    HardSigmoid, HardSwish, LeakyReLU, ELU) are dispatched via
+    ``conv_epilogue_ops.py``'s generic factory.
     """
     conv_node: Node = ctx["conv_node"]
     pw_node: Node = ctx["pw_node"]
     epilogue_name: str = ctx["epilogue_name"]
 
-    # For now, only ReLU has a dedicated fused custom op.
-    if epilogue_name != "OpReLU":
-        # Future: register conv2d_gelu_fused, conv2d_silu_fused, etc.
-        # and dispatch here.  For now, leave the graph unchanged so the
-        # scheduler fuses the pointwise into a downstream kernel.
-        return gm
+    from ..eager.conv_epilogue_ops import (
+        EPILOGUE_SPECS,
+        _ensure_conv2d_epilogue_op_registered,
+    )
 
-    from ..eager.conv import _ensure_conv2d_relu_fused_op_registered
+    spec = EPILOGUE_SPECS.get(epilogue_name)
+    if spec is None:
+        return gm  # unknown epilogue — no fusion
+    fused_op = _ensure_conv2d_epilogue_op_registered(spec)
 
-    fused_op = _ensure_conv2d_relu_fused_op_registered()
-
-    # Conv node args: (input, weight, bias, stride, padding, dilation, groups)
     conv_args = conv_node.args
     with gm.graph.inserting_before(pw_node):
         fused = gm.graph.call_function(fused_op, args=conv_args)
