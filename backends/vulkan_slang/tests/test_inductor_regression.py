@@ -61679,3 +61679,82 @@ class TestMODEL1_Conv3dRegression:
             "MODEL.1: Conv3d backward extern kernel class must subclass "
             "ir.ExternKernelOut"
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestV10GAP1_OpsSuppressInvariant:
+    """V10 GAP.1 — Every op in ops_to_suppress must have a Vulkan lowering.
+
+    Ensures that the suppress→lowering invariant holds at runtime.
+    If a suppressed op doesn't have a lowering, Inductor silently falls
+    through to FallbackKernel — which may route to aten (not Vulkan Slang).
+    """
+
+    @pytest.mark.timeout(300)
+    def test_all_suppressed_ops_have_lowerings(self):
+        """All 41 ops in the suppress list have registered Vulkan lowerings."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        suppressed = [
+            aten.native_layer_norm_backward.default,
+            aten.native_group_norm_backward.default,
+            aten.native_batch_norm_backward.default,
+            aten.native_batch_norm.default,
+            aten._native_batch_norm_legit.default,
+            aten._native_batch_norm_legit_functional.default,
+            aten.native_group_norm.default,
+            aten.native_layer_norm.default,
+            aten.embedding_dense_backward.default,
+            aten._log_softmax_backward_data.default,
+            aten._softmax_backward_data.default,
+            aten.gelu_backward.default,
+            aten.silu_backward.default,
+            aten.sigmoid_backward.default,
+            aten.tanh_backward.default,
+            aten.elu_backward.default,
+            aten.hardswish_backward.default,
+            aten.hardsigmoid_backward.default,
+            aten.softplus_backward.default,
+            aten.mish_backward.default,
+            aten.mse_loss_backward.default,
+            aten.binary_cross_entropy_backward.default,
+            aten.smooth_l1_loss_backward.default,
+            aten.huber_loss_backward.default,
+            aten.native_dropout_backward.default,
+            aten.clamp.default,
+            aten.clamp_min.default,
+            aten.clamp_max.default,
+            aten.narrow_copy.default,
+            aten.repeat_interleave.self_int,
+            aten.scaled_dot_product_attention.default,
+            aten.lerp.Tensor,
+            aten._adaptive_avg_pool2d.default,
+            aten.avg_pool2d_backward.default,
+            aten.max_pool2d_with_indices.default,
+            aten.max_pool2d_with_indices_backward.default,
+            aten.nll_loss_backward.default,
+            aten.convolution_backward.default,
+            aten._softmax.default,
+            aten._log_softmax.default,
+            aten.matmul.default,
+        ]
+        if hasattr(aten, "relu_backward"):
+            suppressed.append(aten.relu_backward.default)
+        for _attr in (
+            "binary_cross_entropy_with_logits_backward",
+            "l1_loss_backward",
+        ):
+            if hasattr(aten, _attr):
+                suppressed.append(getattr(aten, _attr).default)
+
+        missing = [
+            str(op) for op in suppressed if op not in _inductor_lowerings
+        ]
+        assert not missing, (
+            f"GAP.1: {len(missing)} suppressed ops lack Vulkan lowerings:\n"
+            + "\n".join(f"  - {m}" for m in sorted(missing))
+        )
