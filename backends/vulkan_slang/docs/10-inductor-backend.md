@@ -288,9 +288,9 @@ blockers that are out-of-scope for the milestone they were filed against:
 | **GAP.1** | V10-GAP | Runtime suppress→lowering invariant test | 0.25 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_gap_analysis.py` passed (41/41). |
 | **BN.1** | V10-BN | BatchNorm2d forward through compile | 0.5 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_bn1_compile.py` — Conv+BN+ReLU forward compiled on Vulkan. running_mean/running_var on vulkan:0. |
 | **BN.2** | V10-BN | BatchNorm2d fwd+bwd through compile | 1 d | 🔲 **BLOCKED** — Dynamo traces running_mean.copy_ mutation into FX graph; Inductor compile fails on compiled graph with BN mutations. Forward-only compile works for BN inference but not training. Eager BN training works via pure-aten Python fallback. |
-| **DYN.1** | V10-DYN | Conv+GN+ReLU dynamic batch compile | 0.5 d | 🔲 OPEN |
+| **DYN.1** | V10-DYN | Conv+GN+ReLU dynamic batch compile | 0.5 d | 🔲 **BLOCKED** — Codegen bug: `undefined identifier 'ks0'` and `'s77u'` in generated Slang reduction kernel for dynamic batch (B=8 after B=4). Static batch compiles fine. |
 | **DYN.2** | V10-DYN | Conv+BN+ReLU dynamic batch compile | 1 d | 🔲 OPEN |
-| **FP16.1** | V10-FP16 | Packed16 pointwise add/mul correctness | 0.5 d | 🔲 OPEN |
+| **FP16.1** | V10-FP16 | Packed16 pointwise add/mul correctness | 0.5 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_fp16_compile.py` — add/mul/fused all max_diff=0.000000 vs CPU reference on RDNA1. |
 | **FP16.2** | V10-FP16 | F16 matmul via mm_tile correctness | 1 d | 🔲 OPEN |
 | **RNN.1** | V10-RNN | LSTM cell forward through compile | 0.5 d | 🔲 OPEN |
 | **RNN.2** | V10-RNN | GRU cell forward through compile | 0.5 d | 🔲 OPEN |
