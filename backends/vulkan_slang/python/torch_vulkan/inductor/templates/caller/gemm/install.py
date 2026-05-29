@@ -452,21 +452,22 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
         for ns in (1, 2):
             # N+1.11: _n111 prevents stale cache hits with old PC layout.
             specs.append(
-                (
-                    f"slang_mm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111_a6",
-                    _render_mm_slang(
-                        tm,
-                        tn,
-                        tk,
-                        dtype_a=dt,
-                        dtype_b=dt,
-                        dtype_c=dt,
-                        dtype_acc="float",
-                        num_stages=ns,
-                        m_per_thread=mpt,
-                        n_per_thread=npt,
-                    ),
-                )
+            (
+                f"slang_mm_{tm}_{tn}_{tk}_s{ns}_r{mpt}x{npt}_{dt}_n111_a6",
+                _render_mm_slang(
+                    tm,
+                    tn,
+                    tk,
+                    dtype_a=dt,
+                    dtype_b=dt,
+                    dtype_c=dt,
+                    dtype_acc="float",
+                    num_stages=ns,
+                    m_per_thread=mpt,
+                    n_per_thread=npt,
+                    use_module=False,
+                ),
+            )
             )
             specs.append(
                 (
@@ -484,6 +485,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
                         has_bias=True,
                         m_per_thread=mpt,
                         n_per_thread=npt,
+                        use_module=False,
                     ),
                 )
             )
@@ -504,6 +506,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
                         epilogue_struct="OpGELU",
                         m_per_thread=mpt,
                         n_per_thread=npt,
+                        use_module=False,
                     ),
                 )
             )
@@ -521,6 +524,7 @@ def _collect_matmul_prewarm_specs() -> list[tuple[str, str]]:
                     m_per_thread=mpt,
                     n_per_thread=npt,
                     has_batch=True,
+                    use_module=False,
                 ),
             )
         )
