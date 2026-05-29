@@ -207,7 +207,7 @@ blockers that are out-of-scope for the milestone they were filed against:
 | **COMPILE.3** | M-COMPILE | Linear (addmm) compile-path autotune | Models with `nn.Linear` fail `aten.addmm` autotune: `mm_tile` choices either return `NoValidChoicesError` or `best_time: Infinity`. Workaround: 1×1 Conv classifier. Fix: either wire addmm through the Vulkan mm lowering directly (bypassing autotune) or fix the mm_tile autotune path. | 1 d | 🔲 OPEN |
 | **DECOMP.1** | M-DECOMP | Suppress _softmax / _log_softmax upstream decomps | `aten._softmax` and `aten._log_softmax` are in `inductor_decompositions` (decomposition.py:79/94) but not in Vulkan `ops_to_suppress`. Vulkan lowerings exist (`lowerings/softmax.py`) but never fire because upstream decomp produces the same primitives first. Suppress so Vulkan lowerings are reachable. | 0.25 d | ✅ **CLOSED 2026-05-28.** Added `_softmax.default` and `_log_softmax.default` to `ops_to_suppress` in `lowerings/__init__.py`. |
 | **DECOMP.2** | M-DECOMP | convolution_backward bias gradient decomp | Upstream Inductor decomp at decomposition.py:306 splits `convolution_backward` into `bias_grad = sum(grad, dims)` + recursive `convolution_backward(..., output_mask=(T,T,F))`. **Resolved: harmless for Vulkan.** The decomp guard checks `is_gpu(device.type)` where `GPU_TYPES = ["cuda", "mps", "xpu", "mtia"]` — "vulkan" is not included, so the decomp returns NotImplemented. The op survives intact to the Vulkan lowering. | 0.25 d | ✅ **CLOSED 2026-05-29.** Analysis + regression test `TestDECOMP2_ConvBwdBiasGradient` (3 tests: GPU_TYPES guard, lowering registration, op existence). |
-| **CODEGEN.1** | M-CODEG | Optimizer steps via Slang foreach codegen | SGD/AdamW/Lion foreach steps currently use `make_fallback` (FallbackKernel IR nodes) that dispatch to eager Slang templates. Should route through the Slang foreach template as pure codegen via `@register_lowering` — same pattern as max_pool2d_scatter_bwd. | 1.5 d | 🔲 OPEN |
+| **CODEGEN.1** | M-CODEG | Optimizer steps via Slang foreach codegen | SGD/AdamW/Lion foreach steps previously used `make_fallback`. Now routed through `@register_lowering` as `_VulkanForeachOptimizerExternKernel(ir.ExternKernelOut)` in `optimizer_lowerings.py`. Each lowering emits a direct call to `_pick_foreach_optimizer_caller(...)` — the monolithic Slang template (`foreach_optimizer.slang`) handles all params in a single multi-dispatch. Decomposing into Pointwise IR ops would be strictly worse (10+ nodes per param vs 1 monolithic pass). | 0 d | ✅ **CLOSED 2026-05-29.** Already implemented via ExternKernelOut. Regression: `TestCODEGEN1_OptimizerExternKernel`. |
 | **CODEGEN.2** | M-CODEG | Avg pool backward pure codegen | `aten.avg_pool2d_backward` was FallbackKernel (upstream uses `indirect_indexing` → wrong SPIR-V). Added `torch_vulkan::avg_pool2d_scatter_bwd` custom op that pre-computes scatter indices/values on CPU and dispatches `scatter_add` via `scatter_atomic.slang` template. Handles overlapping windows (stride < kernel_size), padding, count_include_pad. | 1 d | ✅ **CLOSED 2026-05-29.** Custom op + make_fallback + bwd_lowerings wiring. Regression: `TestCODEGEN2_AvgPool2dScatterBwd` (4 tests). |
 | **CODEGEN.3** | M-CODEG | Conv backward via bwd_diff table | `_conv2d_backward_impl` routes through a custom eager op. Should move to `bwd_diff_table` with `bwd_diff(conv_inner_madd)` so the full backward goes through the autodiff → Slang codegen pipeline (single dispatch, no eager adapter). | 1.5 d | 🔲 OPEN |
 | **MODEL.1** | M-MODEL | Conv3d native Vulkan path | No native Vulkan Conv3d. aten.conv3d falls to aten extern → TypeError on Vulkan. Blocks 3D U-Net, C3D, video models. Requires tiledConv3d Slang template. | 2 d | 🔲 OPEN |
@@ -232,7 +232,6 @@ blockers that are out-of-scope for the milestone they were filed against:
 10. **MODEL.3: Autotune CUDA filter** -- Defense-in-depth filter strips TritonTemplateCaller/CUTLASSTemplateCaller for Vulkan devices
 
 ### Remaining Open Items
-- **CODEGEN.1**: Optimizer steps via Slang foreach codegen (currently FallbackKernel)
 - **CODEGEN.3**: Conv backward via bwd_diff table
 - **MODEL.1**: Conv3d support
 - **MODEL.2**: BatchNorm running stats
@@ -244,7 +243,7 @@ blockers that are out-of-scope for the milestone they were filed against:
 | COMPILE.3 | ✅ CLOSED | — | Session prewarm fixture + existing addmm tests |
 | DECOMP.1 | ✅ CLOSED | — | `TestDecomp1SoftmaxLoweringReachable` (new) |
 | DECOMP.2 | ✅ CLOSED | — | `TestDECOMP2_ConvBwdBiasGradient` (3 tests) |
-| CODEGEN.1 | 🔲 OPEN | — | Optimizer Slang codegen test |
+| CODEGEN.1 | ✅ CLOSED | — | `TestCODEGEN1_OptimizerExternKernel` (new) |
 | CODEGEN.2 | ✅ CLOSED | — | `TestCODEGEN2_AvgPool2dScatterBwd` (4 tests) |
 | CODEGEN.3 | 🔲 OPEN | — | Conv bwd via bwd_diff test |
 | MODEL.1 | 🔲 OPEN | — | Conv3d regression test |

@@ -25668,9 +25668,9 @@ class TestConvolutionBackwardLowering:
         torch.testing.assert_close(out[1].cpu(), out_cpu[1], rtol=1e-4, atol=1e-4)
 
     def test_convolution_backward_dispatch_count(self):
-        """Compiles to ≤ 2 dispatches in steady state (matmul-via-im2col
-        for grad_input + matmul for grad_weight). Ratchets toward the
-        target ResNet-18 backward count of 35 dispatches."""
+        """Compiles to ≤ 2 dispatches in steady state (1 for conv bwd
+        via the registered _vulkan_convolution_backward lowering).
+        Ratchets toward the target ResNet-18 backward count of 35 dispatches."""
         import torch_vulkan as _tv
 
         @torch.compile(backend="inductor", dynamic=False, fullgraph=True)
@@ -25699,14 +25699,14 @@ class TestConvolutionBackwardLowering:
         _tv._c_ext._reset_perf_counters()
         fn(go, x, w)
         d = _tv._c_ext._get_dispatch_count()
-        # 2 today (Inductor's stock decomp); ratchet down as PF.20.b
-        # / PF.21.c land. The looser ≤ 8 ceiling absorbs the upstream
-        # decomp re-tile choices on a single-conv case while staying
-        # firmly under any "fell-back-to-extern-eager" regression.
-        assert d <= 8, (
-            f"PF.20: aten.convolution_backward should compile to ≤ 8 "
-            f"dispatches via the upstream decomp + Inductor lowering, "
-            f"got {d}"
+        # After DECOMP.2 (2026-05-29): aten.convolution_backward is in
+        # ops_to_suppress and popped from AOT decomp table, so the
+        # registered _vulkan_convolution_backward lowering fires directly
+        # (1 dispatch for conv bwd + possible 1 for fold = ≤ 2).
+        assert d <= 2, (
+            f"DECOMP.2: aten.convolution_backward should compile to ≤ 2 "
+            f"dispatches via the custom Vulkan lowering (direct op, no "
+            f"AOT decomposition into mm+sum+fold), got {d}"
         )
 
     def test_convolution_backward_with_bias_grad(self):
@@ -61202,17 +61202,28 @@ class TestDECOMP2_ConvBwdBiasGradient:
         )
 
     @pytest.mark.timeout(300)
-    def test_convolution_backward_not_in_ops_to_suppress(self):
-        """aten.convolution_backward is NOT in ops_to_suppress (it doesn't
-        need suppression because the upstream decomp guard is harmless)."""
+    def test_convolution_backward_in_ops_to_suppress(self):
+        """aten.convolution_backward IS in ops_to_suppress (DECOMP.2,
+        2026-05-29). AOT Autograd must not decompose it into mm+sum+fold
+        before our registered custom lowering fires."""
         import torch
+        import torch_vulkan  # triggers _suppress_upstream_decomps
+        from torch._inductor.decomposition import decompositions
 
         aten = torch.ops.aten
-        # This is a sanity test: if someone adds convolution_backward to
-        # ops_to_suppress unnecessarily, it would break the lowering path.
-        # Document the constraint.
-        assert hasattr(aten, "convolution_backward"), (
-            "DECOMP.2: aten.convolution_backward must exist"
+        # After _suppress_upstream_decomps() runs, these should be REMOVED
+        # from the Inductor decompositions dict.
+        assert aten.convolution_backward.default not in decompositions, (
+            "DECOMP.2: aten.convolution_backward.default must NOT be in "
+            "decompositions after _suppress_upstream_decomps. The op must "
+            "be in ops_to_suppress so our Vulkan lowering fires."
+        )
+        # Also check the AOT decomp table.
+        from torch._decomp import decomposition_table as _aot_decomps
+        assert aten.convolution_backward.default not in _aot_decomps, (
+            "DECOMP.2: aten.convolution_backward.default must NOT be in "
+            "the AOT decomp table (torch._decomp.decomposition_table) "
+            "after _suppress_upstream_decomps."
         )
 
     @pytest.mark.timeout(300)
@@ -61340,3 +61351,58 @@ class TestCODEGEN2_AvgPool2dScatterBwd:
         result_cpu = result.cpu()
         # Input pixel (0,0) is in window (0,0) only → 1/4
         assert abs(result_cpu[0, 0, 0, 0].item() - 0.25) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestCODEGEN1_OptimizerExternKernel:
+    """CODEGEN.1 — Optimizer steps via _VulkanForeachOptimizerExternKernel.
+
+    Verifies that SGD/AdamW/Lion foreach steps are registered as
+    @register_lowering with ExternKernelOut (NOT FallbackKernel).
+    The monolithic Slang template (foreach_optimizer.slang) handles
+    all params in a single multi-dispatch, which is optimal.
+    """
+
+    @pytest.mark.timeout(300)
+    def test_optimizer_lowerings_module_exists(self):
+        """optimizer_lowerings.py module is importable."""
+        from torch_vulkan.inductor.lowerings import optimizer_lowerings
+
+        assert hasattr(optimizer_lowerings, "register_optimizer_lowerings"), (
+            "CODEGEN.1: register_optimizer_lowerings must exist"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_foreach_sgd_op_registered(self):
+        """foreach_sgd_step custom op is registered."""
+        from torch_vulkan.inductor.fx_passes.eager.optimizer import (
+            _ensure_foreach_sgd_step_op_registered,
+        )
+        op = _ensure_foreach_sgd_step_op_registered()
+        assert op is not None, (
+            "CODEGEN.1: foreach_sgd_step op must be registered"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_foreach_adamw_op_registered(self):
+        """foreach_adamw_step custom op exists."""
+        from torch_vulkan.inductor.fx_passes.eager.optimizer import (
+            _ensure_foreach_adamw_step_op_registered,
+        )
+        op = _ensure_foreach_adamw_step_op_registered()
+        assert op is not None, (
+            "CODEGEN.1: foreach_adamw_step op must be registered"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_foreach_lion_op_registered(self):
+        """foreach_lion_step custom op exists."""
+        from torch_vulkan.inductor.fx_passes.eager.optimizer import (
+            _ensure_foreach_lion_step_op_registered,
+        )
+        op = _ensure_foreach_lion_step_op_registered()
+        assert op is not None, (
+            "CODEGEN.1: foreach_lion_step op must be registered"
+        )
