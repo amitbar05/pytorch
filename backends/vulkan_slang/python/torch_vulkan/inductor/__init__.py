@@ -217,6 +217,91 @@ def _install_vulkan_scheduler_exemption() -> None:
         _log.warning("Failed to patch Scheduler.create_backend: %s", e)
 
 
+def _install_vulkan_autotune_cuda_filter() -> None:
+    """MODEL.3 — filter CUDA-only autotune candidates for Vulkan devices.
+
+    Upstream ``torch._inductor.select_algorithm.autotune_select_algorithm``
+    collects a list of ``ChoiceCaller`` candidates (Triton kernels, CUTLASS
+    templates, extern kernels, …) and benchmarks them.  For Vulkan, only
+    ``ExternKernelChoice`` entries (registered by our Slang tile
+    ``install_external_{mm,bmm,addmm,attention}``) are valid — Triton and
+    CUTLASS choices require CUDA hardware.
+
+    Existing defenses:
+      * ``VulkanScheduling.get_backend_features()`` omits
+        ``TRITON_TEMPLATES``, so ``use_triton_template()`` returns False
+        and the upstream ``tuned_mm`` never adds Triton choices.
+      * ``tuned_bmm`` / ``tuned_addmm`` are fully overridden.
+      * ``use_cutlass_template()`` fails its ``try_import_cutlass()``
+        check on a CUDA-less build.
+
+    This filter is a defense-in-depth layer: if a future upstream change
+    or an edge-case codegen path (e.g. attention, conv) introduces
+    non-extern CUDA choices into the autotune list, they are silently
+    stripped before benchmarking so the autotuner never tries to compile
+    or run a CUDA kernel on Vulkan.
+
+    Idempotent — safe to call multiple times.
+    """
+    import logging
+
+    _log = logging.getLogger(__name__)
+    try:
+        from torch._inductor.select_algorithm import add_preprocessing_fn
+
+        _filter_installed = getattr(
+            _install_vulkan_autotune_cuda_filter, "_done", False
+        )
+        if _filter_installed:
+            return
+
+        def _filter_cuda_choices(choices):
+            """Remove CUDA-only autotune choices when compiling for Vulkan."""
+            from torch._inductor.virtualized import V
+
+            graph = getattr(V, "graph", None)
+            if graph is None:
+                return choices
+            device_types = getattr(graph, "device_types", set())
+            if "vulkan" not in device_types:
+                return choices
+
+            # Filter out Triton and CUTLASS choices — neither runs on Vulkan.
+            # TritonTemplateCallerBase is the base class for all Triton
+            # template choices; CUTLASSTemplateCaller is the CUTLASS entry.
+            from torch._inductor.ir import TritonTemplateCallerBase
+
+            try:
+                from torch._inductor.codegen.cutlass.kernel import (
+                    CUTLASSTemplateCaller,
+                )
+
+                cuda_only_types = (TritonTemplateCallerBase, CUTLASSTemplateCaller)
+            except Exception:  # noqa: BLE001
+                cuda_only_types = (TritonTemplateCallerBase,)
+
+            original_len = len(choices)
+            filtered = [c for c in choices if not isinstance(c, cuda_only_types)]
+            removed = original_len - len(filtered)
+            if removed > 0:
+                _log.debug(
+                    "[MODEL.3] Filtered %d CUDA-only autotune candidate(s) "
+                    "from Vulkan graph (remaining: %d)",
+                    removed,
+                    len(filtered),
+                )
+            return filtered if filtered else choices
+
+        add_preprocessing_fn(_filter_cuda_choices)
+        _install_vulkan_autotune_cuda_filter._done = True
+        _log.info(
+            "Installed Vulkan autotune CUDA filter (MODEL.3) — "
+            "TritonTemplate/CUTLASS choices stripped for vulkan graphs"
+        )
+    except Exception as e:
+        _log.warning("Failed to install Vulkan autotune CUDA filter: %s", e)
+
+
 # M17.1: _install_vulkan_aten_only_autotune removed (2026-05-16).
 # Slang tile mm/bmm/addmm correctness is now verified (max diff ~1e-5 vs CPU).
 # The gate was already dead code (never called from _legacy_register).
@@ -609,6 +694,9 @@ def _legacy_register() -> None:
     _install_vulkan_gpu_types()
     _install_vulkan_scheduler_exemption()
     _install_vulkan_cpu_timer_benchmark()
+    # MODEL.3 — defense-in-depth: strip any CUDA-only autotune choices
+    # (Triton templates, CUTLASS) that might reach Vulkan graphs.
+    _install_vulkan_autotune_cuda_filter()
 
     from torch._inductor.codegen.common import register_backend_for_device
 
