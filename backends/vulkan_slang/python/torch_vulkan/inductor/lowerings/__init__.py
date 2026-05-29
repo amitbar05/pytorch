@@ -391,9 +391,9 @@ def register() -> None:
     install_external_scatter()
     _install_external_rnn()
     _install_philox_dispatch()
-    # T4.8: Register foreach optimizer custom ops as fallback kernels
-    # so Inductor can lower torch_vulkan::foreach_{sgd,sgd_momentum,adamw,lion}_step
-    # nodes inserted by the _route_foreach_add_to_template FX pass.
+    # T4.8 / CODEGEN.1: Foreach optimizer step lowerings — replace the
+    # FallbackKernel path with ExternKernelOut subclasses that emit direct
+    # _slang_foreach_optimizer() calls during codegen.
     import torch
     from torch._inductor.lowering import make_fallback
 
@@ -426,10 +426,9 @@ def register() -> None:
     from .scatter import _register_scatter_family_lowerings
     from .searchsorted import _register_searchsorted_and_repeat_interleave_tensor
 
-    make_fallback(torch.ops.torch_vulkan.foreach_sgd_step)
-    make_fallback(torch.ops.torch_vulkan.foreach_sgd_momentum_step)
-    make_fallback(torch.ops.torch_vulkan.foreach_adamw_step)
-    make_fallback(torch.ops.torch_vulkan.foreach_lion_step)
+    from .optimizer_lowerings import _register_optimizer_lowerings
+
+    _register_optimizer_lowerings()
 
     # M17.8.d.2 / M22.14 — opaque conv2d_backward custom op. Emits
     # extern_kernels.conv2d_backward(...) which runs the C++
