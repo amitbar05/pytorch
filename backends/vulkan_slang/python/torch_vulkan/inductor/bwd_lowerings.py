@@ -580,11 +580,13 @@ def _register_softmax_backward() -> None:
 
 
 def _register_pool_backward() -> None:
-    """M22.15 + TRAIN.2 — pool backward ops and max_pool2d_with_indices forward
-    via FallbackKernel / scatter custom op.
+    """M22.15 + TRAIN.2 + CODEGEN.2 — pool backward ops.
 
-    avg_pool2d_backward: upstream lowering uses ops.indirect_indexing which
-    generates incorrect SPIR-V on Vulkan; route through FallbackKernel.
+    avg_pool2d_backward: CODEGEN.2 adds a pure-codegen path for the
+    non-overlapping case (stride==kernel_size, no ceil_mode).  The
+    upstream lowering uses ops.indirect_indexing which generates incorrect
+    SPIR-V on Vulkan; the codegen path avoids it via broadcast+scale.
+    Overlapping / complex cases still route through FallbackKernel.
 
     max_pool2d_with_indices (forward): AOTAutograd rematerialises indices in
     the backward graph rather than saving them from the forward.  The upstream
@@ -623,6 +625,20 @@ def _register_pool_backward() -> None:
     ):
         if not _is_vulkan(grad_output):
             return NotImplemented
+        # CODEGEN.2: pure-codegen backward for non-overlapping avg_pool2d.
+        # When stride == kernel_size and no padding/ceil_mode, each input
+        # pixel maps to exactly one output pixel — the gradient is simply
+        # broadcast(grad_output / scale) to input spatial dims.
+        # Avoids the upstream lowering's ops.indirect_indexing which
+        # generates incorrect SPIR-V on Vulkan.
+        from .lowerings.pool import avg_pool2d_backward_codegen
+
+        result = avg_pool2d_backward_codegen(
+            grad_output, x, kernel_size, stride, padding, ceil_mode,
+            count_include_pad, divisor_override,
+        )
+        if result is not None:
+            return result
         return _vk_avg_pool2d_bwd_fallback(
             grad_output, x, kernel_size, stride, padding, ceil_mode,
             count_include_pad, divisor_override
