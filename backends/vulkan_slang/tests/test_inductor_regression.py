@@ -61609,3 +61609,54 @@ class TestCODEGEN3_ConvBwdBwdDiff:
             "CODEGEN.3: _VulkanConvBwdExternKernel must subclass "
             "ir.ExternKernelOut (not FallbackKernel)"
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestMODEL1_Conv3dRegression:
+    """MODEL.1 — Conv3d native Vulkan path.
+
+    Verifies that Conv3d (5D tensors) is fully supported:
+    1. aten.conv3d.default has a Vulkan lowering
+    2. Conv3d native kernel exists (KD>1 path)
+    3. Conv3d backward kernel exists
+    """
+
+    @pytest.mark.timeout(300)
+    def test_conv3d_lowering_registered(self):
+        """aten.conv3d.default has a Vulkan lowering."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        key = aten.conv3d.default
+        assert key in _inductor_lowerings, (
+            "MODEL.1: aten.conv3d.default must have a registered lowering"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_conv3d_native_kernel_exists(self):
+        """_VulkanConv3dExternKernel exists for KD>1 native path."""
+        from torch_vulkan.inductor.lowerings.conv3d import (
+            _VulkanConv3dExternKernel,
+        )
+        from torch._inductor import ir
+
+        assert issubclass(_VulkanConv3dExternKernel, ir.ExternKernelOut), (
+            "MODEL.1: _VulkanConv3dExternKernel must subclass "
+            "ir.ExternKernelOut"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_conv3d_backward_kernel_exists(self):
+        """_VulkanConv3dBwdExternKernel exists for backward path."""
+        from torch_vulkan.inductor.lowerings.conv3d_backward import (
+            _VulkanConv3dBwdExternKernel,
+        )
+        from torch._inductor import ir
+
+        assert issubclass(_VulkanConv3dBwdExternKernel, ir.ExternKernelOut), (
+            "MODEL.1: _VulkanConv3dBwdExternKernel must subclass "
+            "ir.ExternKernelOut"
+        )
