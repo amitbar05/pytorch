@@ -60926,3 +60926,161 @@ class TestDecomp1SoftmaxLoweringReachable:
 
         actual = compiled_log_softmax(x_vk).cpu()
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestCOMPILE2_Mark0dDiv:
+    """COMPILE.2 — 0-d div operations tagged ``must_be_in_forward`` before
+    the AOT partitioner runs, preventing "Node was invalid" crashes when
+    compiling conv + cross_entropy models with backward.
+
+    The partitioner's min-cut algorithm may place a scalar (0-d)
+    ``aten.div.Tensor`` (e.g. ``loss / numel`` inside
+    ``nll_loss_backward``) in the backward sub-graph.  When the div
+    depends on forward-only scalars, the partitioner marks those inputs
+    ``InvalidNode``, and the backward graph ends up referencing an
+    invalid node as an output — crashing compilation.
+
+    The ``mark_0d_div_must_be_in_forward`` pre-partition pass tags such
+    nodes so the partitioner is forced to keep them in forward.
+    """
+
+    @pytest.mark.timeout(600)
+    def test_conv_cross_entropy_backward_compiles(self):
+        """conv2d → cross_entropy → .backward() doesn't crash under compile."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan  # noqa: F401 — register backend
+
+        class SmallCNN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 8, 3, padding=1)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.fc = nn.Linear(8, 4)
+
+            def forward(self, x):
+                x = F.relu(self.conv(x))
+                x = self.pool(x).flatten(1)
+                return self.fc(x)
+
+        model = SmallCNN().to("vulkan:0")
+        compiled = torch.compile(model, backend="inductor")
+
+        x = torch.randn(2, 3, 8, 8, device="vulkan:0")
+        target = torch.randint(0, 4, (2,), device="vulkan:0")
+
+        # Forward should not crash.
+        logits = compiled(x)
+        loss = F.cross_entropy(logits, target)
+
+        # Backward compilation is the bug trigger — without the fix this
+        # raises "AssertionError: Node was invalid, but is output".
+        loss.backward()
+
+        # Sanity: gradients exist.
+        for name, p in model.named_parameters():
+            assert p.grad is not None, (
+                f"COMPILE.2: parameter {name!r} has no gradient after backward"
+            )
+
+    @pytest.mark.timeout(300)
+    def test_mark_0d_div_tags_correctly(self):
+        """Unit test: mark_0d_div_must_be_in_forward sets the tag on 0-d div nodes."""
+        import torch
+        import torch.fx as fx
+        from torch_vulkan.inductor.fx_passes.pre_aot_partition import (
+            mark_0d_div_must_be_in_forward,
+        )
+
+        graph = fx.Graph()
+        # Two 0-d tensor inputs.
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+
+        # 0-d div → should be tagged.
+        div_0d = graph.call_function(
+            torch.ops.aten.div.Tensor, args=(a, b)
+        )
+        with torch.device("meta"):
+            div_0d.meta["val"] = torch.empty((), dtype=torch.float32)
+
+        # N-d div → should NOT be tagged.
+        c = graph.placeholder("c")
+        d = graph.placeholder("d")
+        div_nd = graph.call_function(
+            torch.ops.aten.div.Tensor, args=(c, d)
+        )
+        with torch.device("meta"):
+            div_nd.meta["val"] = torch.empty(4, dtype=torch.float32)
+
+        graph.output((div_0d, div_nd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        # Run the pass.
+        mark_0d_div_must_be_in_forward(gm)
+
+        # 0-d div should be tagged.
+        assert div_0d.meta.get("partitioner_tag") == "must_be_in_forward", (
+            "COMPILE.2: 0-d div.Tensor node should be tagged must_be_in_forward"
+        )
+        # N-d div should NOT be tagged.
+        assert "partitioner_tag" not in div_nd.meta, (
+            "COMPILE.2: N-d div.Tensor node should NOT be tagged"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_mark_0d_div_idempotent(self):
+        """The pass is idempotent — running it twice doesn't change tags."""
+        import torch
+        import torch.fx as fx
+        from torch_vulkan.inductor.fx_passes.pre_aot_partition import (
+            mark_0d_div_must_be_in_forward,
+        )
+
+        graph = fx.Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        div_node = graph.call_function(
+            torch.ops.aten.div.Tensor, args=(a, b)
+        )
+        with torch.device("meta"):
+            div_node.meta["val"] = torch.empty((), dtype=torch.float32)
+
+        graph.output((div_node,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        mark_0d_div_must_be_in_forward(gm)
+        # Second run must be a no-op.
+        mark_0d_div_must_be_in_forward(gm)
+        assert div_node.meta["partitioner_tag"] == "must_be_in_forward"
+
+    @pytest.mark.timeout(300)
+    def test_mark_0d_div_preserves_existing_tag(self):
+        """The pass does NOT overwrite a pre-existing partitioner_tag."""
+        import torch
+        import torch.fx as fx
+        from torch_vulkan.inductor.fx_passes.pre_aot_partition import (
+            mark_0d_div_must_be_in_forward,
+        )
+
+        graph = fx.Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        div_node = graph.call_function(
+            torch.ops.aten.div.Tensor, args=(a, b)
+        )
+        with torch.device("meta"):
+            div_node.meta["val"] = torch.empty((), dtype=torch.float32)
+        div_node.meta["partitioner_tag"] = "is_backward"  # pre-existing
+
+        graph.output((div_node,))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        mark_0d_div_must_be_in_forward(gm)
+        assert div_node.meta["partitioner_tag"] == "is_backward", (
+            "COMPILE.2: existing partitioner_tag must not be overwritten"
+        )

@@ -707,6 +707,15 @@ def _install_joint_partition_device_fix() -> None:
             )
 
             fx_g = annotate_lifetime_classes(fx_g, joint_inputs)
+            # COMPILE.2: tag 0-d div nodes as must_be_in_forward so the
+            # AOT partitioner doesn't split them into the backward
+            # sub-graph (which would cause "Node was invalid" crashes
+            # on conv + cross_entropy + backward models).
+            from torch_vulkan.inductor.fx_passes.pre_aot_partition import (
+                mark_0d_div_must_be_in_forward,
+            )
+
+            fx_g = mark_0d_div_must_be_in_forward(fx_g)
         return fx_g
 
     _chained._vulkan_partition_pass = True  # type: ignore[attr-defined]
