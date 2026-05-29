@@ -60850,3 +60850,79 @@ class TestTrain6DynamicBatch:
             "TRAIN.6: spec constant emission missing default value. "
             "Expected '= {value_}' in the vk::constant_id format string."
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestDecomp1SoftmaxLoweringReachable:
+    """DECOMP.1 — _softmax / _log_softmax lowerings fire (not upstream decomp).
+
+    Before DECOMP.1, aten._softmax and aten._log_softmax were in the
+    upstream inductor_decompositions table (decomposition.py:79/94) but
+    NOT in the Vulkan backend's ops_to_suppress list. The upstream decomp
+    decomposed them into sub/exp/sum/div primitives before Inductor
+    saw the op, so the Vulkan lowerings (lowerings/softmax.py) were
+    unreachable dead code.
+
+    After DECOMP.1, both ops are in ops_to_suppress, so the Vulkan
+    lowerings fire. Since our lowerings decompose into the same primitives,
+    the result is functionally identical — but the lowering is now reachable
+    and the scheduler can see the single softmax/log_softmax node for
+    better fusion with adjacent ops.
+    """
+
+    def test_softmax_in_suppress_list(self):
+        """aten._softmax and aten._log_softmax must be in ops_to_suppress."""
+        import torch
+        from torch._inductor.decomposition import decompositions
+
+        aten = torch.ops.aten
+        # After _suppress_upstream_decomps() runs, these should be REMOVED
+        # from the Inductor decompositions dict.
+        import torch_vulkan  # triggers _suppress_upstream_decomps
+
+        assert aten._softmax.default not in decompositions, (
+            "DECOMP.1: aten._softmax still in inductor_decompositions. "
+            "Must be in ops_to_suppress so Vulkan lowering fires."
+        )
+        assert aten._log_softmax.default not in decompositions, (
+            "DECOMP.1: aten._log_softmax still in inductor_decompositions. "
+            "Must be in ops_to_suppress so Vulkan lowering fires."
+        )
+
+    @pytest.mark.timeout(300)
+    def test_softmax_compile_correctness(self):
+        """softmax output matches CPU reference after suppression."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+        x_cpu = torch.randn(4, 10)
+        x_vk = x_cpu.to("vulkan:0")
+
+        expected = torch.nn.functional.softmax(x_cpu, dim=-1)
+
+        @torch.compile(backend="inductor")
+        def compiled_softmax(x):
+            return torch.nn.functional.softmax(x, dim=-1)
+
+        actual = compiled_softmax(x_vk).cpu()
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.timeout(300)
+    def test_log_softmax_compile_correctness(self):
+        """log_softmax output matches CPU reference after suppression."""
+        import torch_vulkan
+
+        torch.manual_seed(42)
+        x_cpu = torch.randn(4, 10)
+        x_vk = x_cpu.to("vulkan:0")
+
+        expected = torch.nn.functional.log_softmax(x_cpu, dim=-1)
+
+        @torch.compile(backend="inductor")
+        def compiled_log_softmax(x):
+            return torch.nn.functional.log_softmax(x, dim=-1)
+
+        actual = compiled_log_softmax(x_vk).cpu()
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)

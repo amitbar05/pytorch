@@ -164,6 +164,17 @@ def _suppress_upstream_decomps() -> None:
     # OP.26: also pop from the AOT decomp table so AOT autograd does not
     # decompose aten.scaled_dot_product_attention before Inductor sees it.
     _aot_decomps.pop(aten.scaled_dot_product_attention.default, None)
+    # V9.SUPPRESS.1: _softmax and _log_softmax are in the upstream
+    # inductor_decompositions table (decomposition.py:79/94). The Vulkan
+    # backend has native lowerings (lowerings/softmax.py) that decompose
+    # into the same primitives (sub/exp/sum/div), but suppressing the
+    # upstream decomp ensures our lowerings fire — giving the scheduler
+    # a single fused softmax/log_softmax IR node for better fusion with
+    # adjacent ops (e.g. log_softmax + gather for manual cross-entropy).
+    ops_to_suppress.extend([
+        aten._softmax.default,
+        aten._log_softmax.default,
+    ])
     for op in ops_to_suppress:
         decompositions.pop(op, None)
     # ``aten.native_dropout_backward`` is also installed in the AOT decomp

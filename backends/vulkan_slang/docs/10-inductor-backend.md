@@ -142,142 +142,118 @@ ReLU/GELU/SiLU, MaxPool2d/AvgPool2d, Linear (fwd+bwd), common losses
 log_softmax+nll_loss), and SGD/AdamW/Lion optimizers — all through
 Slang codegen kernels with no aten eager fallback on the compile path.
 
-## v8 milestones
+## v8 milestones (all CLOSED — 2026-05-27/28)
 
-| # | Title | Why | Effort | Status |
-|---|-------|-----|--------|--------|
-| **TRAIN.1** | Loss backward reachability | 7 loss bwd ops in BWD_DIFF_TABLE were unreachable: 4 decomposed by upstream before Inductor, 2 had custom_op but no @register_lowering, 1 was phantom (aten op doesn't exist). | 0.5 d | ✅ **CLOSED 2026-05-27.** Suppressed upstream decomps for 6 loss bwd ops (`_suppress_upstream_decomps` + `_aot_decomps.pop`). Added `aten.l1_loss_backward` to `_BINARY_LOSS_BWD_DIFF_OPS` + `_BINARY_BWD_DIFF_LOWERING_OPS` + `_BINARY_INLINE_OPS`. Added `aten.binary_cross_entropy_with_logits_backward` to lowering + inline + special weight handler. Removed phantom `aten.kl_div_backward` from BWD_DIFF_TABLE. Test: `TestTrain1LossBackwardReachability`. |
-| **TRAIN.2** | MaxPool2d backward codegen path | Current backward uses FallbackKernel → C++ kernel with int64→uint32 CPU roundtrip (`backward_ops.cpp:410-473`). Not M-CG compliant. Scatter template (`scatter_atomic.slang`) exists but not wired for pool backward. | 1 d | ✅ **CLOSED 2026-05-27.** Registered custom op `torch_vulkan::max_pool2d_scatter_bwd` that computes global int32 indices on GPU (no CPU roundtrip) and dispatches `scatter_add` via `scatter_atomic.slang`. Replaced FallbackKernel in `bwd_lowerings.py` with `fallback_handler` on the custom op + shape extraction. Regression test: `TestTrain2MaxPoolBackwardCodegen` (5 tests: op registration, eager direct, compile path, overlapping windows scatter_add, no-CPU-roundtrip assertion). Files: `fx_passes/eager/pool.py`, `bwd_lowerings.py:660-690`, `lowerings/__init__.py:398-404`. |
-| **TRAIN.3** | AdamW/Lion decoupled weight decay | `foreach_optimizer.slang` applied L2 weight decay (`g += wd*p`) for ALL algorithms, contaminating moment estimates for AdamW. AdamW's update formula ALSO applied wd, causing double-counting. | 0.25 d | ✅ **CLOSED 2026-05-27.** Wrapped generic weight decay in `{% if algorithm in ("sgd", "sgd_momentum") %}` so only SGD variants use L2 regularization. AdamW and Lion now use only their decoupled wd paths. Test: `TestTrain3AdamWDecoupledWd`. |
-| **TRAIN.4** | Cross-entropy (nll_loss) backward | `F.cross_entropy` decomposes to `log_softmax + nll_loss`. The backward produces `aten.nll_loss_backward` which is NOT in bwd_diff_table or any lowering. Most common classification loss. | 1 d | ✅ **CLOSED 2026-05-27, compile-path fix 2026-05-28.** Added `@register_lowering(aten.nll_loss_backward)` in `lowerings/loss.py`. Initial decomposition used `aten.scatter.src` which caused `AttributeError: aten.scatter_ has no overload 'default'` (Inductor current_node still pointed to `nll_loss_backward.default`). Fixed by replacing scatter with `ir.Pointwise.create` (arange via index_expr) + `eq` + `where` — pure pointwise IR, no scatter needed. Verified end-to-end through `torch.compile`: fwd+bwd+SGD training converges over multiple steps. Handles mean/sum/none reductions, per-class weight, ignore_index. Tests: `TestTrain4CrossEntropyBackward` (5 tests: eager direct, compile path, weighted, conv model, SGD training convergence). |
-| **TRAIN.5** | Pool allocator / extern-kernel buffer reuse | 6 GB VRAM GPU will OOM on multi-step training without buffer reuse. TRAIN.8 (pool allocator hook) and TRAIN.9 (50-step memory plateau) not started. | 2 d | ✅ **CLOSED 2026-05-27.** Routed conv backward output buffers (grad_input, grad_weight, grad_bias) through `pool_acquire()` for buffer reuse across training steps. The wrapper codegen already routes 95%+ of allocations through the pool; the remaining gap was bare `torch.zeros_like` calls in the conv backward eager impl. Test: `TestTrain5PoolAllocatorReuse`. |
-| **TRAIN.6** | Dynamic shapes for variable-batch training | Current codegen hardcodes batch size in push constants and spec constants. Variable batch → full recompilation. D.1 (symbolic shape foundation), D.2 (dynamic dispatch grid), D.3 (dynamic buffer binding) not started. | 3 d | ✅ **CLOSED 2026-05-28.** Phase 1: (a) Fixed spec constant emission to include default values (`[[vk::constant_id(N)]] const uint xnumel = VALUE;`) — previously emitted bare declarations defaulting to 0 in Slang, which would produce zero-iteration kernels. (b) Removed `numel` from `generic_pointwise_dispatch._make_cache_key` — SPIR-V uses numel as a push constant so source is shape-agnostic; including numel fragmented the slangc cache. (c) Dynamic batch path (`torch.compile(dynamic=True)`) routes batch-dependent numels through push constants (`dyn_numel`), grid via `dynamic_wg_counts()` — one SPIR-V works for all batch sizes. Phase 2 (descriptor rebinding) is implicit: each dispatch creates a fresh descriptor set with actual buffer sizes via `dispatch.py`. Phase 3 (scheduler shape-agnostic IR) is an upstream Inductor change, not in backend scope. Test: `TestTrain6DynamicBatch` (4 tests: loss decrease B=4/8, no recompilation on batch switch, shape-agnostic cache key, spec constant defaults). |
-| **TRAIN.7** | Conv backward pure Slang codegen (upgrade from extern) | M-pipeline-8 tracks upgrading conv backward from the ratified `extern_kernels.conv2d_backward` to a pure `bwd_diff(conv_inner_madd)` Slang codegen path. The eager path already has this (`_slang_tile_conv2d_bwd`). | 2 d | ✅ **CLOSED 2026-05-27.** Routed `_conv2d_backward_impl` to `_slang_tile_conv2d_bwd` for fp32 Vulkan groups==1 (single Slang compute dispatch, no CPU roundtrip). Falls back to `aten.convolution_backward` for groups>1 or non-fp32. Test: `TestTrain7ConvBackwardPureSlang`. |
-| **TRAIN.8** | Conv training correctness sweep | End-to-end correctness validation for 3 conv model classes under torch.compile: (A) Conv+BN+FC (ResNet-mini), (B) Conv+GN+ReLU+FC (SmallCNN), (C) Conv+MaxPool+FC (SimpleCNN). Each must match CPU loss curve within rtol=0.5 over 10 training steps. | 0.5 d | ✅ **CLOSED 2026-05-28 (forward-only compile).** Partitioner blocker resolved via forward-only compilation pattern: `@torch.compile(backend="vulkan")` wraps only the forward pass, while loss computation and backward remain in eager autograd. This bypasses the AOT partitioner entirely (no joint graph = no partitioner error). Tested with conv-only models (no Linear/addmm). Tests: `TestTrain8ConvTrainingSweep` (3 models × 10 steps, CPU-Vulkan parity). See `docs/plans/option-c-forward-only-architecture.md` for rationale. |
-| **TRAIN.9** | Missing training-critical eager ops (reciprocal) | `clip_grad_norm_()` calls `max_norm / (total_norm + 1e-6)` → `__rdiv__` → `self.reciprocal()` → `aten::reciprocal.out`. Not registered in PrivateUse1 backend → RuntimeError. Blocks any training loop with gradient clipping. | 0.25 d | ✅ **CLOSED 2026-05-27.** Added `vulkan_reciprocal()` + `vulkan_reciprocal_out()` using `unary_reciprocal_fwd` shader (already in generated/shaders.h). Registered both `reciprocal` and `reciprocal.out` in Registration.cpp. Test: `TestTrain9ReciprocalOp`. |
-| **TRAIN.10** | Benchmark async dispatch sync | `_vulkan_benchmark` routes to `benchmark_cpu()` whose inner loop calls `callable_()` warmup+rep times without GPU sync. Vulkan dispatches are async → command buffer fills → `VK_ERROR_OUT_OF_DEVICE_MEMORY` → ALL candidates return Infinity. Blocks addmm/mm autotune — SmallCNN North Star crashes with `best_time: Infinity`. | 0.25 d | ✅ **CLOSED 2026-05-27.** Wrapped benchmark callable with `torch_vulkan.synchronize(0)` (calls `vkDeviceWaitIdle`) after each dispatch in the inner loop. File: `inductor/__init__.py:_vulkan_benchmark`. Test: `TestTrain10BenchmarkSync`. |
-| **TRAIN.11** | mm_tile.slang precompilation | Autotune fails with `mm_tile.slang-module not found after precompilation` for all addmm choices → `best_time: Infinity` → NoValidChoicesError. Root cause: M-NEW.5 level filtering (default level=1) skips mm_tile during prewarm, and the old `_ensure_mm_tile_module()` relied on the level-filtered `_ensure_shader_lib_modules()` which never compiled it. | 0.5 d | ✅ **CLOSED 2026-05-28.** Added `_compile_single_module(name)` that compiles a single shader-lib module on-demand, bypassing the M-NEW.5 level filter. Both `_ensure_mm_tile_module` and `_ensure_mm_int8_module` now use it. Linear layers now work through `torch.compile` without requiring `TORCH_VULKAN_PREWARM_LEVEL=2`. Verified: `mm_tile.slang-module` (124 KB) compiles and caches correctly on first use. Test: `debug_mm_tile_compile.py`. |
-| **TRAIN.12** | Multi-norm backward tiling assertion | Models with 2+ GroupNorm/BatchNorm layers crash in upstream Inductor's `tiling_utils.get_pw_red_splits()` assertion (line 271): `assert get_hint(prod(sizes[0])) == get_hint(pw_numel * red_numel)`. The scheduler fuses backward reduction nodes from different norm layers (with different reduction dims) into one `FusedSchedulerNode`. `analyze_reads_and_writes` then calls `get_pw_red_splits` w/o `none_if_not_divisible=True`, hitting the assertion. Blocks SmallCNN (2 GN) and ResNet-mini (3 GN). | 1 d | ✅ **CLOSED 2026-05-28.** Added Vulkan `can_fuse` guard: reject fusion of two reductions with different `(numel, rnumel)` groups. This prevents the upstream assertion by keeping incompatible reductions in separate kernels. Semantically correct — on Vulkan, two reductions with different rnumel can't share a workgroup reduction strategy anyway. Removed xfail from `test_small_cnn_conv_gn_relu_fc` and `test_resnet_block_conv_gn_residual_fc`. Test: same 2 tests now unxfail. |
-| **TRAIN.13** | Test infra: AdamW full-compile pattern + BN backward | (a) `test_adamw_optimizer` compiles backward INSIDE `torch.compile` (loss+backward in inner function), risking AOT partitioner "Node invalid" error. Should use forward-only pattern. (b) `test_multi_architecture_loss_decreases` uses BatchNorm2d — need to verify all BN eager backward sub-ops have Vulkan PrivateUse1 registration (welford backward, normalize backward, scale/shift backward). | 0.5 d | ✅ **CLOSED 2026-05-28.** (a) Switched `test_adamw_optimizer` to forward-only compile: forward pass is compiled, loss+backward run in eager autograd. Uses log_softmax+gather+neg+sum manual cross-entropy to avoid AOT partitioner. (b) `test_multi_architecture_loss_decreases` already uses forward-only pattern via `_train_loop_vulkan_compiled`. BN backward ops route through eager Vulkan PrivateUse1 ops (welford, normalize, scale/shift). Test: `test_adamw_optimizer`, `test_multi_architecture_loss_decreases`. |
+Detailed closeout notes archived in
+[`docs/archive/v8-closeouts-2026-05-28.md`](archive/v8-closeouts-2026-05-28.md).
 
-## TRAIN.12 analysis — multi-norm backward tiling assertion
+| # | Title | Close date | Regression test |
+|---|-------|-----------|-----------------|
+| TRAIN.1 | Loss backward reachability (6 loss bwd decomps suppressed) | 2026-05-27 | `TestTrain1LossBackwardReachability` |
+| TRAIN.2 | MaxPool2d backward scatter codegen (replaces FallbackKernel + CPU roundtrip) | 2026-05-27 | `TestTrain2MaxPoolBackwardCodegen` |
+| TRAIN.3 | AdamW/Lion decoupled weight decay (L2 gate by algorithm) | 2026-05-27 | `TestTrain3AdamWDecoupledWd` |
+| TRAIN.4 | Cross-entropy (nll_loss) backward lowering | 2026-05-28 | `TestTrain4CrossEntropyBackward` |
+| TRAIN.5 | Pool allocator reuse for conv backward output buffers | 2026-05-27 | `TestTrain5PoolAllocatorReuse` |
+| TRAIN.6 | Dynamic shapes for variable-batch training (spec const defaults + shape-agnostic cache keys) | 2026-05-28 | `TestTrain6DynamicBatch` |
+| TRAIN.7 | Conv backward via pure Slang codegen (replaces extern) | 2026-05-27 | `TestTrain7ConvBackwardPureSlang` |
+| TRAIN.8 | Conv training correctness sweep (SimpleCNN/SmallCNN/ResNet-mini) | 2026-05-28 | `TestTrain8ConvTrainingSweep` |
+| TRAIN.9 | aten::reciprocal registration (blocks clip_grad_norm_) | 2026-05-27 | `TestTrain9ReciprocalOp` |
+| TRAIN.10 | Benchmark async dispatch sync (VK_OOM fix) | 2026-05-27 | `TestTrain10BenchmarkSync` |
+| TRAIN.11 | mm_tile.slang precompilation bypass level filter | 2026-05-28 | `debug_mm_tile_compile.py` |
+| TRAIN.12 | Multi-norm backward can_fuse guard (tiling assertion) | 2026-05-28 | TestTrain8 unxfail |
+| TRAIN.13 | Test infra fixes: forward-only compile + BN backward | 2026-05-28 | TestTrain8 (AdamW, multi-arch) |
 
-**Error path** (reproduced on SmallCNN/ResNet-mini with forward-only compile):
-```
-tiling_utils.py:271  AssertionError
-assert get_hint(sympy_product(n._body.sizes[0])) == get_hint(pointwise_numel * red_numel)
-```
+### Residual xfails (open)
 
-**Root chain**:
-1. Model has 2+ norm layers (e.g. GN(4,16) + GN(4,32))
-2. Backward graph has reduction nodes from each norm: different `(numel, rnumel)` pairs
-3. Upstream `SIMDScheduling.can_fuse()` considers them fusible (same group tag or compatible iteration vars)
-4. The scheduler creates a `FusedSchedulerNode` with mixed group `(pw_numel_1, red_numel_1)` containing a sub-node from group `(pw_numel_2, red_numel_2)`
-5. `NodeSplitGetter.__init__` (line 327) uses `none_if_not_divisible=True` — safe
-6. `analyze_reads_and_writes` (line 552) calls without it — **assertion fires**
+Two tests in v8 suites still carry `pytest.xfail` markers for known
+blockers that are out-of-scope for the milestone they were filed against:
 
-**Fix strategies** (ranked by effort/risk):
+- `TestTrain5PoolAllocatorReuse.test_vram_plateaus_across_training_steps`
+  — xfailed by "0-d scalar div" partitioner blocker (multi-step training
+  with AOT joint graph triggers an unsupported scalar division).
+- `TestTrain7ConvBackwardPureSlang.test_conv_backward_through_compile`
+  — xfailed by "Tensor has no backing Vulkan buffer" in compile path
+  (eager path works; compile path has memory-planning gap).
 
-1. **Vulkan `can_fuse` guard** (0.5 d) — In `scheduling.py:can_fuse`, check that when both nodes are reductions (`rnumel > 1`), their `(numel, rnumel)` groups match. If not, reject fusion. This prevents the problematic case upstream of the assertion. Risk: misses legitimate fusion opportunities.
+---
 
-2. **Upstream patch** (0.25 d) — Patch `tiling_utils.py:552` to use `none_if_not_divisible=True` + handle the `None` return. Cleanest fix but modifies upstream code.
+# § v9 — Compile-Path Completeness & Codegen Hygiene (2026-05-28)
 
-3. **`torch._inductor.config.max_fusion_size = 1`** (0.01 d) — Blunt instrument: disables multi-node fusion entirely. Correct but kills all fusion benefits. Useful as a diagnostic.
+> **v9 (2026-05-28)** — v7/v8 closed all milestones. v9 targets the
+> **remaining compile-path blockers and codegen gaps** that prevent
+> arbitrary CNN training (ResNet/EfficientNet/MobileNet) through
+> `torch.compile(backend="inductor")` with full AOT backward.
+>
+> The forward-only compile pattern (v8 escape hatch) works for 3 small
+> conv architectures. Full AOT backward works in standalone scripts but
+> fails in pytest. v9 aims to make full AOT backward reliable and
+> eliminate the forward-only workaround.
 
-**Recommended**: Strategy 1 (Vulkan `can_fuse` guard). It's a 2-line check that only affects the Vulkan backend, doesn't modify upstream, and is the semantically correct thing — two reductions with different reduction dims should not be fused on Vulkan anyway.
+## v9 pillars
 
-```python
-# In scheduling.py:can_fuse, before calling super().can_fuse():
-if rnumel1 > 1 and rnumel2 > 1:
-    if (numel1, rnumel1) != (numel2, rnumel2):
-        return False  # Don't fuse reductions with incompatible shapes
-```
+| # | Pillar | Goal |
+|---|--------|------|
+| **M-COMPILE** | Compile-path blockers | Fix the 3 residual compile-path xfails (conv bwd "no backing buffer", scalar div in joint graph, addmm autotune). Make `torch.compile(backend="inductor")` with loss+backward in the compiled function work reliably. |
+| **M-DECOMP** | Decomposition gaps | Suppress upstream decomps that eat ops before Vulkan lowerings fire. Ensure all registered `@register_lowering` ops are actually reachable. |
+| **M-CODEG** | FallbackKernel → pure codegen | Replace `make_fallback`/`FallbackKernel` paths with fused Slang codegen or `bwd_diff` table entries. Targets: optimizer steps, avg_pool2d_backward, convolution_backward. |
+| **M-MODEL** | Model coverage | Expand to Conv3d, BatchNorm running stats, LSTM/GRU cell compile-path, and autotune CUDA-filter. |
 
-## v8 status tracking
+## v9 milestones
+
+| # | Pillar | Title | Why | Effort | Status |
+|---|--------|-------|-----|--------|--------|
+| **COMPILE.1** | M-COMPILE | Conv backward compile-path memory planning | `TestTrain7ConvBackwardPureSlang.test_conv_backward_through_compile` xfailed: "Tensor has no backing Vulkan buffer". Eager path works. Compile path produces an FX graph where conv_bwd output tensors lack Vulkan backing buffers — memory planner issue. | 1 d | 🔲 OPEN |
+| **COMPILE.2** | M-COMPILE | Joint-graph scalar div in multi-step training | `TestTrain5PoolAllocatorReuse.test_vram_plateaus_across_training_steps` xfailed: "0-d scalar div" partitioner blocker. AOT partitioner can't handle 0-d scalar operations that arise in multi-step training with joint fwd+bwd graph. Either register scalar ops via PrivateUse1 or route through Inductor's scalar lowering. | 1.5 d | 🔲 OPEN |
+| **COMPILE.3** | M-COMPILE | Linear (addmm) compile-path autotune | Models with `nn.Linear` fail `aten.addmm` autotune: `mm_tile` choices either return `NoValidChoicesError` or `best_time: Infinity`. Workaround: 1×1 Conv classifier. Fix: either wire addmm through the Vulkan mm lowering directly (bypassing autotune) or fix the mm_tile autotune path. | 1 d | 🔲 OPEN |
+| **DECOMP.1** | M-DECOMP | Suppress _softmax / _log_softmax upstream decomps | `aten._softmax` and `aten._log_softmax` are in `inductor_decompositions` (decomposition.py:79/94) but not in Vulkan `ops_to_suppress`. Vulkan lowerings exist (`lowerings/softmax.py`) but never fire because upstream decomp produces the same primitives first. Suppress so Vulkan lowerings are reachable. | 0.25 d | ✅ **CLOSED 2026-05-28.** Added `_softmax.default` and `_log_softmax.default` to `ops_to_suppress` in `lowerings/__init__.py`. |
+| **DECOMP.2** | M-DECOMP | convolution_backward bias gradient decomp | Upstream Inductor decomp at decomposition.py:306 splits `convolution_backward` into `bias_grad = sum(grad, dims)` + recursive `convolution_backward(..., output_mask=(T,T,F))`. Vulkan doesn't suppress this. The bias gradient goes through `aten.sum` (works), but the recursive backward call may not route correctly. Analyse and suppress or adapt. | 0.5 d | 🔲 OPEN |
+| **CODEGEN.1** | M-CODEG | Optimizer steps via Slang foreach codegen | SGD/AdamW/Lion foreach steps currently use `make_fallback` (FallbackKernel IR nodes) that dispatch to eager Slang templates. Should route through the Slang foreach template as pure codegen via `@register_lowering` — same pattern as max_pool2d_scatter_bwd. | 1.5 d | 🔲 OPEN |
+| **CODEGEN.2** | M-CODEG | Avg pool backward pure codegen | `aten.avg_pool2d_backward` is FallbackKernel (upstream uses `indirect_indexing` → wrong SPIR-V). Needs Slang codegen using average-weight scatter, similar to max_pool2d scatter_bwd from TRAIN.2. | 1 d | 🔲 OPEN |
+| **CODEGEN.3** | M-CODEG | Conv backward via bwd_diff table | `_conv2d_backward_impl` routes through a custom eager op. Should move to `bwd_diff_table` with `bwd_diff(conv_inner_madd)` so the full backward goes through the autodiff → Slang codegen pipeline (single dispatch, no eager adapter). | 1.5 d | 🔲 OPEN |
+| **MODEL.1** | M-MODEL | Conv3d native Vulkan path | No native Vulkan Conv3d. aten.conv3d falls to aten extern → TypeError on Vulkan. Blocks 3D U-Net, C3D, video models. Requires tiledConv3d Slang template. | 2 d | 🔲 OPEN |
+| **MODEL.2** | M-MODEL | BatchNorm running stats in compiled training | `aten::_native_batch_norm_legit` running_mean/running_var mutations disabled in compiled path. Single-step gradients correct, but multi-step training accumulates wrong running stats. Either register the running stats ops or replace BN with GN (current workaround). | 1 d | 🔲 OPEN |
+| **MODEL.3** | M-MODEL | Convolution autotune CUDA-filter | `select_algorithm.py` generates Triton/CUDA-only conv kernel choices. Vulkan backend needs to inject its own Slang conv choices or filter out CUDA ones before autotune evaluation. | 1 d | 🔲 OPEN |
+| **TEST.1** | M-COMPILE | TRAIN.11 regression test in suite | `debug_mm_tile_compile.py` is a standalone debug script, not in `test_inductor_regression.py`. Roadmap discipline requires every milestone to have a regression test in the suite. | 0.25 d | 🔲 OPEN |
+
+## v9 status tracking
 
 | Milestone | Status | Blocked by | Regression test |
 |-----------|--------|------------|-----------------|
-| TRAIN.1 | ✅ CLOSED | — | `TestTrain1LossBackwardReachability` |
-| TRAIN.2 | ✅ CLOSED | — | `TestTrain2MaxPoolBackwardCodegen` |
-| TRAIN.3 | ✅ CLOSED | — | `TestTrain3AdamWDecoupledWd` |
-| TRAIN.4 | ✅ CLOSED | — | `TestTrain4CrossEntropyBackward` |
-| TRAIN.5 | ✅ CLOSED | — | `TestTrain5PoolAllocatorReuse` |
-| TRAIN.6 | ✅ CLOSED | — | `TestTrain6DynamicBatch` |
-| TRAIN.7 | ✅ CLOSED | — | `TestTrain7ConvBackwardPureSlang` |
-| TRAIN.8 | ✅ CLOSED | — | `TestTrain8ConvTrainingSweep` (forward-only compile) |
-| TRAIN.9 | ✅ CLOSED | — | `TestTrain9ReciprocalOp` |
-| TRAIN.10 | ✅ CLOSED | — | `TestTrain10BenchmarkSync` |
-| TRAIN.11 | ✅ CLOSED | — | `debug_mm_tile_compile.py` |
-| TRAIN.12 | ✅ CLOSED | — | `test_small_cnn_*`, `test_resnet_block_*` (unxfail) |
-| TRAIN.13 | ✅ CLOSED | — | `test_adamw_optimizer`, `test_multi_architecture_*` |
+| COMPILE.1 | 🔲 OPEN | — | `TestTrain7...test_conv_backward_through_compile` (remove xfail) |
+| COMPILE.2 | 🔲 OPEN | — | `TestTrain5...test_vram_plateaus_across_training_steps` (remove xfail) |
+| COMPILE.3 | 🔲 OPEN | — | New test |
+| DECOMP.1 | ✅ CLOSED | — | `TestDecomp1SoftmaxLoweringReachable` (new) |
+| DECOMP.2 | 🔲 OPEN | — | Test pending |
+| CODEGEN.1 | 🔲 OPEN | — | Test pending |
+| CODEGEN.2 | 🔲 OPEN | — | Test pending |
+| CODEGEN.3 | 🔲 OPEN | — | Test pending |
+| MODEL.1 | 🔲 OPEN | — | Test pending |
+| MODEL.2 | 🔲 OPEN | — | Test pending |
+| MODEL.3 | 🔲 OPEN | — | Test pending |
+| TEST.1 | 🔲 OPEN | — | `TestMmTilePrecompilation` (new) |
 
-## TRAIN.8 test coverage matrix (current state)
+---
 
-| Test | Arch | Norm | Compile pattern | Status | Blocker |
-|------|------|------|-----------------|--------|---------|
-| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
-| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
-| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
-| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
-| `test_multi_architecture_loss_decreases` | Conv+**GN**+Pool+1×1Conv | 1 GN | Forward-only | ✅ Pass | — |
+# § v8 closeout analysis (archived)
 
-**v8 status: 13/13 milestones closed.** All TRAIN.8 tests unxfail.
+## TRAIN.8 test coverage matrix
 
-## Compilation Patterns & AOT Analysis (2026-05-28)
+| Test | Arch | Norm | Status |
+|------|------|------|--------|
+| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | ✅ Pass |
+| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | ✅ Pass |
+| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | ✅ Pass |
+| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | ✅ Pass |
+| `test_multi_architecture_loss_decreases` | Conv+GN+Pool+1×1Conv | 1 GN | ✅ Pass |
 
-### Forward-only compilation (TRAIN.8 tests)
+## Compilation patterns
 
-All TRAIN.8 tests use **forward-only compilation**: the compiled function
-returns only logits, while loss and backward happen in eager autograd:
-
-```python
-@torch.compile(backend="inductor")
-def forward_only(x):
-    return model(x)
-
-out = forward_only(x_vk)
-loss = F.cross_entropy(out, y_vk, reduction="sum")
-loss.backward()
-optimizer.step()
-```
-
-This avoids the AOT partitioner's "Node was invalid, but is output" error
-that occurs when `nll_loss_forward`'s `total_weight` output depends on
-`target` (backward-only) in the joint forward/backward graph.
-
-### Full AOT backward (proven in standalone)
-
-Full AOT compilation (forward+loss+backward through Slang codegen) works
-in standalone scripts:
-
-```python
-@torch.compile(backend="inductor")
-def train_step(x, target):
-    out = model(x)
-    loss = F.cross_entropy(out, target)  # routes through patched nll_loss_forward
-    loss.backward()
-    return loss
-```
-
-**Results** (`agent_space/min_debug_aot_bwd2.py`): 57 Vulkan dispatches,
-14.8s warm compile, correct loss values for SmallCNN+GN.
-
-**Pytest limitation**: The same code fails in pytest with the partitioner
-error despite `aot_cross_entropy.py` properly removing `nll_loss_forward`
-from Inductor's decomp table. Root cause under investigation — likely
-Dynamo state management difference between standalone Python and pytest
-test collection. `@register_decomposition` approach was rejected (conflicts
-with upstream `torch._decomp` registration).
-
-### GroupNorm replacement
-
-`aten::_native_batch_norm_legit` is NOT registered on Vulkan PrivateUse1.
-All TRAIN.8 tests use **GroupNorm** instead (4-group for 16/32 ch).
-
-### Linear layer autotune
-
-Models with Linear layers fail `aten.addmm` autotune for large K dimensions.
-TRAIN.8 uses 1×1 Conv + AdaptiveAvgPool instead of Linear classifiers.
+- **Forward-only** (current standard): `@torch.compile` wraps forward pass only;
+  loss+backward in eager autograd. Avoids AOT partitioner errors.
+- **Full AOT** (works in standalone, fails in pytest): forward+loss+backward
+  through compiled function. Blocked by Dynamo state management in pytest.
+- **GroupNorm for BatchNorm**: `_native_batch_norm_legit` not on PrivateUse1.
+- **1×1 Conv for Linear**: addmm autotune fails for large K dims.
 
 ---
 
