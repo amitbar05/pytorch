@@ -223,18 +223,41 @@ def _register_batch_norm_forward() -> None:
             rstd_1d = L.lowerings[aten.view.default](rstd_kd, [C])
             normalized = L.lowerings[aten.mul.Tensor](dx, rstd_kd)
 
-            # M22.15 follow-up: running_mean/running_var copy_ mutations are
-            # temporarily disabled in the compiled path.  The copy_ makes
-            # running_mean an InplacedBuffer (buffer ID 1, RW).  In the joint
-            # forward+backward compiled graph the Welford m2 output is also
-            # assigned buffer ID 1, causing a struct conflict where out_ptr1 is
-            # absent from KernelArgs → slangc error.  Running stats correctness
-            # in multi-step compiled training is a known limitation tracked in
-            # the roadmap.  The gradient-parity tests only require correct
-            # save_mean / save_invstd (computed from the Welford), not running
-            # stats, so disabling the copy_ fixes those tests without affecting
-            # the gradient correctness goal.
-            pass
+            # MODEL.2: running_mean / running_var EMA update (training mode).
+            # Compute new stats using pointwise ops that produce plain IR
+            # buffers (no InplacedBuffer), then use copy_ to write back.
+            # realize() on both new_* tensors before copy_ forces separate
+            # dispatches so the copy_ mutations don't alias with the
+            # normalization kernel's intermediates.
+            if running_mean is not None and running_var is not None:
+                one_minus_mom = 1.0 - float(momentum)
+                mom = float(momentum)
+
+                # new_running_mean = running_mean * (1 - momentum) + mean_1d * momentum
+                rm_decay = L.lowerings[aten.mul.Scalar](running_mean, one_minus_mom)
+                rm_new_contrib = L.lowerings[aten.mul.Scalar](mean_1d, mom)
+                new_rm = L.lowerings[aten.add.Tensor](rm_decay, rm_new_contrib)
+
+                # new_running_var = running_var * (1 - momentum) + unbiased_var * momentum
+                # PyTorch uses unbiased variance (Bessel correction) for running_var
+                if N_eff > 1:
+                    unbiased_factor = float(N_eff) / float(N_eff - 1)
+                    unbiased_var = L.lowerings[aten.mul.Scalar](var_1d, unbiased_factor)
+                else:
+                    unbiased_var = var_1d
+
+                rv_decay = L.lowerings[aten.mul.Scalar](running_var, one_minus_mom)
+                rv_new_contrib = L.lowerings[aten.mul.Scalar](unbiased_var, mom)
+                new_rv = L.lowerings[aten.add.Tensor](rv_decay, rv_new_contrib)
+
+                # Force materialization before copy_ to avoid InplacedBuffer
+                # aliasing with the normalization kernel's Welford intermediates.
+                new_rm.realize()
+                new_rv.realize()
+
+                # Write back via copy_ (in-place mutation on running stats)
+                L.lowerings[aten.copy_.default](running_mean, new_rm)
+                L.lowerings[aten.copy_.default](running_var, new_rv)
         else:
             if running_mean is None or running_var is None:
                 return NotImplemented
