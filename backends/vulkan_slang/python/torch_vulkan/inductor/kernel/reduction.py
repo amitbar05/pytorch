@@ -623,7 +623,109 @@ class ReductionMixin(ReductionLoadMixin):
         sorter,
         sorter_indices,
     ):
-        raise NotImplementedError(
-            "Vulkan Inductor: bucketize not yet implemented via Slang codegen. "
-            "Set TORCHINDUCTOR_DISABLE_COMBO_KERNEL=1 to avoid searchsorted/topk patterns."
+        """Emit inline Slang binary search for bucketize in the combo kernel path.
+
+        For each value, find the insertion point in the sorted boundaries array.
+        This is called during Inductor's combo kernel codegen (e.g.,
+        searchsorted / topk patterns within a combined kernel).
+
+        The common case (sorted boundaries, no sorter) uses an iterative
+        binary search over the boundaries buffer.  The ``sorter`` parameter
+        (unsorted boundaries with an indirection permutation) is not yet
+        supported — raises ``NotImplementedError`` with a fallback hint.
+
+        Args:
+            values: CSEVariable (already-loaded Slang expression for this lane)
+            boundaries: ``tuple[str, sympy.Expr, sympy.Expr, sympy.Expr]`` —
+                (buffer outer name, last-dim size, underlying numel, stride).
+            boundary_indices: CSEVariable (flat offset into boundaries buffer)
+            indexing_dtype: ``torch.int32`` or ``torch.int64``
+            right: bool — True → ``val >= b[i]``; False → ``val > b[i]``
+            sorter: optional tuple for unsorted boundaries (not implemented)
+            sorter_indices: CSEVariable for sorter (not implemented)
+
+        Returns:
+            CSEVariable containing the bucket index (0 = before first boundary,
+            boundary_size = after last boundary).
+        """
+        if sorter is not None:
+            raise NotImplementedError(
+                "Vulkan Inductor: bucketize with sorter (unsorted boundaries) "
+                "not yet implemented.  Set TORCHINDUCTOR_DISABLE_COMBO_KERNEL=1 "
+                "to fall back to separate dispatch."
+            )
+
+        # Resolve boundary buffer name → Slang variable.
+        boundaries_name = boundaries[0]
+        boundaries_inner = self.args.input(boundaries_name)
+        boundaries_buf = self._buf_path(boundaries_inner)
+
+        # Convert sympy expressions to Slang strings.
+        boundary_size = self.index_to_str(boundaries[1])
+        boundary_stride = self.index_to_str(boundaries[3])
+        underlying_numel = self.index_to_str(boundaries[2])
+
+        # Already-loaded CSEVariable strings.
+        val_str = str(values)
+        bi_str = str(boundary_indices)
+
+        # Slang integer type for indexing.
+        idx_type = "int" if indexing_dtype == torch.int32 else "long"
+
+        # Unique suffix for variable names.
+        uid = self.cse.newvar(dtype=indexing_dtype)
+
+        # Low / high / range for binary search.
+        low_v = f"_bkt_low_{uid}"
+        high_v = f"_bkt_high_{uid}"
+        mid_v = f"_bkt_mid_{uid}"
+        range_v = f"_bkt_range_{uid}"
+        bval_v = f"_bkt_bval_{uid}"
+        above_v = f"_bkt_above_{uid}"
+
+        # Emit binary-search loop.
+        self.compute.writeline(f"{idx_type} {low_v} = 0;")
+        self.compute.writeline(f"{idx_type} {high_v} = (int)({boundary_size});")
+        self.compute.writeline(f"uint {range_v} = (uint)({boundary_size}) + 1u;")
+        self.compute.writeline(f"while ({range_v} > 1u) {{")
+        self.compute.writeline(
+            f"    {idx_type} {mid_v} = ({high_v} + {low_v}) / 2;"
         )
+
+        # Buffer offset: boundary_indices + stride * mid.
+        off_expr = f"(int)({bi_str}) + (int)({boundary_stride}) * {mid_v}"
+
+        # Bounds check: offset < underlying_numel AND mid < boundary_size.
+        self.compute.writeline(
+            f"    if ((uint)({off_expr}) < (uint)({underlying_numel})"
+            f" && {mid_v} < (int)({boundary_size})) {{"
+        )
+        self.compute.writeline(
+            f"        float {bval_v} = float({boundaries_buf}[{off_expr}]);"
+        )
+
+        # Comparison: right=True → val >= bval; right=False → val > bval.
+        if right:
+            cmp_expr = f"(({val_str}) >= {bval_v})"
+        else:
+            cmp_expr = f"(({val_str}) > {bval_v})"
+
+        # NaN handling: NaN always "above" → pushes index to end.
+        self.compute.writeline(
+            f"        bool {above_v} = {cmp_expr} || (({val_str}) != ({val_str}));"
+        )
+        self.compute.writeline(
+            f"        {low_v} = {above_v} ? {mid_v} + 1 : {low_v};"
+        )
+        self.compute.writeline(
+            f"        {high_v} = {above_v} ? {high_v} : {mid_v};"
+        )
+        self.compute.writeline(f"    }}")
+        self.compute.writeline(
+            f"    {range_v} = ({range_v} + 1u) / 2u;"
+        )
+        self.compute.writeline(f"}}")
+
+        # Result: low_v contains the bucket index.
+        result = self.cse.generate(self.compute, low_v, dtype=indexing_dtype)
+        return result
