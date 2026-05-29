@@ -220,55 +220,23 @@ def _ensure_conv2d_with_optional_bias_op_registered() -> "object":
                 # Same bias fix as groups==1: clean reduction, not Slang atomic add
                 g_b = grad_output.sum([0, 2, 3]) if has_bias else None
         else:
-            # M17.8.d.2 — IDEAL ROUTING (currently blocked):
-            # We would prefer to route through the opaque
-            # ``torch.ops.torch_vulkan.conv2d_backward.default`` custom op
-            # here so AOTAutograd's joint trace lands a single FX node
-            # rather than decomposing into ``empty_like`` sub-ops that the
-            # partitioner collapses to literal zeros. The op IS registered
-            # (see ``_ensure_conv2d_backward_op_registered``) but Inductor
-            # has no lowering for it yet — ``make_fallback`` must be added
-            # in ``lowerings/__init__.py`` (Matmul-3D territory; queued for
-            # parent-agent integration after M19.1).
-            #
-            # Until then, fall through to ``aten.convolution_backward.default``.
-            # The M18.3 fix to ``op_registration.py:_layer_norm_bwd_meta`` /
-            # ``_linear_bwd_meta`` / etc. (now using ``new_empty(shape)``
-            # rather than ``empty_like``) keeps this path producing
-            # non-zero gradients during AOT trace.
-            bias_sizes = [int(w.shape[0])] if has_bias else None
-            result = torch.ops.aten.convolution_backward.default(
-                grad_output,
+            # COMPILE.1: Route through torch_vulkan.conv2d_backward custom op.
+            # This is an opaque FX node (make_fallback at lowerings/__init__.py:438)
+            # that at runtime dispatches _slang_tile_conv2d_bwd in a single
+            # Slang compute dispatch (no CPU roundtrip).
+            _bwd_result = torch.ops.torch_vulkan.conv2d_backward.default(
                 inp,
+                grad_output,
                 w,
-                bias_sizes,
-                ctx.stride,
-                ctx.padding,
-                ctx.dilation,
-                False,
-                [0] * len(ctx.stride),
+                list(ctx.stride),
+                list(ctx.padding),
+                list(ctx.dilation),
                 int(groups),
-                [True, True, has_bias],
+                has_bias,
             )
-            g_inp = (
-                result[0]
-                if result[0] is not None
-                else inp.new_empty(inp.shape).zero_()
-            )
-            g_w = (
-                result[1]
-                if result[1] is not None
-                else w.new_empty(w.shape).zero_()
-            )
-            g_b = (
-                result[2]
-                if len(result) > 2 and result[2] is not None and has_bias
-                else (
-                    w.new_empty((int(w.shape[0]),)).zero_()
-                    if has_bias
-                    else None
-                )
-            )
+            g_inp = _bwd_result[0]
+            g_w = _bwd_result[1]
+            g_b = _bwd_result[2] if len(_bwd_result) > 2 else None
         return g_inp, g_w, g_b if has_bias else None, None, None, None, None
 
     conv_op.register_autograd(_conv2d_backward, setup_context=_conv2d_setup_context)
