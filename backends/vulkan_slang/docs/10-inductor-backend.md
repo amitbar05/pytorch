@@ -287,7 +287,7 @@ blockers that are out-of-scope for the milestone they were filed against:
 |---|--------|-------|--------|--------|
 | **GAP.1** | V10-GAP | Runtime suppress→lowering invariant test | 0.25 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_gap_analysis.py` passed (41/41). |
 | **BN.1** | V10-BN | BatchNorm2d forward through compile | 0.5 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_bn1_compile.py` — Conv+BN+ReLU forward compiled on Vulkan. running_mean/running_var on vulkan:0. |
-| **BN.2** | V10-BN | BatchNorm2d fwd+bwd through compile | 1 d | 🔲 OPEN |
+| **BN.2** | V10-BN | BatchNorm2d fwd+bwd through compile | 1 d | 🔲 **BLOCKED** — Dynamo traces running_mean.copy_ mutation into FX graph; Inductor compile fails on compiled graph with BN mutations. Forward-only compile works for BN inference but not training. Eager BN training works via pure-aten Python fallback. |
 | **DYN.1** | V10-DYN | Conv+GN+ReLU dynamic batch compile | 0.5 d | 🔲 OPEN |
 | **DYN.2** | V10-DYN | Conv+BN+ReLU dynamic batch compile | 1 d | 🔲 OPEN |
 | **FP16.1** | V10-FP16 | Packed16 pointwise add/mul correctness | 0.5 d | 🔲 OPEN |

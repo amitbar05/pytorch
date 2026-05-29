@@ -370,26 +370,32 @@ def _register_optional_tensor_workarounds():
             if training:
                 # Compute mean and variance using ops with Vulkan lowerings
                 reduce_dims = [d for d in range(input.dim()) if d != 1]
-                # mean
+                # mean: reduce over N, H, W dims → shape [C]
                 mean_val = input.mean(dim=reduce_dims, keepdim=False)
                 # var: E[(x - mean)^2]
-                input_centered = input - mean_val.unsqueeze(1).unsqueeze(2).unsqueeze(3) if input.dim() == 4 else input - mean_val.reshape([1, -1] + [1] * (input.dim() - 2))
-                var_val = (input_centered * input_centered).mean(dim=reduce_dims, keepdim=False)
+                bcast = [1, -1] + [1] * (input.dim() - 2)
+                mean_b = mean_val.reshape(bcast)
+                input_centered = input - mean_b
+                var_val = (input_centered * input_centered).mean(
+                    dim=reduce_dims, keepdim=False
+                )
                 
                 # Normalize
                 invstd = 1.0 / (var_val + eps).sqrt()
-                invstd_b = invstd.reshape([1, -1] + [1] * (input.dim() - 2))
-                mean_b = mean_val.reshape([1, -1] + [1] * (input.dim() - 2))
-                weight_b = weight.reshape([1, -1] + [1] * (input.dim() - 2))
-                bias_b = bias.reshape([1, -1] + [1] * (input.dim() - 2))
+                invstd_b = invstd.reshape(bcast)
+                weight_b = weight.reshape(bcast)
+                bias_b = bias.reshape(bcast)
                 
                 out = (input - mean_b) * invstd_b * weight_b + bias_b
                 
                 # Update running stats
                 n = input.numel() // input.shape[1]
-                running_mean.copy_((1 - momentum) * running_mean + momentum * mean_val.detach())
+                running_mean.copy_(
+                    (1 - momentum) * running_mean + momentum * mean_val.detach()
+                )
                 running_var.copy_(
-                    (1 - momentum) * running_var + momentum * var_val.detach() * (n / (n - 1))
+                    (1 - momentum) * running_var
+                    + momentum * var_val.detach() * (n / (n - 1))
                 )
                 return out
         return _orig_batch_norm(
