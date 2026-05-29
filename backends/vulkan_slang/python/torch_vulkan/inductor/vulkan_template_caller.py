@@ -127,6 +127,12 @@ from .templates.caller.conv import (
     _slang_tile_conv2d,
     _slang_tile_conv2d_bwd,
 )
+from .templates.caller.conv3d import (
+    _render_conv3d_slang,
+    _render_conv3d_bwd_slang,
+    _slang_tile_conv3d,
+    _slang_tile_conv3d_bwd,
+)
 from .templates.caller.fft import (
     _dispatch_fft,
     _render_fft_stockham,

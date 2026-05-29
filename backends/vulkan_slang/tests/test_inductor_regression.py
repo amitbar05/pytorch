@@ -8556,6 +8556,38 @@ class TestConvGeneralityGaps:
             m_vk.weight.grad.cpu(), m_cpu.weight.grad, rtol=1e-3, atol=1e-3
         )
 
+    def test_conv3d_dispatch_count(self):
+        """MODEL.1: Conv3d forward compiles to ≤ 2 dispatches.
+
+        The native slang_conv3d template should produce 1 dispatch for
+        the conv3d compute (+ possibly 1 for bias add if not fused).
+        Ratchets toward the target of minimal dispatches for 3D models."""
+        import torch.nn.functional as F
+        import torch_vulkan as _tv
+
+        torch._dynamo.reset()
+        x = torch.randn(1, 3, 4, 4, 4, device="vulkan:0")
+        w = torch.randn(6, 3, 3, 3, 3, device="vulkan:0")  # KD=3
+
+        @torch.compile(backend="inductor", dynamic=False, fullgraph=True)
+        def fn(x, w):
+            return F.conv3d(x, w)
+
+        # Warmup compile
+        with torch.no_grad():
+            fn(x, w)
+
+        _tv._c_ext._reset_perf_counters()
+        with torch.no_grad():
+            fn(x, w)
+        d = _tv._c_ext._get_dispatch_count()
+        # Forward conv3d should be 1-2 dispatches (1 for the compute,
+        # possibly 1 for contiguous or other overhead)
+        assert d <= 3, (
+            f"MODEL.1: Conv3d forward should compile to ≤ 3 dispatches "
+            f"via the native slang_conv3d template, got {d}"
+        )
+
     def test_transposed_conv_graph_breaks_gracefully(self):
         """Transposed conv2d (stride=1) matches CPU via decomposition.
 

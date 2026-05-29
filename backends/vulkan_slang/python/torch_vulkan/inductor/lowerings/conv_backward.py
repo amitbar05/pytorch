@@ -177,17 +177,29 @@ def _get_conv_backward_lowering_impl():
         groups,
         output_mask,
     ):
-        # Gate on supported envelope: groups==1, not transposed, 4D, fp32.
+        # Gate on supported envelope: groups==1, not transposed, fp32.
         if bool(transposed):
             return NotImplemented
         g = int(groups)
         if g != 1:
             return NotImplemented
-        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
-            return NotImplemented
         if input.get_dtype() != torch.float32:
             return NotImplemented
         if input.get_device().type != "vulkan":
+            return NotImplemented
+
+        # MODEL.1: delegate 5D inputs to Conv3d backward lowering.
+        if len(input.get_size()) == 5 and len(weight.get_size()) == 5:
+            from .conv3d_backward import _get_conv3d_backward_lowering_impl
+
+            conv3d_impl = _get_conv3d_backward_lowering_impl()
+            return conv3d_impl(
+                grad_output, input, weight, bias_sizes,
+                stride, padding, dilation, transposed,
+                output_padding, groups, output_mask,
+            )
+
+        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
             return NotImplemented
 
         t_sizes = input.get_size()

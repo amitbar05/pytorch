@@ -33,10 +33,10 @@ Convolution Lowering Support Matrix (T4.12):
 |                                |                    | template. Backward inherited|
 |                                |                    | from Conv2d bwd (CG.M6).    |
 +--------------------------------+--------------------+-----------------------------+
-| Conv3d                          | ❌ Not supported   | Falls to ``aten.convolution``|
-|                                |                    | extern. 5-D tensor support  |
-|                                |                    | would require a new Slang   |
-|                                |                    | template + dispatch caller. |
+| Conv3d                          | ✅ Fwd+bwd (MODEL.1) | KD==1: reshape to Conv2d;    |
+|                                |                    | KD>1: native slang_conv3d    |
+|                                |                    | template. Backward via       |
+|                                |                    | slang_conv3d_bwd template.   |
 +--------------------------------+--------------------+-----------------------------+
 | Transposed conv                 | ❌ Not supported   | Falls to ``aten.convolution``|
 |                                |                    | extern. No Vulkan-native    |
@@ -62,10 +62,11 @@ Convolution Lowering Support Matrix (T4.12):
 |                                |                    | + ``amax`` reduction.       |
 +--------------------------------+--------------------+-----------------------------+
 
-Blockers for Conv3d / Transposed conv (T4.12):
+Blockers for Transposed conv (T4.12):
 
-- **Conv3d**: 5-D tensor support would require a new Slang
-  template + dispatch caller.
+- **Conv3d**: ✅ RESOLVED (MODEL.1) — native slang_conv3d template supports
+  all KD values. KD==1 still uses the faster reshape-to-Conv2d path;
+  KD>1 delegates to the native 3D template.
 - **Transposed conv**: No Vulkan-native ``conv_transpose`` path.
 
 M6 Phase 2 (T4.12 groups>1) — COMPLETE:
@@ -537,18 +538,16 @@ def _register_conv_and_pool_lowerings() -> None:
         )
 
     # ═════════════════════════════════════════════════════════════════════
-    # T4.12 — Conv3d compile-path lowering via reshape to Conv2d.
+    # T4.12 / MODEL.1 — Conv3d compile-path lowering.
     #
-    # Conv3d input [N, C, D, H, W] is reshaped to [N*D, C, H, W], and
-    # weight [C_out, C_in, KD, KH, KW] is reshaped to
-    # [C_out, C_in, KD*KH, KW].  This only preserves the original Conv3d
-    # semantics when KD == 1 (no cross-depth coupling).  For KD > 1 the
-    # 3-D kernel would couple depth slices incorrectly under a 2-D
-    # sliding window, so we return NotImplemented for those cases.
+    # KD==1 case: reshape input [N, C, D, H, W] → [N*D, C, H, W] and
+    # apply Conv2d. This is the fast path for per-frame spatial convolutions.
     #
-    # This is a pragmatic lowering that handles the common 1×K×K Conv3d
-    # pattern (e.g. video models with 2-D spatial conv applied per-frame).
-    # Full 3-D template support is deferred to a future milestone.
+    # KD>1 case: delegate to native slang_conv3d template (MODEL.1) which
+    # handles full 3D kernels including arbitrary kernel depth, stride,
+    # and dilation along the depth dimension.
+    #
+    # Both paths support groups==1 and fp32.
     # ═════════════════════════════════════════════════════════════════════
 
     def _conv3d_to_conv2d_lowering(
@@ -557,7 +556,7 @@ def _register_conv_and_pool_lowerings() -> None:
         """Reshape Conv3d args → Conv2d, dispatch, reshape back.
 
         KD==1 case: reshape [N,C,D,H,W] → [N*D,C,H,W], apply Conv2d.
-        KD>1 case: returns NotImplemented (full 3-D template deferred).
+        KD>1 case: delegate to native Conv3d template (MODEL.1).
         """
         if len(input.get_size()) != 5 or len(weight.get_size()) != 5:
             return NotImplemented
@@ -648,11 +647,14 @@ def _register_conv_and_pool_lowerings() -> None:
                 result_4d, [N, C_out, D_out, H_out_actual, W_out_actual]
             )
 
-        # KD > 1 or dD > 1 or sD > 1 — full 3-D kernel support is deferred.
-        # The previous per-depth-slice decomposition created many Conv2d
-        # dispatches and hit the same aten.convolution out= kwarg issue.
-        # A proper 3-D tiled template is planned for a future milestone.
-        return NotImplemented
+        # KD > 1 or dD > 1 or sD > 1 — full 3D kernel support via native
+        # Conv3d template (MODEL.1). Delegates to the dedicated
+        # slang_conv3d.slang template which handles arbitrary 3D kernels.
+        from .conv3d import _vulkan_conv3d_native_lowering
+
+        return _vulkan_conv3d_native_lowering(
+            input, weight, bias, stride, padding, dilation, groups
+        )
 
     # Register for aten.conv3d overloads so torch.nn.Conv3d and F.conv3d
     # both route through the reshape-to-Conv2d path.
