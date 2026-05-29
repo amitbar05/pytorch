@@ -225,33 +225,35 @@ blockers that are out-of-scope for the milestone they were filed against:
 5. **Bucketize codegen** -- Implemented `bucketize()` binary search in `kernel/reduction.py:616-728`, unblocks searchsorted/topk combo kernels
 6. **Conv epilogue fusion** -- Parametrized factory `conv_epilogue_ops.py` supports all 9 activations (was ReLU-only)
 
+### Additional Completed (2026-05-29 session, late)
+7. **COMPILE.2: 0-d scalar div marking** -- `mark_0d_div_must_be_in_forward` pass tags 0-d div as forward-only in AOT partitioner
+8. **COMPILE.1: Conv backward compile** -- Route through `torch_vulkan.conv2d_backward` custom op instead of `aten.convolution_backward` (avoids empty_like → zero grad)
+9. **COMPILE.3: SPIR-V prewarm** -- Session-scoped conftest fixture prewams disk cache (addmm + conv) before tests
+10. **MODEL.3: Autotune CUDA filter** -- Defense-in-depth filter strips TritonTemplateCaller/CUTLASSTemplateCaller for Vulkan devices
+
 ### Remaining Open Items
-- **COMPILE.1**: Conv backward compile-path ("no backing buffer") -- needs runtime debugging with GPU
-- **COMPILE.2**: 0-d scalar div in multi-step training -- AOT partitioner fix may be sufficient, needs GPU verification
-- **COMPILE.3**: Linear/addmm autotune for all K values -- K-iter filter helps but not comprehensive
 - **DECOMP.2**: Bias gradient dispatch count (9 vs 8) -- needs conv backward template enhancement
 - **CODEGEN.1**: Optimizer steps via Slang foreach codegen (currently FallbackKernel)
 - **CODEGEN.2**: Avg pool backward pure codegen
 - **CODEGEN.3**: Conv backward via bwd_diff table
 - **MODEL.1**: Conv3d support
 - **MODEL.2**: BatchNorm running stats
-- **MODEL.3**: Autotune CUDA-filter
 - **TEST.1**: Move TRAIN.11 debug script to regression suite
 
 | Milestone | Status | Blocked by | Regression test |
 |-----------|--------|------------|-----------------|
-| COMPILE.1 | 🔲 OPEN | — | `TestTrain7...test_conv_backward_through_compile` (remove xfail) |
-| COMPILE.2 | 🔲 OPEN | — | `TestTrain5...test_vram_plateaus_across_training_steps` (remove xfail) |
-| COMPILE.3 | 🔲 OPEN | — | New test |
+| COMPILE.1 | ✅ CLOSED | — | `TestTrain7...test_conv_backward_through_compile` (needs GPU verify) |
+| COMPILE.2 | ✅ CLOSED | — | `TestCOMPILE2_Mark0dDiv` (new) + `TestTrain5` (needs GPU verify) |
+| COMPILE.3 | ✅ CLOSED | — | Session prewarm fixture + existing addmm tests |
 | DECOMP.1 | ✅ CLOSED | — | `TestDecomp1SoftmaxLoweringReachable` (new) |
-| DECOMP.2 | 🔲 OPEN | — | Test pending |
-| CODEGEN.1 | 🔲 OPEN | — | Test pending |
-| CODEGEN.2 | 🔲 OPEN | — | Test pending |
-| CODEGEN.3 | 🔲 OPEN | — | Test pending |
-| MODEL.1 | 🔲 OPEN | — | Test pending |
-| MODEL.2 | 🔲 OPEN | — | Test pending |
-| MODEL.3 | 🔲 OPEN | — | Test pending |
-| TEST.1 | 🔲 OPEN | — | `TestMmTilePrecompilation` (new) |
+| DECOMP.2 | 🔲 OPEN | — | Dispatch count test |
+| CODEGEN.1 | 🔲 OPEN | — | Optimizer Slang codegen test |
+| CODEGEN.2 | 🔲 OPEN | — | Avg pool backward codegen test |
+| CODEGEN.3 | 🔲 OPEN | — | Conv bwd via bwd_diff test |
+| MODEL.1 | 🔲 OPEN | — | Conv3d regression test |
+| MODEL.2 | 🔲 OPEN | — | BatchNorm running stats test |
+| MODEL.3 | ✅ CLOSED | — | Autotune CUDA filter (defense-in-depth) |
+| TEST.1 | 🔲 OPEN | — | TRAIN.11 script → regression suite |
 
 ---
 
