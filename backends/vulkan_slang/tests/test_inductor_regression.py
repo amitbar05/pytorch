@@ -8466,10 +8466,10 @@ class TestConvGeneralityGaps:
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
     def test_conv3d_kd_gt_1_falls_back(self):
-        """Conv3d with KD>1: falls back to eager via NotImplemented.
+        """Conv3d with KD>1: native slang_conv3d template (MODEL.1).
 
-        The KD>1 path returns NotImplemented from the lowering, which
-        routes through the aten.convolution extern fallback."""
+        The KD>1 path now compiles via the dedicated slang_conv3d.slang
+        template instead of falling back to eager extern."""
         import torch.nn.functional as F
 
         torch._dynamo.reset()
@@ -8487,6 +8487,74 @@ class TestConvGeneralityGaps:
 
         ref = F.conv3d(x_cpu, w_cpu)
         assert out.shape == ref.shape, f"unexpected shape: {out.shape}"
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    def test_conv3d_forward_basic(self):
+        """MODEL.1: Conv3d forward basic — KD>1 with padding/stride.
+
+        Verifies that native Conv3d compilation produces correct output
+        values matching CPU for a simple 3D convolution case."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        m_cpu = nn.Conv3d(2, 4, kernel_size=3, padding=1)
+        m_vk = nn.Conv3d(2, 4, kernel_size=3, padding=1).to("vulkan:0")
+        m_vk.load_state_dict(m_cpu.state_dict())
+
+        x_cpu = torch.randn(1, 2, 6, 6, 6)
+        x_vk = x_cpu.to("vulkan:0")
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return m_vk(x)
+
+        with torch.no_grad():
+            out = fn(x_vk).cpu()
+
+        ref = m_cpu(x_cpu)
+        assert out.shape == ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}"
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+    def test_conv3d_backward_basic(self):
+        """MODEL.1: Conv3d backward gradient check.
+
+        Verifies that the Conv3d backward via slang_conv3d_bwd template
+        produces gradients that match CPU autograd."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        m_cpu = nn.Conv3d(2, 4, kernel_size=3, padding=1)
+        m_vk = nn.Conv3d(2, 4, kernel_size=3, padding=1).to("vulkan:0")
+        # Copy weights (no deepcopy across devices for nn.Module)
+        with torch.no_grad():
+            m_vk.weight.copy_(m_cpu.weight)
+            if m_vk.bias is not None:
+                m_vk.bias.copy_(m_cpu.bias)
+
+        x_cpu = torch.randn(1, 2, 4, 4, 4, requires_grad=True)
+        x_vk = x_cpu.detach().clone().to("vulkan:0").requires_grad_(True)
+
+        # Forward + backward on CPU
+        y_cpu = m_cpu(x_cpu)
+        loss_cpu = y_cpu.sum()
+        loss_cpu.backward()
+
+        # Forward + backward on Vulkan (compiled)
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return m_vk(x).sum()
+
+        loss_vk = fn(x_vk)
+        loss_vk.backward()
+
+        grad_vk = x_vk.grad.cpu()
+        grad_cpu = x_cpu.grad
+        torch.testing.assert_close(grad_vk, grad_cpu, rtol=1e-3, atol=1e-3)
+
+        # Check weight gradients
+        torch.testing.assert_close(
+            m_vk.weight.grad.cpu(), m_cpu.weight.grad, rtol=1e-3, atol=1e-3
+        )
 
     def test_transposed_conv_graph_breaks_gracefully(self):
         """Transposed conv2d (stride=1) matches CPU via decomposition.
@@ -61405,4 +61473,48 @@ class TestCODEGEN1_OptimizerExternKernel:
         op = _ensure_foreach_lion_step_op_registered()
         assert op is not None, (
             "CODEGEN.1: foreach_lion_step op must be registered"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestMODEL2_BatchNormLegitLowering:
+    """MODEL.2 — _native_batch_norm_legit lowering for running stats.
+
+    Suppresses _native_batch_norm_legit and _native_batch_norm_legit_functional
+    from the Inductor decomposition table so our lowering (which delegates
+    to native_batch_norm with copy_ mutations) handles running_mean/
+    running_var updates directly for multi-step training.
+    """
+
+    @pytest.mark.timeout(300)
+    def test_batch_norm_legit_lowering_registered(self):
+        """_native_batch_norm_legit has a Vulkan lowering."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        if not hasattr(aten, "_native_batch_norm_legit"):
+            pytest.skip("_native_batch_norm_legit not in this PyTorch version")
+        key = aten._native_batch_norm_legit.default
+        assert key in _inductor_lowerings, (
+            "MODEL.2: _native_batch_norm_legit.default must have a lowering"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_batch_norm_legit_functional_lowering_registered(self):
+        """_native_batch_norm_legit_functional has a Vulkan lowering."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        if not hasattr(aten, "_native_batch_norm_legit_functional"):
+            pytest.skip(
+                "_native_batch_norm_legit_functional not in this PyTorch"
+            )
+        key = aten._native_batch_norm_legit_functional.default
+        assert key in _inductor_lowerings, (
+            "MODEL.2: _native_batch_norm_legit_functional.default must "
+            "have a lowering"
         )

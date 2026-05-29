@@ -68,6 +68,13 @@ def _suppress_upstream_decomps() -> None:
         aten.native_group_norm_backward.default,
         aten.native_batch_norm_backward.default,
         aten.native_batch_norm.default,
+        # MODEL.2 (2026-05-29): Suppress _native_batch_norm_legit decomps
+        # so running_mean/running_var mutations go through the existing
+        # native_batch_norm Vulkan lowering (norm.py:226-260) instead of
+        # the upstream decomp that produces copy_ nodes which may not
+        # propagate correctly across compiled graph invocations.
+        aten._native_batch_norm_legit.default,
+        aten._native_batch_norm_legit_functional.default,
         # DR.1+: Suppress native_group_norm and native_layer_norm decompositions
         # so our dedicated Vulkan lowerings (norm.py) fire instead of the
         # upstream AOT autograd decomposition into view→native_batch_norm→view→
@@ -153,6 +160,13 @@ def _suppress_upstream_decomps() -> None:
         # TRAIN.4 (2026-05-27): suppress upstream nll_loss_backward decomposition
         # so our lowering in lowerings/loss.py can intercept it.
         aten.nll_loss_backward.default,
+        # DECOMP.2 (2026-05-29): suppress aten.convolution_backward decomposition
+        # so the registered custom lowering _vulkan_convolution_backward
+        # (bwd_lowerings.py::_register_consolidated_backward_impls) fires directly
+        # instead of being decomposed by AOT Autograd into mm+sum+fold primitives
+        # (8-9 dispatches). The lowering produces 1 dispatch for a single conv bwd.
+        # Gated by the lowering itself: groups=1, fp32, not transposed, 4D tensors.
+        aten.convolution_backward.default,
     ]
     if hasattr(aten, "relu_backward"):
         ops_to_suppress.append(aten.relu_backward.default)
@@ -233,6 +247,16 @@ def _suppress_upstream_decomps() -> None:
     # causing AOTAutograd to decompose the op away before our Vulkan lowering
     # in bwd_lowerings.py fires. Pop it here so Inductor sees the raw op.
     _aot_decomps.pop(aten.native_batch_norm_backward.default, None)
+    # MODEL.2 (2026-05-29): also pop _native_batch_norm_legit variants
+    # from the AOT decomp table so AOTAutograd does not decompose them
+    # into functional form with separate running stat updates.
+    _aot_decomps.pop(aten._native_batch_norm_legit.default, None)
+    _aot_decomps.pop(aten._native_batch_norm_legit_functional.default, None)
+    # DECOMP.2 (2026-05-29): also pop convolution_backward from the AOT decomp
+    # table so AOTAutograd does not decompose it into mm+sum+fold primitives
+    # before Inductor's lowering layer sees the op. With this pop, the
+    # registered _vulkan_convolution_backward lowering fires directly.
+    _aot_decomps.pop(aten.convolution_backward.default, None)
     # M18.TB.1: Replace the upstream hardtanh decomp (hardtanh → clamp) with a
     # clamp_min/clamp_max based decomp that avoids aten.clamp entirely.  The
     # stock torch._refs decomp rewrites hardtanh as clamp(x, min, max), which

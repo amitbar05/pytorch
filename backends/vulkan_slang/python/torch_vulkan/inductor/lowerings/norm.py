@@ -294,6 +294,49 @@ def _register_batch_norm_forward() -> None:
 
         return [out, mean_1d, rstd_1d]
 
+    # MODEL.2 (2026-05-29): Register _native_batch_norm_legit to delegate
+    # to the same lowering as native_batch_norm. The "legit" variant has
+    # proper mutation annotations so AOT autograd functionalizes it
+    # correctly, but with the decomp suppressed our lowering handles the
+    # running_mean/running_var copy_ mutations directly.
+    if hasattr(aten, "_native_batch_norm_legit"):
+        @register_lowering(aten._native_batch_norm_legit, type_promotion_kind=None)
+        def _vulkan_batch_norm_legit(
+            inp, weight, bias, running_mean, running_var,
+            training, momentum, eps,
+        ):
+            if not _is_vulkan(inp):
+                return NotImplemented
+            return _vulkan_native_batch_norm(
+                inp, weight, bias, running_mean, running_var,
+                training, momentum, eps,
+            )
+
+    if hasattr(aten, "_native_batch_norm_legit_functional"):
+        @register_lowering(
+            aten._native_batch_norm_legit_functional,
+            type_promotion_kind=None,
+        )
+        def _vulkan_batch_norm_legit_functional(
+            inp, weight, bias, running_mean, running_var,
+            training, momentum, eps,
+        ):
+            if not _is_vulkan(inp):
+                return NotImplemented
+            result = _vulkan_native_batch_norm(
+                inp, weight, bias, running_mean, running_var,
+                training, momentum, eps,
+            )
+            if result is NotImplemented:
+                return NotImplemented
+            # The non-functional variant mutates running_mean/running_var
+            # in-place via copy_.  The functional variant must return
+            # the new running stats as additional outputs.
+            # Since _vulkan_native_batch_norm already did the copy_,
+            # we can return the (now-updated) running stats directly.
+            out, save_mean, save_rstd = result
+            return [out, save_mean, save_rstd, running_mean, running_var]
+
 
 # Backward lowerings for layer_norm, group_norm, and batch_norm have
 # been consolidated into ``bwd_lowerings.py`` (TR.19).  The no-op
