@@ -444,6 +444,10 @@ def register() -> None:
     if hasattr(torch.ops.torch_vulkan, "max_pool2d_scatter_bwd"):
         make_fallback(torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default)
 
+    # CODEGEN.2: avg_pool2d scatter backward custom op (overlapping pools).
+    if hasattr(torch.ops.torch_vulkan, "avg_pool2d_scatter_bwd"):
+        make_fallback(torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default)
+
     # TRAIN.7: autocast boundary ops — identity dtype casts that must not
     # break fusion.  aten._autocast_to_reduced_precision (fp32→fp16/bf16)
     # and aten._autocast_to_full_precision (fp16/bf16→fp32) are generated

@@ -278,6 +278,179 @@ def _ensure_max_pool2d_scatter_bwd_op_registered() -> "object":
     return torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# CODEGEN.2 — avg_pool2d backward via scatter_add (overlapping + uniform)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _ensure_avg_pool2d_scatter_bwd_op_registered() -> "object":
+    """Register ``torch_vulkan::avg_pool2d_scatter_bwd`` (CODEGEN.2).
+
+    GPU-only avg_pool2d backward via the ``scatter_atomic`` Slang template.
+
+    For overlapping pooling windows (stride < kernel_size), the gradient
+    from each output position is distributed equally to all input elements
+    in the pooling window.  This produces kH*kW scatter entries per output
+    position, each atomically accumulated into grad_input via scatter_add.
+
+    For the non-uniform pool_size case (count_include_pad=False + padding),
+    a per-position divisor is pre-computed.
+
+    Returns the ``grad_input`` tensor.
+    """
+    import torch
+
+    op_name = "torch_vulkan::avg_pool2d_scatter_bwd"
+    existing = getattr(torch.ops.torch_vulkan, "avg_pool2d_scatter_bwd", None)
+    if existing is not None and hasattr(existing, "default"):
+        return existing.default
+
+    Tensor = torch.Tensor
+
+    def _avg_pool2d_scatter_bwd_impl(
+        grad_output: Tensor,
+        N: int,
+        C: int,
+        iH: int,
+        iW: int,
+        kH: int,
+        kW: int,
+        sH: int,
+        sW: int,
+        pH: int,
+        pW: int,
+        count_include_pad: bool,
+        divisor_override: int,
+    ) -> Tensor:
+        from ...vulkan_template_caller import _dispatch_scatter_atomic
+
+        # 1. Zero-initialized grad_input.
+        input_shape = (N, C, iH, iW)
+        grad_input = torch.zeros(
+            input_shape, dtype=grad_output.dtype, device=grad_output.device
+        )
+
+        oH = grad_output.shape[2]
+        oW = grad_output.shape[3]
+        output_numel = grad_output.numel()
+        input_numel = N * C * iH * iW
+
+        if output_numel == 0:
+            return grad_input
+
+        # 2. Compute scatter indices and values on CPU (sizes are static).
+        #
+        # For each output position (n, c, oh, ow) and kernel (kh, kw):
+        #   ih = oh * sH - pH + kh
+        #   iw = ow * sW - pW + kw
+        #   if in bounds: scatter_add grad_output[output] / pool_size
+        import numpy as np
+
+        max_entries = output_numel * kH * kW
+
+        # Uniform divisor when count_include_pad or no padding or override.
+        use_uniform = (
+            count_include_pad
+            or (divisor_override is not None and divisor_override > 0)
+            or (pH == 0 and pW == 0)
+        )
+        if use_uniform:
+            if divisor_override is not None and divisor_override > 0:
+                uniform_div = float(divisor_override)
+            else:
+                uniform_div = float(kH * kW)
+        else:
+            uniform_div = None
+
+        scatter_indices = np.empty(max_entries, dtype=np.int32)
+        scatter_values = np.empty(max_entries, dtype=np.float32)
+        count = 0
+
+        go_flat = grad_output.detach().cpu().numpy().ravel()
+
+        for nc in range(N * C):
+            plane_off = nc * iH * iW
+            for oh in range(oH):
+                for ow in range(oW):
+                    out_idx = nc * oH * oW + oh * oW + ow
+                    go_val = float(go_flat[out_idx])
+
+                    if not use_uniform:
+                        ih_lo = max(oh * sH - pH, 0)
+                        ih_hi = min(oh * sH - pH + kH, iH)
+                        iw_lo = max(ow * sW - pW, 0)
+                        iw_hi = min(ow * sW - pW + kW, iW)
+                        pool_sz = max((ih_hi - ih_lo) * (iw_hi - iw_lo), 1)
+                    else:
+                        pool_sz = int(uniform_div)
+
+                    scaled = go_val / pool_sz
+
+                    for kh in range(kH):
+                        ih = oh * sH - pH + kh
+                        if ih < 0 or ih >= iH:
+                            continue
+                        for kw in range(kW):
+                            iw = ow * sW - pW + kw
+                            if iw < 0 or iw >= iW:
+                                continue
+                            scatter_indices[count] = plane_off + ih * iW + iw
+                            scatter_values[count] = scaled
+                            count += 1
+
+        if count == 0:
+            return grad_input
+
+        # Trim and transfer to GPU.
+        idx_gpu = torch.from_numpy(scatter_indices[:count]).to(grad_output.device)
+        val_gpu = torch.from_numpy(scatter_values[:count]).to(grad_output.device)
+
+        # 3. Scatter-add into grad_input.
+        grad_input_flat = grad_input.reshape(-1)
+        _dispatch_scatter_atomic(
+            operation="scatter_add",
+            numel=count,
+            src_numel=count,
+            out_numel=input_numel,
+            output=grad_input_flat,
+            src=val_gpu,
+            indices=idx_gpu,
+            dtype="float",
+            index_dtype="int",
+            cache_key="slang_scatter_avgpool2d_bwd_float_int",
+        )
+        return grad_input
+
+    _avg_pool2d_scatter_bwd_impl.__annotations__ = {
+        "grad_output": Tensor,
+        "N": int,
+        "C": int,
+        "iH": int,
+        "iW": int,
+        "kH": int,
+        "kW": int,
+        "sH": int,
+        "sW": int,
+        "pH": int,
+        "pW": int,
+        "count_include_pad": bool,
+        "divisor_override": int,
+        "return": Tensor,
+    }
+    op = torch.library.custom_op(op_name, mutates_args=())(
+        _avg_pool2d_scatter_bwd_impl
+    )
+
+    def _avg_pool2d_scatter_bwd_fake(
+        grad_output, N, C, iH, iW, kH, kW, sH, sW, pH, pW,
+        count_include_pad, divisor_override,
+    ):
+        return grad_output.new_empty((N, C, iH, iW))
+
+    op.register_fake(_avg_pool2d_scatter_bwd_fake)
+    return torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default
+
+
 def _ensure_adaptive_avg_pool2d_op_registered() -> "object":
     """Register ``torch_vulkan::adaptive_avg_pool2d`` as a custom_op.
 

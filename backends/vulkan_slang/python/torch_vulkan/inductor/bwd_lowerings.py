@@ -591,12 +591,22 @@ def _register_pool_backward() -> None:
         register_lowering,
     )
 
-    from .fx_passes.eager.pool import _ensure_max_pool2d_scatter_bwd_op_registered
+    from .fx_passes.eager.pool import (
+        _ensure_max_pool2d_scatter_bwd_op_registered,
+        _ensure_avg_pool2d_scatter_bwd_op_registered,
+    )
 
     aten = torch.ops.aten
 
     _vk_avg_pool2d_bwd_fallback = fallback_handler(
         aten.avg_pool2d_backward.default,
+        add_to_fallback_set=False,
+    )
+
+    # CODEGEN.2: scatter_bwd path for overlapping avg_pool2d backward.
+    _ensure_avg_pool2d_scatter_bwd_op_registered()
+    _vk_avg_pool2d_scatter_bwd_fb = fallback_handler(
+        torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default,
         add_to_fallback_set=False,
     )
 
@@ -624,9 +634,48 @@ def _register_pool_backward() -> None:
         )
         if result is not None:
             return result
-        return _vk_avg_pool2d_bwd_fallback(
-            grad_output, x, kernel_size, stride, padding, ceil_mode,
-            count_include_pad, divisor_override
+
+        # CODEGEN.2 (overlapping): use scatter_add via custom op.
+        # This avoids the old FallbackKernel eager Vulkan path and routes
+        # through the scatter_atomic Slang template in the compile path.
+        if not stride:
+            stride = kernel_size
+        if not padding:
+            padding = [0, 0]
+        if not (isinstance(kernel_size, (list, tuple)) and len(kernel_size) == 2):
+            return _vk_avg_pool2d_bwd_fallback(
+                grad_output, x, kernel_size, stride, padding, ceil_mode,
+                count_include_pad, divisor_override,
+            )
+        if not (isinstance(stride, (list, tuple)) and len(stride) == 2):
+            return _vk_avg_pool2d_bwd_fallback(
+                grad_output, x, kernel_size, stride, padding, ceil_mode,
+                count_include_pad, divisor_override,
+            )
+        if not (isinstance(padding, (list, tuple)) and len(padding) == 2):
+            return _vk_avg_pool2d_bwd_fallback(
+                grad_output, x, kernel_size, stride, padding, ceil_mode,
+                count_include_pad, divisor_override,
+            )
+
+        kh, kw = kernel_size
+        sh, sw = stride
+        ph, pw = padding
+
+        x_size = x.get_size()
+        if len(x_size) != 4:
+            return _vk_avg_pool2d_bwd_fallback(
+                grad_output, x, kernel_size, stride, padding, ceil_mode,
+                count_include_pad, divisor_override,
+            )
+        _N = int(x_size[0])
+        _C = int(x_size[1])
+        _iH = int(x_size[2])
+        _iW = int(x_size[3])
+        _div_ovr = divisor_override if divisor_override is not None else 0
+        return _vk_avg_pool2d_scatter_bwd_fb(
+            grad_output, _N, _C, _iH, _iW, kh, kw, sh, sw, ph, pw,
+            count_include_pad, _div_ovr,
         )
 
     # Forward: max_pool2d_with_indices — AOTAutograd rematerialises indices
