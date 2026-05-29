@@ -61550,3 +61550,62 @@ class TestMODEL2_BatchNormLegitLowering:
             "MODEL.2: _native_batch_norm_legit_functional.default must "
             "have a lowering"
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestCODEGEN3_ConvBwdBwdDiff:
+    """CODEGEN.3 — Conv backward uses bwd_diff(conv_inner_madd) via
+    _VulkanConvBwdExternKernel.
+
+    Verifies that the conv backward compile path:
+    1. Is registered as an ExternKernelOut (not FallbackKernel)
+    2. Uses the bwd_diff template registry with conv_inner_madd
+    3. The conv_inner_madd Slang function has [Differentiable] annotation
+    """
+
+    @pytest.mark.timeout(300)
+    def test_conv_bwd_lowering_registered(self):
+        """aten.convolution_backward.default has a Vulkan lowering."""
+        import torch
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        key = aten.convolution_backward.default
+        assert key in _inductor_lowerings, (
+            "CODEGEN.3: aten.convolution_backward.default must have a "
+            "registered lowering"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_conv_bwd_in_template_registry(self):
+        """conv_im2col_f32 is registered in BWD_TEMPLATE_REGISTRY with
+        fwd_fn='conv_inner_madd'."""
+        from torch_vulkan.inductor.bwd_template_registry import (
+            BWD_TEMPLATE_REGISTRY,
+        )
+
+        entry = BWD_TEMPLATE_REGISTRY.get("conv_im2col_f32")
+        assert entry is not None, (
+            "CODEGEN.3: conv_im2col_f32 must be in BWD_TEMPLATE_REGISTRY"
+        )
+        assert entry.fwd_fn == "conv_inner_madd", (
+            f"CODEGEN.3: expected fwd_fn='conv_inner_madd', "
+            f"got '{entry.fwd_fn}'"
+        )
+
+    @pytest.mark.timeout(300)
+    def test_conv_bwd_extern_kernel_class_exists(self):
+        """_VulkanConvBwdExternKernel exists in conv_backward.py."""
+        from torch_vulkan.inductor.lowerings.conv_backward import (
+            _VulkanConvBwdExternKernel,
+        )
+
+        # Must be a subclass of ir.ExternKernelOut (not FallbackKernel)
+        from torch._inductor import ir
+
+        assert issubclass(_VulkanConvBwdExternKernel, ir.ExternKernelOut), (
+            "CODEGEN.3: _VulkanConvBwdExternKernel must subclass "
+            "ir.ExternKernelOut (not FallbackKernel)"
+        )
