@@ -185,6 +185,9 @@ def reset_per_test_caches() -> None:
     PF.27.a.2 extension (2026-05-02): also resets shader-lib module
     readiness, reflection cache, and async pool — globals that previously
     leaked worker-id-dependent state across tests within an xdist worker.
+
+    PF.27.b/c (2026-05-29): also resets Philox RNG state so each test
+    starts with fresh seed derivation and offset.
     """
     from .dispatch import _KERNEL_SPIRV_HASH
     from .profile import _DISPATCH_TIMES
@@ -209,6 +212,14 @@ def reset_per_test_caches() -> None:
     # (M22a Stage 2 previously reset it here, which forced a full 16-module
     # recompile before every test that calls slangc, causing test timeouts.)
     _DISPATCH_TIMES.clear()
+
+    # PF.27.b/c: reset Philox RNG state so each test starts fresh.
+    try:
+        from ..philox_state import reset_philox_state
+
+        reset_philox_state()
+    except Exception:
+        pass
 
 
 def __getattr__(name: str):
