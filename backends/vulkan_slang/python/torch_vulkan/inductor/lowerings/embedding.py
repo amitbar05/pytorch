@@ -5,30 +5,17 @@ from __future__ import annotations
 from . import _is_vulkan
 
 
-def _register_embedding_dense_backward() -> None:
-    """B2 — Inductor lowering for ``aten.embedding_dense_backward.default``.
+def _get_embedding_dense_backward_impl():
+    """Return the implementation function for aten.embedding_dense_backward.
 
-    Without this, compiled models using ``nn.Embedding`` extern-fall on the
-    backward path because the hand-written ``embedding_backward.slang`` is
-    reachable only on the eager dispatch path. Decomposes the backward into
-    ``aten.index_put.default(accumulate=True)`` which is already lowered
-    (PF.22), so the scheduler fuses the scatter-add into the backward chain.
-
-    Schema:
-      ``embedding_dense_backward(grad_output, indices, num_weights, padding_idx,
-        scale_grad_by_freq) -> grad_weight``
-
-    The decomposition creates a zero ``grad_weight`` of shape
-    ``(num_weights, embedding_dim)`` and scatters ``grad_output`` rows into it
-    at the positions indicated by ``indices``.
+    Registration is done in bwd_lowerings.py (anti-goal #3).
     """
     import torch
     from torch._inductor import lowering as L
-    from torch._inductor.lowering import register_lowering
 
     aten = torch.ops.aten
 
-    @register_lowering(aten.embedding_dense_backward, type_promotion_kind=None)
+    # NOTE (anti-goal #3): @register_lowering moved to bwd_lowerings.py.
     def _vulkan_embedding_dense_backward(
         grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
     ):
@@ -80,6 +67,8 @@ def _register_embedding_dense_backward() -> None:
             grad_weight, [safe_indices], safe_grad, True
         )
         return result
+
+    return _vulkan_embedding_dense_backward
 
 
 def _register_embedding_bag_forward() -> None:
@@ -384,9 +373,10 @@ def _register_embedding_bag_forward() -> None:
     )(_vulkan_embedding_bag)
 
 
-def _register_embedding_bag_backward() -> None:
-    """OP.21 — Inductor lowering for ``aten._embedding_bag_backward.default``.
+def _get_embedding_bag_backward_impl():
+    """Return the implementation function for aten._embedding_bag_backward.
 
+    Registration is done in bwd_lowerings.py (anti-goal #3).
     Decomposes the backward into the same primitives the forward uses:
     - mode=0 (sum):  ``index_put(accumulate=True)`` via offset2bag mapping
     - mode=1 (mean): sum-mode with per-bag division by bag_size
@@ -399,11 +389,10 @@ def _register_embedding_bag_backward() -> None:
     """
     import torch
     from torch._inductor import lowering as L
-    from torch._inductor.lowering import register_lowering
 
     aten = torch.ops.aten
 
-    @register_lowering(aten._embedding_bag_backward, type_promotion_kind=None)
+    # NOTE (anti-goal #3): @register_lowering moved to bwd_lowerings.py.
     def _vulkan_embedding_bag_backward(
         grad,
         indices,
@@ -492,3 +481,5 @@ def _register_embedding_bag_backward() -> None:
             grad_weight, [safe_indices], flat_grad, True
         )
         return result
+
+    return _vulkan_embedding_bag_backward

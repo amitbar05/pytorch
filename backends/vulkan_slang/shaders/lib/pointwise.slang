@@ -138,14 +138,18 @@ void hardsigmoid_fast_bwd(inout DifferentialPair<float> x, float dout) {
 }
 
 [BackwardDerivative(softplus_fast_bwd)]
-public float softplus_fwd(float x) {
-    return log(1.0f + exp(x));
+public float softplus_fwd(float x, no_diff float beta, no_diff float threshold) {
+    float bx = beta * x;
+    float stable = max(x, 0.0f) + log(1.0f + exp(-abs(bx))) / beta;
+    return min(stable, threshold);
 }
 
-void softplus_fast_bwd(inout DifferentialPair<float> x, float dout) {
+void softplus_fast_bwd(inout DifferentialPair<float> x, no_diff float beta, no_diff float threshold, float dout) {
     float xv = x.p;
-    float sig = 1.0f / (1.0f + exp(-xv));
-    x = diffPair(xv, dout * sig);
+    float bx = beta * xv;
+    float sig = 1.0f / (1.0f + exp(-bx));
+    float grad = (bx > threshold) ? 1.0f : sig;
+    x = diffPair(xv, dout * grad);
 }
 
 // Mish'(x) = tanh(sp) + x * sech^2(sp) * sigmoid(x)
@@ -429,7 +433,7 @@ public struct OpMish : IPointwise, IDifferentiable {
 
 public struct OpSoftplus : IPointwise, IDifferentiable {
     [Differentiable]
-    static float apply(float x) { return softplus_fwd(x); }
+    static float apply(float x) { return softplus_fwd(x, 1.0f, 20.0f); }
 };
 
 public struct OpLeakyReLU : IPointwise, IDifferentiable {

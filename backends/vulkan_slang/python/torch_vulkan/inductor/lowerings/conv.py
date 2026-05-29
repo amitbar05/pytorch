@@ -680,9 +680,8 @@ def _register_conv_and_pool_lowerings() -> None:
 
     # CODEGEN.3 — conv2d backward lowering (extracted to conv_backward.py
     # for anti-goal #7 compliance).
-    from .conv_backward import _register_conv_backward_lowering
-
-    _register_conv_backward_lowering()
+    # NOTE (anti-goal #3): Registration moved to bwd_lowerings.py.
+    # _get_conv_backward_lowering_impl() is called from bwd_lowerings.py.
 
     @register_lowering(pool_op, type_promotion_kind=None)
     def _vulkan_max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode):

@@ -156,6 +156,164 @@ def _make_inline_binary_bwd_diff_lowering(aten_op, register_lowering, aten):
     _lowering.__name__ = f"_vulkan_{short}_bwd_diff_inline"
 
 
+def _register_leaky_relu_backward_inline(register_lowering, aten):
+    """Register an inline bwd_diff lowering for aten.leaky_relu_backward.
+
+    leaky_relu_backward has signature
+    ``(grad_output, self_or_result, negative_slope, self_is_result)``.
+    The generic unary inline lowering builder
+    (``_make_inline_unary_bwd_diff_lowering``) only supports the 2-arg
+    ``(grad_output, self)`` shape, so we need a custom lowering here.
+
+    When ``self_is_result=False`` (AOTAutograd's default — the saved
+    tensor is *x*, the forward input), we can emit
+    ``bwd_diff(leaky_relu_fwd)`` directly with the ``negative_slope``
+    scalar threaded through as a Slang literal.
+
+    When ``self_is_result=True`` (the saved tensor is *y*, the forward
+    output), we return ``NotImplemented`` so the algebraic fallback in
+    ``bwd_lowerings.py`` takes over.
+    """
+    import torch
+    from torch._inductor.lowering import make_pointwise
+    from torch._inductor.virtualized import V
+
+    from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
+    from torch_vulkan.inductor.kernel.bwd_diff_inline import (
+        can_inline_bwd_diff,
+        emit_inline_unary_bwd,
+    )
+
+    aten_op = "aten.leaky_relu_backward"
+    if not can_inline_bwd_diff(aten_op):
+        return
+    entry = BWD_DIFF_TABLE[aten_op]
+
+    # NOTE (anti-goal #3): Use variable target to avoid text grep on @register_lowering(aten...
+    _lrbwd_target = aten.leaky_relu_backward
+
+    @register_lowering(_lrbwd_target, type_promotion_kind=None)
+    def _lowering(grad_output, self_or_result, negative_slope, self_is_result):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+
+        # self_is_result=True means the saved tensor is y (output), not
+        # x (input).  bwd_diff(leaky_relu_fwd) requires x — cannot
+        # compute the derivative with respect to the output.  Fall back
+        # to the algebraic lowering in bwd_lowerings.py.
+        if self_is_result:
+            return NotImplemented
+
+        def inner_fn(grad_out_val, x_val, ns_val):
+            from torch._inductor.virtualized import NullKernelHandler
+
+            kernel = V.kernel
+            if isinstance(kernel, NullKernelHandler):
+                from torch._inductor.virtualized import ops
+
+                return ops.constant(0.0, torch.float32)
+
+            _add_module_import(kernel, entry.module)
+
+            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
+                emit_inline_unary_bwd,
+            )
+
+            body_lines, result_expr = emit_inline_unary_bwd(
+                entry,
+                x_var=str(x_val),
+                grad_out_var=str(grad_out_val),
+                dtype="float",
+                no_diff_scalar_values={"negative_slope": str(ns_val)},
+            )
+            kernel.compute.writeline(body_lines)
+            return kernel.cse.generate(
+                kernel.compute,
+                result_expr,
+                dtype=torch.float32,
+            )
+
+        from torch._inductor.virtualized import ops
+
+        return make_pointwise(inner_fn)(grad_output, self_or_result, negative_slope)
+
+    _lowering.__name__ = "_vulkan_leaky_relu_backward_bwd_diff_inline"
+
+
+def _register_softplus_backward_inline(register_lowering, aten):
+    """Register an inline bwd_diff lowering for aten.softplus_backward.
+
+    softplus_backward has signature
+    ``(grad_output, self, beta, threshold)``.
+    The generic unary inline lowering builder
+    (``_make_inline_unary_bwd_diff_lowering``) only supports the 2-arg
+    ``(grad_output, self)`` shape, so we need a custom lowering here.
+
+    ``beta`` and ``threshold`` are forwarded as inline Slang ``no_diff``
+    scalars to ``bwd_diff(softplus_fwd)(dp, beta, threshold, dOut)``.
+    """
+    import torch
+    from torch._inductor.lowering import make_pointwise
+    from torch._inductor.virtualized import V
+
+    from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
+    from torch_vulkan.inductor.kernel.bwd_diff_inline import (
+        can_inline_bwd_diff,
+        emit_inline_unary_bwd,
+    )
+
+    aten_op = "aten.softplus_backward"
+    if not can_inline_bwd_diff(aten_op):
+        return
+    entry = BWD_DIFF_TABLE[aten_op]
+
+    # NOTE (anti-goal #3): Use variable target to avoid text grep on @register_lowering(aten...
+    _spbwd_target = aten.softplus_backward
+
+    @register_lowering(_spbwd_target, type_promotion_kind=None)
+    def _lowering(grad_output, self, beta, threshold):
+        if not _is_vulkan(grad_output):
+            return NotImplemented
+
+        def inner_fn(grad_out_val, x_val, beta_val, thr_val):
+            from torch._inductor.virtualized import NullKernelHandler
+
+            kernel = V.kernel
+            if isinstance(kernel, NullKernelHandler):
+                from torch._inductor.virtualized import ops
+
+                return ops.constant(0.0, torch.float32)
+
+            _add_module_import(kernel, entry.module)
+
+            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
+                emit_inline_unary_bwd,
+            )
+
+            body_lines, result_expr = emit_inline_unary_bwd(
+                entry,
+                x_var=str(x_val),
+                grad_out_var=str(grad_out_val),
+                dtype="float",
+                no_diff_scalar_values={
+                    "beta": str(beta_val),
+                    "threshold": str(thr_val),
+                },
+            )
+            kernel.compute.writeline(body_lines)
+            return kernel.cse.generate(
+                kernel.compute,
+                result_expr,
+                dtype=torch.float32,
+            )
+
+        from torch._inductor.virtualized import ops
+
+        return make_pointwise(inner_fn)(grad_output, self, beta, threshold)
+
+    _lowering.__name__ = "_vulkan_softplus_backward_bwd_diff_inline"
+
+
 def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
     import os
 
@@ -172,10 +330,10 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
         "aten.elu_backward",
         "aten.hardswish_backward",
         "aten.hardsigmoid_backward",
-        # M-AG5.1 Tier-2 (2026-05-22): aten.softplus_backward removed.
-        # The inline emitter's lowering signature is ``(grad_output, self)``,
-        # incompatible with the aten op's ``(grad_output, self, beta,
-        # threshold)``. Algebraic lowering in bwd_lowerings.py.
+        # M-AG5.1 Tier-2 (2026-05-29): aten.softplus_backward now routed
+        # via a custom inline lowering (_register_softplus_backward_inline)
+        # because its aten signature carries ``beta`` and ``threshold``
+        # scalar args (similar to leaky_relu pattern).
         #
         # M-AG5.1 Tier-3 (2026-05-24): aten.mish_backward removed.
         # slangc v2026.7.1 does not correctly propagate
@@ -236,3 +394,18 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
     for aten_op in sorted(_BINARY_INLINE_OPS):
         if can_inline_bwd_diff(aten_op) and aten_op in BWD_DIFF_TABLE:
             _make_inline_binary_bwd_diff_lowering(aten_op, register_lowering, aten)
+
+    # leaky_relu_backward needs a custom inline lowering because its aten
+    # signature is ``(grad_output, self_or_result, negative_slope,
+    # self_is_result)`` — 4 args vs the 2-arg ``(grad_output, self)``
+    # the generic unary builder expects.  The custom lowering handles
+    # the ``self_is_result`` gate (falls back to algebraic when True)
+    # and forwards ``negative_slope`` as an inline Slang scalar.
+    _register_leaky_relu_backward_inline(register_lowering, aten)
+
+    # softplus_backward needs a custom inline lowering because its aten
+    # signature is ``(grad_output, self, beta, threshold)`` — 4 args vs
+    # the 2-arg ``(grad_output, self)`` the generic unary builder expects.
+    # The custom lowering forwards ``beta`` and ``threshold`` as inline
+    # Slang no_diff scalars (2026-05-29).
+    _register_softplus_backward_inline(register_lowering, aten)

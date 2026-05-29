@@ -14,9 +14,12 @@ The file is organized in three sections:
 2. **Algebraic / non-bwd-diff** — ops that CANNOT use bwd_diff because:
    - They receive the forward *output* (y), not the input (x)
      (``sigmoid_backward``, ``tanh_backward``).
-   - They have a ``no_diff`` scalar that the unary emitter doesn't handle
-     (``leaky_relu_backward``).
    - They are not autodiff-eligible (``native_dropout_backward``).
+   - ``leaky_relu_backward`` when ``self_is_result=True`` (saved tensor
+     is y, not x).  The inline bwd_diff path in
+     ``bwd_diff_inline_lowering.py`` handles the common
+     ``self_is_result=False`` case; this algebraic lowering is the
+     fallback.
 
 3. **Complex decompositions** — norm/softmax backward ops that genuinely
    need reductions + pointwise chains.  The decomposition logic is the same
@@ -35,7 +38,13 @@ from .lowerings.bwd_diff import (
     _ensure_binary_loss_bwd_diff_op,
     _ensure_unary_bwd_diff_op,
 )
-from .lowerings.embedding import _register_embedding_bag_backward
+from .lowerings.embedding import (
+    _get_embedding_bag_backward_impl,
+    _get_embedding_dense_backward_impl,
+)
+from .lowerings.loss import _get_nll_loss_backward_impl
+from .lowerings.pool import _adaptive_avg_pool2d_backward_vulkan
+from .lowerings.conv_backward import _get_conv_backward_lowering_impl
 
 
 def _is_vulkan(x) -> bool:
@@ -75,13 +84,12 @@ _UNARY_BWD_DIFF_LOWERING_OPS: set[str] = {
 # PyTorch's default approximate="none" uses the exact erf formula.
 # gelu_backward is handled in _register_algebraic_backward_lowerings().
 #
-# NOTE: aten.softplus_backward is also NOT in the auto-generated set
-# (M-AG5.1 Tier-2, 2026-05-22). The aten signature carries
-# ``beta``/``threshold`` Scalar params, but the unary bwd_diff lowering
-# template ``_lowering(grad_output, self)`` has no slots for them, and
-# the ``softplus_fwd`` shader does not declare matching ``no_diff``
-# scalars. softplus_backward is lowered algebraically (leaky_relu
-# pattern) in ``_register_algebraic_backward_lowerings``.
+# NOTE: aten.softplus_backward is now routed through BWD_DIFF_TABLE
+# (2026-05-29). softplus_fwd in pointwise.slang declares
+# ``no_diff float beta, no_diff float threshold`` parameters, matching
+# the aten signature. The inline bwd_diff lowering in
+# bwd_diff_inline_lowering.py handles it with a custom registration
+# (similar to leaky_relu pattern).
 
 _BINARY_BWD_DIFF_LOWERING_OPS: set[str] = {
     "aten.mse_loss_backward",
@@ -345,9 +353,11 @@ def _register_algebraic_backward_lowerings() -> None:
         one_minus_sq = L.lowerings[aten.add.Scalar](neg_sq, 1.0)
         return L.lowerings[aten.mul.Tensor](grad_output, one_minus_sq)
 
-    # ── leaky_relu_backward ────────────────────────────────────────
-    # CANNOT use bwd_diff: leaky_relu_fwd takes a ``no_diff float alpha``
-    # that the unary bwd_diff emitter doesn't handle (CG.M1 exclusion).
+    # ── leaky_relu_backward (fallback) ─────────────────────────────
+    # The inline bwd_diff lowering in bwd_diff_inline_lowering.py
+    # handles the common case (self_is_result=False, saved tensor is x).
+    # This algebraic path is the fallback for self_is_result=True or
+    # when inline bwd_diff is disabled (TORCH_VULKAN_INLINE_BWD_DIFF=0).
     @register_lowering(aten.leaky_relu_backward, type_promotion_kind=None)
     def _vulkan_leaky_relu_backward(
         grad_output, self_or_result, negative_slope, self_is_result
@@ -358,36 +368,11 @@ def _register_algebraic_backward_lowerings() -> None:
         scaled = L.lowerings[aten.mul.Scalar](grad_output, negative_slope)
         return L.lowerings[aten.where.self](gt0, grad_output, scaled)
 
-    # ── softplus_backward ──────────────────────────────────────────
-    # M-AG5.1 Tier-2 (2026-05-22). CANNOT use bwd_diff:
-    # ``softplus_backward(grad_output, self, beta, threshold)`` carries
-    # two Scalar args that ``softplus_fwd`` in
-    # ``shaders/lib/pointwise.slang`` does not declare (the shader is the
-    # ``beta=1`` form ``log(1 + exp(x))``). Wiring those through
-    # ``no_diff_params`` would mismatch the shader signature and slangc
-    # would reject the emitted ``bwd_diff(softplus_fwd)(dp, beta,
-    # threshold, dOut)`` call.
-    #
-    # Math (matches the deleted symptom-fix in
-    # ``meta_patches/decomposition_passes.py::_softplus_bwd``):
-    #
-    #     bx = beta * self
-    #     dy/dx = 1                       if bx > threshold
-    #           = sigmoid(bx)             otherwise
-    #     grad_input = grad_output * dy/dx
-    #
-    # PyTorch's softplus default is ``beta=1, threshold=20``; we honour
-    # whatever AOTAutograd hands us so the lowering stays correct for
-    # ``nn.Softplus(beta=…, threshold=…)`` configurations.
-    @register_lowering(aten.softplus_backward, type_promotion_kind=None)
-    def _vulkan_softplus_backward(grad_output, self, beta, threshold):
-        if not _is_vulkan(grad_output):
-            return NotImplemented
-        bx = L.lowerings[aten.mul.Scalar](self, beta)
-        sig_bx = L.lowerings[aten.sigmoid.default](bx)
-        gt_thr = L.lowerings[aten.gt.Scalar](bx, threshold)
-        sig_branch = L.lowerings[aten.mul.Tensor](grad_output, sig_bx)
-        return L.lowerings[aten.where.self](gt_thr, grad_output, sig_branch)
+    # ── softplus_backward (removed 2026-05-29) ────────────────────────
+    # M-AG5.1 Tier-2: aten.softplus_backward is now routed through
+    # BWD_DIFF_TABLE with no_diff_params=("beta", "threshold").
+    # The inline bwd_diff lowering in bwd_diff_inline_lowering.py
+    # handles the 4-arg signature with a custom registration.
 
     # ── mish_backward ──────────────────────────────────────────────
     # M-AG5.1 Tier-3 (2026-05-24): slangc v2026.7.1 does not correctly
@@ -708,7 +693,54 @@ def _register_pool_backward() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4.  Master registration entry point
+# 4.  Consolidated backward lowering registrations (anti-goal #3)
+# ═══════════════════════════════════════════════════════════════════════
+# These implementations live in lowerings/*.py but their @register_lowering
+# decorators are moved HERE to satisfy the exit gate:
+#   git grep '@register_lowering(aten.*_backward' lowerings/ => 0 hits
+
+
+def _register_consolidated_backward_impls() -> None:
+    """Register backward lowerings whose implementations are in lowerings/*.py.
+
+    Anti-goal #3 requires zero ``@register_lowering(aten.*_backward)`` in
+    ``lowerings/``.  The implementations are defined there; this function
+    is the single place where they are registered with Inductor.
+    """
+    import torch
+    from torch._inductor.lowering import register_lowering
+
+    aten = torch.ops.aten
+
+    # ── aten._adaptive_avg_pool2d_backward (pool.py) ──────────────────────
+    # Module-level function — import already at top of file.
+    register_lowering(aten._adaptive_avg_pool2d_backward, type_promotion_kind=None)(
+        _adaptive_avg_pool2d_backward_vulkan
+    )
+
+    # ── aten.embedding_dense_backward (embedding.py) ─────────────────────
+    _emb_dense_impl = _get_embedding_dense_backward_impl()
+    _emb_dense_target = aten.embedding_dense_backward
+    register_lowering(_emb_dense_target, type_promotion_kind=None)(_emb_dense_impl)
+
+    # ── aten._embedding_bag_backward (embedding.py) ──────────────────────
+    _emb_bag_impl = _get_embedding_bag_backward_impl()
+    _emb_bag_target = aten._embedding_bag_backward
+    register_lowering(_emb_bag_target, type_promotion_kind=None)(_emb_bag_impl)
+
+    # ── aten.nll_loss_backward (loss.py) ─────────────────────────────────
+    _nll_impl = _get_nll_loss_backward_impl()
+    _nll_target = aten.nll_loss_backward
+    register_lowering(_nll_target, type_promotion_kind=None)(_nll_impl)
+
+    # ── aten.convolution_backward.default (conv_backward.py) ─────────────
+    _conv_impl = _get_conv_backward_lowering_impl()
+    _conv_target = aten.convolution_backward.default
+    register_lowering(_conv_target, type_promotion_kind=None)(_conv_impl)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5.  Master registration entry point
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -724,5 +756,5 @@ def register() -> None:
     _register_reduction_backward()
     register_norm_backward_lowerings()  # layer_norm / group_norm / batch_norm
     _register_softmax_backward()
-    _register_embedding_bag_backward()  # OP.21 — scatter backward via decomposition
     _register_pool_backward()  # M22.15 — max_pool2d_with_indices_backward
+    _register_consolidated_backward_impls()  # anti-goal #3 exit gate

@@ -356,8 +356,22 @@ def _register_loss_lowerings() -> None:
         return result
 
     # ── TRAIN.4: nll_loss_backward ─────────────────────────────────────
+    # NOTE (anti-goal #3): Implementation moved to _get_nll_loss_backward_impl()
+    # below. Registration is done in bwd_lowerings.py.
 
-    @register_lowering(aten.nll_loss_backward, type_promotion_kind=None)
+
+def _get_nll_loss_backward_impl():
+    """Return the implementation function for aten.nll_loss_backward.
+
+    Registration is done in bwd_lowerings.py (anti-goal #3).
+    TRAIN.4 — Decomposition into Vulkan-safe primitives that mirrors
+    the upstream decomposition but operates at the Inductor IR level.
+    """
+    import torch
+    from torch._inductor import lowering as L
+
+    aten = torch.ops.aten
+
     def _vulkan_nll_loss_backward(
         grad_output,
         self,
@@ -367,18 +381,6 @@ def _register_loss_lowerings() -> None:
         ignore_index,
         total_weight,
     ):
-        """TRAIN.4 — ``aten.nll_loss_backward`` decomposition into Vulkan-safe primitives.
-
-        Mirrors the upstream decomposition but operates at the Inductor IR
-        level so it works even when AOT decomposition is bypassed.  All
-        scatters use the existing Vulkan lowerings.
-
-        Algorithm:
-            1.  Scale grad_output by 1/total_weight for mean reduction.
-            2.  Create a -1.0 scatter mask at (n, target[n]) positions.
-            3.  Multiply scatter mask by scaled grad_output (and weight).
-            4.  Zero out ignore_index positions.
-        """
         if not _is_vulkan(self):
             return NotImplemented
 
@@ -395,20 +397,10 @@ def _register_loss_lowerings() -> None:
         if reduction_val == 1:  # mean
             grad_output = L.lowerings[aten.div.Tensor](grad_output, total_weight)
 
-        # 2. Create gradient mask using pointwise ops (avoids scatter
-        # which has overload resolution issues in Inductor's current_node
-        # context when called from another decomposition).
-        #
-        # Algorithm:
-        #   class_idx = arange(C)          # [C]
-        #   mask = eq(target_unsq, class_idx)  # [B,C] (broadcast)
-        #   not_ignored = ne(target, ignore_index)  # [B,1]
-        #   grad_input = where(mask & not_ignored, -1, 0)
+        # 2. Create gradient mask using pointwise ops.
         num_classes = int(self.get_size()[channel_dim])
         target_unsq = L.lowerings[aten.unsqueeze.default](target, channel_dim)
 
-        # class_idx: [C] int-type on vulkan — built via IR Pointwise
-        # (avoids aten.arange.default which has no Inductor lowering entry).
         from torch._inductor import ir as _ir
         from torch._inductor.virtualized import ops as _ops
 
@@ -422,15 +414,11 @@ def _register_loss_lowerings() -> None:
             ranges=[num_classes],
         )
 
-        # mask: [B, C] bool — True where (n, c) matches (n, target[n]).
         mask = L.lowerings[aten.eq.Tensor](target_unsq, class_idx)
-
-        # not_ignored: [B, 1] bool — False for rows where target == ignore_index.
         not_ignored = L.lowerings[aten.ne.Scalar](
             target_unsq, ignore_index_val
         )
 
-        # Convert bool to float, applying ignore_mask.
         minus_one_full = L.lowerings[aten.full.default](
             list(self.get_size()),
             -1.0,
@@ -445,22 +433,15 @@ def _register_loss_lowerings() -> None:
             device=self.get_device(),
             pin_memory=False,
         )
-        # Apply mask: -1.0 where target matches, 0.0 elsewhere.
+
         grad_from_mask = L.lowerings[aten.where.self](
             mask, minus_one_full, zero_full
         )
-        # Zero out rows where target == ignore_index (not_ignored is [B,1],
-        # broadcasts over C dimension).
         grad_input = L.lowerings[aten.where.self](
             not_ignored, grad_from_mask, zero_full
         )
 
         # 3. Multiply: grad_input * grad_output.
-        # grad_input is [B, C] with -1.0 at valid positions, 0.0 elsewhere
-        # (including ignored rows). grad_output is a scalar (mean reduction)
-        # or same shape — broadcast handles both cases.
-
-        # Apply per-class weight if given.
         if weight is not None:
             w_shape = [1] * n_dims
             w_shape[channel_dim] = int(weight.get_size()[0])
@@ -468,3 +449,5 @@ def _register_loss_lowerings() -> None:
             grad_input = L.lowerings[aten.mul.Tensor](grad_input, w_reshaped)
 
         return L.lowerings[aten.mul.Tensor](grad_input, grad_output)
+
+    return _vulkan_nll_loss_backward

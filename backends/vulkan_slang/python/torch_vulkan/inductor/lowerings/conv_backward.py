@@ -60,15 +60,16 @@ def _audit_conv_backward_routing() -> None:
             )
 
 
-def _register_conv_backward_lowering() -> None:
-    """Register the conv2d backward lowering using _slang_tile_conv2d_bwd.
+def _get_conv_backward_lowering_impl():
+    """Return the implementation function for aten.convolution_backward.default.
 
+    Registration is done in bwd_lowerings.py (anti-goal #3).
+    Conv2d backward lowering using _slang_tile_conv2d_bwd template (CODEGEN.3).
     Called from ``_register_conv_and_pool_lowerings`` in ``conv.py`` so
     the Conv2d custom op is already resolved and registered.
     """
     import torch
     from torch._inductor import ir
-    from torch._inductor.lowering import register_lowering
 
     aten = torch.ops.aten
 
@@ -161,8 +162,8 @@ def _register_conv_backward_lowering() -> None:
 
     # ═════════════════════════════════════════════════════════════════════
     # CODEGEN.3: aten.convolution_backward lowering → _slang_tile_conv2d_bwd
+    # NOTE (anti-goal #3): @register_lowering moved to bwd_lowerings.py.
     # ═════════════════════════════════════════════════════════════════════
-    @register_lowering(aten.convolution_backward.default, type_promotion_kind=None)
     def _vulkan_convolution_backward(
         grad_output,
         input,
@@ -260,3 +261,5 @@ def _register_conv_backward_lowering() -> None:
 
     # T4.2 — audit backward routing via BWD_TEMPLATE_REGISTRY
     _audit_conv_backward_routing()
+
+    return _vulkan_convolution_backward

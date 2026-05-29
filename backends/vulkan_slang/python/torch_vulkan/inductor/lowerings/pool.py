@@ -60,7 +60,8 @@ def _adaptive_avg_pool2d_vulkan(x, output_size):
     return _fallback_fwd(x, output_size)
 
 
-@register_lowering(aten._adaptive_avg_pool2d_backward)
+# NOTE (anti-goal #3): @register_lowering moved to bwd_lowerings.py.
+# This function is imported there and registered via _register_pool_adaptive_bwd().
 def _adaptive_avg_pool2d_backward_vulkan(grad_out, x, output_size):
     """Lower the backward pass for adaptive_avg_pool2d.
 

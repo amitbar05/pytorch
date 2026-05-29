@@ -408,7 +408,7 @@ def register() -> None:
     from .conv import _register_conv_and_pool_lowerings
     from .embedding import (
         _register_embedding_bag_forward,
-        _register_embedding_dense_backward,
+        _get_embedding_dense_backward_impl,
     )
     from .fft import _register_fft_lowerings
     from .loss import _register_loss_lowerings
@@ -633,7 +633,8 @@ def register() -> None:
     _register_group_norm_backward()
     _register_batch_norm_backward()
     _register_loss_lowerings()
-    _register_embedding_dense_backward()
+    # NOTE (anti-goal #3): _get_embedding_dense_backward_impl() no longer
+    # registers — registration is in bwd_lowerings.py via _register_bwd_lowerings().
     _register_embedding_bag_forward()
     _register_fft_lowerings()
     _register_scatter_family_lowerings()
