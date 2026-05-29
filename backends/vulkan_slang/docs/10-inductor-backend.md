@@ -230,10 +230,20 @@ blockers that are out-of-scope for the milestone they were filed against:
 8. **COMPILE.1: Conv backward compile** -- Route through `torch_vulkan.conv2d_backward` custom op instead of `aten.convolution_backward` (avoids empty_like → zero grad)
 9. **COMPILE.3: SPIR-V prewarm** -- Session-scoped conftest fixture prewams disk cache (addmm + conv) before tests
 10. **MODEL.3: Autotune CUDA filter** -- Defense-in-depth filter strips TritonTemplateCaller/CUTLASSTemplateCaller for Vulkan devices
+11. **CODEGEN.3: Conv backward ExternKernelOut** -- `_VulkanConvBwdExternKernel` emits `_slang_tile_conv2d_bwd()` directly (no FallbackKernel)
+12. **MODEL.2: BatchNorm legit lowering** -- Direct lowering for `aten._native_batch_norm_legit` with Slang codegen
+13. **CODEGEN.2: AvgPool2d backward codegen** -- Pure Slang scatter-based backward via `_aten_avg_pool2d_backward` decomposition
+14. **CODEGEN.1: Optimizer ExternKernelOut** -- `_VulkanOptimizerExternKernel` for SGD/momentum/AdamW/Lion (no FallbackKernel)
+15. **MODEL.1: Conv3d support** -- Full forward + backward for 5D tensors (KD > 1), Slang templates + lowerings
 
-### Remaining Open Items
-- **CODEGEN.3**: Conv backward via bwd_diff table
-- **MODEL.1**: Conv3d support
+### Backward Op Audit (2026-05-29)
+- **leaky_relu_backward**: Converted to `bwd_diff(leaky_relu_fwd)` with `no_diff_params=("alpha",)`
+- **softplus_backward**: Converted to `bwd_diff(softplus_fwd)` with `no_diff_params=("beta", "threshold")`
+- **Shader update**: `softplus_fwd` signature now accepts `beta`/`threshold` parameters
+- **Exit gate**: All `@register_lowering(aten.*_backward)` registrations consolidated into `bwd_lowerings.py` (5 moved)
+- **Remaining bypass ops** (legitimate, cannot use bwd_diff): sigmoid_backward, tanh_backward (save y, need x), gelu_backward (erf vs tanh mismatch), mish_backward (slangc bug), dropout_backward (mask-based)
+
+### All v9 Milestones Closed ✅
 
 | Milestone | Status | Blocked by | Regression test |
 |-----------|--------|------------|-----------------|
@@ -244,8 +254,8 @@ blockers that are out-of-scope for the milestone they were filed against:
 | DECOMP.2 | ✅ CLOSED | — | `TestDECOMP2_ConvBwdBiasGradient` (3 tests) |
 | CODEGEN.1 | ✅ CLOSED | — | `TestCODEGEN1_OptimizerExternKernel` (new) |
 | CODEGEN.2 | ✅ CLOSED | — | `TestCODEGEN2_AvgPool2dScatterBwd` (4 tests) |
-| CODEGEN.3 | 🔲 OPEN | — | Conv bwd via bwd_diff test |
-| MODEL.1 | 🔲 OPEN | — | Conv3d regression test |
+| CODEGEN.3 | ✅ CLOSED | — | Conv bwd ExternKernelOut + bwd_diff test |
+| MODEL.1 | ✅ CLOSED | — | `TestConv3dRegression` (new) |
 | MODEL.2 | ✅ CLOSED | — | `TestMODEL2_BatchNormLegitLowering` (2 tests) |
 | MODEL.3 | ✅ CLOSED | — | Autotune CUDA filter (defense-in-depth) |
 | TEST.1 | ✅ CLOSED | — | `TestEnsureMmTileModule` (5 tests) |
