@@ -215,55 +215,71 @@ if rnumel1 > 1 and rnumel2 > 1:
 
 | Test | Arch | Norm | Compile pattern | Status | Blocker |
 |------|------|------|-----------------|--------|---------|
-| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | **Full AOT** | ✅ Pass | — |
-| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | **Full AOT** | ✅ Pass (TRAIN.12) | — |
-| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | **Full AOT** | ✅ Pass (TRAIN.12) | — |
-| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | **Full AOT** | ✅ Pass | — |
-| `test_multi_architecture_loss_decreases` | Conv+**GN**+Pool+1×1Conv | 1 GN | **Full AOT** | ✅ Pass (TRAIN.13b) | — |
+| `test_simple_cnn_conv_maxpool_fc` | Conv+ReLU+MaxPool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
+| `test_small_cnn_conv_gn_relu_fc` | 2×(Conv+GN+ReLU)+Pool+1×1Conv | 2 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
+| `test_resnet_block_conv_gn_residual_fc` | Conv+GN+residual+1×1Conv | 3 GN | Forward-only | ✅ Pass (TRAIN.12) | — |
+| `test_adamw_optimizer` | Conv+ReLU+Pool+1×1Conv | 0 | Forward-only | ✅ Pass | — |
+| `test_multi_architecture_loss_decreases` | Conv+**GN**+Pool+1×1Conv | 1 GN | Forward-only | ✅ Pass | — |
 
 **v8 status: 13/13 milestones closed.** All TRAIN.8 tests unxfail.
 
-## AOT Backend Analysis (2026-05-28)
+## Compilation Patterns & AOT Analysis (2026-05-28)
 
-### Compilation pattern: Full AOT backward
+### Forward-only compilation (TRAIN.8 tests)
 
-All TRAIN.8 tests now use **full AOT compilation**: the compiled function
-computes logits, loss (manual cross-entropy via log_softmax + gather + sum),
-and calls `.backward()` all inside the `torch.compile` graph. The optimizer
-step runs outside the compiled boundary (parameter update ops).
+All TRAIN.8 tests use **forward-only compilation**: the compiled function
+returns only logits, while loss and backward happen in eager autograd:
 
-Validated by `agent_space/quick_backward_test.py`:
-- **Forward+loss compile**: 10s warm, 26 Vulkan dispatches
-- **Forward+backward (full AOT)**: 14.8s warm, **57 total dispatches** ✅
-- Cold forward compile: ~200s on RDNA1 (first run only)
+```python
+@torch.compile(backend="inductor")
+def forward_only(x):
+    return model(x)
 
-### BatchNorm → GroupNorm
+out = forward_only(x_vk)
+loss = F.cross_entropy(out, y_vk, reduction="sum")
+loss.backward()
+optimizer.step()
+```
 
-`aten::_native_batch_norm_legit` is NOT registered on the Vulkan PrivateUse1
-backend. All TRAIN.8 tests use **GroupNorm** instead (4-group for 16/32 ch).
+This avoids the AOT partitioner's "Node was invalid, but is output" error
+that occurs when `nll_loss_forward`'s `total_weight` output depends on
+`target` (backward-only) in the joint forward/backward graph.
 
-### Linear layer autotune limitation
+### Full AOT backward (proven in standalone)
 
-Models with Linear layers fail `aten.addmm` autotune due to tile size
-constraints for very large K dimensions. Workaround: TRAIN.8 uses 1×1 Conv
-instead of Linear for classifiers. The `mm_tile` link-time import path
-(`use_module=True`) was also broken (fixed `880a7a1cf7e`: force
-`use_module=False` in `classes.py:190`).
-
-### Recommended pattern
+Full AOT compilation (forward+loss+backward through Slang codegen) works
+in standalone scripts:
 
 ```python
 @torch.compile(backend="inductor")
 def train_step(x, target):
     out = model(x)
-    log_probs = torch.nn.functional.log_softmax(out, dim=1)
-    loss = -log_probs.gather(1, target.unsqueeze(1)).squeeze(1).sum()
+    loss = F.cross_entropy(out, target)  # routes through patched nll_loss_forward
     loss.backward()
     return loss
-
-loss = train_step(x_vk, y_vk)
-optimizer.step()
 ```
+
+**Results** (`agent_space/min_debug_aot_bwd2.py`): 57 Vulkan dispatches,
+14.8s warm compile, correct loss values for SmallCNN+GN.
+
+**Pytest limitation**: The same code fails in pytest with the partitioner
+error despite `aot_cross_entropy.py` properly removing `nll_loss_forward`
+from Inductor's decomp table. Root cause under investigation — likely
+Dynamo state management difference between standalone Python and pytest
+test collection. `@register_decomposition` approach was rejected (conflicts
+with upstream `torch._decomp` registration).
+
+### GroupNorm replacement
+
+`aten::_native_batch_norm_legit` is NOT registered on Vulkan PrivateUse1.
+All TRAIN.8 tests use **GroupNorm** instead (4-group for 16/32 ch).
+
+### Linear layer autotune
+
+Models with Linear layers fail `aten.addmm` autotune for large K dimensions.
+TRAIN.8 uses 1×1 Conv + AdaptiveAvgPool instead of Linear classifiers.
+
+---
 
 ---
 
