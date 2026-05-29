@@ -119,6 +119,19 @@ def _vulkan_scatter_reduce_eager(
 
     from ..vulkan_template_caller import _dispatch_scatter_atomic
 
+    # Flush queued batcher dispatches before running the eager scatter.
+    # Inductor's wrapper emits ``_batcher.add(copy_kernel, x, buf0)`` followed
+    # by ``aten.scatter_reduce_.two(buf0, ...)`` — the copy is still queued
+    # when our eager impl fires, so buf0 contains stale/uninitialised data.
+    # Flushing ensures the copy lands on the GPU before we read+scatter into
+    # buf0.  Same defence-in-depth that direct-call helpers use
+    # (DispatchBatcher.flush_current_if_active).
+    try:
+        from ..runtime.batcher import DispatchBatcher
+        DispatchBatcher.flush_current_if_active()
+    except Exception:
+        pass
+
     if reduce == "sum":
         # Sum-mode — let the caller handle.  Inductor's sum-mode lowering
         # uses ``ir.Scatter(scatter_mode='atomic_add')`` directly without
