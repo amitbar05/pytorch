@@ -125,7 +125,7 @@ def patch_nll_loss_forward() -> None:
     aten = torch.ops.aten
     _inductor_decomps.pop(aten.nll_loss_forward.default, None)
 
-    # Also remove from fast_random_decomps cache so removal is effective.
+    # Also clear fast_random_decomps cache so removal is effective.
     try:
         from torch._inductor.decomposition import fast_random_decomps
         fast_random_decomps.cache_clear()
