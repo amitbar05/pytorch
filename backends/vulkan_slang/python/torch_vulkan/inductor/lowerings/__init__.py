@@ -178,6 +178,11 @@ def _suppress_upstream_decomps() -> None:
     # OP.26: also pop from the AOT decomp table so AOT autograd does not
     # decompose aten.scaled_dot_product_attention before Inductor sees it.
     _aot_decomps.pop(aten.scaled_dot_product_attention.default, None)
+    # DECOMP.2: also pop convolution_backward from AOT decomp.
+    # The upstream decomp guard checks GPU_TYPES (excludes "vulkan"), but
+    # the guard may not catch all paths; a defensive pop ensures our
+    # registered _vulkan_convolution_backward lowering fires directly.
+    _aot_decomps.pop(aten.convolution_backward.default, None)
     # V9.SUPPRESS.1: _softmax and _log_softmax are in the upstream
     # inductor_decompositions table (decomposition.py:79/94). The Vulkan
     # backend has native lowerings (lowerings/softmax.py) that decompose
