@@ -140,6 +140,14 @@ class VulkanExprPrinter(ExprPrinter_):
         b = self.doprint(expr.args[1])
         return f"({a} / {b})"
 
+    def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
+        """ModularIndexing(a, b, c) → (a / b) % c.
+        All Vulkan index values are positive."""
+        a = self.doprint(expr.args[0])
+        b = self.doprint(expr.args[1])
+        c = self.doprint(expr.args[2])
+        return f"(({a} / {b}) % {c})"
+
     def _print_ceiling(self, expr: sympy.Expr) -> str:
         return f"ceil({self.doprint(expr.args[0])})"
 
