@@ -82,6 +82,7 @@ DEVICE_TO_ATEN = {
     "cuda": "at::kCUDA",
     "xpu": "at::kXPU",
     "mps": "at::kMPS",
+    "vulkan": "at::kPrivateUse1",
 }
 
 LAYOUT_TO_ATEN = {
