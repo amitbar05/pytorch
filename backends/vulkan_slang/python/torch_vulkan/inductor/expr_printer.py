@@ -133,6 +133,13 @@ class VulkanExprPrinter(ExprPrinter_):
     def _print_floor(self, expr: sympy.Expr) -> str:
         return f"floor({self.doprint(expr.args[0])})"
 
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        """FloorDiv(a, b) → int floor division. All Vulkan index values
+        are positive, so integer truncation IS floor division."""
+        a = self.doprint(expr.args[0])
+        b = self.doprint(expr.args[1])
+        return f"({a} / {b})"
+
     def _print_ceiling(self, expr: sympy.Expr) -> str:
         return f"ceil({self.doprint(expr.args[0])})"
 
