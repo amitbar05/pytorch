@@ -69,28 +69,17 @@ def _ensure_conv2d_backward_op_registered() -> "object":
         )
 
         if use_slang_bwd:
-            from ..templates.caller.conv import _slang_tile_conv2d_bwd
+            from ...templates.caller.conv import _slang_tile_conv2d_bwd
 
             sH, sW = int(stride[0]), int(stride[-1] if len(stride) > 1 else stride[0])
             pH, pW = int(padding[0]), int(padding[-1] if len(padding) > 1 else padding[0])
             dH, dW = int(dilation[0]), int(dilation[-1] if len(dilation) > 1 else dilation[0])
 
-            # TRAIN.5: route through pool_acquire for buffer reuse across steps
-            from ...buffer_pool import pool_acquire
-
-            _gi = pool_acquire(tuple(input.shape), input.dtype, input.device)
-            grad_input = _gi.zero_() if _gi is not None else torch.zeros_like(input)
-            _gw = pool_acquire(tuple(weight.shape), weight.dtype, weight.device)
-            grad_weight = _gw.zero_() if _gw is not None else torch.zeros_like(weight)
-            if has_bias:
-                _gb = pool_acquire(
-                    (weight.shape[0],), input.dtype, input.device,
-                )
-                grad_bias = _gb.zero_() if _gb is not None else torch.zeros(
-                    weight.shape[0], device=input.device, dtype=input.dtype,
-                )
-            else:
-                grad_bias = None
+            # Allocate fresh output tensors — do NOT use pool_acquire which
+            # may alias with input buffers in compiled contexts.
+            grad_input = torch.zeros_like(input)
+            grad_weight = torch.zeros_like(weight)
+            grad_bias = torch.zeros(weight.shape[0], device=input.device, dtype=input.dtype) if has_bias else None
 
             _slang_tile_conv2d_bwd(
                 input, weight, grad_output,
@@ -100,6 +89,14 @@ def _ensure_conv2d_backward_op_registered() -> "object":
                 dilation=(dH, dW),
                 grad_bias=grad_bias,
             )
+
+            # Force GPU pipeline drain before returning tensors to the
+            # compiled wrapper.  In the FallbackKernel path, the wrapper may
+            # consume output buffers immediately; a pending GPU write
+            # produces stale data.  ``.item()`` on grad_bias forces a
+            # blocking read-back that commits all prior dispatches.
+            if has_bias:
+                _ = grad_bias[0].item()
 
             if not has_bias:
                 grad_bias = grad_output.new_empty((0,))
