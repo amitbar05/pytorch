@@ -153,6 +153,27 @@ def _register_conv_and_pool_lowerings() -> None:
     # routes conv2d through the dedicated slang_conv2d template.
     # ═════════════════════════════════════════════════════════════════════
 
+    def _vk_realize_then_unwrap(x):
+        """Realize Pointwise/Reduction, then unwrap StorageBox → data.
+        Returns Buffer/ReinterpretView (what ExternKernel expects).
+        """
+        import torch._inductor.ir as _ir
+
+        # Unwrap TensorBox → StorageBox
+        if isinstance(x, _ir.TensorBox):
+            x = x.data
+
+        # If StorageBox contains Pointwise/Reduction, realize it first
+        if isinstance(x, _ir.StorageBox) and isinstance(
+            x.data, (_ir.Pointwise, _ir.Reduction)
+        ):
+            x.realize()
+
+        # Unwrap to raw data (Buffer/ReinterpretView)
+        if isinstance(x, _ir.StorageBox):
+            return x.data
+        return x
+
     class _VulkanConv2dExternKernel(ir.ExternKernelOut):
         """ExternKernelOut that dispatches conv2d via the slang_conv2d template.
 
@@ -167,6 +188,25 @@ def _register_conv_and_pool_lowerings() -> None:
         M17.2: Optional ``epilogue`` param (e.g. ``"OpReLU"``) for
         fused conv+activation in a single dispatch.
         """
+
+        @staticmethod
+        def unwrap_storage(inputs):
+            """Override to realize Pointwise before unwrapping.
+            The base class unwraps StorageBox → data, then asserts
+            Buffer|ReinterpretView. We intercept to realize first.
+            """
+            from collections.abc import Sequence
+
+            inputs_new = []
+            for x in inputs:
+                if isinstance(x, Sequence):
+                    x = [
+                        _vk_realize_then_unwrap(i) for i in x
+                    ]
+                else:
+                    x = _vk_realize_then_unwrap(x)
+                inputs_new.append(x)
+            return inputs_new
 
         def __init__(
             self,

@@ -828,6 +828,21 @@ def _legacy_register() -> None:
     # @torch.compiler.disable and graph-break Dynamo at every call.
     register_eager_patch_custom_ops()
 
+    # Register conv2d_backward lowering AFTER the custom op now exists.
+    # Must be here (not in lowerings/__init__.py) because the custom op
+    # is created by register_eager_patch_custom_ops() above.
+    import torch as _torch_cb
+    if hasattr(_torch_cb.ops.torch_vulkan, "conv2d_backward"):
+        from torch._inductor.lowering import (
+            register_lowering as _conv_bwd_low,
+        )
+        from torch_vulkan.inductor.lowerings.conv_backward import (
+            _get_conv2d_backward_custom_op_lowering,
+        )
+        _conv_bwd_low(_torch_cb.ops.torch_vulkan.conv2d_backward.default)(
+            _get_conv2d_backward_custom_op_lowering()
+        )
+
     # Mark custom ops as registered so _ensure_patch_custom_ops() in
     # __init__.py's lazy path returns immediately without re-registering.
     # Without this, Dynamo traces see different bytecode paths on

@@ -692,3 +692,56 @@ def _register_logical_and_for_vulkan() -> None:
         logging.getLogger(__name__).warning(
             "Registering logical_and.out for Vulkan failed: %s", e
         )
+
+
+_bitwise_ops_registered = False
+
+
+def _register_bitwise_ops_for_vulkan():
+    """Register bitwise_and.out and bitwise_or.out for bool/int8 tensors.
+    
+    torch.isclose (used by torch.testing.assert_close) calls bitwise_and.Tensor_out,
+    which isn't registered for Vulkan. Implement using float arithmetic:
+    - bitwise_and: (a.float() * b.float()) > 0.5 → bool
+    - bitwise_or: (a.float() + b.float()) > 0.5 → bool
+    """
+    global _bitwise_ops_registered
+    if _bitwise_ops_registered:
+        return
+    _bitwise_ops_registered = True
+        
+    try:
+        _bitwise_lib = torch.library.Library("aten", "IMPL", "PrivateUse1")
+
+        def _bitwise_and_out(
+            self: torch.Tensor, other: torch.Tensor, *, out: torch.Tensor
+        ) -> torch.Tensor:
+            # Logical AND for bool tensors: (a.bool() + b.bool()) == 2
+            # Since both are already bool, use multiplication: a * b
+            # Convert to float, multiply, convert back to bool.
+            a_f = self.float()
+            b_f = other.float()
+            result = (a_f * b_f) > 0.5
+            out.copy_(result)
+            return out
+
+        def _bitwise_or_out(
+            self: torch.Tensor, other: torch.Tensor, *, out: torch.Tensor
+        ) -> torch.Tensor:
+            # Logical OR for bool tensors: (a.float() + b.float()) > 0.5
+            a_f = self.float()
+            b_f = other.float()
+            result = (a_f + b_f) > 0.5
+            out.copy_(result)
+            return out
+
+        _bitwise_lib.impl("bitwise_and.Tensor_out", _bitwise_and_out)
+        _bitwise_lib.impl("bitwise_or.Tensor_out", _bitwise_or_out)
+        # Keep a reference so GC doesn't destroy the Library object.
+        _register_bitwise_ops_for_vulkan._lib = _bitwise_lib  # type: ignore[attr-defined]
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Registering bitwise ops for Vulkan failed: %s", e
+        )

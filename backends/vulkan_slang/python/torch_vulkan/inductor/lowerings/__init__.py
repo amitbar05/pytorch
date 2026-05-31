@@ -454,17 +454,20 @@ def register() -> None:
 
     _register_optimizer_lowerings()
 
-    # M17.8.d.2 / M22.14 — opaque conv2d_backward custom op. Emits
-    # extern_kernels.conv2d_backward(...) which runs the C++
-    # vulkan_convolution_backward_overrideable adapter at runtime.
-    # Registered by fx_passes/eager/conv.py::_ensure_conv2d_backward_op_registered.
-    if hasattr(torch.ops.torch_vulkan, "conv2d_backward"):
-        make_fallback(torch.ops.torch_vulkan.conv2d_backward.default)
-
     # TRAIN.2: GPU-only max_pool2d backward via scatter_add template.
     # The custom op is registered by fx_passes/eager/pool.py during
     # register_eager_patch_custom_ops(); register it as a known extern
     # kernel for Inductor codegen.
+    if hasattr(torch.ops.torch_vulkan, "conv2d_backward"):
+        from torch._inductor.lowering import (
+            register_lowering as _conv_bwd_reg_low,
+        )
+        from torch_vulkan.inductor.lowerings.conv_backward import (
+            _get_conv2d_backward_custom_op_lowering,
+        )
+        _conv_bwd_reg_low(torch.ops.torch_vulkan.conv2d_backward.default)(
+            _get_conv2d_backward_custom_op_lowering()
+        )
     if hasattr(torch.ops.torch_vulkan, "max_pool2d_scatter_bwd"):
         make_fallback(torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default)
 

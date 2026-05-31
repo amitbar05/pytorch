@@ -158,6 +158,8 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         dH, dW = self.dilation_arg
 
         # Zero-init output buffers (bwd kernel accumulates via +=)
+        # Must synchronize BEFORE the kernel dispatch — .zero_() on Vulkan
+        # may be async, and the kernel must not read stale memory.
         wrapper.writeline(f"{out_name}.zero_()")
         wrapper.writeline(f"{grad_weight}.zero_()")
 
@@ -165,6 +167,10 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         if self.has_bias and len(input_names) > 4:
             grad_bias_arg = input_names[4]
             wrapper.writeline(f"{grad_bias_arg}.zero_()")
+
+        # Sync: guarantee zero-init committed before kernel reads output buffers
+        wrapper.add_import_once("import torch_vulkan")
+        wrapper.writeline("torch_vulkan.synchronize(0)")
 
         self.codegen_comment(wrapper)
         wrapper.writeline(
@@ -267,8 +273,8 @@ def _get_conv_backward_lowering_impl():
         from torch._inductor.lowering import lowerings as _lowerings
 
         gw_size = [C_out, C_in, kH, kW]
-        gw_box = _lowerings[aten.full.default](
-            gw_size, 0.0, dtype=dtype, device=dev
+        gw_box = _lowerings[aten.empty.memory_format](
+            gw_size, dtype=dtype, device=dev
         )
 
         # grad_bias allocation (if needed)
@@ -276,8 +282,8 @@ def _get_conv_backward_lowering_impl():
         kernel_inputs = [input, weight, grad_output, gw_box]
         if has_bias:
             gb_size = [int(w_sizes[0])]
-            gb_box = _lowerings[aten.full.default](
-                gb_size, 0.0, dtype=dtype, device=dev
+            gb_box = _lowerings[aten.empty.memory_format](
+                gb_size, dtype=dtype, device=dev
             )
             kernel_inputs.append(gb_box)
 
@@ -365,21 +371,21 @@ def _get_conv2d_backward_custom_op_lowering():
         from torch._inductor.lowering import lowerings as _lowerings
 
         gw_size = [C_out, C_in, int(w_sizes[2]), int(w_sizes[3])]
-        gw_box = _lowerings[_aten.full.default](
-            gw_size, 0.0, dtype=dtype, device=dev
+        gw_box = _lowerings[_aten.empty.memory_format](
+            gw_size, dtype=dtype, device=dev
         )
-        # Force realization so the buffer is allocated and zero-initialized
-        # BEFORE the kernel writes into it (avoid overwriting kernel output).
-        gw_box.realize()
+        # Note: do NOT call gw_box.realize() here — the ExternKernelOut
+        # codegen handles zero-init and scheduling. Pre-realizing causes
+        # the scheduler to treat gw_box as already-finalized, dropping
+        # the kernel's writes (zero gradients).
 
         kernel_inputs = [input, weight, grad_output, gw_box]
         hb = bool(has_bias)
         if hb:
             gb_size = [C_out]
-            gb_box = _lowerings[_aten.full.default](
-                gb_size, 0.0, dtype=dtype, device=dev
+            gb_box = _lowerings[_aten.empty.memory_format](
+                gb_size, dtype=dtype, device=dev
             )
-            gb_box.realize()
             kernel_inputs.append(gb_box)
 
         kernel = _VulkanConvBwdExternKernel(

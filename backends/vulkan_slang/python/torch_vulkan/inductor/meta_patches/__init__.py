@@ -115,6 +115,7 @@ from .op_registration import (
     _patch_einsum_proxy_decomp,
     _patch_proxy_call_matmul_decomp,
     _register_backward_meta_decomps,
+    _register_bitwise_ops_for_vulkan,
     _register_logical_and_for_vulkan,
     _register_matmul_meta,
     _register_sdpa_meta,
@@ -429,6 +430,11 @@ def apply() -> None:
     # tensors. The compiled backward lowers through overrides.py (&&), but
     # eager callers and any un-lowered path need the PrivateUse1 impl.
     _register_logical_and_for_vulkan()
+
+    # PF.56 — Register bitwise_and.Tensor_out and bitwise_or.Tensor_out for
+    # bool/int8 tensors. torch.isclose (used by torch.testing.assert_close)
+    # calls bitwise_and.Tensor_out, which isn't registered for Vulkan.
+    _register_bitwise_ops_for_vulkan()
 
     # PF.55 — Python AutogradPrivateUse1 impl for view/reshape/_unsafe_view
     # so dynamic-shape compile (`torch.compile(dynamic=True)`) doesn't blow

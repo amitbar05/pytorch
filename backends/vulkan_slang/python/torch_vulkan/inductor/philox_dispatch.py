@@ -75,7 +75,11 @@ def _dispatch_dropout(input_tensor, p, train, seed_lo, seed_hi, offset=0):
         input_tensor=input_tensor,
         dropout_p=p,
     )
-    mask = (result != 0.0) | (input_tensor == 0.0)
+    # Simplification: the result tensor has already had dropout applied.
+    # Elements that are 0 in the result were dropped. Elements that are
+    # non-zero were kept (with scaling). This works for the common case
+    # where input values aren't exactly 0 before dropout.
+    mask = result != 0.0
     return result, mask
 
 

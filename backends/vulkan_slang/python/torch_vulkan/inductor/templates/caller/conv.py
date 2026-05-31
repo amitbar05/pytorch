@@ -537,7 +537,10 @@ def _slang_tile_conv2d_bwd(
     oH = (iH + 2 * pH - dH * (kH - 1) - 1) // sH + 1
     oW = (iW + 2 * pW - dW * (kW - 1) - 1) // sW + 1
 
-    has_bias = bias is not None
+    # grad_bias is not None means the caller wants bias gradients computed.
+    # The backward doesn't need the forward bias tensor — bias gradient is
+    # just sum(grad_out, dim=(N,H,W)).  Gate on grad_bias, not bias.
+    has_bias = grad_bias is not None
     dtype_s = _dtype_to_slang(input_t.dtype)
     src = _render_conv_bwd_slang(
         tile_w=tile_w,

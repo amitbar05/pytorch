@@ -677,20 +677,12 @@ def _filter_int8_configs_wave_aligned(
 def install_external_mm_int8() -> None:
     """Register Slang template int8 mm callables as external matmul choices.
 
-    OP.24: Appends int8 matmul callables to
-    ``torch._inductor.config.external_matmul`` so that Inductor's
-    ``tuned_mm`` lowering can benchmark our Slang tiled-int8 templates
-    alongside the CPU fallback path.
-
-    Only active when Slang tiles are enabled (``TORCH_VULKAN_DISABLE_SLANG_TILES``
-    is not set to ``1`` — same gate as other Slang tile matmul variants).
-
-    Safe to call multiple times — only installs once.
+    DISABLED: The int8 wrapper uses ``import mm_int8;`` but slangc can't find
+    the precompiled module during autotune (compiled in temp dir without
+    module search path). This causes slangc failures that waste ~15s per
+    Linear layer. Int8 matmul isn't needed for fp32 training workloads.
     """
-    global _int8_installed
-    if _int8_installed:
-        return
-    _int8_installed = True
+    return  # Disabled — see docstring
 
     if not _slang_tiles_enabled():
         return

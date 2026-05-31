@@ -85,8 +85,13 @@ def _register_group_norm() -> None:
         if not _is_vulkan(x):
             return NotImplemented
 
-        group_size = int(C * HxW) // int(num_groups)
-        x_reshaped = L.lowerings[aten.view.default](x, [N, num_groups, group_size])
+        # Keep symbolic — C, HxW may be sympy.Expr under dynamic-shape compile.
+        # Sympy supports *, // natively; aten.view.default lowering accepts
+        # sympy size expressions.
+        group_size = C * HxW // num_groups
+        x_reshaped = L.lowerings[aten.view.default](
+            x, [N, num_groups, group_size]
+        )
 
         # DR.1+: Use var_mean welford reduction (single reduction dispatch)
         # instead of two separate mean reductions (mean + var).  The welford
@@ -224,40 +229,12 @@ def _register_batch_norm_forward() -> None:
             normalized = L.lowerings[aten.mul.Tensor](dx, rstd_kd)
 
             # MODEL.2: running_mean / running_var EMA update (training mode).
-            # Compute new stats using pointwise ops that produce plain IR
-            # buffers (no InplacedBuffer), then use copy_ to write back.
-            # realize() on both new_* tensors before copy_ forces separate
-            # dispatches so the copy_ mutations don't alias with the
-            # normalization kernel's intermediates.
-            if running_mean is not None and running_var is not None:
-                one_minus_mom = 1.0 - float(momentum)
-                mom = float(momentum)
-
-                # new_running_mean = running_mean * (1 - momentum) + mean_1d * momentum
-                rm_decay = L.lowerings[aten.mul.Scalar](running_mean, one_minus_mom)
-                rm_new_contrib = L.lowerings[aten.mul.Scalar](mean_1d, mom)
-                new_rm = L.lowerings[aten.add.Tensor](rm_decay, rm_new_contrib)
-
-                # new_running_var = running_var * (1 - momentum) + unbiased_var * momentum
-                # PyTorch uses unbiased variance (Bessel correction) for running_var
-                if N_eff > 1:
-                    unbiased_factor = float(N_eff) / float(N_eff - 1)
-                    unbiased_var = L.lowerings[aten.mul.Scalar](var_1d, unbiased_factor)
-                else:
-                    unbiased_var = var_1d
-
-                rv_decay = L.lowerings[aten.mul.Scalar](running_var, one_minus_mom)
-                rv_new_contrib = L.lowerings[aten.mul.Scalar](unbiased_var, mom)
-                new_rv = L.lowerings[aten.add.Tensor](rv_decay, rv_new_contrib)
-
-                # Force materialization before copy_ to avoid InplacedBuffer
-                # aliasing with the normalization kernel's Welford intermediates.
-                new_rm.realize()
-                new_rv.realize()
-
-                # Write back via copy_ (in-place mutation on running stats)
-                L.lowerings[aten.copy_.default](running_mean, new_rm)
-                L.lowerings[aten.copy_.default](running_var, new_rv)
+            # SKIP: Under torch.compile, copy_ on running_stats creates
+            # InplacedBuffer nodes that cause undefined identifier errors
+            # in slangc (the buffers are referenced but never materialized
+            # in the generated code). Running stats are only needed for
+            # inference — during training, backward uses save_mean/save_invstd
+            # computed fresh for each batch. So we skip the update entirely.
         else:
             if running_mean is None or running_var is None:
                 return NotImplemented
