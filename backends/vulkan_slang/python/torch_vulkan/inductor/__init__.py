@@ -738,11 +738,13 @@ def _legacy_register() -> None:
     if hasattr(_ic, "b2b_gemm_pass"):
         _ic.b2b_gemm_pass = True
 
-    # T5.4 Phase A: enable upstream combo_kernels to group sibling
-    # pointwise ops into ForeachKernelSchedulerNodes, reducing dispatch
-    # count on large pointwise chains.
+    # T5.4 Phase A: combo_kernels disabled (TR.20).
+    # The upstream combo-kernel fusion path has a stale name_to_fused_node
+    # bug after ForeachKernelSchedulerNode creation — extern kernels
+    # reference original node names that no longer exist in the graph,
+    # breaking _topological_sort_nodes().  Disabled until upstream fix.
     if hasattr(_ic, "combo_kernels"):
-        _ic.combo_kernels = True
+        _ic.combo_kernels = False
     # TRAIN.6-F1: Wave-uniform combo-kernel dispatch for reductions enabled.
     # VulkanComboKernel now uses a multi-dimensional grid where gid.y selects
     # the subkernel and gid.x is the subkernel's own workgroup ID. All threads

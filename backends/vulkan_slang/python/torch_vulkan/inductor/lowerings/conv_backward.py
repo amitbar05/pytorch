@@ -136,6 +136,22 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         self.padding_arg = padding_arg
         self.dilation_arg = dilation_arg
         self.has_bias = has_bias
+        # CODEGEN.3-fix: mark grad_weight (inputs[3]) and grad_bias (inputs[4])
+        # as mutation outputs so the scheduler knows this kernel WRITES to them.
+        # Without this, the scheduler treats them as read-only inputs, and
+        # downstream codegen creates a separate buffer for the output — the
+        # kernel's writes never reach the parameter's .grad attribute.
+        from torch._inductor.ir import MutationOutput, NoneLayout
+        if len(self.inputs) > 3:
+            gw_node = self.inputs[3]
+            self.mutation_outputs.append(
+                MutationOutput(NoneLayout(device=layout.device), gw_node, self)
+            )
+        if has_bias and len(self.inputs) > 4:
+            gb_node = self.inputs[4]
+            self.mutation_outputs.append(
+                MutationOutput(NoneLayout(device=layout.device), gb_node, self)
+            )
 
     def codegen(self, wrapper):
         """Emit a call to ``_slang_tile_conv2d_bwd`` in the generated wrapper."""
@@ -144,8 +160,20 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
             "import _slang_tile_conv2d_bwd"
         )
 
+        # TR.20: the wrapper's codegen_allocation won't trigger for
+        # extern-kernel primary outputs when they're the final output
+        # (no downstream consumer reads them).  Emit allocation directly.
+        out_name = self.codegen_reference()
+        layout = self.get_layout()
+        size = list(layout.size)
+        stride = list(layout.stride)
+        dtype_str = "torch.float32"
+        wrapper.writeline(
+            f"{out_name} = empty_strided_vulkan({size}, {stride}, {dtype_str}, "
+            f"lifetime_class='transient')"
+        )
+
         input_names = [inp.codegen_reference() for inp in self.inputs]
-        out_name = self.codegen_reference()  # grad_input
 
         # inputs layout: [input, weight, grad_output, grad_weight, grad_bias?]
         input_t = input_names[0]
@@ -276,6 +304,7 @@ def _get_conv_backward_lowering_impl():
         gw_box = _lowerings[aten.empty.memory_format](
             gw_size, dtype=dtype, device=dev
         )
+        gw_box.realize()
 
         # grad_bias allocation (if needed)
         gb_box = None
@@ -285,6 +314,7 @@ def _get_conv_backward_lowering_impl():
             gb_box = _lowerings[aten.empty.memory_format](
                 gb_size, dtype=dtype, device=dev
             )
+            gb_box.realize()
             kernel_inputs.append(gb_box)
 
         # Create the ExternKernelOut (grad_input is the primary output)
