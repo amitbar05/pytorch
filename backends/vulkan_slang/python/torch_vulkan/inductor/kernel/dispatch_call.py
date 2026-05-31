@@ -16,6 +16,7 @@ class (``VulkanKernel``); this mixin contributes no state of its own.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import sympy
@@ -137,45 +138,56 @@ class CallKernelMixin:
         # expression references the sizevar names (e.g. ks27) and is
         # divided by the threadgroup size to yield the workgroup count.
         thr = self.max_threadgroup_size
-        if config.dynamic_shapes() and non_red:
-            # Build a single Python expression for the total numel across
-            # all non-reduction dimensions.  Dynamic numels reference the
-            # sizevar name (rendered via sexpr); static numels are literals.
-            total_numel_expr = self.sexpr(non_red[0].numel)
-            for v in non_red[1:]:
-                total_numel_expr = f"({total_numel_expr}) * ({self.sexpr(v.numel)})"
-
-            if red:
-                # D.2.a — For reductions, one workgroup per output element
-                # (no division by threadgroup_size).  The threads within
-                # each WG collaborate to reduce the reduction dimension.
-                from .symbolic import MAX_COMPUTE_WG_X
-
-                wg_x = f"min(({total_numel_expr}), {MAX_COMPUTE_WG_X})"
-                wg_y = (
-                    f"((({total_numel_expr}) + {MAX_COMPUTE_WG_X - 1})"
-                    f" // {MAX_COMPUTE_WG_X})"
-                )
-            else:
-                # Pointwise: ceil(total_elements / threadgroup_size)
-                from .symbolic import dynamic_wg_counts
-
-                wg_x, wg_y = dynamic_wg_counts(total_numel_expr, thr)
-            wg_z = "1"
-        else:
-            if non_red:
-                wg_x_str = self.sexpr(non_red[0].numel)
+        # DYN.1: The VK expression printer defaults to ``pc.``-prefixed
+        # sizevar names for Slang source emission.  Here we are generating
+        # the Python wrapper — the bare inner name is used for wrapper
+        # variable lookup.  Disable the prefix temporarily.
+        _vk_printer = getattr(self, "_vk_printer", None)
+        _ctx = (
+            _vk_printer._disable_pc_prefix()
+            if _vk_printer is not None
+            else contextlib.nullcontext()
+        )
+        with _ctx:
+            if config.dynamic_shapes() and non_red:
+                # Build a single Python expression for the total numel across
+                # all non-reduction dimensions.  Dynamic numels reference the
+                # sizevar name (rendered via sexpr); static numels are literals.
+                total_numel_expr = self.sexpr(non_red[0].numel)
                 for v in non_red[1:]:
-                    wg_x_str = f"({wg_x_str}) * ({self.sexpr(v.numel)})"
+                    total_numel_expr = f"({total_numel_expr}) * ({self.sexpr(v.numel)})"
+
+                if red:
+                    # D.2.a — For reductions, one workgroup per output element
+                    # (no division by threadgroup_size).  The threads within
+                    # each WG collaborate to reduce the reduction dimension.
+                    from .symbolic import MAX_COMPUTE_WG_X
+
+                    wg_x = f"min(({total_numel_expr}), {MAX_COMPUTE_WG_X})"
+                    wg_y = (
+                        f"((({total_numel_expr}) + {MAX_COMPUTE_WG_X - 1})"
+                        f" // {MAX_COMPUTE_WG_X})"
+                    )
+                else:
+                    # Pointwise: ceil(total_elements / threadgroup_size)
+                    from .symbolic import dynamic_wg_counts
+
+                    wg_x, wg_y = dynamic_wg_counts(total_numel_expr, thr)
+                wg_z = "1"
             else:
-                wg_x_str = "1"
+                if non_red:
+                    wg_x_str = self.sexpr(non_red[0].numel)
+                    for v in non_red[1:]:
+                        wg_x_str = f"({wg_x_str}) * ({self.sexpr(v.numel)})"
+                else:
+                    wg_x_str = "1"
 
-            if red:
-                wg_x_str = f"({wg_x_str})"
+                if red:
+                    wg_x_str = f"({wg_x_str})"
 
-            wg_x = wg_x_str
-            wg_y = "1"
-            wg_z = "1"
+                wg_x = wg_x_str
+                wg_y = "1"
+                wg_z = "1"
 
         ordered_args.append(wg_x)
         ordered_args.append(wg_y)

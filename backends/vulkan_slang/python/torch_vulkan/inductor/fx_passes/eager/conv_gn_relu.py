@@ -100,6 +100,138 @@ def _dispatch_group_norm_slang(
     )
 
 
+def _dispatch_group_norm_backward_slang(
+    grad_output: "torch.Tensor",
+    input_t: "torch.Tensor",
+    mean: "torch.Tensor",
+    rstd: "torch.Tensor",
+    weight: "torch.Tensor | None",
+    grad_input: "torch.Tensor",
+    num_groups: int,
+) -> None:
+    """Dispatch the ``group_norm_backward.slang`` fused shader for grad_input.
+
+    All tensors are reshaped to [N*G, group_size] so the shader operates
+    one workgroup per (batch, group) row.  One dispatch replaces the old
+    10+ dispatch decomposition (view → sub → mul → mul → sum → sub → …).
+    """
+    import os
+    import struct
+
+    import torch
+
+    N_total = grad_output.shape[0] * grad_output.shape[1]  # N * C
+    N = input_t.shape[0]
+    C = input_t.shape[1]
+    G = num_groups
+    cpg = C // G
+    HxW = grad_output.shape[2] * grad_output.shape[3]
+    group_size = cpg * HxW
+    num_rows = N * G
+
+    go_2d = grad_output.reshape(num_rows, group_size)
+    inp_2d = input_t.reshape(num_rows, group_size)
+    gi_2d = grad_input.reshape(num_rows, group_size)
+
+    if weight is not None:
+        w_1d = weight.view(-1)
+        has_weight = 1
+    else:
+        w_1d = torch.empty(1, dtype=torch.float32, device=grad_output.device)
+        has_weight = 0
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    shader_path = os.path.join(
+        this_dir, "..", "..", "..", "..", "..",
+        "shaders", "normalization", "group_norm_backward.slang",
+    )
+    with open(shader_path) as f:
+        src = f.read()
+
+    from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+    pc = struct.pack(
+        "6I",
+        num_rows,
+        group_size,
+        num_groups,
+        cpg,
+        HxW,
+        has_weight,
+    )
+
+    buffers = [go_2d, inp_2d, mean, rstd, w_1d, gi_2d]
+    cache_key = f"gn_bwd_input_{G}_{cpg}_{HxW}_f32_m22_6"
+
+    compile_and_dispatch(
+        src, buffers,
+        num_rows, 1, 1,
+        push_constants=pc,
+        num_outputs=1,
+        entry="computeMain",
+        cache_key=cache_key,
+    )
+
+
+def _dispatch_group_norm_backward_weight_slang(
+    grad_output: "torch.Tensor",
+    input_t: "torch.Tensor",
+    mean: "torch.Tensor",
+    rstd: "torch.Tensor",
+    grad_weight: "torch.Tensor",
+    grad_bias: "torch.Tensor",
+    num_groups: int,
+    compute_weight: bool = True,
+    compute_bias: bool = True,
+) -> None:
+    """Dispatch the ``group_norm_backward_weight.slang`` fused shader.
+
+    One thread per channel (C), each accumulates over N and HxW to produce
+    grad_weight and grad_bias.  One dispatch replaces the old 5+ dispatch
+    decomposition (sum over dims → view → sum over dims → view → ...).
+    """
+    import os
+    import struct
+
+    import torch
+
+    N = input_t.shape[0]
+    C = input_t.shape[1]
+    HxW = grad_output.shape[2] * grad_output.shape[3]
+    G = num_groups
+    cpg = C // G
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    shader_path = os.path.join(
+        this_dir, "..", "..", "..", "..", "..",
+        "shaders", "normalization", "group_norm_backward_weight.slang",
+    )
+    with open(shader_path) as f:
+        src = f.read()
+
+    from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+    pc = struct.pack(
+        "7I",
+        N, C, HxW, G, cpg,
+        1 if compute_weight else 0,
+        1 if compute_bias else 0,
+    )
+
+    buffers = [grad_output, input_t, mean, rstd, grad_weight, grad_bias]
+    grid_x = (C + 255) // 256
+    cache_key = f"gn_bwd_weight_{G}_{C}_{HxW}_f32_m22_6"
+
+    compile_and_dispatch(
+        src, buffers,
+        grid_x, 1, 1,
+        push_constants=pc,
+        num_outputs=1,
+        entry="computeMain",
+        cache_key=cache_key,
+    )
+
+
 def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
     """Register ``torch_vulkan::conv2d_gn_relu_fused`` as a custom_op.
 

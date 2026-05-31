@@ -2,6 +2,10 @@
 
 Contains layer_norm, group_norm, and batch_norm backward.  Extracted to
 keep bwd_lowerings.py under the 800-line anti-goal #7 cap.
+
+GroupNorm backward: uses fused Slang shaders via ExternKernelOut
+(2 dispatches) instead of the old ~15 dispatch decomposition.
+See ``lowerings/gn_backward_extern.py`` for the ExternKernelOut classes.
 """
 
 from __future__ import annotations
@@ -106,11 +110,17 @@ def _register_layer_norm_backward() -> None:
 def _register_group_norm_backward() -> None:
     """P0.1 — Inductor lowering for ``aten.native_group_norm_backward``.
 
-    (Moved from ``lowerings/norm.py`` per TR.19.)
+    M22.6: Replaced the old ~15-dispatch decomposition with 2 fused
+    Slang dispatches via ExternKernelOut.
     """
     import torch
-    from torch._inductor import lowering as L
-    from torch._inductor.lowering import register_lowering
+    from torch._inductor import ir
+    from torch._inductor.lowering import register_lowering, lowerings
+
+    from torch_vulkan.inductor.lowerings.gn_backward_extern import (
+        _VulkanGNBwdInputExternKernel,
+        _VulkanGNBwdWeightExternKernel,
+    )
 
     aten = torch.ops.aten
 
@@ -128,89 +138,93 @@ def _register_group_norm_backward() -> None:
         if N <= 0 or C <= 0 or HxW <= 0 or group <= 0 or C % group != 0:
             return NotImplemented
         cpg = C // group
-        s = 1.0 / float(cpg * HxW)
 
-        # Work in 4D [N, group, cpg, HxW] throughout so mean/rstd broadcast
-        # cleanly over (cpg, HxW) and reductions land on the right dims.
-        in_4d = L.lowerings[aten.view.default](inp, [N, group, cpg, HxW])
-        go_4d = L.lowerings[aten.view.default](grad_output, [N, group, cpg, HxW])
-        mean_4d = L.lowerings[aten.view.default](mean, [N, group, 1, 1])
-        rstd_4d = L.lowerings[aten.view.default](rstd, [N, group, 1, 1])
+        dev = grad_output.get_device()
+        dtype = grad_output.get_dtype()
 
-        # xhat = (x - mean) * rstd  — the per-group normalised input
-        xhat_4d = L.lowerings[aten.mul.Tensor](
-            L.lowerings[aten.sub.Tensor](in_4d, mean_4d), rstd_4d
+        # ── Output buffers (pre-allocated zeros) ──
+        gi_size = list(inp.get_size())
+        gi_stride = [C * HxW, HxW, int(inp.get_size()[-1]), 1]
+        gi_layout = ir.FixedLayout(
+            device=dev, dtype=dtype, size=gi_size, stride=gi_stride
         )
+        gi_buf = lowerings[aten.full.default](
+            gi_size, 0.0, dtype=dtype, device=dev
+        )
+        gi_buf.realize()
 
-        def _sum2(t, d0, d1):
-            """Reduce t over two dims sequentially (d0 first, then d1)."""
-            t = L.lowerings[aten.sum.dim_IntList](t, [d0], keepdims=False)
-            # Removing dim d0 shifts all dims > d0 down by 1.
-            adj = d1 - 1 if d1 > d0 else d1
-            return L.lowerings[aten.sum.dim_IntList](t, [adj], keepdims=False)
+        gw_size = [C]
+        gw_stride = [1]
+        gw_layout = ir.FixedLayout(
+            device=dev, dtype=dtype, size=gw_size, stride=gw_stride
+        )
+        gw_buf = lowerings[aten.full.default](
+            gw_size, 0.0, dtype=dtype, device=dev
+        )
+        gw_buf.realize()
 
-        def _zero_like_shape(shape):
-            return L.lowerings[aten.full.default](
-                shape,
-                0,
-                dtype=grad_output.get_dtype(),
-                device=grad_output.get_device(),
-                pin_memory=False,
+        gb_buf = None
+        if bool(output_mask[2]):
+            gb_size = [C]
+            gb_stride = [1]
+            gb_layout = ir.FixedLayout(
+                device=dev, dtype=dtype, size=gb_size, stride=gb_stride
             )
+            gb_buf = lowerings[aten.full.default](
+                gb_size, 0.0, dtype=dtype, device=dev
+            )
+            gb_buf.realize()
 
-        outputs: list = [
-            _zero_like_shape(list(inp.get_size())),
-            _zero_like_shape([C]),
-            _zero_like_shape([C]),
-        ]
-
-        # Correct PyTorch GroupNorm backward (matches ATen group_norm.cpp):
-        #   d_x_i = rstd * (gamma_i * dy_i
-        #             - (1/n) * sum_j(gamma_j * dy_j)
-        #             - xhat_i * (1/n) * sum_j(gamma_j * dy_j * xhat_j))
-        # where n = cpg * HxW.  gamma must be INSIDE the group-level sums;
-        # factoring it outside is only valid when cpg == 1.
-
-        # go_gamma = gamma * dy  (or just dy when gamma is None)
+        # ── Dispatch 1: grad_input via fused shader ──
+        gn_bwd_inputs = [grad_output, inp, mean, rstd]
         if gamma is not None:
-            gamma_4d = L.lowerings[aten.view.default](gamma, [1, group, cpg, 1])
-            go_gamma = L.lowerings[aten.mul.Tensor](go_4d, gamma_4d)
+            gn_bwd_inputs.append(gamma)
         else:
-            go_gamma = go_4d
+            gn_bwd_inputs.append(None)
+        gn_bwd_inputs.append(gi_buf)
 
-        # dy * xhat — needed for d_gamma (no gamma factor)
-        dy_xhat = L.lowerings[aten.mul.Tensor](go_4d, xhat_4d)
-
-        if output_mask[0]:
-            # group sums with gamma inside
-            go_gamma_xhat = L.lowerings[aten.mul.Tensor](go_gamma, xhat_4d)
-            # ds_g[n,g] = sum_{cpg,HxW}(gamma * dy * xhat)
-            ds_g = _sum2(go_gamma_xhat, 3, 2)  # [N, group]
-            # db_g[n,g] = sum_{cpg,HxW}(gamma * dy)
-            db_g = _sum2(go_gamma, 3, 2)  # [N, group]
-            ds_g_4d = L.lowerings[aten.view.default](ds_g, [N, group, 1, 1])
-            db_g_4d = L.lowerings[aten.view.default](db_g, [N, group, 1, 1])
-            db_term = L.lowerings[aten.mul.Scalar](db_g_4d, s)
-            ds_term = L.lowerings[aten.mul.Scalar](ds_g_4d, s)
-            xhat_ds = L.lowerings[aten.mul.Tensor](xhat_4d, ds_term)
-            correction = L.lowerings[aten.sub.Tensor](go_gamma, db_term)
-            correction = L.lowerings[aten.sub.Tensor](correction, xhat_ds)
-            d_input_4d = L.lowerings[aten.mul.Tensor](rstd_4d, correction)
-            outputs[0] = L.lowerings[aten.view.default](
-                d_input_4d, list(inp.get_size())
+        need_gi = bool(output_mask[0])
+        if need_gi:
+            gi_kernel = _VulkanGNBwdInputExternKernel(
+                layout=gi_layout,
+                inputs=gn_bwd_inputs,
+                num_groups=group,
+            )
+            gi_result = ir.TensorBox.create(gi_kernel)
+        else:
+            gi_result = lowerings[aten.full.default](
+                [1], 0.0, dtype=dtype, device=dev
             )
 
-        if output_mask[1]:
-            # d_gamma_c = sum_{N,HxW}(dy_c * xhat_c)  — no gamma factor
-            tmp = _sum2(dy_xhat, 3, 0)  # sum HxW then N: [group, cpg]
-            outputs[1] = L.lowerings[aten.view.default](tmp, [C])
+        # ── Dispatch 2: grad_weight + grad_bias via fused shader ──
+        need_gw = bool(output_mask[1])
+        need_gb = bool(output_mask[2])
 
-        if output_mask[2]:
-            # d_bias_c = sum_{N,HxW}(dy_c)  — no gamma factor
-            tmp = _sum2(go_4d, 3, 0)  # sum HxW then N: [group, cpg]
-            outputs[2] = L.lowerings[aten.view.default](tmp, [C])
+        if need_gw or need_gb:
+            gn_bwd_w_inputs = [grad_output, inp, mean, rstd, gw_buf]
+            if need_gb and gb_buf is not None:
+                gn_bwd_w_inputs.append(gb_buf)
 
-        return outputs
+            gw_kernel = _VulkanGNBwdWeightExternKernel(
+                layout=gw_layout,
+                inputs=gn_bwd_w_inputs,
+                num_groups=group,
+                compute_bias=need_gb,
+            )
+            gw_result = ir.TensorBox.create(gw_kernel)
+        else:
+            gw_result = lowerings[aten.full.default](
+                [1], 0.0, dtype=dtype, device=dev
+            )
+
+        if need_gb and gb_buf is not None:
+            gb_result = gb_buf
+        else:
+            gb_result = lowerings[aten.full.default](
+                [1], 0.0, dtype=dtype, device=dev
+            )
+
+        return [gi_result, gw_result, gb_result]
 
 
 def _register_batch_norm_backward() -> None:
@@ -284,11 +298,6 @@ def _register_batch_norm_backward() -> None:
         x_centered = L.lowerings[aten.sub.Tensor](inp, mean_b)
 
         # M22.15 v3: 2-step reshape-reduce — same fix as BN forward.
-        # Reshape [N,C,H*] to [N,C,H_W] then:
-        #   step1 sum(dim=2) → [N,C]   (xnumel=N*C, r0_numel=H_W)
-        #   step2 sum(dim=0) → [C]     (xnumel=C,   r0_numel=N)
-        # The two steps have DIFFERENT xnumel/r0_numel so the combo-kernel
-        # scheduler never merges dY_sum and dY_xc into a buggy Welford combo.
         dY_xc_elem = L.lowerings[aten.mul.Tensor](grad_out, x_centered)
         N = int(sizes[0])
         if ndim >= 3:
@@ -302,7 +311,6 @@ def _register_batch_norm_backward() -> None:
         else:
             dY_sum = L.lowerings[aten.sum.dim_IntList](grad_out, [0], keepdims=False)
             dY_xc = L.lowerings[aten.sum.dim_IntList](dY_xc_elem, [0], keepdims=False)
-        # dY_sum and dY_xc are now shape [C]
         dY_sum_b = L.lowerings[aten.view.default](dY_sum, bcast_shape)
         dY_xc_sum_b = L.lowerings[aten.view.default](dY_xc, bcast_shape)
 

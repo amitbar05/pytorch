@@ -9,6 +9,26 @@ from torch.utils._sympy.printers import ExprPrinter as ExprPrinter_
 from torch._inductor.virtualized import V
 
 
+def _kernel_is_fully_static(kernel) -> bool:
+    """Check whether *kernel* will emit sizevars as ``static const uint``.
+
+    When True, sizevar inner names (e.g. ``ks0``) are module-scope
+    constants and do not need a ``pc.`` prefix.  When False, they are
+    push-constant struct members and MUST be referenced as ``pc.ks0``.
+    """
+    idx_vars = getattr(kernel, "active_range_trees", lambda: [])()
+    if not idx_vars:
+        return True
+    if not all(isinstance(v.numel, sympy.Integer) for v in idx_vars):
+        return False
+    sv = getattr(getattr(kernel, "args", None), "sizevars", None)
+    if sv is not None:
+        for expr in sv:
+            if not isinstance(expr, sympy.Integer):
+                return False
+    return True
+
+
 class VulkanExprPrinter(ExprPrinter_):
     """SymPy → Slang expression printer.
 
@@ -25,6 +45,23 @@ class VulkanExprPrinter(ExprPrinter_):
     """
 
     _subscript_depth: int = 0
+
+    # DYN.1: When True (default) — the Slang source emission context —
+    # sizevar inner names get a ``pc.`` prefix so the generated Slang
+    # references push-constant struct members.  When False — the Python
+    # wrapper codegen context — the bare inner name is used for wrapper
+    # variable lookup.  Toggle via ``_disable_pc_prefix()`` context manager.
+    _use_pc_prefix: bool = True
+
+    @contextlib.contextmanager
+    def _disable_pc_prefix(self):
+        """Context manager for Python-wrapper codegen: sizevars are bare names."""
+        prev = self._use_pc_prefix
+        self._use_pc_prefix = False
+        try:
+            yield
+        finally:
+            self._use_pc_prefix = prev
 
     @contextlib.contextmanager
     def subscript(self):
@@ -51,76 +88,47 @@ class VulkanExprPrinter(ExprPrinter_):
         if not non_one:
             return "1"
         if len(non_one) == 1:
-            return self._print(non_one[0])
-        return self.stringify(non_one, "*", sympy.printing.precedence.precedence(expr))
+            return self.doprint(non_one[0])
+        return " * ".join(
+            f"({self.doprint(a)})" if isinstance(a, sympy.Add) else self.doprint(a)
+            for a in non_one
+        )
 
-    def _print_Add(self, expr: sympy.Expr, order: str | None = None) -> str:
+    def _print_Add(self, expr: sympy.Expr) -> str:
         from sympy import S
-        non_zero = [a for a in expr.args if a != S.Zero]
-        if not non_zero:
+        args = [a for a in expr.args if a != S.Zero]
+        if not args:
             return "0"
-        if len(non_zero) == 1:
-            return self._print(non_zero[0])
-        s = self.stringify(non_zero, " + ", sympy.printing.precedence.precedence(expr))
-        # P10 / replication_pad2d: Slang's uint arithmetic wraps on overflow.
-        # The expression ``(-1) + x1`` with ``uint x1`` produces 0xFFFFFFFF for
-        # x1=0 instead of -1, causing min()/max() indexing to read from the
-        # wrong memory location. When any arg is a negative Integer, wrap the
-        # entire sum in ``(int)(...)`` to force signed arithmetic.
-        if any(isinstance(a, sympy.Integer) and a < 0 for a in expr.args):
-            return f"(int)({s})"
-        return s
+        parts = []
+        for a in args:
+            s = self.doprint(a)
+            if parts and s.startswith("-"):
+                parts.append(f" - {s[1:]}")
+            else:
+                parts.append(f" + " + s if parts else s)
+        return "".join(parts)
 
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        x, div = expr.args
-        # P11.5 / P6.6 — Dead-axis elimination for size-1 dims:
-        # `FloorDiv(x, 1) = x` and `FloorDiv(0, _) = 0`. SymPy normally
-        # folds these but `keepdim=True` reductions can construct them
-        # with `evaluate=False`.
-        if div == 1:
-            return self.doprint(x)
-        if x == 0:
-            return "0"
-        xs = self.doprint(x)
-        ds = self.doprint(div)
-        if expr.is_integer:
-            # For negative ints Slang follows C (`/` rounds toward 0). Use a
-            # branchless floor-divide for correctness.
-            return f"(({xs}) / ({ds}) - ((({xs}) % ({ds})) != 0 && (({xs}) < 0) != (({ds}) < 0) ? 1 : 0))"
-        return f"floor(({xs}) / ({ds}))"
+    def _print_Pow(self, expr: sympy.Expr) -> str:
+        base, exp = expr.args
+        if exp == 0.5:
+            return f"sqrt({self.doprint(base)})"
+        if exp == -1:
+            return f"(1.0f / ({self.doprint(base)}))"
+        if exp == 2:
+            return f"(({self.doprint(base)}) * ({self.doprint(base)}))"
+        return f"pow({self.doprint(base)}, {self.doprint(exp)})"
 
-    def _print_ModularIndexing(self, expr: sympy.Expr) -> str:
-        x, div, mod = expr.args
-        # P11.5 — `x % 1 = 0` (any value modulo 1 is 0). Same dead-axis
-        # case as FloorDiv above.
-        if mod == 1:
-            return "0"
-        xs = self.doprint(x)
-        if div != 1:
-            ds = self.doprint(div)
-            xs = f"(({xs}) / ({ds}))" if expr.is_integer else f"(floor({xs}) / ({ds}))"
-        ms = self.doprint(mod)
-        return f"(({xs}) % ({ms}))"
+    def _print_Mod(self, expr: sympy.Expr) -> str:
+        return f"({self.doprint(expr.args[0])} % {self.doprint(expr.args[1])})"
 
-    def _print_Min(self, expr: sympy.Expr) -> str:
-        if len(expr.args) != 2:
-            raise RuntimeError("Slang min only supported for 2 args")
-        a, b = map(self._print, expr.args)
-        return f"min({a}, {b})"
+    def _print_Integer(self, expr: sympy.Expr) -> str:
+        return str(int(expr))
 
-    def _print_Max(self, expr: sympy.Expr) -> str:
-        if len(expr.args) != 2:
-            raise RuntimeError("Slang max only supported for 2 args")
-        a, b = map(self._print, expr.args)
-        return f"max({a}, {b})"
+    def _print_Float(self, expr: sympy.Expr) -> str:
+        return f"{float(expr)}f"
 
-    def _print_Abs(self, expr: sympy.Expr) -> str:
-        (a,) = expr.args
-        return f"abs({self.doprint(a)})"
-
-    def _print_Where(self, expr: sympy.Expr) -> str:
-        c, t, f = expr.args
-        return f"({self.doprint(c)} ? {self.doprint(t)} : {self.doprint(f)})"
+    def _print_Rational(self, expr: sympy.Expr) -> str:
+        return f"({float(expr.p)}f / {float(expr.q)}f)"
 
     def _print_floor(self, expr: sympy.Expr) -> str:
         return f"floor({self.doprint(expr.args[0])})"
@@ -137,11 +145,20 @@ class VulkanExprPrinter(ExprPrinter_):
         # struct as `ks0`, `ks1`, ... Only size symbols (conventionally
         # start with `s` or `u` in Inductor) are registered; axis variables
         # like `xindex` / `tmp0` already exist in scope.
+        #
+        # DYN.1 fix: when the kernel is NOT fully static, sizevars are
+        # push-constant members (``pc.ks0``).  The expression printer must
+        # emit the ``pc.`` prefix so the generated Slang body resolves
+        # against the correct struct member.  Without it, slangc fails with
+        # "undefined identifier 'ks0'" / "'s77u'" on dynamic-batch compiles.
         name = expr.name
         if name[:1] in ("s", "u") and name[1:2].isdigit():
             k = V.kernel if hasattr(V, "kernel") else None
             if k is not None and getattr(k, "args", None) is not None:
-                return k.args.size(expr)
+                inner = k.args.size(expr)
+                if not _kernel_is_fully_static(k) and self._use_pc_prefix:
+                    return f"pc.{inner}"
+                return inner
         # `tmp\d+` symbols are CSE locals from indirect_indexing on int64
         # gather/scatter indices. The CSE machinery declares them `float`
         # (kernel newvar_prefix) but they hold integer index values. Used
