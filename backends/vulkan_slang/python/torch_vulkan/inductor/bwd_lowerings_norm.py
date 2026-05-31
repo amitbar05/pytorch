@@ -142,26 +142,28 @@ def _register_group_norm_backward() -> None:
         dev = grad_output.get_device()
         dtype = grad_output.get_dtype()
 
-        # ── Output buffers (pre-allocated zeros) ──
+        # ── Output buffers (pre-allocated, NOT realized) ──
+        # GN-BWD-FIX: use empty.memory_format (like conv backward) instead of
+        # full+realize.  empty.memory_format allocates a buffer with a name
+        # immediately, so MutationOutput.get_name() works.  Zero-init happens
+        # in codegen() via .zero_() calls.
         gi_size = list(inp.get_size())
         gi_stride = [C * HxW, HxW, int(inp.get_size()[-1]), 1]
         gi_layout = ir.FixedLayout(
             device=dev, dtype=dtype, size=gi_size, stride=gi_stride
         )
-        gi_buf = lowerings[aten.full.default](
-            gi_size, 0.0, dtype=dtype, device=dev
+        gi_buf = lowerings[aten.empty.memory_format](
+            gi_size, dtype=dtype, device=dev
         )
-        gi_buf.realize()
 
         gw_size = [C]
         gw_stride = [1]
         gw_layout = ir.FixedLayout(
             device=dev, dtype=dtype, size=gw_size, stride=gw_stride
         )
-        gw_buf = lowerings[aten.full.default](
-            gw_size, 0.0, dtype=dtype, device=dev
+        gw_buf = lowerings[aten.empty.memory_format](
+            gw_size, dtype=dtype, device=dev
         )
-        gw_buf.realize()
 
         gb_buf = None
         if bool(output_mask[2]):
@@ -170,10 +172,9 @@ def _register_group_norm_backward() -> None:
             gb_layout = ir.FixedLayout(
                 device=dev, dtype=dtype, size=gb_size, stride=gb_stride
             )
-            gb_buf = lowerings[aten.full.default](
-                gb_size, 0.0, dtype=dtype, device=dev
+            gb_buf = lowerings[aten.empty.memory_format](
+                gb_size, dtype=dtype, device=dev
             )
-            gb_buf.realize()
 
         # ── Dispatch 1: grad_input via fused shader ──
         gn_bwd_inputs = [grad_output, inp, mean, rstd]
@@ -185,12 +186,14 @@ def _register_group_norm_backward() -> None:
 
         need_gi = bool(output_mask[0])
         if need_gi:
-            gi_kernel = _VulkanGNBwdInputExternKernel(
+            _VulkanGNBwdInputExternKernel(
                 layout=gi_layout,
                 inputs=gn_bwd_inputs,
                 num_groups=group,
             )
-            gi_result = ir.TensorBox.create(gi_kernel)
+            # TR.20: the kernel writes to gi_buf (last input),
+            # NOT the primary output.  Return gi_buf directly.
+            gi_result = gi_buf
         else:
             gi_result = lowerings[aten.full.default](
                 [1], 0.0, dtype=dtype, device=dev
@@ -205,13 +208,16 @@ def _register_group_norm_backward() -> None:
             if need_gb and gb_buf is not None:
                 gn_bwd_w_inputs.append(gb_buf)
 
-            gw_kernel = _VulkanGNBwdWeightExternKernel(
+            _VulkanGNBwdWeightExternKernel(
                 layout=gw_layout,
                 inputs=gn_bwd_w_inputs,
                 num_groups=group,
                 compute_bias=need_gb,
             )
-            gw_result = ir.TensorBox.create(gw_kernel)
+            # TR.20: the kernel writes to gw_buf/gb_buf (last inputs),
+            # NOT the primary output.  Return those buffers directly
+            # so AOTAutograd aliases them to param.grad.
+            gw_result = gw_buf
         else:
             gw_result = lowerings[aten.full.default](
                 [1], 0.0, dtype=dtype, device=dev

@@ -40,8 +40,17 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
 
     @staticmethod
     def unwrap_storage(inputs):
-        """Unwrap all inputs — no StorageBox dependency trick needed here."""
-        return [_vk_realize_then_unwrap(x) for x in inputs if x is not None]
+        """Unwrap all computation inputs. Keep the LAST input (gi_buf) as
+        StorageBox to preserve data dependency for MutationOutput."""
+        if not inputs:
+            return []
+        inputs_new = []
+        for i, x in enumerate(inputs):
+            if i < len(inputs) - 1:
+                x = _vk_realize_then_unwrap(x)
+            # else: keep last (gi_buf) as StorageBox for MutationOutput
+            inputs_new.append(x)
+        return inputs_new
 
     def __init__(
         self,
@@ -64,11 +73,33 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
         self.num_groups = num_groups
         self._has_weight = inputs[4] is not None if len(inputs) > 4 else False
         self._gi_buf = inputs[-1]
+        # GN-BWD-FIX: mark gi_buf (last clean input) as MutationOutput so the
+        # scheduler knows this kernel WRITES to it. Without this, the scheduler
+        # treats gi_buf as read-only and allocates a separate output buffer,
+        # which stays zero — gradients never reach param.grad.
+        from torch._inductor.ir import MutationOutput, NoneLayout
+        gi_node = self.inputs[-1]  # grad_input buffer (last non-None input)
+        self.mutation_outputs.append(
+            MutationOutput(NoneLayout(device=layout.device), gi_node, self)
+        )
 
     def codegen(self, wrapper):
         wrapper.add_import_once(
             "from torch_vulkan.inductor.fx_passes.eager.conv_gn_relu "
             "import _dispatch_group_norm_backward_slang"
+        )
+
+        # GN-BWD-FIX: explicit allocation for primary output (gi_buf is the
+        # mutation output; the wrapper won't allocate this buffer because no
+        # downstream consumer references the ExternKernelOut's primary output).
+        out_name = self.codegen_reference()
+        layout = self.get_layout()
+        size = list(layout.size)
+        stride = list(layout.stride)
+        dtype_str = "torch.float32"
+        wrapper.writeline(
+            f"{out_name} = empty_strided_vulkan({size}, {stride}, {dtype_str}, "
+            f"lifetime_class='transient')"
         )
 
         names = [inp.codegen_reference() for inp in self.inputs]
@@ -103,7 +134,15 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
 
     @staticmethod
     def unwrap_storage(inputs):
-        return [_vk_realize_then_unwrap(x) for x in inputs]
+        """Unwrap only computational inputs (indices 0-3). Keep gw_buf/gb_buf
+        (indices 4+) as StorageBox to preserve data dependency for MutationOutput."""
+        inputs_new = []
+        for i, x in enumerate(inputs):
+            if i <= 3:
+                x = _vk_realize_then_unwrap(x)
+            # else: keep as StorageBox to preserve dependency for MutationOutput
+            inputs_new.append(x)
+        return inputs_new
 
     def __init__(
         self,
@@ -123,11 +162,35 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
         )
         self.num_groups = num_groups
         self.compute_bias = compute_bias
+        # GN-BWD-FIX: mark gw_buf (inputs[4]) and gb_buf (inputs[5] if present)
+        # as MutationOutput so the scheduler knows this kernel WRITES to them.
+        from torch._inductor.ir import MutationOutput, NoneLayout
+        gw_node = self.inputs[4]  # grad_weight buffer
+        self.mutation_outputs.append(
+            MutationOutput(NoneLayout(device=layout.device), gw_node, self)
+        )
+        if compute_bias and len(self.inputs) > 5:
+            gb_node = self.inputs[5]  # grad_bias buffer
+            self.mutation_outputs.append(
+                MutationOutput(NoneLayout(device=layout.device), gb_node, self)
+            )
 
     def codegen(self, wrapper):
         wrapper.add_import_once(
             "from torch_vulkan.inductor.fx_passes.eager.conv_gn_relu "
             "import _dispatch_group_norm_backward_weight_slang"
+        )
+
+        # GN-BWD-FIX: explicit allocation for primary output (gw_buf is the
+        # mutation output; the wrapper won't allocate this buffer automatically).
+        out_name = self.codegen_reference()
+        layout = self.get_layout()
+        size = list(layout.size)
+        stride = list(layout.stride)
+        dtype_str = "torch.float32"
+        wrapper.writeline(
+            f"{out_name} = empty_strided_vulkan({size}, {stride}, {dtype_str}, "
+            f"lifetime_class='transient')"
         )
 
         names = [inp.codegen_reference() for inp in self.inputs]
