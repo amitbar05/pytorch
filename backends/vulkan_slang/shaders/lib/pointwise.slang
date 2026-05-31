@@ -660,6 +660,36 @@ public float i1_fwd(float x) { return (x).i1(); }
 [BackwardDerivative(i1e_fast_bwd)]
 public float i1e_fwd(float x) { return (x).i1e(); }
 
+// ── CG.M22.6: GroupNorm affine elemental ────────────────────────────────
+// Per-element GN affine transform: y = (x - mean) * rstd * gamma + bias.
+// Only x is differentiated; mean, rstd, gamma, bias are no_diff because
+// their gradients require a reduction over the normalized dimension.
+// d_weight / d_bias are computed via the fused group_norm_backward shader.
+[Differentiable]
+[BackwardDerivative(gn_affine_bwd)]
+public float gn_affine_fwd(
+    float x,
+    no_diff float mean,
+    no_diff float rstd,
+    no_diff float gamma,
+    no_diff float bias
+) {
+    return (x - mean) * rstd * gamma + bias;
+}
+
+void gn_affine_bwd(
+    inout DifferentialPair<float> x,
+    no_diff float mean,
+    no_diff float rstd,
+    no_diff float gamma,
+    no_diff float bias,
+    float dout
+) {
+    float xv = x.p;
+    // dy/dx = rstd * gamma, so dx = dout * rstd * gamma
+    x = diffPair(xv, dout * rstd * gamma);
+}
+
 public struct OpTan : IPointwise, IDifferentiable {
     [Differentiable]
     static float apply(float x) { return tan_fwd(x); }

@@ -177,6 +177,11 @@ EXCLUDED_DIFFERENTIABLE_FWDS: dict[str, str] = {
     "ln_no_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_affine_elem": "norm: needs reduction ops for full backward (T3.5)",
     "rms_no_affine_elem": "norm: Welford reduction not autodiff-safe (P2.3)",
+    # M22.6: gn_affine_fwd is the per-element affine step of group_norm.
+    # The backward for d_weight / d_bias requires a reduction over the
+    # normalized spatial dimensions — that reduction is emitted by the
+    # fused group_norm_backward shader, not by bwd_diff codegen.
+    "gn_affine_fwd": "group_norm elemental: reductions for d_weight/d_bias via fused shader (M22.6)",
     # M-AG5.1 Tier-2 (2026-05-29): ``softplus_fwd`` removed from exclusions.
     # The shader now declares ``no_diff float beta, no_diff float threshold``
     # parameters; aten.softplus_backward is routed via BWD_DIFF_TABLE.

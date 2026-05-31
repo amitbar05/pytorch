@@ -26319,11 +26319,11 @@ class TestBwdDiffCoverageGate:
         )
 
         found = self._scan_lib_differentiable_fwds()
-        # Sanity: scan must find at least the 44 [Differentiable] entries
-        # after CG.M1 (was 21 pre-M1).
-        assert len(found) >= 44, (
+        # Sanity: scan must find at least the 45 [Differentiable] entries
+        # after M22.6 (was 44 before gn_affine_fwd).
+        assert len(found) >= 45, (
             f"CG.M1: scanner found only {len(found)} [Differentiable] "
-            f"entries (expected ≥ 44): {sorted(found)}",
+            f"entries (expected ≥ 45): {sorted(found)}",
         )
         covered = {e.fwd_fn for e in BWD_DIFF_TABLE.values()}
         excluded = set(EXCLUDED_DIFFERENTIABLE_FWDS)
@@ -61758,3 +61758,370 @@ class TestV10GAP1_OpsSuppressInvariant:
             f"GAP.1: {len(missing)} suppressed ops lack Vulkan lowerings:\n"
             + "\n".join(f"  - {m}" for m in sorted(missing))
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestM226GnAffineBwdDiff:
+    """M22.6 — ``gn_affine_fwd`` in ``shaders/lib/pointwise.slang`` is a
+    [Differentiable] elemental with [BackwardDerivative(gn_affine_bwd)] that
+    computes the per-element GN affine transform::
+
+        y = (x - mean) * rstd * gamma + bias
+
+    Only ``x`` is differentiated; ``mean``, ``rstd``, ``gamma``, ``bias``
+    are ``no_diff`` because their gradients require a reduction over the
+    normalized spatial dimension.  The reductions for ``d_weight`` /
+    ``d_bias`` are emitted by the fused ``group_norm_backward`` shader,
+    not by ``bwd_diff`` codegen, so ``gn_affine_fwd`` must be listed in
+    ``EXCLUDED_DIFFERENTIABLE_FWDS``.
+
+    Tests:
+
+    * ``test_gn_affine_fwd_is_differentiable_in_slang`` — the Slang shader
+      declares ``gn_affine_fwd`` with ``[Differentiable]`` and
+      ``[BackwardDerivative(gn_affine_bwd)]`` in ``pointwise.slang``.
+    * ``test_gn_affine_fwd_in_excluded_fwds`` — ``gn_affine_fwd`` is
+      listed in ``EXCLUDED_DIFFERENTIABLE_FWDS`` with the correct M22.6
+      reason.
+    * ``test_gn_affine_bwd_signature_in_slang`` — the hand-written
+      ``gn_affine_bwd`` function exists in ``pointwise.slang`` and
+      accepts ``inout DifferentialPair<float> x, no_diff float mean,
+      no_diff float rstd, no_diff float gamma, no_diff float bias,
+      float dout``.
+    """
+
+    _GN_AFFINE_DIR = os.path.join(
+        os.path.dirname(__file__), "..", "shaders", "lib"
+    )
+    _POINTWISE_SLANG = os.path.join(_GN_AFFINE_DIR, "pointwise.slang")
+
+    def test_gn_affine_fwd_is_differentiable_in_slang(self):
+        """gn_affine_fwd carries [Differentiable] and
+        [BackwardDerivative(gn_affine_bwd)] in pointwise.slang."""
+        with open(self._POINTWISE_SLANG) as f:
+            src = f.read()
+
+        # Forward function must exist.
+        assert "gn_affine_fwd" in src, (
+            "M22.6: gn_affine_fwd not found in pointwise.slang"
+        )
+
+        # Must carry [Differentiable].
+        import re
+
+        # Check the annotation block immediately preceding the function.
+        # Search for [Differentiable] followed by [BackwardDerivative(gn_affine_bwd)]
+        # and then the public float gn_affine_fwd declaration.
+        pattern = (
+            r"\[Differentiable\]\s*\n"
+            r"\s*\[BackwardDerivative\(gn_affine_bwd\)\]\s*\n"
+            r"\s*public float gn_affine_fwd\("
+        )
+        assert re.search(pattern, src), (
+            "M22.6: gn_affine_fwd must be preceded by [Differentiable] "
+            "and [BackwardDerivative(gn_affine_bwd)] in pointwise.slang"
+        )
+
+        # The coverage gate scanner must also find it.
+        from tests.test_inductor_regression import TestBwdDiffCoverageGate
+
+        found = TestBwdDiffCoverageGate._scan_lib_differentiable_fwds()
+        assert "gn_affine_fwd" in found, (
+            "M22.6: gn_affine_fwd not found by _scan_lib_differentiable_fwds(). "
+            "Check the [Differentiable] attribute placement."
+        )
+        assert found["gn_affine_fwd"] == "pointwise.slang", (
+            f"M22.6: gn_affine_fwd found in wrong file: {found['gn_affine_fwd']}"
+        )
+
+    def test_gn_affine_fwd_in_excluded_fwds(self):
+        """gn_affine_fwd is in EXCLUDED_DIFFERENTIABLE_FWDS with the
+        M22.6 reason."""
+        from torch_vulkan.inductor.bwd_diff_table import (
+            EXCLUDED_DIFFERENTIABLE_FWDS,
+        )
+
+        assert "gn_affine_fwd" in EXCLUDED_DIFFERENTIABLE_FWDS, (
+            "M22.6: gn_affine_fwd must be listed in "
+            "EXCLUDED_DIFFERENTIABLE_FWDS — it carries [Differentiable] "
+            "in pointwise.slang but its d_weight/d_bias gradients require "
+            "a fused reduction shader."
+        )
+
+        reason = EXCLUDED_DIFFERENTIABLE_FWDS["gn_affine_fwd"]
+        assert reason == (
+            "group_norm elemental: reductions for d_weight/d_bias via "
+            "fused shader (M22.6)"
+        ), (
+            f"M22.6: unexpected exclusion reason for gn_affine_fwd: "
+            f"{reason!r}"
+        )
+
+    def test_gn_affine_bwd_signature_in_slang(self):
+        """gn_affine_bwd exists in pointwise.slang with the correct
+        parameter signature."""
+        with open(self._POINTWISE_SLANG) as f:
+            src = f.read()
+
+        import re
+
+        # The backward function must exist.
+        pattern = (
+            r"void gn_affine_bwd\(\s*\n"
+            r"\s*inout DifferentialPair<float> x,\s*\n"
+            r"\s*no_diff float mean,\s*\n"
+            r"\s*no_diff float rstd,\s*\n"
+            r"\s*no_diff float gamma,\s*\n"
+            r"\s*no_diff float bias,\s*\n"
+            r"\s*float dout\s*\n"
+            r"\s*\)"
+        )
+        assert re.search(pattern, src), (
+            "M22.6: gn_affine_bwd not found or has wrong signature in "
+            "pointwise.slang. Expected: "
+            "void gn_affine_bwd(inout DifferentialPair<float> x, "
+            "no_diff float mean, no_diff float rstd, "
+            "no_diff float gamma, no_diff float bias, float dout)"
+        )
+
+        # The backward formula must compute dx = dout * rstd * gamma.
+        assert "dout * rstd * gamma" in src, (
+            "M22.6: gn_affine_bwd in pointwise.slang must compute "
+            "dx = dout * rstd * gamma"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestDYN1DynamicBatchSizevarPCPrefix:
+    """DYN.1 — Dynamic batch sizevar ``pc.`` prefix regression tests.
+
+    The DYN.1 bug: expression printer emitted bare sizevar names (e.g.
+    ``ks0``) instead of ``pc.ks0`` when push constants were active.
+    Fixed by adding the ``pc.`` prefix in ``_print_Symbol`` when the
+    kernel is not fully static and ``_use_pc_prefix`` is True.
+    """
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Helpers: mock kernel objects for testing the printer in isolation
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _make_mock_kernel(dynamic: bool):
+        """Build a mock kernel object with enough surface area for
+        ``_print_Symbol`` and ``_kernel_is_fully_static`` to work.
+
+        *dynamic=True*  → numels are sympy.Symbol (e.g. ``s27``)
+        *dynamic=False* → numels are sympy.Integer
+        """
+        import sympy
+
+        class MockSizeVars:
+            def __init__(self, symbols):
+                self._symbols = symbols
+
+            def size(self, expr):
+                """Return the inner sizevar name (e.g. 'ks0') for a symbol."""
+                for i, s in enumerate(self._symbols):
+                    if s is expr:
+                        return f"ks{i}"
+                return expr.name
+
+        class MockRangeTree:
+            def __init__(self, numel):
+                self.numel = numel
+
+        class MockKernelArgs:
+            def __init__(self, sizevars, sizevars_list):
+                self._sizevars_map = sizevars
+                self._sizevars_list = sizevars_list
+
+            @property
+            def sizevars(self):
+                return self._sizevars_list
+
+            def size(self, expr):
+                return self._sizevars_map.size(expr)
+
+        if dynamic:
+            s0 = sympy.Symbol("s27")
+            mock_sizevars = MockSizeVars([s0])
+            tree = MockRangeTree(s0)
+            sizevars_list = []  # empty will fail _kernel_is_fully_static check
+        else:
+            s0 = sympy.Integer(128)
+            mock_sizevars = MockSizeVars([s0])
+            tree = MockRangeTree(s0)
+            sizevars_list = [sympy.Integer(128)]
+
+        mock_args = MockKernelArgs(mock_sizevars, sizevars_list)
+
+        class MockKernel:
+            def __init__(self):
+                self.args = mock_args
+                self._trees = [tree]
+
+            def active_range_trees(self):
+                return self._trees
+
+        return MockKernel()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Tests
+    # ═══════════════════════════════════════════════════════════════════
+
+    def test_pc_prefix_emitted_for_dynamic_sizevars(self):
+        """When the kernel has dynamic numels, ``_print_Symbol`` emits
+        ``pc.ks0`` instead of bare ``ks0``."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+        from torch._inductor.virtualized import V
+
+        kernel = self._make_mock_kernel(dynamic=True)
+        printer = VulkanExprPrinter()
+        s27 = sympy.Symbol("s27")
+        with V.set_kernel_handler(kernel):
+            result = printer.doprint(s27)
+        assert result == "pc.ks0", (
+            f"DYN.1: expected 'pc.ks0' for dynamic sizevar, got {result!r}"
+        )
+
+    def test_static_kernel_no_pc_prefix(self):
+        """When the kernel is fully static (all numels are ``sympy.Integer``),
+        ``_print_Symbol`` emits bare ``ks0`` (no ``pc.`` prefix)."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+        from torch._inductor.virtualized import V
+
+        kernel = self._make_mock_kernel(dynamic=False)
+        printer = VulkanExprPrinter()
+        s128 = sympy.Integer(128)
+        with V.set_kernel_handler(kernel):
+            result = printer.doprint(s128)
+        # static Integer 128 should print as "128"
+        assert result == "128", (
+            f"expected '128' for static Integer, got {result!r}"
+        )
+
+    def test_static_kernel_symbol_no_pc_prefix(self):
+        """When kernel is fully static but a symbol still reaches the printer,
+        it emits the bare inner name without ``pc.`` prefix."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+        from torch._inductor.virtualized import V
+
+        # Fully-static kernel but with a Symbol input
+        kernel = self._make_mock_kernel(dynamic=False)
+        printer = VulkanExprPrinter()
+        s27 = sympy.Symbol("s27")
+        with V.set_kernel_handler(kernel):
+            result = printer.doprint(s27)
+        # With static kernel, should emit bare ks0
+        assert result == "ks0", (
+            f"DYN.1: expected bare 'ks0' for static kernel, got {result!r}"
+        )
+
+    def test_disable_pc_prefix_context(self):
+        """``_disable_pc_prefix()`` context manager temporarily sets
+        ``_use_pc_prefix=False`` so sizevars emit bare names even for
+        dynamic kernels. Used by wrapper-side dispatch codegen."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+        from torch._inductor.virtualized import V
+
+        kernel = self._make_mock_kernel(dynamic=True)
+        printer = VulkanExprPrinter()
+        s27 = sympy.Symbol("s27")
+
+        with V.set_kernel_handler(kernel):
+            # Without the context manager: pc. prefix
+            result_with = printer.doprint(s27)
+            assert result_with == "pc.ks0", (
+                f"expected 'pc.ks0' outside _disable_pc_prefix, got {result_with!r}"
+            )
+
+            # With the context manager: bare name (for Python wrapper)
+            with printer._disable_pc_prefix():
+                result_without = printer.doprint(s27)
+            assert result_without == "ks0", (
+                f"expected bare 'ks0' inside _disable_pc_prefix, got {result_without!r}"
+            )
+
+    def test_disable_pc_prefix_restores_on_exit(self):
+        """The context manager restores ``_use_pc_prefix`` to its previous
+        value after exit, even if an exception occurs."""
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+
+        printer = VulkanExprPrinter()
+        original = printer._use_pc_prefix
+        assert original is True, "default should be True"
+
+        with printer._disable_pc_prefix():
+            assert printer._use_pc_prefix is False
+        assert printer._use_pc_prefix is True, (
+            "should restore True after context exit"
+        )
+
+        # Nested context: outer False, inner False → still restores True
+        printer._use_pc_prefix = False
+        with printer._disable_pc_prefix():
+            assert printer._use_pc_prefix is False
+        assert printer._use_pc_prefix is False, (
+            "should restore to False (the value when entering)"
+        )
+
+        # Reset for cleanliness
+        printer._use_pc_prefix = True
+
+    def test_kernel_is_fully_static_dynamic(self):
+        """``_kernel_is_fully_static`` returns False when a numel is a
+        symbolic ``sympy.Symbol``."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import _kernel_is_fully_static
+
+        kernel = self._make_mock_kernel(dynamic=True)
+        assert _kernel_is_fully_static(kernel) is False, (
+            "DYN.1: _kernel_is_fully_static should return False for dynamic kernel"
+        )
+
+    def test_kernel_is_fully_static_static(self):
+        """``_kernel_is_fully_static`` returns True when all numels are
+        ``sympy.Integer``."""
+        from torch_vulkan.inductor.expr_printer import _kernel_is_fully_static
+
+        kernel = self._make_mock_kernel(dynamic=False)
+        assert _kernel_is_fully_static(kernel) is True, (
+            "DYN.1: _kernel_is_fully_static should return True for static kernel"
+        )
+
+    def test_kernel_is_fully_static_no_trees(self):
+        """``_kernel_is_fully_static`` returns True when there are no
+        active range trees (degenerate/empty kernel)."""
+        from torch_vulkan.inductor.expr_printer import _kernel_is_fully_static
+
+        class EmptyKernel:
+            def active_range_trees(self):
+                return []
+
+        assert _kernel_is_fully_static(EmptyKernel()) is True
+
+    def test_non_size_symbol_unchanged(self):
+        """Symbols that are NOT size symbols (don't start with s/u + digit)
+        are emitted as-is, regardless of kernel static/dynamic state."""
+        import sympy
+        from torch_vulkan.inductor.expr_printer import VulkanExprPrinter
+        from torch._inductor.virtualized import V
+
+        kernel = self._make_mock_kernel(dynamic=True)
+        printer = VulkanExprPrinter()
+
+        with V.set_kernel_handler(kernel):
+            # xindex: not a size symbol
+            assert printer.doprint(sympy.Symbol("xindex")) == "xindex"
+            # tmp0: CSE local, not a size symbol
+            assert printer.doprint(sympy.Symbol("tmp0")) == "tmp0"
+            # regular variable name
+            assert printer.doprint(sympy.Symbol("myvar")) == "myvar"
