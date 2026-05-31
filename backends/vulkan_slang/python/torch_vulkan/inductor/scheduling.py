@@ -680,6 +680,8 @@ class VulkanScheduling(SIMDScheduling):
             f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
             f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{combo_config_key}')\n"
         )
+        # AOTI-FIX: store kernel source for AOTI C++ codegen to compile to SPIR-V
+        _set_kernel_source(wrapper, kernel_name, src_code)
         return kernel_name
 
     def define_kernel(
@@ -740,6 +742,8 @@ class VulkanScheduling(SIMDScheduling):
             f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
             f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{kernel.config_key}')\n"
         )
+        # AOTI-FIX: store kernel source for AOTI C++ codegen to compile to SPIR-V
+        _set_kernel_source(wrapper, kernel_name, src_code)
         return kernel_name
 
     @classmethod
@@ -811,5 +815,27 @@ class VulkanScheduling(SIMDScheduling):
                 enable()
 
         return kernels
+
+
+# ── AOTI kernel source registry ────────────────────────────────────────
+
+# Mapped on the wrapper object at _kernel_name_to_src so the AOTI C++
+# wrapper can compile Slang→SPIR-V during codegen (not at runtime).
+_KERNEL_NAME_TO_SRC_ATTR = "_kernel_name_to_src"
+
+
+def _set_kernel_source(wrapper, kernel_name: str, src_code: str) -> None:
+    """Store kernel Slang source keyed by kernel_name on the wrapper."""
+    if not hasattr(wrapper, _KERNEL_NAME_TO_SRC_ATTR):
+        setattr(wrapper, _KERNEL_NAME_TO_SRC_ATTR, {})
+    getattr(wrapper, _KERNEL_NAME_TO_SRC_ATTR)[kernel_name] = src_code
+
+
+def get_kernel_source(wrapper, kernel_name: str) -> str | None:
+    """Return the Slang source for a kernel name, or None if not found."""
+    d = getattr(wrapper, _KERNEL_NAME_TO_SRC_ATTR, None)
+    if d is None:
+        return None
+    return d.get(kernel_name)
 
 

@@ -277,6 +277,21 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
                     # Try the full key as-is
                     spv = _disk_cache_read(key)
 
+        # AOTI-FIX: When SPIR-V is not yet cached (normal for AOTI —
+        # the Python runtime hasn't executed), compile it now from the
+        # kernel's Slang source stored during define_kernel().
+        if spv is None:
+            from .scheduling import get_kernel_source
+            from .runtime.slangc import compile_slang_to_spirv
+
+            src = get_kernel_source(V.graph.wrapper_code, key)
+            if src is not None:
+                # compile_slang_to_spirv returns the SPIR-V bytes
+                # directly; no need to re-read from disk cache.
+                spv = compile_slang_to_spirv(src, cache_key=key)
+            else:
+                pass  # fall through to the error below
+
         if spv is not None:
             spv_c_name = _spv_key_to_c_name(key)
             self._spv_blobs[key] = spv
@@ -316,6 +331,15 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
                 f"}}"
             )
             self.writeline(init_line)
+        else:
+            # AOTI-FIX: SPIR-V not in JIT cache. This means the kernel
+            # compilation didn't produce cached SPIR-V before AOTI codegen.
+            # Raise a clear error so we can investigate.
+            raise RuntimeError(
+                f"AOTI: SPIR-V not found in cache for kernel '{key}'. "
+                f"Kernel must be compiled before AOTI codegen. "
+                f"hash={_KERNEL_SPIRV_HASH.get(key, 'N/A')}"
+            )
 
         # ── Parse call_args to separate: buffers, push-constants, wg dims ──
         # Convention (matching Python wrapper):

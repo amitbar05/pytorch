@@ -711,6 +711,12 @@ def _legacy_register() -> None:
 
     from .fx_passes import _make_vulkan_pass
 
+    # AOTI-FIX: add "vulkan" to upstream's DEVICE_TO_ATEN so the C++
+    # wrapper doesn't assert-fail. Vulkan → PrivateUse1 → at::kPrivateUse1.
+    from torch._inductor.codegen.cpp_utils import DEVICE_TO_ATEN as _DEVICE_TO_ATEN
+    if "vulkan" not in _DEVICE_TO_ATEN:
+        _DEVICE_TO_ATEN["vulkan"] = "at::kPrivateUse1"
+
     # DR.8 / T7.5: register VulkanCppWrapperGpu as the AOTI C++ wrapper.
     # When V.graph.aot_mode is True, Inductor selects this wrapper instead
     # of VulkanPythonWrapperCodegen, emitting C++ that calls the Vulkan AOTI
