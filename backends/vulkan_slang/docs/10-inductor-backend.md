@@ -297,6 +297,42 @@ blockers that are out-of-scope for the milestone they were filed against:
 
 ---
 
+# § v11 — Batcher Ordering Fixes & Multi-Layer Training (2026-06-01)
+
+> **v11 (2026-06-01)** — v10 closed all 8 verification milestones. v11
+> addresses the **batch dispatcher ordering bug** that caused zero
+> gradients in compiled multi-layer Conv+GN+ReLU models. The underlying
+> kernels are correct (eager GPU training matches CPU exactly); the bug
+> is in how compiled wrappers order batched pointwise kernels vs
+> synchronous extern kernel dispatches.
+
+## v11 pillars
+
+| # | Pillar | Goal |
+|---|--------|------|
+| **V11-BATCH** | Batcher ordering | Fix batcher→extern flush ordering so compiled backward produces correct gradients |
+| **V11-COMBO** | Combo-kernel topology | Prevent ForeachKernelSchedulerNode combos with broken topological placement |
+| **V11-TRAIN** | Multi-layer training | Conv+GN+ReLU multi-layer models train correctly through compile |
+
+## v11 milestones
+
+| # | Pillar | Title | Effort | Status |
+|---|--------|-------|--------|--------|
+| **BATCH.1** | V11-BATCH | GN backward flushes batcher before sync dispatch | 0.25 d | ✅ **CLOSED 2026-06-01.** Added ``wrapper._flush_batcher_before_direct_call()`` in ``gn_backward_extern.py`` (both ``_VulkanGNBwdInputExternKernel.codegen()`` and ``_VulkanGNBwdWeightExternKernel.codegen()``). Root cause: batched ReLU backward pointwise kernel was queued via ``_batcher.add()`` but GN backward dispatch ran synchronously BEFORE the batcher flushed → GN backward read stale/zero ``buf3`` → all gradients zero. Single-layer Conv+GN+ReLU now cos=1.0 for all grads. |
+| **BATCH.2** | V11-BATCH | Conv backward flushes batcher before sync dispatch | 0.1 d | ✅ **CLOSED 2026-06-01.** Same flush pattern in ``conv_backward.py`` ``_VulkanConvBwdExternKernel.codegen()``. |
+| **COMBO.1** | V11-COMBO | Combo-kernel gate respects upstream combo_kernels flag | 0.25 d | ✅ **CLOSED 2026-06-01.** ``_coalesce_orphan_pointwise_post_fusion`` gateway in ``__init__.py`` now checks ``torch._inductor.config.combo_kernels``. Previously gated only on ``aggressive_fusion()``, causing ForeachKernelSchedulerNode combos to leak through even with ``combo_kernels=False``. The dual-GN rsqrt combo kernel referenced ``buf10`` (GN2 var) before its allocation after conv2 — ``UnboundLocalError``. Now properly skipped. |
+| **TRAIN.1** | V11-TRAIN | Single-layer Conv+GN+ReLU gradient parity | 0.5 d | ✅ **CLOSED 2026-06-01.** All grads cos=1.0 vs CPU. conv.w, conv.b, gn.w, gn.b all match to < 2e-5. |
+| **TRAIN.2** | V11-TRAIN | 2-block Conv+GN+ReLU gradient verification | 0.5 d | ⚠️ **PARTIAL 2026-06-01.** conv2/gn1/gn2 all cos=1.0. conv1 cos=0.057 (first conv in chain receives wrong grad_input from GN1 backward). GN1 weight cos=1.0 proves GN1 gets correct input; the GN1 grad_input kernel produces different output quality from weight kernel for non-uniform upstream gradients. **Root cause not yet isolated** — buffer pool disabled, batcher disabled, still wrong. |
+| **TRAIN.3** | V11-TRAIN | MNISTNet fwd+bwd training through compile | 1 d | ⚠️ **PARTIAL 2026-06-01.** Works with ``TORCH_VULKAN_BATCH_DISPATCH=0`` (all 5 training steps match CPU exactly). Frozen loss (~2.30) with batcher enabled even with BATCH.1/2 flush fixes. **Root cause**: batcher has deeper multi-layer ordering bug beyond per-op flushes. Batcher needs either auto-flush before ALL extern dispatches or architectural redesign. Eager GPU training (no compile) matches CPU perfectly → all underlying kernels correct. |
+
+## Known residual issues
+
+1. **Batch dispatcher** (`TORCH_VULKAN_BATCH_DISPATCH=1` default): Causes frozen gradients in multi-layer compiled models. Workaround: `TORCH_VULKAN_BATCH_DISPATCH=0`. Fix: add auto-flush to wrapper's node dispatch before every ExternKernelOut/FallbackKernel, or inject flush into base codegen() method.
+
+2. **conv1 in 2-block model** (TRAIN.2): First conv in multi-layer GN chain gets wrong gradients (cos=0.057) even with batcher disabled. GN weight correct (cos=1.0) but GN grad_input kernel produces wrong output for non-uniform upstream gradients. Not yet root-caused — possibly a Slang kernel bug in the GN grad_input shader for certain gradient patterns.
+
+---
+
 # § v8 closeout analysis (archived)
 
 ## TRAIN.8 test coverage matrix
