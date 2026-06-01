@@ -746,6 +746,15 @@ def _legacy_register() -> None:
     _patch_aot_joint_trace(meta_patches._joint_trace_ctx)
     _patch_bw_compiler_devices(meta_patches._FixMetaDevicePass)
 
+    # NOTE: Conv+GN+ReLU combo fusion (M18.8.b / post_grad.py) is
+    # NOT active.  Forward fusion works (33→10 dispatches) but the
+    # combo op's autograd backward produces IR with nested StorageBox
+    # wrapping Pointwise nodes that crash ExternKernelSchedulerNode.
+    # Fix requires solving ExternKernel.get_read_writes() realizing
+    # deeply-wrapped Pointwise inputs — attempted _vk_realize_then_unwrap
+    # fixes and lowering-level pre-realization without success.
+    # See docs/10-inductor-backend.md §v13 DISP.3.
+
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
     # which is harmless but wasteful — the config flag is global.
