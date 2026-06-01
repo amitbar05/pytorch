@@ -268,24 +268,42 @@ def _register_batch_norm_forward() -> None:
             return NotImplemented
 
         if bool(training):
-            # TRAIN.12 (2026-06-02): Simplified reduction path.  The original
-            # M22.15 v3 workaround used 2-step reshape-reduce to avoid a buggy
-            # combo-kernel merge (identical-shape reductions → Welford combo
-            # missing out_ptr1 for variance).  With combo_kernels=False (TR.20,
-            # set in __init__.py), the combo scheduler never creates these merges.
-            # We can now use the simpler var_mean Welford reduction — 1 dispatch
-            # instead of 4 (reshape + sum + sum + div → var_mean).
+            # M22.15 v3: 2-step reshape-reduce to avoid the combo-kernel
+            # scheduler merging the mean-sum and var-sum into a buggy
+            # Welford combo kernel.  The two sequential single-dim sums
+            # previously had identical xnumel=C / r0_numel=N_eff, which
+            # caused the scheduler to fuse them into a combo Welford kernel
+            # whose generated struct was missing out_ptr1 (the variance
+            # output), causing silent wrong values.
             #
-            # Reshape to [N_eff, C] for contiguous reduction over dim 0.
-            # Reducing over non-contiguous dims [0, 2, 3] causes Inductor
-            # scheduler hangs.  N_eff = total_numel // C.
-            inp_2d = L.lowerings[aten.view.default](inp, [N_eff, C])
-            var_1d, mean_1d = L.lowerings[aten.var_mean.correction](
-                inp_2d, [0], correction=0, keepdim=False,
-            )
+            # Fix: reshape [N,C,H*] to [N,C,H_W] and use two reductions
+            # at DIFFERENT scales so the combo scheduler never merges them:
+            #   step1 → xnumel=N*C, r0_numel=H_W  (reduces spatial dims)
+            #   step2 → xnumel=C,   r0_numel=N     (reduces batch dim)
+            N = int(sizes[0])
+            if ndim >= 3:
+                H_W = N_eff // N
+                inp_3d = L.lowerings[aten.view.default](inp, [N, C, H_W])
+                s1 = L.lowerings[aten.sum.dim_IntList](inp_3d, [2], keepdims=False)
+                sum_inp = L.lowerings[aten.sum.dim_IntList](s1, [0], keepdims=False)
+            else:
+                # ndim == 2: no spatial dims — single reduction over batch
+                sum_inp = L.lowerings[aten.sum.dim_IntList](inp, [0], keepdims=False)
+            # sum_inp is now shape [C]
+            inv_N = 1.0 / float(N_eff)
+            mean_1d = L.lowerings[aten.mul.Scalar](sum_inp, inv_N)
             mean_kd = L.lowerings[aten.view.default](mean_1d, bcast_shape)
-            var_kd = L.lowerings[aten.view.default](var_1d, bcast_shape)
             dx = L.lowerings[aten.sub.Tensor](inp, mean_kd)
+            dx_sq = L.lowerings[aten.mul.Tensor](dx, dx)
+            if ndim >= 3:
+                dx_sq_3d = L.lowerings[aten.view.default](dx_sq, [N, C, H_W])
+                sq1 = L.lowerings[aten.sum.dim_IntList](dx_sq_3d, [2], keepdims=False)
+                sum_dx_sq = L.lowerings[aten.sum.dim_IntList](sq1, [0], keepdims=False)
+            else:
+                sum_dx_sq = L.lowerings[aten.sum.dim_IntList](dx_sq, [0], keepdims=False)
+            # sum_dx_sq is now shape [C]
+            var_1d = L.lowerings[aten.mul.Scalar](sum_dx_sq, inv_N)
+            var_kd = L.lowerings[aten.view.default](var_1d, bcast_shape)
             var_eps = L.lowerings[aten.add.Scalar](var_kd, float(eps))
             rstd_kd = L.lowerings[aten.rsqrt.default](var_eps)
             rstd_1d = L.lowerings[aten.view.default](rstd_kd, [C])
