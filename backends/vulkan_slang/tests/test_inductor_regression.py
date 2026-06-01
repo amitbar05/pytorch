@@ -62380,3 +62380,58 @@ class TestV10BN2_BatchNormCompileTraining:
             )
         finally:
             del os.environ["TORCH_VULKAN_BN_EMA_UPDATE"]
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestV10DYN2_ConvBNDynamicBatch:
+    """DYN.2 — Conv+BN+ReLU dynamic batch compile.
+
+    Verifies that a Conv→BN→ReLU stack compiles with variable batch size
+    (dynamic shapes) using the push-constant infrastructure from DYN.1.
+    Unblocked by BN.2 fix (2026-06-01).
+    """
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        reason=(
+            "DYN.2: Conv+BN+ReLU dynamic batch requires GPU verification. "
+            "Unblocked after BN.2 fix (helpers capability) 2026-06-01. "
+            "Will flip to PASS after verified on RDNA1."
+        ),
+        strict=True,
+    )
+    def test_conv_bn_relu_dynamic_batch(self):
+        """Conv+BN+ReLU compiles with variable batch sizes."""
+        import torch
+        import torch.nn as nn
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class ConvBNReLU(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(4, 8, 3, padding=1, bias=False)
+                self.bn = nn.BatchNorm2d(8)
+                self.relu = nn.ReLU()
+
+            def forward(self, x):
+                return self.relu(self.bn(self.conv(x)))
+
+        model = ConvBNReLU().to("vulkan:0").train()
+
+        # Compile with dynamic shapes
+        compiled = torch.compile(model, backend="inductor", dynamic=True)
+
+        # Test with batch=2
+        x2 = torch.randn(2, 4, 16, 16, device="vulkan:0")
+        y2 = compiled(x2)
+        assert y2.shape == (2, 8, 16, 16), f"DYN.2: wrong shape {y2.shape}"
+
+        # Test with batch=4 (different batch)
+        x4 = torch.randn(4, 4, 16, 16, device="vulkan:0")
+        y4 = compiled(x4)
+        assert y4.shape == (4, 8, 16, 16), f"DYN.2: wrong shape {y4.shape}"
