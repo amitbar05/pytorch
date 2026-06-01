@@ -84,6 +84,13 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
         )
 
     def codegen(self, wrapper):
+        # M-NEW.12: flush batcher before this direct Vulkan dispatch.
+        # Without this flush, any batched kernel (e.g., ReLU backward
+        # pointwise) whose output feeds into this GN backward runs AFTER
+        # this synchronous dispatch → GN backward reads stale/zero data
+        # → zero gradients flow to upstream conv → model doesn't learn.
+        wrapper._flush_batcher_before_direct_call()
+
         wrapper.add_import_once(
             "from torch_vulkan.inductor.fx_passes.eager.conv_gn_relu "
             "import _dispatch_group_norm_backward_slang"
@@ -176,6 +183,10 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
             )
 
     def codegen(self, wrapper):
+        # M-NEW.12: flush batcher before this direct Vulkan dispatch
+        # (same pattern as _VulkanGNBwdInputExternKernel above).
+        wrapper._flush_batcher_before_direct_call()
+
         wrapper.add_import_once(
             "from torch_vulkan.inductor.fx_passes.eager.conv_gn_relu "
             "import _dispatch_group_norm_backward_weight_slang"

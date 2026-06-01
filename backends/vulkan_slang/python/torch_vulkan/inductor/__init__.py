@@ -22,10 +22,20 @@ def _vulkan_post_fusion_pass(nodes):
     can pickle the compilation key. Local closures fail pickle and silently
     disable the disk cache for every graph that uses this pass.
     """
+    import torch._inductor.config as _ic
     from . import config as _vk_cfg
     from .vulkan_combo_kernel import VulkanComboKernel as _VCK
 
     if not _vk_cfg.aggressive_fusion():
+        return nodes
+    # T5.4: Respect upstream combo_kernels flag.
+    # When combo_kernels=False, the scheduler has already been told not to
+    # create ForeachKernelSchedulerNode instances.  _coalesce_orphan_pointwise
+    # creates additional ForeachKernelSchedulerNode wrappers, so it MUST also
+    # be disabled — otherwise combo kernels leak through with broken
+    # topological ordering (e.g., buf10 used before its definition in a
+    # dual-GN rsqrt combo placed between conv1 and conv2).
+    if hasattr(_ic, "combo_kernels") and not _ic.combo_kernels:
         return nodes
     return _VCK._coalesce_orphan_pointwise(nodes)
 

@@ -155,6 +155,13 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
 
     def codegen(self, wrapper):
         """Emit a call to ``_slang_tile_conv2d_bwd`` in the generated wrapper."""
+        # M-NEW.12: flush batcher before this direct Vulkan dispatch.
+        # Batched pointwise/foreach kernels queued before this ExternKernelOut
+        # (e.g., ReLU backward mask for Conv-GN-ReLU chains) must be flushed
+        # so their output buffers are populated before the conv backward reads
+        # the GN grad_input.
+        wrapper._flush_batcher_before_direct_call()
+
         wrapper.add_import_once(
             "from torch_vulkan.inductor.vulkan_template_caller "
             "import _slang_tile_conv2d_bwd"
