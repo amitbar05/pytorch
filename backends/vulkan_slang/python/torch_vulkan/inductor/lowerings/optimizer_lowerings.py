@@ -85,6 +85,9 @@ def _register_optimizer_lowerings() -> None:
 
         def codegen(self, wrapper):
             """Emit a call to ``_pick_foreach_optimizer_caller`` in the wrapper."""
+            # M-NEW.12: flush batcher before direct Vulkan dispatch
+            wrapper._flush_batcher_before_direct_call()
+
             wrapper.add_import_once(
                 "from torch_vulkan.inductor.templates.caller.optimizer "
                 "import _pick_foreach_optimizer_caller"

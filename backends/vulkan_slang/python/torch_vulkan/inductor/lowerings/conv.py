@@ -239,6 +239,9 @@ def _register_conv_and_pool_lowerings() -> None:
             M17.2: When ``self.epilogue`` is set, the ``epilogue`` kwarg
             is emitted, routing through the fused conv+activation path.
             """
+            # M-NEW.12: flush batcher before direct Vulkan dispatch
+            wrapper._flush_batcher_before_direct_call()
+
             wrapper.add_import_once(
                 "from torch_vulkan.inductor.vulkan_template_caller "
                 "import _slang_tile_conv2d"

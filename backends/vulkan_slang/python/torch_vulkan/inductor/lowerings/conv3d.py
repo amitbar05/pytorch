@@ -56,6 +56,9 @@ def _get_conv3d_native_extern_kernel_class():
 
         def codegen(self, wrapper):
             """Emit a call to ``_slang_tile_conv3d`` in the generated wrapper."""
+            # M-NEW.12: flush batcher before direct Vulkan dispatch
+            wrapper._flush_batcher_before_direct_call()
+
             wrapper.add_import_once(
                 "from torch_vulkan.inductor.vulkan_template_caller "
                 "import _slang_tile_conv3d"

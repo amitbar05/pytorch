@@ -146,6 +146,9 @@ def _register_mm_lowering() -> None:
             or delegate to standard ``ExternKernelOut.codegen`` for the
             ``aten.mm.out`` fallback path.
             """
+            # M-NEW.12: flush batcher before direct Vulkan dispatch
+            wrapper._flush_batcher_before_direct_call()
+
             if self._tile_m is not None:
                 # M17.1: Slang tiled matmul path.
                 wrapper.add_import_once(
