@@ -202,8 +202,14 @@ def _trust_inductor() -> bool:
 
 
 def _batch_dispatch_enabled() -> bool:
-    """GPU.1: batch dispatch submission."""
-    return os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "1") != "0"
+    """GPU.1: batch dispatch submission.
+
+    Disabled by default (2026-06-01) due to ordering bug in multi-layer
+    backward wrappers. Batched pointwise kernels can execute AFTER
+    synchronous extern dispatches → stale gradients → frozen loss.
+    Set ``TORCH_VULKAN_BATCH_DISPATCH=1`` to re-enable.
+    """
+    return os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "0") != "0"
 
 
 def _wrapper_fastpath_enabled() -> bool:
