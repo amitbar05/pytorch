@@ -176,27 +176,39 @@ public float wave_read_first(float v) { return WaveReadLaneFirst(v); }
 //   / `OpGroupNonUniformBallotBitCount` (capability `GroupNonUniformBallot`,
 //   Slang atom `subgroup_ballot`). RDNA1 / Vulkan 1.2+ has all three.
 
+// (capability `GroupNonUniform`, slangc 2026.7.1 now requires this explicitly
+// alongside the subgroup-specific capability atoms — without it, wave
+// intrinsics fail with E36104 "undeclared capability used". Fixed RNN.1/2.)
+
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_vote)]
 public bool wave_active_any(bool v) { return WaveActiveAnyTrue(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_vote)]
 public bool wave_active_all(bool v) { return WaveActiveAllTrue(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_ballot)]
 public uint4 wave_active_ballot(bool v) { return WaveActiveBallot(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_arithmetic)]
 public uint wave_active_bit_and(uint v) { return WaveActiveBitAnd(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_arithmetic)]
 public uint wave_active_bit_or(uint v) { return WaveActiveBitOr(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_arithmetic)]
 public uint wave_active_bit_xor(uint v) { return WaveActiveBitXor(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_ballot)]
 public uint wave_active_count_bits(bool v) { return WaveActiveCountBits(v); }
 
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_ballot)]
 public uint wave_prefix_count_bits(bool v) { return WavePrefixCountBits(v); }
 
@@ -208,6 +220,7 @@ public uint wave_prefix_count_bits(bool v) { return WavePrefixCountBits(v); }
 
 // SPIR-V path (production — Vulkan on RDNA1+).
 // WaveActiveSum is natively available via subgroup_arithmetic.
+[require(spirv, spvGroupNonUniform)]
 [require(spirv, subgroup_arithmetic)]
 void wave_reduce_sum(float val, inout float acc) {
     acc = WaveActiveSum(val);

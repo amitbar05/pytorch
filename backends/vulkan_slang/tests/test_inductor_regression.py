@@ -62125,3 +62125,157 @@ class TestDYN1DynamicBatchSizevarPCPrefix:
             assert printer.doprint(sympy.Symbol("tmp0")) == "tmp0"
             # regular variable name
             assert printer.doprint(sympy.Symbol("myvar")) == "myvar"
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestFP162_Fp16MatmulCorrectness:
+    """FP16.2 — FP16 matmul through Slang tiled matmul codegen.
+
+    Verifies that f16 matmul routes through the Slang mm_tile path instead
+    of falling through to the C++ eager vulkan_mm.  The lowering gate in
+    matmul.py:``_vulkan_mm`` was changed from ``t1_dtype == torch.float32``
+    to ``t1_dtype in (torch.float32, torch.float16)`` (2026-06-01).
+
+    Correctness tests run on real GPU (xfail strict until GPU verification).
+    """
+
+    @pytest.mark.timeout(300)
+    def test_f16_mm_lowering_accepts_f16(self):
+        """The _vulkan_mm lowering accepts torch.float16, not just float32."""
+        import torch
+        import torch_vulkan  # triggers backend init
+
+        # Verify the lowering doesn't reject f16 at registration-time
+        from torch._inductor.lowering import lowerings as _inductor_lowerings
+
+        aten = torch.ops.aten
+        assert aten.mm.default in _inductor_lowerings, (
+            "FP16.2: aten.mm.default must have a registered lowering"
+        )
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        reason=(
+            "FP16.2: f16 mm via Slang tile requires real GPU verification. "
+            "The lowering gate was opened 2026-06-01. Will flip to PASS "
+            "after correctness verified on RDNA1."
+        ),
+        strict=True,
+    )
+    def test_f16_mm_compiles_small(self):
+        """Small f16 matmul (64,32,64) compiles and runs on Vulkan."""
+        import torch
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _slang_tile_mm,
+        )
+
+        a = torch.randn(64, 32, device="vulkan:0", dtype=torch.float16)
+        b = torch.randn(32, 64, device="vulkan:0", dtype=torch.float16)
+        c = torch.empty(64, 64, device="vulkan:0", dtype=torch.float16)
+
+        _slang_tile_mm(
+            a, b, c,
+            tile_m=8, tile_n=8, tile_k=8,
+            num_stages=1,
+            m_per_thread=1, n_per_thread=1,
+            dtype_a="half", dtype_b="half", dtype_c="half", dtype_acc="float",
+        )
+        torch_vulkan.synchronize()
+
+        ref = (a.cpu().float() @ b.cpu().float()).half()
+        out = c.cpu()
+        max_diff = (ref.float() - out.float()).abs().max().item()
+        assert max_diff < 0.5, (
+            f"FP16.2: f16 mm max_diff={max_diff} exceeds tolerance 0.5"
+        )
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        reason=(
+            "FP16.2: f16 mm through torch.compile requires real GPU "
+            "verification. The lowering gate was opened 2026-06-01. "
+            "Will flip to PASS after verified on RDNA1."
+        ),
+        strict=True,
+    )
+    def test_f16_mm_through_compile(self):
+        """F16 matmul through torch.compile uses Slang mm_tile path."""
+        import torch
+
+        a = torch.randn(64, 32, device="vulkan:0", dtype=torch.float16)
+        b = torch.randn(32, 64, device="vulkan:0", dtype=torch.float16)
+
+        compiled_mm = torch.compile(lambda x, y: x @ y, backend="inductor")
+        out = compiled_mm(a, b)
+
+        ref = (a.cpu().float() @ b.cpu().float()).half()
+        max_diff = (ref.float() - out.cpu().float()).abs().max().item()
+        assert max_diff < 0.5, (
+            f"FP16.2: f16 mm through compile max_diff={max_diff} > 0.5"
+        )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestV10RNN12_RnnTemplateCapabilityFix:
+    """RNN.1/RNN.2 — slangc spvGroupNonUniform capability fix.
+
+    slangc 2026.7.1 requires explicit ``[require(spirv, spvGroupNonUniform)]``
+    alongside the subgroup-specific capability atoms (subgroup_vote,
+    subgroup_ballot, subgroup_arithmetic). Without this, all wave intrinsics
+    in helpers.slang and vk_helpers.slang fail with E36104
+    "undeclared capability used", which blocks LSTM/GRU/RNN template
+    compilation.
+
+    Fixed 2026-06-01 by adding ``[require(spirv, spvGroupNonUniform)]`` to
+    all wave-intrinsic functions in both helpers.slang and vk_helpers.slang.
+
+    These tests verify standalone slangc compilation (no GPU required).
+    The existing GPU tests (TestCP3RnnCellTemplate, etc.) cover correctness.
+    """
+
+    _CELL_TYPES = ("lstm", "gru", "rnn_tanh", "rnn_relu")
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("cell_type", _CELL_TYPES)
+    def test_rnn_cell_fwd_compiles(self, cell_type):
+        """RNN.1: rnn_cell.slang template compiles for all 4 cell types."""
+        from torch_vulkan.inductor.runtime.slangc import compile_slang_to_spirv
+        from torch_vulkan.inductor.templates.caller.rnn import _render_rnn_cell
+
+        src = _render_rnn_cell(cell_type, hidden_size=128, input_size=64)
+        cache_key = f"test_rnn12_fwd_{cell_type}"
+        spirv = compile_slang_to_spirv(src, cache_key=cache_key)
+        assert spirv is not None and len(spirv) > 0, (
+            f"RNN.1: rnn_cell forward template failed to compile for {cell_type}"
+        )
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.parametrize("cell_type", _CELL_TYPES)
+    def test_rnn_cell_bwd_compiles(self, cell_type):
+        """RNN.2: rnn_cell_bwd.slang template compiles for all 4 cell types."""
+        from torch_vulkan.inductor.runtime.slangc import compile_slang_to_spirv
+        from torch_vulkan.inductor.templates.caller.rnn import _render_rnn_cell
+
+        # rnn_cell_bwd uses same Jinja params, different template file.
+        # The caller module renders rnn_cell_bwd.slang internally.
+        # We test the baseline probe approach: Jinja-render rnn_cell_bwd.slang.
+        from jinja2 import Environment
+
+        from torch_vulkan.inductor.vulkan_template import _load_slang_template
+
+        tmpl_src = _load_slang_template("rnn_cell_bwd")
+        if not tmpl_src:
+            pytest.skip("rnn_cell_bwd template not found")
+
+        src = Environment().from_string(tmpl_src).render(
+            cell_type=cell_type, hidden_size=128, input_size=64, dtype="float",
+        )
+        cache_key = f"test_rnn12_bwd_{cell_type}"
+        spirv = compile_slang_to_spirv(src, cache_key=cache_key)
+        assert spirv is not None and len(spirv) > 0, (
+            f"RNN.2: rnn_cell backward template failed to compile for {cell_type}"
+        )

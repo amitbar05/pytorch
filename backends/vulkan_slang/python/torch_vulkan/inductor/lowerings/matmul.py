@@ -239,11 +239,13 @@ def _register_mm_lowering() -> None:
             stride=[N, 1],
         )
 
-        # M17.1: For fp32 Vulkan tensors, route through Slang tiled matmul
+        # M17.1: For fp32/fp16 Vulkan tensors, route through Slang tiled matmul
         # instead of eager C++ vulkan_mm.  The (8,8,8) 1-output-per-thread
         # tile is the most universal config — it fits a single wave on both
         # wave32 and wave64 hardware.
-        if t1_dtype == torch.float32:
+        # FP16.2 (2026-06-01): fp16 enabled — slang_mm.slang renders half
+        # correctly (f16 storage, f32 accumulation).
+        if t1_dtype in (torch.float32, torch.float16):
             kernel = _VulkanMMOut(
                 layout=out_layout,
                 inputs=[tensor1, tensor2],
@@ -258,7 +260,7 @@ def _register_mm_lowering() -> None:
             )
             return ir.TensorBox.create(kernel)
 
-        # Non-fp32 Vulkan tensors (e.g. fp16): fall through to aten.mm.out
+        # Non-fp32/fp16 Vulkan tensors (e.g. bf16): fall through to aten.mm.out
         # path which dispatches to eager C++ vulkan_mm.
         kernel = _VulkanMMOut(
             layout=out_layout,

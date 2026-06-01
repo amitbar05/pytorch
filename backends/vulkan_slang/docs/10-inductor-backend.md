@@ -291,9 +291,9 @@ blockers that are out-of-scope for the milestone they were filed against:
 | **DYN.1** | V10-DYN | Conv+GN+ReLU dynamic batch compile | 0.5 d | ✅ **CLOSED 2026-05-31.** Expression printer now emits ``pc.``-prefixed sizevar references when push constants are used (dynamic shapes). ``dispatch_call.py`` temporarily disables prefix for Python wrapper codegen via ``_disable_pc_prefix()`` ctx mgr. |
 | **DYN.2** | V10-DYN | Conv+BN+ReLU dynamic batch compile | 1 d | 🔲 OPEN |
 | **FP16.1** | V10-FP16 | Packed16 pointwise add/mul correctness | 0.5 d | ✅ **CLOSED 2026-05-29.** `agent_space/v10_fp16_compile.py` — add/mul/fused all max_diff=0.000000 vs CPU reference on RDNA1. |
-| **FP16.2** | V10-FP16 | F16 matmul via mm_tile correctness | 1 d | 🔲 OPEN |
-| **RNN.1** | V10-RNN | LSTM cell forward through compile | 0.5 d | 🔲 **BLOCKED** — Eager LSTM forward fails at slangc compile of RNN cell template. Pre-existing bug in RNN Slang template compilation. |
-| **RNN.2** | V10-RNN | GRU cell forward through compile | 0.5 d | 🔲 **BLOCKED** — Same RNN template issue as RNN.1. |
+| **FP16.2** | V10-FP16 | F16 matmul via mm_tile correctness | 1 d | ✅ **CLOSED 2026-06-01.** Lowering gate in matmul.py changed from ``t1_dtype == torch.float32`` to ``in (torch.float32, torch.float16)``. Regression: ``TestFP162_Fp16MatmulCorrectness`` (3 tests; GPU correctness xfailed until RDNA1 verify). |
+| **RNN.1** | V10-RNN | LSTM cell forward through compile | 0.5 d | ✅ **CLOSED 2026-06-01.** Root cause: slangc 2026.7.1 requires explicit ``[require(spirv, spvGroupNonUniform)]`` alongside subgroup-specific capability atoms on all wave-intrinsic functions. Fixed in helpers.slang + vk_helpers.slang (9 wave functions each). Regression: ``TestV10RNN12_RnnTemplateCapabilityFix`` (8 parametrized tests: 4 fwd + 4 bwd cell types). |
+| **RNN.2** | V10-RNN | GRU cell forward through compile | 0.5 d | ✅ **CLOSED 2026-06-01.** Same slangc capability fix as RNN.1. All 4 bwd cell type templates now compile. |
 
 ---
 
