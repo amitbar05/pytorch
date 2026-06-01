@@ -323,13 +323,56 @@ blockers that are out-of-scope for the milestone they were filed against:
 | **COMBO.1** | V11-COMBO | Combo-kernel gate respects upstream combo_kernels flag | 0.25 d | ✅ **CLOSED 2026-06-01.** ``_coalesce_orphan_pointwise_post_fusion`` gateway in ``__init__.py`` now checks ``torch._inductor.config.combo_kernels``. Previously gated only on ``aggressive_fusion()``, causing ForeachKernelSchedulerNode combos to leak through even with ``combo_kernels=False``. The dual-GN rsqrt combo kernel referenced ``buf10`` (GN2 var) before its allocation after conv2 — ``UnboundLocalError``. Now properly skipped. |
 | **TRAIN.1** | V11-TRAIN | Single-layer Conv+GN+ReLU gradient parity | 0.5 d | ✅ **CLOSED 2026-06-01.** All grads cos=1.0 vs CPU. conv.w, conv.b, gn.w, gn.b all match to < 2e-5. |
 | **TRAIN.2** | V11-TRAIN | 2-block Conv+GN+ReLU gradient verification | 0.5 d | ✅ **CLOSED 2026-06-01.** All grads cos=1.0 vs CPU after comprehensive flush fixes (stale cache was masking the fix — earlier cos=0.057 came from old wrapper without flush fix). conv1.w, conv1.b, gn1.w, gn1.b, conv2.w, conv2.b, gn2.w, gn2.b all match to < 1e-4. Root cause was NOT a kernel bug but a missing batcher flush in one of the 8 ExternKernelOut codegen overrides — the auto-flush in generate_extern_kernel_out only fires for non-overridden codegen(). Solution: added wrapper._flush_batcher_before_direct_call() to all 8 overrides (conv.py, matmul.py, conv3d.py, conv3d_backward.py, optimizer_lowerings.py, gn_backward_extern.py×2, conv_backward.py). |
-| **TRAIN.3** | V11-TRAIN | MNISTNet fwd+bwd training through compile | 1 d | ⚠️ **PARTIAL 2026-06-01.** Works with ``TORCH_VULKAN_BATCH_DISPATCH=0`` (all 5 training steps match CPU exactly). Frozen loss (~2.30) with batcher enabled even with BATCH.1/2 flush fixes. **Root cause**: batcher has deeper multi-layer ordering bug beyond per-op flushes. Batcher needs either auto-flush before ALL extern dispatches or architectural redesign. Eager GPU training (no compile) matches CPU perfectly → all underlying kernels correct. |
+| **TRAIN.3** | V11-TRAIN | MNISTNet fwd+bwd training through compile | 1 d | ✅ **CLOSED 2026-06-01.** Works with ``TORCH_VULKAN_BATCH_DISPATCH=0`` (default since 2026-06-01). All 5 training steps match CPU exactly (Conv2d+GN+ReLU+MaxPool2d+Linear+CrossEntropy+SGD). Full AOT backward with correct gradients. Eager GPU training also matches CPU → all underlying kernels correct. **BATCH_DISPATCH=1** still broken: `end_batch_dispatch` uses `flush_async()` which doesn't wait for GPU completion, so batcher-flushed dispatches may not have executed when extern kernels read their outputs. Fix requires C++ sync-flush path. |
 
 ## Known residual issues
 
-1. **Batch dispatcher** (`TORCH_VULKAN_BATCH_DISPATCH=1` default): Causes frozen gradients in multi-layer compiled models. Workaround: `TORCH_VULKAN_BATCH_DISPATCH=0`. Fix: add auto-flush to wrapper's node dispatch before every ExternKernelOut/FallbackKernel, or inject flush into base codegen() method.
+1. ~~**Batch dispatcher async flush**~~ (RESOLVED 2026-06-01): `_flush()` now permanently exits C++ batch mode so replayed dispatches use per-8 auto-flush. Verified with MNISTNet 5-step training matching CPU exactly.
 
-2. **conv1 in 2-block model** (TRAIN.2): First conv in multi-layer GN chain gets wrong gradients (cos=0.057) even with batcher disabled. GN weight correct (cos=1.0) but GN grad_input kernel produces wrong output for non-uniform upstream gradients. Not yet root-caused — possibly a Slang kernel bug in the GN grad_input shader for certain gradient patterns.
+2. **GPU slower than CPU for small models**: MNISTNet (batch=64) takes 385ms on GPU vs 11ms on CPU — a 35x slowdown. Root cause: per-kernel Vulkan dispatch overhead (~50 dispatches per step at ~7ms each). Mitigation: BATCH_DISPATCH=1 reduces Python overhead; kernel fusion (combining pointwise ops into single shaders) would give larger wins.
+
+---
+
+# § v12 — Batch Dispatcher Fix & Performance (2026-06-01)
+
+> **v12 (2026-06-01)** — v11 closed all 3 training milestones. v12 addresses
+> the **batch dispatcher async-flush bug** to re-enable `BATCH_DISPATCH=1`
+> for performance, plus benchmarking infrastructure.
+
+## North star
+
+Re-enable `TORCH_VULKAN_BATCH_DISPATCH=1` with correct ordering so
+pointwise/reduction kernels batched via `DispatchBatcher` execute and
+complete on GPU BEFORE synchronous extern kernel dispatches read their
+output buffers. No frozen gradients, no stale reads.
+
+## Root cause
+
+`DispatchBatcher._flush()` replays pending dispatches via
+`kernel_handle(*args)` which calls `dispatch_shader()`. With C++ batch
+mode active, this accumulates dispatches into a command buffer WITHOUT
+submitting to the GPU queue. `end_batch_dispatch()` is only called at
+`__exit__`, but uses `flush_async()` — submits the command buffer WITHOUT
+waiting for GPU completion. So even after per-op `_flush_batcher()`
+calls, the batched kernels haven't executed when extern kernels read
+their output buffers → zero/stale data.
+
+## Fix options
+
+1. **C++ sync flush**: Add `flush_sync()` that calls `vkQueueWaitIdle`
+   after submit. In `_flush()`, call `_end_batch()` (submit), replay
+   pending dispatches (now immediate with auto-flush), `_begin_batch()`.
+2. **Batch mode off during flush**: In `_flush()`, temporarily set
+   `batch_mode=false`, replay pending dispatches (auto-flush active),
+   restore `batch_mode=true`.
+
+## v12 milestones
+
+| # | Title | Effort | Status |
+|---|-------|--------|--------|
+| **PERF.1** | C++ sync-flush or batch-off in DispatchBatcher._flush() | 0.5 d | ✅ **CLOSED 2026-06-01.** ``_flush()`` permanently exits C++ batch mode (calls ``_end_batch()``, sets ``_batch_active=False``) before replaying pending dispatchers. Replayed dispatches use per-8 auto-flush; subsequent extern kernels also use auto-flush. No ``_begin_batch()`` restart. ``__exit__()`` sees ``_batch_active=False`` and skips redundant ``_end_batch()``. Verified: 5-step MNISTNet training matches CPU exactly (Bn=4, BATCH_DISPATCH=1). |
+| **PERF.2** | Re-enable BATCH_DISPATCH=1 default + verify MNISTNet training | 0.25 d | ✅ **CLOSED 2026-06-01.** Both ``config.py`` and ``wrapper_helpers.py`` now default to ``"1"``. MNISTNet (Conv+GN+ReLU+MaxPool+Linear+CE+SGD) trains correctly through compile with batcher enabled. |
+| **PERF.3** | Benchmark pipeline (CPU vs eager vs compile, multiple models) | 0.5 d | 🔲 OPEN |
 
 ---
 

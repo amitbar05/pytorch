@@ -117,11 +117,18 @@ class DispatchBatcher:
     def _flush(self):
         """Submit all pending dispatches.
 
-        When C++ batch mode is active (M17.5), the ``begin_batch_dispatch``
-        call has suppressed per-8-dispatch auto-flush, so all dispatches
-        accumulate in a single command buffer.  We replay them sequentially
-        here, then ``end_batch_dispatch`` (called in ``__exit__``) flushes
-        with a single ``vkQueueSubmit``.
+        When C++ batch mode is active (M17.5), we permanently exit batch
+        mode so the replayed dispatches are actually submitted to the GPU
+        queue (via per-8-dispatch auto-flush).  We do NOT re-enter batch
+        mode because the extern kernel that triggered this flush must
+        execute AFTER the replayed dispatches, and restarting batch mode
+        would suppress auto-flush again — causing the extern kernel and
+        the replayed dispatches to all accumulate in an un-submitted
+        command buffer.
+
+        The ``__exit__`` handler sees ``_batch_active=False`` and skips
+        its own ``_end_batch()`` call (already done here).  Remaining
+        dispatches for this graph use auto-flush mode.
 
         Falls back to sequential individual dispatches with per-8-dispatch
         auto-flush when the C++ batch functions are unavailable.
@@ -129,12 +136,21 @@ class DispatchBatcher:
         if not self._pending:
             return
 
-        # Sequential replay: each kernel_handle calls through to
-        # dispatch_shader() which, with batch_mode=true, skips auto-flush.
-        # All dispatches accumulate in one command buffer.
-        for kernel_handle, dispatch_args in self._pending:
-            kernel_handle(*dispatch_args)
-        self._pending.clear()
+        if self._batch_active and self._end_batch is not None:
+            # v12/PERF.1: Exit C++ batch mode permanently.  The
+            # accumulated command buffer is submitted (if non-empty);
+            # replayed dispatches use auto-flush, and subsequent extern
+            # kernels also use auto-flush — ensuring correct queue order.
+            self._end_batch()
+            self._batch_active = False
+            for kernel_handle, dispatch_args in self._pending:
+                kernel_handle(*dispatch_args)
+            self._pending.clear()
+        else:
+            # Sequential replay: no batch mode or no C++ batch functions.
+            for kernel_handle, dispatch_args in self._pending:
+                kernel_handle(*dispatch_args)
+            self._pending.clear()
 
     @classmethod
     def _ensure_batch_resolved(cls):
