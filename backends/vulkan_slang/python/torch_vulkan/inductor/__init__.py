@@ -800,13 +800,13 @@ def _legacy_register() -> None:
     _patch_nested_storage_unwrap()
 
     # TR.21 — Conv+GN+ReLU combo fusion (M18.8.b / post_grad.py).
-    # NOT active. Forward fusion works (33→10 dispatches) but compilation
-    # hangs in autotune. Backward: TR.21 nested-StorageBox fix applied but
-    # unverified. Re-enable after GPU testing both paths.
-    # from torch_vulkan.inductor.fx_passes.post_grad import (
-    #     install_conv_patched_gn_relu_fusion,
-    # )
-    # install_conv_patched_gn_relu_fusion()
+    # Forward: 1 fused conv2d_gn_relu_fused dispatch replaces 3 separate
+    # dispatches (conv + GN + ReLU). Verified working on GPU.
+    # Backward: TR.21 nested-StorageBox fix applied. Pending GPU verify.
+    from torch_vulkan.inductor.fx_passes.post_grad import (
+        install_conv_patched_gn_relu_fusion,
+    )
+    install_conv_patched_gn_relu_fusion()
 
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
