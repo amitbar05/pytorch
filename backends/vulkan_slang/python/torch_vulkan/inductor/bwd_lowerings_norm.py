@@ -176,6 +176,31 @@ def _register_group_norm_backward() -> None:
                 gb_size, dtype=dtype, device=dev
             )
 
+        # ── Pre-realize inputs for ExternKernel ──
+        # v13-DISP.3-FIX2: The combo backward can pass Pointwise IR
+        # nodes as inputs (e.g., grad_output * relu_mask).  The
+        # ExternKernel's unwrap_storage handles simple nesting, but
+        # deeply-wrapped chains (TensorBox→StorageBox→StorageBox→
+        # Pointwise) can still escape.  Realize inputs before passing
+        # to the ExternKernel so they have proper buffer names.
+        from torch._inductor.ir import Pointwise, Reduction, StorageBox, TensorBox
+        def _realize_if_pointwise(t):
+            if isinstance(t, TensorBox):
+                t_data = t.data
+            else:
+                t_data = t
+            if isinstance(t_data, StorageBox) and isinstance(
+                t_data.data, (Pointwise, Reduction)
+            ):
+                t_data.realize()
+            return t
+        grad_output = _realize_if_pointwise(grad_output)
+        inp = _realize_if_pointwise(inp)
+        mean = _realize_if_pointwise(mean)
+        rstd = _realize_if_pointwise(rstd)
+        if gamma is not None:
+            gamma = _realize_if_pointwise(gamma)
+
         # ── Dispatch 1: grad_input via fused shader ──
         gn_bwd_inputs = [grad_output, inp, mean, rstd]
         if gamma is not None:

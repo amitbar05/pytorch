@@ -640,10 +640,10 @@ def register() -> None:
     _register_group_norm()
     # GN.1: Fused GN forward via standalone Slang shader (ExternKernelOut).
     # Replaces ~10 dispatch decomposition with 1 fused dispatch.
-    # Gate: TORCH_VULKAN_GN_FUSED_FWD=1 until GPU-verified on RDNA1.
-    import os as _os_gn
-    if _os_gn.environ.get("TORCH_VULKAN_GN_FUSED_FWD") == "1":
-        _register_group_norm_fused()
+    # Always-on since 2026-06-02.  The fused shader (group_norm.slang)
+    # computes per-(batch,group) mean/variance via shared-memory reduction
+    # and applies per-channel affine in a single kernel dispatch.
+    _register_group_norm_fused()
     _register_softmax()
     _register_batch_norm_forward()
     _register_clamp_lowerings()
