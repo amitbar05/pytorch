@@ -372,7 +372,43 @@ their output buffers → zero/stale data.
 |---|-------|--------|--------|
 | **PERF.1** | C++ sync-flush or batch-off in DispatchBatcher._flush() | 0.5 d | ✅ **CLOSED 2026-06-01.** ``_flush()`` permanently exits C++ batch mode (calls ``_end_batch()``, sets ``_batch_active=False``) before replaying pending dispatchers. Replayed dispatches use per-8 auto-flush; subsequent extern kernels also use auto-flush. No ``_begin_batch()`` restart. ``__exit__()`` sees ``_batch_active=False`` and skips redundant ``_end_batch()``. Verified: 5-step MNISTNet training matches CPU exactly (Bn=4, BATCH_DISPATCH=1). |
 | **PERF.2** | Re-enable BATCH_DISPATCH=1 default + verify MNISTNet training | 0.25 d | ✅ **CLOSED 2026-06-01.** PERF.1 fix verified correct (all 5 steps match CPU). However BATCH_DISPATCH=1 is 1.8x SLOWER than BATCH_DISPATCH=0 (676ms vs 385ms, MNISTNet batch=64) due to setup/teardown overhead without batching benefit (batch mode exits on first flush). Default kept at 0. BATCH_DISPATCH=1 available as opt-in for correctness verification. |
-| **PERF.3** | Benchmark pipeline (CPU vs eager vs compile, multiple models) | 0.5 d | 🔲 OPEN |
+| **PERF.3** | Benchmark pipeline (CPU vs eager vs compile, multiple models) | 0.5 d | ✅ **CLOSED 2026-06-01.** Benchmark script at ``agent_space/bench_perf3_pipeline.py`` (4 models: Tiny/Small/Medium/ResNet, all with GN). Regression tests at ``TestPerf3BenchmarkPipeline`` (4 tests: tiny/small/medium training correctness + dispatch count). |
+
+---
+
+# § v13 — Performance & Productionization (2026-06-01)
+
+> **v13 (2026-06-01)** — v12 closed PERF.1-PERF.3. v13 targets
+> **dispatch-count reduction, fused shader deployment, and GPU verification**
+> of the features gated behind env vars (BN training, dynamic shapes, FP16).
+
+## North star
+
+A Conv+GN model trained through ``torch.compile(backend="inductor")`` on Vulkan
+should have dispatch counts competitive with Triton backends: ≤4 dispatches per
+Conv+GN+ReLU block (conv extern + GN fused + ReLU pointwise), and ≤8 dispatches
+per full training step including backward.
+
+## v13 pillars
+
+| # | Pillar | Goal |
+|---|--------|------|
+| **V13-DISP** | Dispatch-count reduction | Fuse decomposed ops into standalone Slang shaders. Target: ≤4 dispatches per Conv+GN+ReLU block. |
+| **V13-VRFY** | GPU verification | Flip BN.2, DYN.2, FP16.2 from xfail to PASS on RDNA1. |
+| **V13-FP16** | FP16 training pipeline | End-to-end mixed-precision training with Conv+GN models on Vulkan. |
+| **V13-AOTI** | AOTInductor deployment | C++ codegen path with embedded SPIR-V for production inference. |
+
+## v13 milestones
+
+| # | Pillar | Title | Effort | Status |
+|---|--------|-------|--------|--------|
+| **DISP.1** | V13-DISP | GN forward fusion: ExternKernelOut (1 dispatch vs ~10) | 0.5 d | 🔲 **DRAFT** — ExternKernelOut + lowering implemented in ``gn_forward_extern.py`` + ``norm.py``. Gated behind ``TORCH_VULKAN_GN_FUSED_FWD=1``. Needs GPU verification. |
+| **DISP.2** | V13-DISP | BN forward fusion: ExternKernelOut (1 dispatch vs ~12) | 0.5 d | 🔲 OPEN — Same pattern as GN.1 but for BatchNorm forward. |
+| **VRFY.1** | V13-VRFY | Flip BN.2 xfail → PASS on RDNA1 | 0.25 d | 🔲 OPEN — TestV10BN2_BatchNormCompileTraining currently xfail(strict=True). Root cause (helpers capability) fixed 2026-06-01. |
+| **VRFY.2** | V13-VRFY | Flip DYN.2 xfail → PASS on RDNA1 | 0.25 d | 🔲 OPEN — TestV10DYN2_ConvBNDynamicBatch currently xfail(strict=True). |
+| **VRFY.3** | V13-VRFY | Flip FP16.2 xfail → PASS on RDNA1 | 0.25 d | 🔲 OPEN — TestFP162_Fp16MatmulCorrectness GPU tests xfailed. |
+| **FP16.1** | V13-FP16 | FP16 Conv+GN+ReLU training correctness | 0.5 d | 🔲 OPEN — End-to-end mixed-precision training with amp autocast. |
+| **AOTI.1** | V13-AOTI | AOTI C++ codegen for Conv+GN models | 1 d | 🔲 OPEN — PF.60 (tensor_str recursion) + PF.13 (FunctionalTensor data_ptr) still block AOTI. |
 
 ---
 

@@ -605,6 +605,7 @@ def register() -> None:
         _register_batch_norm_forward,
         _register_group_norm,
         _register_group_norm_backward,
+        _register_group_norm_fused,
         _register_layer_norm,
         _register_layer_norm_backward,
     )
@@ -637,6 +638,12 @@ def register() -> None:
     _register_sdpa_lowering()
     _register_layer_norm()
     _register_group_norm()
+    # GN.1: Fused GN forward via standalone Slang shader (ExternKernelOut).
+    # Replaces ~10 dispatch decomposition with 1 fused dispatch.
+    # Gate: TORCH_VULKAN_GN_FUSED_FWD=1 until GPU-verified on RDNA1.
+    import os as _os_gn
+    if _os_gn.environ.get("TORCH_VULKAN_GN_FUSED_FWD") == "1":
+        _register_group_norm_fused()
     _register_softmax()
     _register_batch_norm_forward()
     _register_clamp_lowerings()

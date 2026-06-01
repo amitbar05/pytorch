@@ -126,6 +126,90 @@ def _register_group_norm() -> None:
         return [out, mean_out, rstd_out]
 
 
+def _register_group_norm_fused() -> None:
+    """GN.1 — Fused GroupNorm forward via standalone Slang shader (ExternKernelOut).
+
+    Replaces the ~10 dispatch decomposition above with 1 fused dispatch
+    using ``group_norm.slang``.  Gated behind ``TORCH_VULKAN_GN_FUSED_FWD=1``
+    until GPU-verified on RDNA1.
+
+    The fused shader computes per-(batch,group) mean/variance via shared-memory
+    reduction, normalizes, and applies per-channel affine in a single
+    kernel dispatch.  save_mean [N*G] and save_rstd [N*G] are written to
+    pre-allocated buffers for the backward pass.
+    """
+    import os
+    import torch
+    from torch._inductor import ir
+    from torch._inductor import lowering as L
+    from torch._inductor.lowering import register_lowering, lowerings
+
+    aten = torch.ops.aten
+
+    @register_lowering(aten.native_group_norm, type_promotion_kind=None)
+    def _vulkan_native_group_norm_fused(x, weight, bias, N, C, HxW, num_groups, eps):
+        if not _is_vulkan(x):
+            return NotImplemented
+
+        N_val = int(N)
+        C_val = int(C)
+        G = int(num_groups)
+        if N_val <= 0 or C_val <= 0 or G <= 0 or C_val % G != 0:
+            return NotImplemented
+
+        from torch_vulkan.inductor.lowerings.gn_forward_extern import (
+            _VulkanGNFwdExternKernel,
+        )
+
+        dev = x.get_device()
+        dtype = x.get_dtype()
+
+        # Pre-allocate save_mean [N*G] and save_rstd [N*G]
+        num_rows = N_val * G
+        sm_size = [num_rows]
+        sm_stride = [1]
+        sm_layout = ir.FixedLayout(
+            device=dev, dtype=dtype, size=sm_size, stride=sm_stride
+        )
+        save_mean_buf = lowerings[aten.empty.memory_format](
+            sm_size, dtype=dtype, device=dev
+        )
+        save_rstd_buf = lowerings[aten.empty.memory_format](
+            sm_size, dtype=dtype, device=dev
+        )
+
+        # GN forward ExternKernelOut — fused dispatch
+        out_size = list(x.get_size())
+        out_stride = [C_val * int(HxW), int(HxW), int(x.get_size()[-1]), 1]
+        out_layout = ir.FixedLayout(
+            device=dev, dtype=dtype, size=out_size, stride=out_stride
+        )
+
+        gn_inputs = [x, weight, bias, save_mean_buf, save_rstd_buf]
+        _VulkanGNFwdExternKernel(
+            layout=out_layout,
+            inputs=gn_inputs,
+            num_groups=G,
+            eps=float(eps),
+        )
+
+        # Reshape save_mean/save_rstd from [N*G] to [N, G] for backward
+        sm_reshaped = L.lowerings[aten.view.default](
+            save_mean_buf, [N_val, G]
+        )
+        sr_reshaped = L.lowerings[aten.view.default](
+            save_rstd_buf, [N_val, G]
+        )
+
+        # The primary output is the ExternKernelOut's codegen_reference()
+        # buffer.  It gets allocated inside codegen() via empty_strided_vulkan.
+        # We return a view (reshape) that aliases it so the scheduler sees a
+        # proper output handle.
+        from torch._inductor.ir import StorageBox
+        out_ret = StorageBox(out_layout)
+        return [out_ret, sm_reshaped, sr_reshaped]
+
+
 def _register_batch_norm_forward() -> None:
     """B1 — Inductor lowering for ``aten.native_batch_norm.default`` (forward).
 

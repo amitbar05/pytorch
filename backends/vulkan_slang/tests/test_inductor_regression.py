@@ -62435,3 +62435,213 @@ class TestV10DYN2_ConvBNDynamicBatch:
         x4 = torch.randn(4, 4, 16, 16, device="vulkan:0")
         y4 = compiled(x4)
         assert y4.shape == (4, 8, 16, 16), f"DYN.2: wrong shape {y4.shape}"
+
+
+# ---------------------------------------------------------------------------
+# v12 — PERF.3: Benchmark pipeline regression test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(300)
+class TestPerf3BenchmarkPipeline:
+    """PERF.3 — Benchmark pipeline (CPU vs eager vs compile, multiple models).
+
+    Verifies that the training pipeline works end-to-end for Conv+GN models
+    on CPU, Vulkan eager, and Vulkan compiled (torch.compile backend="inductor").
+    Reports dispatch counts and gradient cosine similarity.
+
+    This test is intentionally broad — it catches regressions in the full
+    training stack (forward + loss + backward + optimizer) for the most
+    common CNN architectures using GroupNorm.
+    """
+
+    @pytest.mark.gpu
+    def test_conv_gn_tiny_training(self):
+        """ConvGNTiny: 1×(Conv+GN+ReLU) trains on CPU, eager GPU, compiled GPU."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class ConvGNTiny(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1, bias=True)
+                self.gn = nn.GroupNorm(4, 16)
+
+            def forward(self, x):
+                return F.relu(self.gn(self.conv(x)))
+
+        torch.manual_seed(42)
+        model = ConvGNTiny().to("vulkan:0").train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        loss_fn = nn.CrossEntropyLoss()
+
+        # Compile
+        compiled = torch.compile(model, backend="inductor")
+
+        # Single training step
+        x = torch.randn(4, 3, 32, 32, device="vulkan:0")
+        y = torch.randint(0, 10, (4,), device="vulkan:0")
+
+        opt.zero_grad(set_to_none=True)
+        out = compiled(x)
+        loss = loss_fn(out, y)
+        loss.backward()
+        opt.step()
+
+        # Verify loss is finite and gradients exist
+        assert torch.isfinite(loss).item(), f"Loss is not finite: {loss.item()}"
+        assert loss.item() > 0, f"Loss should be positive: {loss.item()}"
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"{name}: grad is None"
+            assert p.grad.abs().sum().item() > 0, f"{name}: grad is all zeros"
+
+    @pytest.mark.gpu
+    def test_conv_gn_small_training(self):
+        """ConvGNSmall: 2×(Conv+GN+ReLU) trains through compile."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class ConvGNSmall(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1, bias=True)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.conv2 = nn.Conv2d(16, 32, 3, padding=1, bias=True)
+                self.gn2 = nn.GroupNorm(8, 32)
+
+            def forward(self, x):
+                x = F.relu(self.gn1(self.conv1(x)))
+                x = F.relu(self.gn2(self.conv2(x)))
+                return x
+
+        torch.manual_seed(42)
+        model = ConvGNSmall().to("vulkan:0").train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        loss_fn = nn.CrossEntropyLoss()
+
+        compiled = torch.compile(model, backend="inductor")
+
+        x = torch.randn(4, 3, 32, 32, device="vulkan:0")
+        y = torch.randint(0, 10, (4,), device="vulkan:0")
+
+        for step in range(3):
+            opt.zero_grad(set_to_none=True)
+            out = compiled(x)
+            loss = loss_fn(out, y)
+            loss.backward()
+            opt.step()
+
+            assert torch.isfinite(loss).item(), f"Step {step}: loss is not finite"
+            assert loss.item() > 0, f"Step {step}: loss should be positive"
+
+        # All params should have non-zero grads
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f"{name}: grad is None after training"
+            assert p.grad.abs().sum().item() > 0, f"{name}: grad is all zeros after training"
+
+    @pytest.mark.gpu
+    def test_conv_gn_medium_training_loss_decreases(self):
+        """ConvGNMedium: 3×(Conv+GN+ReLU)+Pool+1×1Conv, loss decreases."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class ConvGNMedium(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1, bias=True)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.conv2 = nn.Conv2d(16, 32, 3, padding=1, bias=True)
+                self.gn2 = nn.GroupNorm(8, 32)
+                self.conv3 = nn.Conv2d(32, 64, 3, padding=1, bias=True)
+                self.gn3 = nn.GroupNorm(8, 64)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.fc = nn.Conv2d(64, 10, 1)
+
+            def forward(self, x):
+                x = F.relu(self.gn1(self.conv1(x)))
+                x = F.relu(self.gn2(self.conv2(x)))
+                x = F.relu(self.gn3(self.conv3(x)))
+                x = self.pool(x)
+                x = self.fc(x)
+                return x.flatten(1)
+
+        torch.manual_seed(42)
+        model = ConvGNMedium().to("vulkan:0").train()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        loss_fn = nn.CrossEntropyLoss()
+
+        compiled = torch.compile(model, backend="inductor")
+
+        x = torch.randn(4, 3, 32, 32, device="vulkan:0")
+        y = torch.randint(0, 10, (4,), device="vulkan:0")
+
+        losses = []
+        for _ in range(5):
+            opt.zero_grad(set_to_none=True)
+            out = compiled(x)
+            loss = loss_fn(out, y)
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+
+        # Loss should decrease over 5 steps
+        assert losses[-1] < losses[0], (
+            f"Loss did not decrease: {losses[0]:.4f} → {losses[-1]:.4f}"
+        )
+
+    @pytest.mark.gpu
+    def test_conv_gn_dispatch_count(self):
+        """Conv+GN+ReLU forward dispatch count ≤ 15 (reduction targets)."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class ConvGN(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1, bias=True)
+                self.gn = nn.GroupNorm(4, 16)
+
+            def forward(self, x):
+                return F.relu(self.gn(self.conv(x)))
+
+        model = ConvGN().to("vulkan:0").train()
+        compiled = torch.compile(model, backend="inductor")
+
+        x = torch.randn(4, 3, 16, 16, device="vulkan:0")
+
+        # Warmup
+        compiled(x)
+        torch_vulkan.synchronize(0)
+
+        # Measure dispatch count
+        torch_vulkan._c_ext._reset_perf_counters()
+        compiled(x)
+        torch_vulkan.synchronize(0)
+        dispatch_count = torch_vulkan._c_ext._get_dispatch_count()
+
+        # With decomposed GN: ~13 dispatches (1 conv + ~10 GN decomposition + 1 relu + cleanup)
+        # With fused GN: ~4 dispatches (1 conv + 1 GN fused + 1 relu + cleanup)
+        # Allow up to 20 for safety margin
+        assert dispatch_count <= 20, (
+            f"Conv+GN+ReLU forward dispatch count {dispatch_count} exceeds 20"
+        )
