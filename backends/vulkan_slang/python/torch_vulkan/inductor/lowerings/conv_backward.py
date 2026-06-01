@@ -70,13 +70,17 @@ def _vk_realize_then_unwrap(x):
 
     Returns Buffer/ReinterpretView (what ExternKernel expects).
     Used by ``_VulkanConvBwdExternKernel``.
+
+    Handles nested StorageBox (TensorBox → StorageBox → StorageBox → Pointwise)
+    by looping until the innermost data is reached.
     """
     if isinstance(x, _ir_module.TensorBox):
         x = x.data
-    if isinstance(x, _ir_module.StorageBox) and isinstance(
-        x.data, (_ir_module.Pointwise, _ir_module.Reduction)
-    ):
-        x.realize()
+    while isinstance(x, _ir_module.StorageBox):
+        if isinstance(x.data, (_ir_module.Pointwise, _ir_module.Reduction)):
+            x.realize()
+            break
+        x = x.data
     if isinstance(x, _ir_module.StorageBox):
         return x.data
     return x

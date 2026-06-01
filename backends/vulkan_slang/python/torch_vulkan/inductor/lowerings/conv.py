@@ -156,6 +156,9 @@ def _register_conv_and_pool_lowerings() -> None:
     def _vk_realize_then_unwrap(x):
         """Realize Pointwise/Reduction, then unwrap StorageBox → data.
         Returns Buffer/ReinterpretView (what ExternKernel expects).
+
+        Handles nested StorageBox (TensorBox → StorageBox → StorageBox → Pointwise)
+        by looping until the innermost data is reached.
         """
         import torch._inductor.ir as _ir
 
@@ -164,10 +167,11 @@ def _register_conv_and_pool_lowerings() -> None:
             x = x.data
 
         # If StorageBox contains Pointwise/Reduction, realize it first
-        if isinstance(x, _ir.StorageBox) and isinstance(
-            x.data, (_ir.Pointwise, _ir.Reduction)
-        ):
-            x.realize()
+        while isinstance(x, _ir.StorageBox):
+            if isinstance(x.data, (_ir.Pointwise, _ir.Reduction)):
+                x.realize()
+                break
+            x = x.data
 
         # Unwrap to raw data (Buffer/ReinterpretView)
         if isinstance(x, _ir.StorageBox):

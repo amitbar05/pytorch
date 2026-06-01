@@ -16,13 +16,19 @@ _aten = _torch_module.ops.aten
 
 
 def _vk_realize_then_unwrap(x):
-    """Realize Pointwise/Reduction, then unwrap StorageBox → data."""
+    """Realize Pointwise/Reduction, then unwrap StorageBox → data.
+
+    Handles nested StorageBox (TensorBox → StorageBox → StorageBox → Pointwise)
+    by looping until the innermost data is reached.
+    """
     if isinstance(x, _ir_module.TensorBox):
         x = x.data
-    if isinstance(x, _ir_module.StorageBox) and isinstance(
-        x.data, (_ir_module.Pointwise, _ir_module.Reduction)
-    ):
-        x.realize()
+    while isinstance(x, _ir_module.StorageBox):
+        if isinstance(x.data, (_ir_module.Pointwise, _ir_module.Reduction)):
+            x.realize()
+            # After realize(), x.data becomes a Buffer — break out
+            break
+        x = x.data
     if isinstance(x, _ir_module.StorageBox):
         return x.data
     return x
