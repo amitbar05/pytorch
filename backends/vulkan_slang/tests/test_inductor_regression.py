@@ -62279,3 +62279,104 @@ class TestV10RNN12_RnnTemplateCapabilityFix:
         assert spirv is not None and len(spirv) > 0, (
             f"RNN.2: rnn_cell backward template failed to compile for {cell_type}"
         )
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestV10BN2_BatchNormCompileTraining:
+    """BN.2 — BatchNorm2d fwd+bwd through torch.compile.
+
+    Verifies that BN training mode (fwd+bwd) compiles and produces correct
+    gradients.  The EMA update on running_mean/running_var is gated behind
+    ``TORCH_VULKAN_BN_EMA_UPDATE=1`` pending GPU verification — without it,
+    backward still works (uses save_mean/save_invstd computed fresh per batch).
+
+    Root cause of original blocker: missing spvGroupNonUniform capability in
+    helpers.slang caused "undefined identifier" slangc errors for ALL kernels
+    importing helpers (including BN-generated Slang code). Fixed in RNN.1/2
+    (2026-06-01, same session).
+
+    GPU correctness tests xfailed pending RDNA1 verify.
+    """
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        reason=(
+            "BN.2: BN fwd+bwd through compile requires GPU verification. "
+            "Root cause (helpers capability) fixed 2026-06-01. "
+            "Will flip to PASS after verified on RDNA1."
+        ),
+        strict=True,
+    )
+    def test_bn_train_compile_forward_backward(self):
+        """BN training: compiled forward+backward produces non-zero grads."""
+        import torch
+        import torch.nn as nn
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        model = nn.BatchNorm2d(8).to("vulkan:0").train()
+        x = torch.randn(2, 8, 4, 4, device="vulkan:0", requires_grad=True)
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return model(x)
+
+        y = fn(x)
+        loss = y.sum()
+        loss.backward()
+
+        assert x.grad is not None, "BN.2: input gradient should not be None"
+        gnorm = x.grad.cpu().norm().item()
+        assert gnorm > 0, f"BN.2: input gradient norm is zero ({gnorm})"
+        assert model.weight.grad is not None, "BN.2: weight grad should not be None"
+        assert model.weight.grad.cpu().norm().item() > 0, "BN.2: weight grad is zero"
+        assert model.bias.grad is not None, "BN.2: bias grad should not be None"
+        assert model.bias.grad.cpu().norm().item() > 0, "BN.2: bias grad is zero"
+
+    @pytest.mark.timeout(300)
+    @pytest.mark.xfail(
+        reason=(
+            "BN.2: BN EMA update (TORCH_VULKAN_BN_EMA_UPDATE=1) requires "
+            "GPU verification. Running stats updated via copy_ in lowering. "
+            "Will flip to PASS after verified on RDNA1."
+        ),
+        strict=True,
+    )
+    def test_bn_ema_update_running_stats(self):
+        """BN EMA: running_mean/running_var updated during compiled training."""
+        import os
+        os.environ["TORCH_VULKAN_BN_EMA_UPDATE"] = "1"
+        try:
+            import torch
+            import torch.nn as nn
+            import torch_vulkan
+            import torch._dynamo
+
+            torch._dynamo.reset()
+
+            model = nn.BatchNorm2d(8).to("vulkan:0").train()
+            # Zero running stats to detect update
+            model.running_mean.zero_()
+            model.running_var.fill_(1.0)
+
+            x = torch.randn(4, 8, 4, 4, device="vulkan:0")
+
+            compiled = torch.compile(model, backend="inductor")
+            y = compiled(x)
+
+            # running_mean should have changed from zero
+            rm = model.running_mean.cpu()
+            assert rm.abs().sum().item() > 1e-6, (
+                "BN.2: running_mean not updated during compiled training"
+            )
+            # running_var should have changed from 1.0
+            rv = model.running_var.cpu()
+            assert (rv - 1.0).abs().sum().item() > 1e-6, (
+                "BN.2: running_var not updated during compiled training"
+            )
+        finally:
+            del os.environ["TORCH_VULKAN_BN_EMA_UPDATE"]
