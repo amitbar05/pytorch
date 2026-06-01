@@ -713,6 +713,12 @@ def _patch_nested_storage_unwrap() -> None:
     _ir.InputsKernel.unwrap_storage_for_input = _patched_unwrap
     _ir.ExternKernel.unwrap_storage_for_input = _patched_unwrap
 
+    # NOTE: TR.21-b (get_read_writes) and TR.21-c (ExternKernelOut.__init__)
+    # monkey-patches attempted but not taking effect — likely module reload
+    # or class caching issue.  The unwrap_storage_for_input patch above
+    # provides partial coverage.  Combo fusion backward (DISP.3) remains
+    # blocked until the full monkey-patch chain works.
+
 
 def _legacy_register() -> None:
     """Body of the historical scattered registration.
@@ -803,14 +809,12 @@ def _legacy_register() -> None:
     # existing BaseView realize_input on line 5947 of upstream ir.py.
     _patch_nested_storage_unwrap()
 
-    # TR.21 — Conv+GN+ReLU combo fusion (M18.8.b / post_grad.py).
-    # Forward: 1 fused conv2d_gn_relu_fused dispatch replaces 3 separate
-    # dispatches (conv + GN + ReLU). Verified working on GPU.
-    # Backward: TR.21 nested-StorageBox fix applied. Pending GPU verify.
-    from torch_vulkan.inductor.fx_passes.post_grad import (
-        install_conv_patched_gn_relu_fusion,
-    )
-    install_conv_patched_gn_relu_fusion()
+    # Conv+GN+ReLU combo fusion (DISP.3).  Forward verified working on GPU.
+    # Backward blocked: nested StorageBox→Pointwise chains crash
+    # ExternKernelSchedulerNode.  TR.21 monkey-patch (unwrap_storage_for_input)
+    # applied but not sufficient — get_read_writes bypasses it.
+    # Blocked until upstream ExternKernelOut inputs can be realized
+    # before scheduler processing.
 
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
