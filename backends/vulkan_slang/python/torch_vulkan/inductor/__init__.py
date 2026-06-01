@@ -707,6 +707,10 @@ def _patch_nested_storage_unwrap() -> None:
         assert isinstance(x, (_ir.Buffer, _ir.ReinterpretView)), type(x)
         return x
 
+    # Patch BOTH InputsKernel AND ExternKernel — unwrap_storage()
+    # calls InputsKernel.unwrap_storage_for_input directly (line 5966),
+    # not through ExternKernel.
+    _ir.InputsKernel.unwrap_storage_for_input = _patched_unwrap
     _ir.ExternKernel.unwrap_storage_for_input = _patched_unwrap
 
 
