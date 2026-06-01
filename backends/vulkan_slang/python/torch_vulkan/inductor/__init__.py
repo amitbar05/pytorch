@@ -713,12 +713,43 @@ def _patch_nested_storage_unwrap() -> None:
     _ir.InputsKernel.unwrap_storage_for_input = _patched_unwrap
     _ir.ExternKernel.unwrap_storage_for_input = _patched_unwrap
 
-    # NOTE: TR.21-b (get_read_writes) and TR.21-c (ExternKernelOut.__init__)
-    # monkey-patches are structurally correct (confirmed called via ImportError
-    # trace) but the innermost element after StorageBox unwrapping is not
-    # Pointwise — it's a different IR node type.  Needs diagnosis of the
-    # actual MRO to select the correct isinstance check.
-    # Disabled until the exact node type is identified.
+    # TR.21-b: get_read_writes monkey-patch — use try/except instead of
+    # isinstance because the IR node class may be dynamically generated
+    # and not match our imported _ir.Pointwise.
+    _orig_get_read_writes = _ir.InputsKernel.get_read_writes
+
+    def _patched_get_read_writes(self):
+        from torch._inductor.dependencies import StarDep, ReadWrites
+        reads = set()
+        for inp in self.inputs:
+            if isinstance(inp, (list, tuple)):
+                reads.update(StarDep(x.get_name()) for x in inp)
+                continue
+            try:
+                reads.add(StarDep(inp.get_name()))
+            except NotImplementedError:
+                # Nested StorageBox chain with unrealized inner node.
+                # Walk to innermost, register buffer name, realize.
+                from torch._inductor.graph import V
+                walk = inp
+                while True:
+                    try:
+                        nxt = walk.data
+                    except AttributeError:
+                        break
+                    if not isinstance(nxt, _ir.IRNode):
+                        break
+                    walk = nxt
+                if not hasattr(walk, 'name') or walk.name is None:
+                    walk.name = V.graph.register_buffer(walk)
+                V.graph.realize(walk)
+                reads.add(StarDep(walk.name))
+        writes = set(
+            StarDep(buf.get_name()) for buf in self.get_outputs()
+        )
+        return ReadWrites(reads=reads, writes=writes, index_exprs=set())
+
+    _ir.InputsKernel.get_read_writes = _patched_get_read_writes
 
 
 def _legacy_register() -> None:
@@ -811,11 +842,11 @@ def _legacy_register() -> None:
     _patch_nested_storage_unwrap()
 
     # Conv+GN+ReLU combo fusion (DISP.3).  Forward verified working on GPU.
-    # Backward blocked: nested StorageBox→X chains where X is neither
-    # Pointwise nor Reduction — a different IR node type that also lacks
-    # get_name().  TR.21 get_read_writes monkey-patch confirmed active
-    # (ImportError trace proves call) but isinstance check needs the
-    # correct type.  Disabled pending MRO diagnosis.
+    # Backward: TR.21-b try/except get_read_writes monkey-patch active.
+    from torch_vulkan.inductor.fx_passes.post_grad import (
+        install_conv_patched_gn_relu_fusion,
+    )
+    install_conv_patched_gn_relu_fusion()
 
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
