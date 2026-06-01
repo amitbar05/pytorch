@@ -186,7 +186,7 @@ def _register_group_norm_fused() -> None:
         )
 
         gn_inputs = [x, weight, bias, save_mean_buf, save_rstd_buf]
-        _VulkanGNFwdExternKernel(
+        gn_kernel = _VulkanGNFwdExternKernel(
             layout=out_layout,
             inputs=gn_inputs,
             num_groups=G,
@@ -201,12 +201,8 @@ def _register_group_norm_fused() -> None:
             save_rstd_buf, [N_val, G]
         )
 
-        # The primary output is the ExternKernelOut's codegen_reference()
-        # buffer.  It gets allocated inside codegen() via empty_strided_vulkan.
-        # We return a view (reshape) that aliases it so the scheduler sees a
-        # proper output handle.
-        from torch._inductor.ir import StorageBox
-        out_ret = StorageBox(out_layout)
+        # The primary output is the ExternKernelOut wrapped in TensorBox
+        out_ret = ir.TensorBox.create(gn_kernel)
         return [out_ret, sm_reshaped, sr_reshaped]
 
 

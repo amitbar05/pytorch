@@ -637,13 +637,13 @@ def register() -> None:
     # pattern matcher in fx_passes/patterns/sdpa.py (anti-goal #5).
     _register_sdpa_lowering()
     _register_layer_norm()
-    _register_group_norm()
     # GN.1: Fused GN forward via standalone Slang shader (ExternKernelOut).
     # Replaces ~10 dispatch decomposition with 1 fused dispatch.
-    # Always-on since 2026-06-02.  The fused shader (group_norm.slang)
-    # computes per-(batch,group) mean/variance via shared-memory reduction
-    # and applies per-channel affine in a single kernel dispatch.
-    _register_group_norm_fused()
+    # Currently DISABLED — runtime crash in group_norm.slang shader.
+    # When re-enabled, MUST be registered BEFORE _register_group_norm()
+    # (Inductor's register_lowering is first-come-first-served).
+    # _register_group_norm_fused()
+    _register_group_norm()
     _register_softmax()
     _register_batch_norm_forward()
     _register_clamp_lowerings()

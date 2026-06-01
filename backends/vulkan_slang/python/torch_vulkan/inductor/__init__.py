@@ -669,6 +669,47 @@ def _patch_direct_call_template_helpers_flush_batcher() -> None:
         # the generated wrapper code resolves at call-time.
 
 
+def _patch_nested_storage_unwrap() -> None:
+    """TR.21 — Fix nested StorageBox unwrapping in ExternKernelOut inputs.
+
+    The upstream ``ExternKernel.unwrap_storage_for_input`` only removes
+    ONE level of StorageBox (lines 5944-5945 of upstream ir.py):
+
+        if isinstance(x, StorageBox):
+            x = x.data
+
+    When a lowering produces an output wrapped in StorageBox(StorageBox(X)),
+    the inner StorageBox(X) survives. If X is Pointwise or Reduction (not
+    yet realized as a Buffer), ``get_read_writes()`` crashes on
+    ``x.get_name()`` → ``NotImplementedError: Pointwise``.
+
+    Fix: (1) loop through ALL StorageBox/TensorBox levels, (2) realize
+    any Pointwise/Reduction that remains after unwrapping — same pattern
+    as ``realize_input`` for BaseView on line 5947.
+    """
+    from torch._inductor import ir as _ir
+
+    _orig_unwrap = _ir.ExternKernel.unwrap_storage_for_input
+
+    @classmethod
+    def _patched_unwrap(cls, x):
+        # Loop to handle nested StorageBox/TensorBox
+        while isinstance(x, (_ir.TensorBox, _ir.StorageBox)):
+            x = x.data
+        if isinstance(x, _ir.BaseView) and not isinstance(x, _ir.ReinterpretView):
+            x = _ir.ExternKernel.realize_input(x)
+        elif isinstance(x, (_ir.Pointwise, _ir.Reduction)):
+            x.realize()
+        if isinstance(x, _ir.TensorBox):
+            return cls.unwrap_storage_for_input(x)
+        if isinstance(x, _ir.TorchBindObject):
+            return x
+        assert isinstance(x, (_ir.Buffer, _ir.ReinterpretView)), type(x)
+        return x
+
+    _ir.ExternKernel.unwrap_storage_for_input = _patched_unwrap
+
+
 def _legacy_register() -> None:
     """Body of the historical scattered registration.
 
@@ -746,14 +787,26 @@ def _legacy_register() -> None:
     _patch_aot_joint_trace(meta_patches._joint_trace_ctx)
     _patch_bw_compiler_devices(meta_patches._FixMetaDevicePass)
 
-    # NOTE: Conv+GN+ReLU combo fusion (M18.8.b / post_grad.py) is
-    # NOT active.  Forward fusion works (33→10 dispatches) but the
-    # combo op's autograd backward produces IR with nested StorageBox
-    # wrapping Pointwise nodes that crash ExternKernelSchedulerNode.
-    # Fix requires solving ExternKernel.get_read_writes() realizing
-    # deeply-wrapped Pointwise inputs — attempted _vk_realize_then_unwrap
-    # fixes and lowering-level pre-realization without success.
-    # See docs/10-inductor-backend.md §v13 DISP.3.
+    # TR.21 — Fix nested StorageBox unwrapping in ExternKernelOut inputs.
+    # The upstream ``unwrap_storage_for_input`` only removes ONE level of
+    # StorageBox (one ``if isinstance(x, StorageBox): x = x.data``). When
+    # a lowering produces an output that gets wrapped in StorageBox →
+    # StorageBox → Pointwise, unwrap stops at StorageBox → Pointwise, and
+    # ``get_read_writes()`` crashes on ``Pointwise.get_name()`` (not implemented).
+    #
+    # Also: when the final unwrapped element is Pointwise or Reduction
+    # (not yet realized as a buffer), realize it — same pattern as the
+    # existing BaseView realize_input on line 5947 of upstream ir.py.
+    _patch_nested_storage_unwrap()
+
+    # TR.21 — Conv+GN+ReLU combo fusion (M18.8.b / post_grad.py).
+    # NOT active. Forward fusion works (33→10 dispatches) but compilation
+    # hangs in autotune. Backward: TR.21 nested-StorageBox fix applied but
+    # unverified. Re-enable after GPU testing both paths.
+    # from torch_vulkan.inductor.fx_passes.post_grad import (
+    #     install_conv_patched_gn_relu_fusion,
+    # )
+    # install_conv_patched_gn_relu_fusion()
 
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
