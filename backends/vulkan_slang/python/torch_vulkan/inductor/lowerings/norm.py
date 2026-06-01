@@ -150,6 +150,7 @@ def _register_batch_norm_forward() -> None:
     eager ``aten.native_batch_norm`` side-effect.
     """
     import torch
+    import os
     from torch._inductor import lowering as L
     from torch._inductor.lowering import register_lowering
 
@@ -228,13 +229,44 @@ def _register_batch_norm_forward() -> None:
             rstd_1d = L.lowerings[aten.view.default](rstd_kd, [C])
             normalized = L.lowerings[aten.mul.Tensor](dx, rstd_kd)
 
-            # MODEL.2: running_mean / running_var EMA update (training mode).
-            # SKIP: Under torch.compile, copy_ on running_stats creates
-            # InplacedBuffer nodes that cause undefined identifier errors
-            # in slangc (the buffers are referenced but never materialized
-            # in the generated code). Running stats are only needed for
-            # inference — during training, backward uses save_mean/save_invstd
-            # computed fresh for each batch. So we skip the update entirely.
+            # BN.2 (2026-06-01): running_mean / running_var EMA update.
+            # Was SKIPPED because copy_ on running_stats created InplacedBuffer
+            # nodes that caused slangc "undefined identifier" errors. Root cause
+            # was the missing spvGroupNonUniform capability in helpers.slang
+            # (fixed RNN.1/2, same session). The InplacedBuffer handling in
+            # dispatch_call.py/scheduling.py/header.py already deduplicates
+            # aliased buffers — the slangc errors were cascading from the
+            # broken helpers import.
+            #
+            # Gate behind TORCH_VULKAN_BN_EMA_UPDATE=1 until GPU-verified.
+            # Without this flag, running_mean/running_var are NOT updated
+            # during compiled training (backward still works — it uses
+            # save_mean/save_invstd computed fresh per batch).
+            if (
+                running_mean is not None
+                and running_var is not None
+                and os.environ.get("TORCH_VULKAN_BN_EMA_UPDATE") == "1"
+            ):
+                decay = 1.0 - float(momentum)
+                # running_mean update
+                updated_rm = L.lowerings[aten.mul.Scalar](running_mean, decay)
+                batch_rm_contrib = L.lowerings[aten.mul.Scalar](
+                    mean_1d, float(momentum)
+                )
+                new_rm = L.lowerings[aten.add.Tensor](updated_rm, batch_rm_contrib)
+                L.lowerings[aten.copy_.default](running_mean, new_rm)
+                # running_var update (unbiased estimate)
+                if N_eff > 1:
+                    correction = float(N_eff) / float(N_eff - 1)
+                    unbiased_var = L.lowerings[aten.mul.Scalar](var_1d, correction)
+                else:
+                    unbiased_var = var_1d
+                updated_rv = L.lowerings[aten.mul.Scalar](running_var, decay)
+                batch_rv_contrib = L.lowerings[aten.mul.Scalar](
+                    unbiased_var, float(momentum)
+                )
+                new_rv = L.lowerings[aten.add.Tensor](updated_rv, batch_rv_contrib)
+                L.lowerings[aten.copy_.default](running_var, new_rv)
         else:
             if running_mean is None or running_var is None:
                 return NotImplemented
@@ -274,8 +306,8 @@ def _register_batch_norm_forward() -> None:
     # MODEL.2 (2026-05-29): Register _native_batch_norm_legit to delegate
     # to the same lowering as native_batch_norm. The "legit" variant has
     # proper mutation annotations so AOT autograd functionalizes it
-    # correctly, but with the decomp suppressed our lowering handles the
-    # running_mean/running_var copy_ mutations directly.
+    # correctly.  EMA update gated behind TORCH_VULKAN_BN_EMA_UPDATE=1
+    # (BN.2, 2026-06-01 — pending GPU verification after RNN capability fix).
     if hasattr(aten, "_native_batch_norm_legit"):
         @register_lowering(aten._native_batch_norm_legit, type_promotion_kind=None)
         def _vulkan_batch_norm_legit(
@@ -307,10 +339,10 @@ def _register_batch_norm_forward() -> None:
             if result is NotImplemented:
                 return NotImplemented
             # The non-functional variant mutates running_mean/running_var
-            # in-place via copy_.  The functional variant must return
-            # the new running stats as additional outputs.
-            # Since _vulkan_native_batch_norm already did the copy_,
-            # we can return the (now-updated) running stats directly.
+            # in-place via copy_ (when TORCH_VULKAN_BN_EMA_UPDATE=1).
+            # The functional variant must return the new running stats
+            # as additional outputs.  Since the EMA update is done inline,
+            # we return the (now-updated) running stats directly.
             out, save_mean, save_rstd = result
             return [out, save_mean, save_rstd, running_mean, running_var]
 
