@@ -126,7 +126,7 @@ class _VulkanGNFwdExternKernel(_ir_module.ExternKernelOut):
         stride = list(layout.stride)
         wrapper.writeline(
             f"{out_name} = empty_strided_vulkan({size}, {stride}, "
-            f"\"torch.float32\", lifetime_class='transient')"
+            f"torch.float32, lifetime_class='transient')"
         )
 
         G = self.num_groups
