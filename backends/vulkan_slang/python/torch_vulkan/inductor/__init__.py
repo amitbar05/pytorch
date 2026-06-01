@@ -714,10 +714,11 @@ def _patch_nested_storage_unwrap() -> None:
     _ir.ExternKernel.unwrap_storage_for_input = _patched_unwrap
 
     # NOTE: TR.21-b (get_read_writes) and TR.21-c (ExternKernelOut.__init__)
-    # monkey-patches attempted but not taking effect — likely module reload
-    # or class caching issue.  The unwrap_storage_for_input patch above
-    # provides partial coverage.  Combo fusion backward (DISP.3) remains
-    # blocked until the full monkey-patch chain works.
+    # monkey-patches are structurally correct (confirmed called via ImportError
+    # trace) but the innermost element after StorageBox unwrapping is not
+    # Pointwise — it's a different IR node type.  Needs diagnosis of the
+    # actual MRO to select the correct isinstance check.
+    # Disabled until the exact node type is identified.
 
 
 def _legacy_register() -> None:
@@ -810,11 +811,11 @@ def _legacy_register() -> None:
     _patch_nested_storage_unwrap()
 
     # Conv+GN+ReLU combo fusion (DISP.3).  Forward verified working on GPU.
-    # Backward blocked: nested StorageBox→Pointwise chains crash
-    # ExternKernelSchedulerNode.  TR.21 monkey-patch (unwrap_storage_for_input)
-    # applied but not sufficient — get_read_writes bypasses it.
-    # Blocked until upstream ExternKernelOut inputs can be realized
-    # before scheduler processing.
+    # Backward blocked: nested StorageBox→X chains where X is neither
+    # Pointwise nor Reduction — a different IR node type that also lacks
+    # get_name().  TR.21 get_read_writes monkey-patch confirmed active
+    # (ImportError trace proves call) but isinstance check needs the
+    # correct type.  Disabled pending MRO diagnosis.
 
     # Enable Inductor's back-to-back GEMM fusion pass once at backend
     # registration. Used to be re-set per FX-graph inside _VulkanCustomPass,
