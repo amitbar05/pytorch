@@ -115,12 +115,12 @@ _VEC4_AUDIT = os.environ.get("TORCH_VULKAN_VEC4_AUDIT", "0") == "1"
 # Set ``TORCH_VULKAN_LINK_TIME_SPEC=1`` to enable.
 _LINK_TIME_SPEC = os.environ.get("TORCH_VULKAN_LINK_TIME_SPEC", "0") == "1"
 
-# GPU.1 — Batch dispatch submission. Enabled by default (2026-06-01)
-# after async-flush fix (v12/PERF.1). Batched pointwise/reduction
-# dispatches are flushed via exit-batch-and-never-restart so they
-# execute on GPU before synchronous extern kernel dispatches.
-# Set ``TORCH_VULKAN_BATCH_DISPATCH=0`` to disable.
-_BATCH_DISPATCH = os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "1") != "0"
+# GPU.1 — Batch dispatch submission. Disabled by default (2026-06-01).
+# PERF.1 fix makes BATCH_DISPATCH=1 correct but adds setup/teardown
+# overhead without batching benefit (batch mode exits on first flush).
+# BATCH_DISPATCH=0 is 1.8x faster (385ms vs 676ms for MNISTNet batch=64).
+# Set ``TORCH_VULKAN_BATCH_DISPATCH=1`` to enable (correct but slower).
+_BATCH_DISPATCH = os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "0") != "0"
 
 # GPU.2 — Python wrapper hot-path optimization. When enabled (default ON),
 # the wrapper codegen caches attribute lookups at function scope, skips

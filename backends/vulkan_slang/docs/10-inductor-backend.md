@@ -371,7 +371,7 @@ their output buffers → zero/stale data.
 | # | Title | Effort | Status |
 |---|-------|--------|--------|
 | **PERF.1** | C++ sync-flush or batch-off in DispatchBatcher._flush() | 0.5 d | ✅ **CLOSED 2026-06-01.** ``_flush()`` permanently exits C++ batch mode (calls ``_end_batch()``, sets ``_batch_active=False``) before replaying pending dispatchers. Replayed dispatches use per-8 auto-flush; subsequent extern kernels also use auto-flush. No ``_begin_batch()`` restart. ``__exit__()`` sees ``_batch_active=False`` and skips redundant ``_end_batch()``. Verified: 5-step MNISTNet training matches CPU exactly (Bn=4, BATCH_DISPATCH=1). |
-| **PERF.2** | Re-enable BATCH_DISPATCH=1 default + verify MNISTNet training | 0.25 d | ✅ **CLOSED 2026-06-01.** Both ``config.py`` and ``wrapper_helpers.py`` now default to ``"1"``. MNISTNet (Conv+GN+ReLU+MaxPool+Linear+CE+SGD) trains correctly through compile with batcher enabled. |
+| **PERF.2** | Re-enable BATCH_DISPATCH=1 default + verify MNISTNet training | 0.25 d | ✅ **CLOSED 2026-06-01.** PERF.1 fix verified correct (all 5 steps match CPU). However BATCH_DISPATCH=1 is 1.8x SLOWER than BATCH_DISPATCH=0 (676ms vs 385ms, MNISTNet batch=64) due to setup/teardown overhead without batching benefit (batch mode exits on first flush). Default kept at 0. BATCH_DISPATCH=1 available as opt-in for correctness verification. |
 | **PERF.3** | Benchmark pipeline (CPU vs eager vs compile, multiple models) | 0.5 d | 🔲 OPEN |
 
 ---

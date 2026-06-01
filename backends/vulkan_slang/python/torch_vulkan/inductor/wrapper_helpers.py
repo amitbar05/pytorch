@@ -204,10 +204,12 @@ def _trust_inductor() -> bool:
 def _batch_dispatch_enabled() -> bool:
     """GPU.1: batch dispatch submission.
 
-    Enabled by default (2026-06-01) after async-flush fix (v12/PERF.1).
-    Set ``TORCH_VULKAN_BATCH_DISPATCH=0`` to disable.
+    Disabled by default (2026-06-01). PERF.1 fix makes it correct but
+    slower due to setup/teardown overhead without batching benefit
+    (batch mode exits on first flush). BATCH_DISPATCH=0 is 1.8x faster.
+    Set ``TORCH_VULKAN_BATCH_DISPATCH=1`` to enable (correct but slower).
     """
-    return os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "1") != "0"
+    return os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "0") != "0"
 
 
 def _wrapper_fastpath_enabled() -> bool:
