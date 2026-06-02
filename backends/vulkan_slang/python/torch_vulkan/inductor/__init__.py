@@ -697,9 +697,27 @@ def _patch_nested_storage_unwrap() -> None:
         while isinstance(x, (_ir.TensorBox, _ir.StorageBox)):
             x = x.data
         if isinstance(x, _ir.BaseView) and not isinstance(x, _ir.ReinterpretView):
-            x = _ir.ExternKernel.realize_input(x)
-        elif isinstance(x, (_ir.Pointwise, _ir.Reduction)):
-            x.realize()
+            # Try realize_input first — handles most BaseView cases.
+            # If it fails (NotImplementedError), the View wraps an
+            # unrealizable inner node. Unwrap the View to get the
+            # inner buffer/StorageBox directly.
+            try:
+                x = _ir.ExternKernel.realize_input(x)
+            except NotImplementedError:
+                x = x.unwrap_view()
+                # After unwrapping, x should be a Buffer or StorageBox.
+                # Recurse to handle any remaining StorageBox/TensorBox layers.
+                if isinstance(x, (_ir.TensorBox, _ir.StorageBox)):
+                    x = _ir.InputsKernel.unwrap_storage_for_input(x)
+        else:
+            # Use try/except on get_name() instead of isinstance checks.
+            # isinstance(_, Pointwise/Reduction) misses dynamically generated
+            # IR classes whose __name__ is "Pointwise" but don't match
+            # _ir.Pointwise in the MRO.
+            try:
+                x.get_name()
+            except NotImplementedError:
+                x.realize()
         if isinstance(x, _ir.TensorBox):
             return cls.unwrap_storage_for_input(x)
         if isinstance(x, _ir.TorchBindObject):
@@ -728,22 +746,11 @@ def _patch_nested_storage_unwrap() -> None:
             try:
                 reads.add(StarDep(inp.get_name()))
             except NotImplementedError:
-                # Nested StorageBox chain with unrealized inner node.
-                # Walk to innermost, register buffer name, realize.
-                from torch._inductor.graph import V
-                walk = inp
-                while True:
-                    try:
-                        nxt = walk.data
-                    except AttributeError:
-                        break
-                    if not isinstance(nxt, _ir.IRNode):
-                        break
-                    walk = nxt
-                if not hasattr(walk, 'name') or walk.name is None:
-                    walk.name = V.graph.register_buffer(walk)
-                V.graph.realize(walk)
-                reads.add(StarDep(walk.name))
+                # Input is an unrealized IR node (e.g., Pointwise).
+                # The scheduler will materialize it later — skip the read dep.
+                # (Pointwise nodes intentionally don't support realize() or get_name()
+                #  — they get fused into their consumers by the scheduler.)
+                pass
         writes = set(
             StarDep(buf.get_name()) for buf in self.get_outputs()
         )

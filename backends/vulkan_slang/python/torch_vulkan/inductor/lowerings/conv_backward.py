@@ -73,16 +73,30 @@ def _vk_realize_then_unwrap(x):
 
     Handles nested StorageBox (TensorBox → StorageBox → StorageBox → Pointwise)
     by looping until the innermost data is reached.
+    Also unwraps View nodes to their inner data.
     """
     if isinstance(x, _ir_module.TensorBox):
         x = x.data
     while isinstance(x, _ir_module.StorageBox):
-        if isinstance(x.data, (_ir_module.Pointwise, _ir_module.Reduction)):
-            x.realize()
-            break
-        x = x.data
+        x = x.data  # Unwrap — ComputedBuffer fallback handles Pointwise below
     if isinstance(x, _ir_module.StorageBox):
-        return x.data
+        x = x.data
+    # Unwrap View layers (View → inner data)
+    while isinstance(x, _ir_module.BaseView) and hasattr(x, 'data'):
+        x = x.data
+    # If result is not a real Buffer (Pointwise/Reduction/etc.),
+    # wrap in a ComputedBuffer so it gets codegen_reference() and allocation.
+    if not isinstance(x, (_ir_module.Buffer, _ir_module.ReinterpretView)):
+        from torch._inductor.graph import V
+        layout = _ir_module.FlexibleLayout(
+            device=x.get_device(),
+            dtype=x.get_dtype(),
+            size=list(x.get_size()),
+        )
+        buf = _ir_module.ComputedBuffer(name=None, layout=layout, data=x)
+        V.graph.register_buffer(buf, set_name=True)
+        V.graph.register_operation(buf)  # Sets operation_name for scheduler
+        return buf
     return x
 
 
