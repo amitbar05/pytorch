@@ -406,7 +406,7 @@ per full training step including backward.
 | **VRFY.2** | V13-VRFY | Flip DYN.2 xfail → PASS on RDNA1 | 0.25 d | ⚠️ **2026-06-02.** P0 fix (lifetime fallback transient→save_for_backward) applied (4d2092e). Crash changed: now `SymInt expect_int() got s77` in C++ dispatch during AOTAutograd backward capture. This is a C++ PrivateUse1 dynamic-shape bug in the Vulkan extension's op dispatch. Forward-only compile+run works. Backward blocked by SymInt resolution gap. |
 | **VRFY.3** | V13-VRFY | Flip FP16.2 xfail → PASS on RDNA1 | 0.25 d | ✅ **GPU-VERIFIED 2026-06-02.** Direct _slang_tile_mm: max_diff=0.0000. Compiled mm: max_diff=0.0000. Both FP16 matmul correctness tests pass on RDNA1. Test: verify_vrfy3.py. |
 | **FP16.1** | V13-FP16 | FP16 Conv+GN+ReLU training correctness | 0.5 d | ✅ **FIXED 2026-06-02.** Root cause: Slang shaders declare StructuredBuffer<float> but fp16 tensors have 2 B/elem → shaders read garbage → NaN. Fix: ensure_float32() at GN backward dispatch boundaries (commit affe6c4). Awaiting GPU re-verification with fixed dispatch. |
-| **AOTI.1** | V13-AOTI | AOTI C++ codegen for Conv+GN models | 1 d | 🔲 OPEN — PF.60 (tensor_str recursion) + PF.13 (FunctionalTensor data_ptr) still block AOTI. |
+| **AOTI.1** | V13-AOTI | AOTI C++ codegen for Conv+GN models | 1 d | ⚠️ **2026-06-02.** PF.60 (tensor_str recursion) monkey-patch applied (606d7b3). PF.13 (FunctionalTensor data_ptr) and PF.31.b (subprocess PrivateUse1 registration) still block AOTI .so generation. VulkanCppWrapperGpu registered and ready once upstream blockers clear. |
 
 ---
 
