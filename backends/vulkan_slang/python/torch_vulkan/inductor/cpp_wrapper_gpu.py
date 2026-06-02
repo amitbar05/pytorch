@@ -228,8 +228,13 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
                 self.wrapper_call.writeline(
                     f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_as_strided({', '.join(as_args)}, &{new_handle}));"
                 )
-                return new_handle
-            return handle_name
+                self.wrapper_call.writeline(
+                    f"wrap_with_raii_handle_if_needed({handle_name});"
+                )
+                # Return RAII wrapper — matching parent contract (caller writelines it).
+                return f"RAIIAtenTensorHandle {name}({new_handle});"
+            # Return RAII wrapper — matching parent contract (caller writelines it).
+            return f"RAIIAtenTensorHandle {name}({handle_name});"
 
         return super().make_allocation(
             name, device, dtype, shape, stride, allocation_shape, is_pinned
@@ -249,7 +254,7 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             return f"aoti_torch_delete({name}){self.ending}"
         return super().make_buffer_free(buffer)
 
-    # ── Kernel call emission (the core of DR.8 / T7.5) ──────────────
+
 
     def _generate_kernel_call_helper(
         self,
