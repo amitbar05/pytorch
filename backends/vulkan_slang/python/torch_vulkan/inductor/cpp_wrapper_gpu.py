@@ -180,30 +180,57 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             if allocation_shape is None:
                 allocation_shape = shape
 
-            codegen_shape_tuple = self.codegen_python_shape_tuple(shape)
-            codegen_alloc_tuple = self.codegen_python_shape_tuple(allocation_shape)
-            codegen_stride_tuple = self.codegen_python_shape_tuple(stride)
-
-            # Emit: auto name = aoti_torch_empty_strided_vulkan(size, stride, dtype, device);
-            out = (
-                f"{self.declare}{name} = "
-                f"aoti_torch_empty_strided_vulkan("
-                f"{codegen_alloc_tuple}, "
-                f"{codegen_stride_tuple}, "
-                f"{dtype}, "
-                f"0"  # device_idx
-                f"){self.ending}"
+            # Use parent's C++-compatible helpers for dtype and array vars
+            dtype_code = self.codegen_dtype(dtype)
+            size_array_var = self.codegen_int_array_var(
+                self.codegen_shape_tuple(shape),
+                self.wrapper_call.writeline,
+                known_statically=self.is_statically_known_list_of_ints(shape),
+                graph=self.get_codegened_graph(),
             )
-            if codegen_shape_tuple != codegen_alloc_tuple:
-                out += (
-                    f"\n{name} = aoti_torch_as_strided("
-                    f"{name}, "
-                    f"{codegen_shape_tuple}, "
-                    f"{codegen_stride_tuple}, "
-                    f"0"
-                    f"){self.ending}"
+            alloc_array_var = self.codegen_int_array_var(
+                self.codegen_shape_tuple(allocation_shape),
+                self.wrapper_call.writeline,
+                known_statically=self.is_statically_known_list_of_ints(allocation_shape),
+                graph=self.get_codegened_graph(),
+            )
+            stride_array_var = self.codegen_int_array_var(
+                self.codegen_shape_tuple(stride),
+                self.wrapper_call.writeline,
+                known_statically=self.is_statically_known_list_of_ints(stride),
+                graph=self.get_codegened_graph(),
+            )
+
+            handle_name = f"{name}_handle"
+            self.wrapper_call.writeline(f"AtenTensorHandle {handle_name};")
+            args = [
+                str(len(shape)),
+                alloc_array_var,
+                stride_array_var,
+                dtype_code,
+                "0",  # device_idx
+                f"&{handle_name}",
+            ]
+            self.wrapper_call.writeline(
+                f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_empty_strided_vulkan({', '.join(args)}));"
+            )
+
+            if allocation_shape != shape:
+                # as_strided to reshape
+                new_handle = f"{name}_as_strided_handle"
+                self.wrapper_call.writeline(f"AtenTensorHandle {new_handle};")
+                as_args = [
+                    f"{handle_name}",
+                    size_array_var,
+                    stride_array_var,
+                    "0",  # storage_offset
+                ]
+                self.wrapper_call.writeline(
+                    f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_as_strided({', '.join(as_args)}, &{new_handle}));"
                 )
-            return out
+                return new_handle
+            return handle_name
+
         return super().make_allocation(
             name, device, dtype, shape, stride, allocation_shape, is_pinned
         )
