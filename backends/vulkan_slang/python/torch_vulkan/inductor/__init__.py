@@ -798,6 +798,10 @@ def _legacy_register() -> None:
     # (Triton templates, CUTLASS) that might reach Vulkan graphs.
     _install_vulkan_autotune_cuda_filter()
 
+    # PF.60 — fix RecursionError in tensor_str for Vulkan tensors during AOTI
+    from .fx_passes.pf60_tensor_str_fix import _install_pf60_tensor_str_fix
+    _install_pf60_tensor_str_fix()
+
     from torch._inductor.codegen.common import register_backend_for_device
 
     from . import meta_patches
