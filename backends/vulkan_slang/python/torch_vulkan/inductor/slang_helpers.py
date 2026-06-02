@@ -233,7 +233,7 @@ def emit_helpers(
     reduction_headers = rest & REDUCTION_MODULE_HEADERS
     rest -= reduction_headers
     if reduction_headers:
-        scratch.splice("import reduction;\n")
+        scratch.splice("import vk_reduction;\n")
 
     # P0.8 — helpers module headers route through `import helpers;`
     helper_headers = rest & HELPERS_MODULE_HEADERS
