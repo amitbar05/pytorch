@@ -235,23 +235,27 @@ def _lifetime_class_for_name(name: str) -> str:
     ``node.meta["lifetime_class"]``; the partitioner copies node meta
     into the per-side fw/bw modules, and Inductor's IR Buffer carries
     a back-pointer to its origin FX node via :meth:`get_origin_node`.
-    Returns ``"transient"`` (the safest default for intra-step reuse)
+    Returns ``"save_for_backward"`` (the safest default — prevents
+    premature buffer reuse that can corrupt autograd saved tensors)
     when the lookup misses for any reason — buffer not found, no
     origin node, no annotation, or an unrecognized class name.
+    Under dynamic shapes, buffer name resolution is unreliable;
+    defaulting to "save_for_backward" avoids segfaults in the
+    autograd Engine caused by freed Vulkan storage.
     """
     try:
         buf = V.graph.try_get_buffer(name)
     except Exception:
-        return "transient"
+        return "save_for_backward"
     if buf is None:
-        return "transient"
+        return "save_for_backward"
     try:
         node = buf.get_origin_node()
     except Exception:
-        return "transient"
+        return "save_for_backward"
     if node is None:
-        return "transient"
+        return "save_for_backward"
     cls = node.meta.get("lifetime_class")
     if cls in _VALID_LIFETIME_CLASSES:
         return cls
-    return "transient"
+    return "save_for_backward"
