@@ -235,11 +235,14 @@ def emit_helpers(
     if reduction_headers:
         scratch.splice("import vk_reduction;\n")
 
-    # P0.8 — helpers module headers route through `import helpers;`
+    # P0.8 — helpers module headers route through `import vk_helpers;`
+    # (precompiled .slang-module via shaders/lib/vk_helpers.slang).
+    # Uses vk_helpers instead of helpers to avoid ambiguity with
+    # vk_reduction's imported VK_SUBGROUP_SIZE from vk_helpers.
     helper_headers = rest & HELPERS_MODULE_HEADERS
     rest -= helper_headers
     if helper_headers:
-        scratch.splice("import helpers;\n")
+        scratch.splice("import vk_helpers;\n")
 
     # Any remaining headers need inline emission.
     if rest:
