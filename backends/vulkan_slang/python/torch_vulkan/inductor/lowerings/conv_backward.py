@@ -267,13 +267,13 @@ def _get_conv_backward_lowering_impl():
         groups,
         output_mask,
     ):
-        # Gate on supported envelope: groups==1, not transposed, fp32.
+        # Gate on supported envelope: groups==1, not transposed.
+        # PF.70 / FP16.1: accept fp16/bf16 inputs — the template caller
+        # handles upcast→float32→downcast internally.
         if bool(transposed):
             return NotImplemented
         g = int(groups)
         if g != 1:
-            return NotImplemented
-        if input.get_dtype() != torch.float32:
             return NotImplemented
         if input.get_device().type != "vulkan":
             return NotImplemented
@@ -397,8 +397,6 @@ def _get_conv2d_backward_custom_op_lowering():
         has_bias,
     ):
         if int(groups) != 1:
-            return NotImplemented
-        if input.get_dtype() != _torch_module.float32:
             return NotImplemented
         if input.get_device().type != "vulkan":
             return NotImplemented

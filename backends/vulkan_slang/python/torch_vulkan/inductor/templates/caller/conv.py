@@ -524,10 +524,35 @@ def _slang_tile_conv2d_bwd(
     ):
         return
 
+    # PF.70 / FP16.1: fp16→fp32 upcast before dispatching to float-only shader.
+    # The conv backward templates declare StructuredBuffer<float>; passing
+    # fp16 tensors (2 B/elem) causes the shader to read garbage (4 B/elem
+    # expected) → NaN or wildly wrong gradients.
+    _orig_dtype = input_t.dtype
+    _needs_upcast = _orig_dtype in (torch.float16, torch.bfloat16)
+    if _needs_upcast:
+        input_f32 = input_t.float().contiguous()
+        weight_f32 = weight_t.float().contiguous()
+        grad_out_f32 = grad_out.float().contiguous()
+        gi_f32 = torch.empty_like(grad_input, dtype=torch.float32)
+        gw_f32 = torch.empty_like(grad_weight, dtype=torch.float32)
+        if has_bias := (grad_bias is not None):
+            gb_f32 = torch.empty_like(grad_bias, dtype=torch.float32)
+        else:
+            gb_f32 = None
+    else:
+        input_f32 = input_t
+        weight_f32 = weight_t
+        grad_out_f32 = grad_out
+        gi_f32 = grad_input
+        gw_f32 = grad_weight
+        gb_f32 = grad_bias
+        has_bias = grad_bias is not None
+
     from ...runtime import compile_and_dispatch
 
-    N, C_in, iH, iW = input_t.shape
-    C_out, C_in_w, kH, kW = weight_t.shape
+    N, C_in, iH, iW = input_f32.shape
+    C_out, C_in_w, kH, kW = weight_f32.shape
     assert C_in == C_in_w, f"weight C_in mismatch: {C_in} vs {C_in_w}"
 
     sH, sW = stride
@@ -540,8 +565,8 @@ def _slang_tile_conv2d_bwd(
     # grad_bias is not None means the caller wants bias gradients computed.
     # The backward doesn't need the forward bias tensor — bias gradient is
     # just sum(grad_out, dim=(N,H,W)).  Gate on grad_bias, not bias.
-    has_bias = grad_bias is not None
-    dtype_s = _dtype_to_slang(input_t.dtype)
+    # (has_bias already set in the upcast block above.)
+    dtype_s = _dtype_to_slang(input_f32.dtype)
     src = _render_conv_bwd_slang(
         tile_w=tile_w,
         tile_h=tile_h,
@@ -570,12 +595,12 @@ def _slang_tile_conv2d_bwd(
     ]
 
     # Ensure contiguous for direct buffer access
-    if not input_t.is_contiguous():
-        input_t = input_t.contiguous()
-    if not weight_t.is_contiguous():
-        weight_t = weight_t.contiguous()
-    if not grad_out.is_contiguous():
-        grad_out = grad_out.contiguous()
+    if not input_f32.is_contiguous():
+        input_f32 = input_f32.contiguous()
+    if not weight_f32.is_contiguous():
+        weight_f32 = weight_f32.contiguous()
+    if not grad_out_f32.is_contiguous():
+        grad_out_f32 = grad_out_f32.contiguous()
 
     # Pack push constants: 27 uint fields (no bias) or 28 (with bias)
     # Layout matches BwdPC in slang_conv_bwd.py.jinja:
@@ -600,18 +625,18 @@ def _slang_tile_conv2d_bwd(
         int(pW),
         int(dH),
         int(dW),
-        int(input_t.stride(0)),
-        int(input_t.stride(1)),
-        int(input_t.stride(2)),
-        int(input_t.stride(3)),
-        int(weight_t.stride(0)),
-        int(weight_t.stride(1)),
-        int(weight_t.stride(2)),
-        int(weight_t.stride(3)),
-        int(grad_out.stride(0)),
-        int(grad_out.stride(1)),
-        int(grad_out.stride(2)),
-        int(grad_out.stride(3)),
+        int(input_f32.stride(0)),
+        int(input_f32.stride(1)),
+        int(input_f32.stride(2)),
+        int(input_f32.stride(3)),
+        int(weight_f32.stride(0)),
+        int(weight_f32.stride(1)),
+        int(weight_f32.stride(2)),
+        int(weight_f32.stride(3)),
+        int(grad_out_f32.stride(0)),
+        int(grad_out_f32.stride(1)),
+        int(grad_out_f32.stride(2)),
+        int(grad_out_f32.stride(3)),
     )
     if has_bias:
         pc = struct.pack("28I", *common_fields, 0)  # _pad_bwd
@@ -623,9 +648,9 @@ def _slang_tile_conv2d_bwd(
     tile_c_count = (C_out + tile_c - 1) // tile_c
     grid_z = N * tile_c_count
 
-    buffers = [input_t, weight_t, grad_out, grad_input, grad_weight]
+    buffers = [input_f32, weight_f32, grad_out_f32, gi_f32, gw_f32]
     if has_bias:
-        buffers.append(grad_bias.view(-1))
+        buffers.append(gb_f32.view(-1))
 
     compile_and_dispatch(
         src,
@@ -639,3 +664,10 @@ def _slang_tile_conv2d_bwd(
         cache_key=cache_key,
         spec_constants=spec_constants,
     )
+
+    # PF.70: fp16 downcast after dispatch
+    if _needs_upcast:
+        grad_input.copy_(gi_f32.to(_orig_dtype))
+        grad_weight.copy_(gw_f32.to(_orig_dtype))
+        if has_bias:
+            grad_bias.copy_(gb_f32.to(_orig_dtype))
