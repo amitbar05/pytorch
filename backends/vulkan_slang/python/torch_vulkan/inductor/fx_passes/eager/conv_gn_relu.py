@@ -129,16 +129,31 @@ def _dispatch_group_norm_backward_slang(
     group_size = cpg * HxW
     num_rows = N * G
 
-    go_2d = grad_output.reshape(num_rows, group_size)
-    inp_2d = input_t.reshape(num_rows, group_size)
-    gi_2d = grad_input.reshape(num_rows, group_size)
-
-    if weight is not None:
-        w_1d = weight.view(-1)
-        has_weight = 1
+    # PF.70: upcast fp16→fp32 before dispatching to float-only shaders.
+    # group_norm_backward.slang declares StructuredBuffer<float>;
+    # passing fp16 tensors (2 B/elem) causes the shader to read garbage
+    # (4 B/elem expected) → NaN / wildly wrong gradients.
+    _orig_dtype = grad_output.dtype
+    _needs_upcast = _orig_dtype in (torch.float16, torch.bfloat16)
+    if _needs_upcast:
+        go_2d = grad_output.float().reshape(num_rows, group_size)
+        inp_2d = input_t.float().reshape(num_rows, group_size)
+        gi_2d = torch.empty(num_rows, group_size, dtype=torch.float32,
+                            device=grad_output.device)
+        if weight is not None:
+            w_1d = weight.float().view(-1)
+        else:
+            w_1d = torch.empty(1, dtype=torch.float32, device=grad_output.device)
     else:
-        w_1d = torch.empty(1, dtype=torch.float32, device=grad_output.device)
-        has_weight = 0
+        go_2d = grad_output.reshape(num_rows, group_size)
+        inp_2d = input_t.reshape(num_rows, group_size)
+        gi_2d = grad_input.reshape(num_rows, group_size)
+        if weight is not None:
+            w_1d = weight.view(-1)
+        else:
+            w_1d = torch.empty(1, dtype=torch.float32, device=grad_output.device)
+
+    has_weight = 1 if weight is not None else 0
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
     shader_path = os.path.join(
@@ -172,6 +187,9 @@ def _dispatch_group_norm_backward_slang(
         cache_key=cache_key,
     )
 
+    if _needs_upcast:
+        grad_input.copy_(gi_2d.to(_orig_dtype).reshape_as(grad_input))
+
 
 def _dispatch_group_norm_backward_weight_slang(
     grad_output: "torch.Tensor",
@@ -201,6 +219,20 @@ def _dispatch_group_norm_backward_weight_slang(
     G = num_groups
     cpg = C // G
 
+    # PF.70: upcast fp16→fp32 before dispatching to float-only shaders.
+    _orig_dtype_w = grad_output.dtype
+    _needs_upcast_w = _orig_dtype_w in (torch.float16, torch.bfloat16)
+    if _needs_upcast_w:
+        go_buf = grad_output.float()
+        inp_buf = input_t.float()
+        gw_buf = torch.empty_like(grad_weight, dtype=torch.float32)
+        gb_buf = torch.empty_like(grad_bias, dtype=torch.float32)
+    else:
+        go_buf = grad_output
+        inp_buf = input_t
+        gw_buf = grad_weight
+        gb_buf = grad_bias
+
     this_dir = os.path.dirname(os.path.abspath(__file__))
     shader_path = os.path.join(
         this_dir, "..", "..", "..", "..", "..",
@@ -218,7 +250,7 @@ def _dispatch_group_norm_backward_weight_slang(
         1 if compute_bias else 0,
     )
 
-    buffers = [grad_output, input_t, mean, rstd, grad_weight, grad_bias]
+    buffers = [go_buf, inp_buf, mean, rstd, gw_buf, gb_buf]
     grid_x = (C + 255) // 256
     cache_key = f"gn_bwd_weight_{G}_{C}_{HxW}_f32_m22_6"
 
@@ -230,6 +262,12 @@ def _dispatch_group_norm_backward_weight_slang(
         entry="computeMain",
         cache_key=cache_key,
     )
+
+    if _needs_upcast_w:
+        if compute_weight:
+            grad_weight.copy_(gw_buf.to(_orig_dtype_w))
+        if compute_bias:
+            grad_bias.copy_(gb_buf.to(_orig_dtype_w))
 
 
 def _ensure_conv2d_gn_relu_fused_op_registered() -> "object":
