@@ -2,6 +2,7 @@
 #include "../vulkan/Context.h"
 #include "../ops/ops.h"
 #include "../ops/dispatch.h"
+#include "MetaGuard.h"
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/native/CPUFallback.h>
@@ -13,6 +14,14 @@ namespace torch_vulkan {
 // ── copy_ implementation (CPU ↔ Vulkan) ─────────────────────────
 at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     auto& alloc = VulkanAllocator::instance();
+
+    // AOTI / Inductor tracing: skip copy if either tensor has null storage
+    // or if the allocator has no buffer for them (fake tensors from deepcopy).
+    if (is_null_storage(self) || is_null_storage(src)
+        || alloc.get_buffer(self.data_ptr()) == nullptr
+        || alloc.get_buffer(src.data_ptr()) == nullptr) {
+        return self;
+    }
 
     if (self.device().type() == c10::DeviceType::PrivateUse1 &&
         src.device().type() == c10::DeviceType::CPU) {
@@ -195,6 +204,29 @@ at::Tensor vulkan_copy_from(const at::Tensor& self, const at::Tensor& dst, bool 
     auto dst_mut = dst;
     vulkan_copy_(dst_mut, self, non_blocking);
     return dst_mut;
+}
+
+// ── set_.source_Storage (needed for AOT Autograd deepcopy) ──────
+at::Tensor& vulkan_set_source_storage(at::Tensor& self, c10::Storage source) {
+    // Metadata-only: reassign the storage of self to the given source.
+    // AOT Autograd calls this during copy.deepcopy(bw_module) to detach
+    // and reassign tensor storage for backward graph construction.
+    self.unsafeGetTensorImpl()->set_storage_keep_dtype(source);
+    return self;
+}
+
+// ── set_.source_Storage_storage_offset ─────────────────────────
+at::Tensor& vulkan_set_source_storage_offset(
+    at::Tensor& self,
+    c10::Storage source,
+    c10::SymInt storage_offset,
+    c10::SymIntArrayRef size,
+    c10::SymIntArrayRef stride) {
+    // Full metadata reassignment during AOT Autograd deepcopy of bw_module.
+    auto* impl = self.unsafeGetTensorImpl();
+    impl->set_storage_keep_dtype(source);
+    impl->set_sizes_and_strides(size, stride, storage_offset);
+    return self;
 }
 
 // ── empty_strided ───────────────────────────────────────────────
@@ -825,6 +857,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("fill_.Scalar", vulkan_fill_scalar);
     m.impl("_copy_from_and_resize", vulkan_copy_from_and_resize);
     m.impl("_copy_from", vulkan_copy_from);
+    m.impl("set_.source_Storage", vulkan_set_source_storage);
+    m.impl("set_.source_Storage_storage_offset", vulkan_set_source_storage_offset);
     m.impl("zero_", vulkan_zero_);
     m.impl("clone", ops::vulkan_clone);
     m.impl("_local_scalar_dense", vulkan_local_scalar_dense);

@@ -108,12 +108,22 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
     def write_header(self):
         """Emit Vulkan-specific includes and forward declarations."""
         super().write_header()
-        # Vulkan AOTI runtime header
+        # Vulkan AOTI runtime header — use absolute path since compilation
+        # runs from a temp directory.
+        import torch_vulkan
+        _pkg_dir = os.path.dirname(torch_vulkan.__file__)  # .../python/torch_vulkan
+        _backend_root = os.path.dirname(os.path.dirname(_pkg_dir))  # repo root
+        _csrc_include = os.path.join(_backend_root, "csrc")
         self.header.splice(
-            '#include "backend/AotiRuntime.h"\n'
+            f'#include "{os.path.join(_csrc_include, "backend", "AotiRuntime.h")}"\n'
             "#include <cstdint>\n"
             "#include <cstring>\n"
             "#include <vector>\n"
+            "\n"
+            "// Vulkan no-op stream guard for AOTI C++ wrapper compatibility.\n"
+            "struct AOTIVulkanStreamGuard {\n"
+            "    AOTIVulkanStreamGuard(void*, int32_t) {}\n"
+            "};\n"
         )
 
     def finalize_prefix(self):

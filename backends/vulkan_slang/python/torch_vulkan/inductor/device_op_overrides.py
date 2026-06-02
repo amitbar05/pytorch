@@ -46,10 +46,10 @@ class VulkanDeviceOpOverrides(DeviceOpOverrides):
         return ""
 
     def cpp_stream_guard(self) -> str:
-        return ""
+        return "AOTIVulkanStreamGuard"
 
     def cpp_aoti_stream_guard(self) -> str:
-        return ""
+        return "AOTIVulkanStreamGuard"
 
     def cpp_getStreamFromExternal(self, *args, **kwargs) -> str:
         return ""
