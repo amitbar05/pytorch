@@ -639,10 +639,11 @@ def register() -> None:
     _register_layer_norm()
     # GN.1: Fused GN forward via standalone Slang shader (ExternKernelOut).
     # Replaces ~10 dispatch decomposition with 1 fused dispatch.
-    # GPU-VERIFIED 2026-06-02 (DISP.1): forward matches eager (allclose=True).
-    # Registered BEFORE _register_group_norm() — Inductor's register_lowering
-    # is first-come-first-served.
-    _register_group_norm_fused()
+    # Currently DISABLED — runtime crash in group_norm.slang shader
+    # when called via ExternKernelOut codegen during Inductor compilation.
+    # When re-enabled, MUST be registered BEFORE _register_group_norm()
+    # (Inductor's register_lowering is first-come-first-served).
+    # _register_group_norm_fused()
     _register_group_norm()
     _register_softmax()
     _register_batch_norm_forward()
