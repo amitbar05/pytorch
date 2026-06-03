@@ -91,6 +91,10 @@ c10::DataPtr VulkanAllocator::allocate(
             ctx.allocator(static_cast<uint32_t>(device_idx)),
             alloc_size,
             vulkan::BufferType::HostVisible);
+    } else {
+        // Recycled buffer from pool — zero it to avoid stale data.
+        void* ptr = buffer->map();
+        std::memset(ptr, 0, alloc_size);
     }
 
     // Use an opaque ID as the "data pointer"
