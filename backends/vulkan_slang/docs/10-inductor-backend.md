@@ -410,6 +410,53 @@ per full training step including backward.
 
 ---
 
+## v13 regressions and open investigations (2026-06-03)
+
+### CRITICAL: All eager GPU ops return wrong results
+
+**Symptom**: `torch.zeros(4, device='vulkan')` sum=0.000000 but `torch.ones(4, device='vulkan')`
+sum=0.000000. `fill_(42.0)` writes zeros/garbage. CPU→GPU copy via `to('vulkan')` loses data.
+All eager shader dispatches and host→device copies broken on RDNA1 (NAVI10, RADV 25.2.8).
+
+**Standalone proof**: Raw Vulkan fill shader works correctly when called via direct Vulkan API
+(`agent_space/test_raw_fill.cpp`). Same SPIR-V, same push constants, same entry point
+(`"main"`, not `"computeMain"` — Slang normalizes this). The GPU hardware, SPIR-V
+binaries, and RADV driver are all correct.
+
+**Ruled out** (verified correct):
+- SPIR-V corruption — embedded SPIR-V in `.so` identical to fresh slangc compile (sha256 match)
+- Push constant values — traced via dispatch debug: `[0]=0x42280000 (42.000000) [1]=0x00000004 (4) size=8`
+- Pipeline layout — `pName="main"` correct, push constant range 8 bytes
+- HOST→COMPUTE barrier — counter increments (0→1) after fill_ dispatch
+- Descriptor set caching (M17.5) — disabled via env var, no change
+
+**Fix applied** (2026-06-03):
+- **Commit `2d438e4`**: Added `ops::notify_host_write(buffer->buffer())` after every
+  `VulkanAllocator::allocate()`. Required by Vulkan spec §7.1.2 for the HOST→COMPUTE
+  pipeline barrier after host-side zero-init. Previously, constructor zero-init called
+  `vmaFlushAllocation` but never notified the dispatch layer, so the first dispatch
+  after allocation read stale GPU memory.
+
+**Current hypothesis**: `VulkanBuffer::write()` calls `unmap()` after `vmaFlushAllocation`.
+On non-coherent memory, `vmaUnmapMemory` may invalidate the flush, causing subsequent
+`vmaMapMemory` in `read()` to return stale data. Also `VulkanBuffer::read()` is not
+being called during `.cpu()` (debug prints in read() didn't fire — suggests PyTorch's
+`.cpu()` path bypasses the registered `_copy_from` op). Fix under test: remove `unmap()`
+from `write()`, keep buffer persistently mapped.
+
+**Next steps**:
+1. Test: does removing `unmap()` from `write()` fix CPU→GPU copy?
+2. Investigate: does `.cpu()` go through `_copy_from` or a different path?
+3. If write+read work after unmap removal, re-test all GPU ops with manual `_C._flush()`.
+
+### BLOCKER: All training E2E tests gated on GPU ops correctness
+
+Until `torch.zeros/ones/fill_/copy_` work correctly on `vulkan:0`, all v13 milestones
+(DISP, VRFY, FP16, AOTI) are blocked. The GPU dispatch path must be fixed before any
+other work can proceed.
+
+---
+
 # § v8 closeout analysis (archived)
 
 ## TRAIN.8 test coverage matrix

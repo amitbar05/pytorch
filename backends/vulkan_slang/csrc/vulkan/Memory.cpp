@@ -123,7 +123,7 @@ void VulkanBuffer::write(const void* data, VkDeviceSize write_size, VkDeviceSize
     void* ptr = map();
     std::memcpy(static_cast<char*>(ptr) + offset, data, write_size);
     vmaFlushAllocation(allocator_, allocation_, offset, write_size);
-    unmap();
+    // Keep mapped — unmap() may invalidate flush on non-coherent memory
 }
 
 void VulkanBuffer::read(void* data, VkDeviceSize read_size, VkDeviceSize offset) const {
