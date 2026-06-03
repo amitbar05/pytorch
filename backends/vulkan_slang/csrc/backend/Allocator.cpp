@@ -91,11 +91,13 @@ c10::DataPtr VulkanAllocator::allocate(
             ctx.allocator(static_cast<uint32_t>(device_idx)),
             alloc_size,
             vulkan::BufferType::HostVisible);
-    } else {
-        // Recycled buffer from pool — zero it to avoid stale data.
-        void* ptr = buffer->map();
-        std::memset(ptr, 0, alloc_size);
     }
+    // Vulkan spec §7.1.2: host writes require a HOST→COMPUTE pipeline
+    // barrier before any GPU dispatch reads the data — even after
+    // vmaFlushAllocation. Without notify_host_write(), the first
+    // dispatch (e.g. fill_ on a torch.zeros/ones tensor) reads stale
+    // pre-init GPU memory, causing silent data corruption.
+    ops::notify_host_write(buffer->buffer());
 
     // Use an opaque ID as the "data pointer"
     void* opaque = reinterpret_cast<void*>(next_id_++);

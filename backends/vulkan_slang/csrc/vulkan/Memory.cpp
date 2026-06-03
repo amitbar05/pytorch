@@ -51,15 +51,6 @@ VulkanBuffer::VulkanBuffer(VmaAllocator allocator, VkDeviceSize size, BufferType
         throw std::runtime_error("VMA: Failed to allocate buffer of size " +
                                  std::to_string(size));
     }
-
-    // Zero-initialize host-visible buffers so new/recycled buffers
-    // start with deterministic (zero) content.
-    if (type == BufferType::HostVisible || type == BufferType::Staging) {
-        void* ptr = map();
-        std::memset(ptr, 0, size);
-        vmaFlushAllocation(allocator_, allocation_, 0, size);
-        // Keep mapped (MAPPED_BIT keeps it mapped anyway).
-    }
 }
 
 VulkanBuffer::~VulkanBuffer() {
