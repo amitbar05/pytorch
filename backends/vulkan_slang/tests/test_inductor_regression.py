@@ -62639,9 +62639,50 @@ class TestPerf3BenchmarkPipeline:
         torch_vulkan.synchronize(0)
         dispatch_count = torch_vulkan._c_ext._get_dispatch_count()
 
-        # With decomposed GN: ~13 dispatches (1 conv + ~10 GN decomposition + 1 relu + cleanup)
-        # With fused GN: ~4 dispatches (1 conv + 1 GN fused + 1 relu + cleanup)
-        # Allow up to 20 for safety margin
-        assert dispatch_count <= 20, (
-            f"Conv+GN+ReLU forward dispatch count {dispatch_count} exceeds 20"
+        # GN.1: With fused GN forward (ExternKernelOut), target ≤6 dispatches
+        # (1 conv + 1 GN fused + 1 relu + ≤3 cleanup). Without fusion,
+        # decomposed path uses ~13 dispatches. The tighter upper bound
+        # catches fusion regressions while allowing scheduler variance.
+        assert dispatch_count <= 8, (
+            f"Conv+GN+ReLU forward dispatch count {dispatch_count} exceeds 8 "
+            f"(expected ≤6 with GN fusion, ≤13 without)"
+        )
+
+    @pytest.mark.gpu
+    def test_gn_fused_forward_correctness(self):
+        """GN.1 — Fused GN forward (ExternKernelOut) matches eager.
+        
+        Verifies that the re-armed GN fusion lowering produces correct
+        output identical to the eager path (within fp32 tolerance).
+        """
+        import torch
+        import torch.nn as nn
+        import torch_vulkan
+        import torch._dynamo
+
+        torch._dynamo.reset()
+
+        class GNOnly(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gn = nn.GroupNorm(2, 8)
+
+            def forward(self, x):
+                return self.gn(x)
+
+        model = GNOnly().to("vulkan:0").eval()
+
+        # Reference: eager forward
+        x = torch.randn(4, 8, 8, 8, device="vulkan:0")
+        with torch.no_grad():
+            ref_out = model(x)
+
+        # Compiled forward (uses fused GN lowering, DISP.1)
+        compiled = torch.compile(model, backend="inductor")
+        with torch.no_grad():
+            test_out = compiled(x)
+
+        diff = (ref_out - test_out).abs().max().item()
+        assert diff < 1e-3, (
+            f"Fused GN forward differs from eager: max_diff={diff:.6e}"
         )
