@@ -436,18 +436,33 @@ binaries, and RADV driver are all correct.
   pipeline barrier after host-side zero-init. Previously, constructor zero-init called
   `vmaFlushAllocation` but never notified the dispatch layer, so the first dispatch
   after allocation read stale GPU memory.
+- **Commit `00585fa`**: Removed `unmap()` from `VulkanBuffer::write()` so buffers stay
+  persistently mapped (MAPPED_BIT). Hypothesis was that `vmaUnmapMemory` invalidates
+  the `vmaFlushAllocation` on non-coherent memory.
 
-**Current hypothesis**: `VulkanBuffer::write()` calls `unmap()` after `vmaFlushAllocation`.
-On non-coherent memory, `vmaUnmapMemory` may invalidate the flush, causing subsequent
-`vmaMapMemory` in `read()` to return stale data. Also `VulkanBuffer::read()` is not
-being called during `.cpu()` (debug prints in read() didn't fire — suggests PyTorch's
-`.cpu()` path bypasses the registered `_copy_from` op). Fix under test: remove `unmap()`
-from `write()`, keep buffer persistently mapped.
+**Test results** (unmap removal + manual `_C._flush()`):
+- `fill_(42.0)` + flush → still ALL ZEROS (8/8 elements zero)
+- `tensor.to('vulkan')` + flush → still garbage (1.5e-9, then zeros)
+- `zeros + ones + add` + flush → still zeros
+
+The issue is NOT the flush timing NOR the unmap in write(). The GPU dispatch IS submitted
+(flush count increments) but the shader output is wrong. CPU→GPU copy also broken
+independently of shaders — suggests low-level buffer mapping/write path is failing.
+
+**Refined hypothesis**: `VulkanBuffer::write()` is writing to the wrong memory or the
+mapped pointer is stale. On RADV + VMA with `VMA_MEMORY_USAGE_AUTO` + `MAPPED_BIT`,
+the `map()` call may return a pointer that doesn't actually reach GPU memory. The
+raw Vulkan test (which works) uses `vkMapMemory` directly without VMA. Investigation
+should compare VMA buffer creation vs raw buffer creation, checking memory type
+selection and mapping behaviour.
 
 **Next steps**:
-1. Test: does removing `unmap()` from `write()` fix CPU→GPU copy?
-2. Investigate: does `.cpu()` go through `_copy_from` or a different path?
-3. If write+read work after unmap removal, re-test all GPU ops with manual `_C._flush()`.
+1. Extend `agent_space/test_raw_fill.cpp` to use VMA (not raw Vulkan) for buffer
+   allocation — isolate whether VMA buffer mapping is the root cause.
+2. If VMA mapping works in standalone, compare VMA allocator creation parameters
+   between standalone test and torch_vulkan's `Context::create_allocator()`.
+3. If VMA mapping fails in standalone, try `VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE`
+   or `VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT`.
 
 ### BLOCKER: All training E2E tests gated on GPU ops correctness
 
