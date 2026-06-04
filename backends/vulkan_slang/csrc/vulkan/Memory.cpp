@@ -35,8 +35,7 @@ VulkanBuffer::VulkanBuffer(VmaAllocator allocator, VkDeviceSize size, BufferType
             break;
         case BufferType::HostVisible:
             alloc_ci.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-            alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
             break;
         case BufferType::Staging:
             alloc_ci.usage = VMA_MEMORY_USAGE_CPU_ONLY;
@@ -123,7 +122,7 @@ void VulkanBuffer::write(const void* data, VkDeviceSize write_size, VkDeviceSize
     void* ptr = map();
     std::memcpy(static_cast<char*>(ptr) + offset, data, write_size);
     vmaFlushAllocation(allocator_, allocation_, offset, write_size);
-    // Keep mapped — unmap() may invalidate flush on non-coherent memory
+    unmap();
 }
 
 void VulkanBuffer::read(void* data, VkDeviceSize read_size, VkDeviceSize offset) const {
