@@ -374,4 +374,6 @@ def _get_async_pool() -> ThreadPoolExecutor:
     global _ASYNC_POOL
     if _ASYNC_POOL is None:
         _ASYNC_POOL = ThreadPoolExecutor(max_workers=_ASYNC_MAX_WORKERS)
+        import atexit
+        atexit.register(_ASYNC_POOL.shutdown, wait=False)
     return _ASYNC_POOL
