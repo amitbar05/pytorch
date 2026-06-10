@@ -137,7 +137,10 @@ def _slang_tile_conv2d_gn_relu(
     #     ``d``-stride loop mirrored Pass 1's.
     # Cache-busting tag prevents stale SPIR-V blobs from being reused.
     # Bumped for M-CG.3 WG 256→64 fix + M-SF.4 bias de-Jinja.
-    cache_key = f"conv_gn_relu_{dtype_s}_mcg3_wg64_msf4"
+    # M-SF.5 follow-up: push-constant struct shrunk from 132 → 128 bytes
+    # (dropped _pad field) to stay within Vulkan's guaranteed 128-byte
+    # maxPushConstantsSize.  Bumping tag forces SPIR-V recompile.
+    cache_key = f"conv_gn_relu_{dtype_s}_mcg3_wg64_msf5"
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
@@ -171,6 +174,7 @@ def _slang_tile_conv2d_gn_relu(
         int(sW),
         int(pH),
         int(pW),
+        int(1),  # groups (groups==1 supported by this template)
         int(dH),
         int(dW),
         int(input_t.stride(0)),
@@ -326,7 +330,7 @@ def _slang_tile_conv2d(
     cache_key = (
         f"slang_conv2d_{tile_w}x{tile_h}x{tile_c}"
         f"_t{threads_w}x{threads_h}_{dtype_s}"
-        f"{'_' + epilogue if epilogue else ''}_msf4"
+        f"{'_' + epilogue if epilogue else ''}_msf5"
     )
 
     # CG.M15: spec_constants for [[vk::constant_id]] overrides.
@@ -361,6 +365,7 @@ def _slang_tile_conv2d(
         int(sW),
         int(pH),
         int(pW),
+        int(1),  # groups (groups==1 supported by this template)
         int(dH),
         int(dW),
         int(input_t.stride(0)),
@@ -379,8 +384,9 @@ def _slang_tile_conv2d(
         int(tile_h),
         int(tile_c),
     )
-    # M-SF.4: always pack full 32-field PC (stride_bias + _pad always present).
-    # When bias is None, stride_bias=0 and the shader skips the bias add.
+    # M-SF.4: PC is exactly 32 uints = 128 bytes (Vulkan min maxPushConstantsSize).
+    # The _pad field was removed — it pushed the struct to 132 bytes, which
+    # some drivers silently truncate, dropping stride_bias and corrupting bias adds.
     bias_1d = (
         bias.view(-1)
         if has_bias
@@ -391,7 +397,6 @@ def _slang_tile_conv2d(
         "32I",
         *common_fields,
         stride_bias,
-        0,  # _pad
     )
 
     grid_x = (oW + tile_w - 1) // tile_w
@@ -449,7 +454,7 @@ def _render_conv_bwd_slang(
 
     src = _load_slang_template("slang_conv_bwd")
     if not src:
-        raise RuntimeError("slang_conv_bwd.py.jinja template not found")
+        raise RuntimeError("slang_conv_bwd.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -573,14 +578,10 @@ def _slang_tile_conv2d_bwd(
         tile_c=tile_c,
         threads_w=threads_w,
         threads_h=threads_h,
-        has_bias=has_bias,
     )
-    # M20.3: tile sizes are spec constants (IDs 40-44) — they don't
-    # affect the SPIR-V hash, so the cache key collapses to (dtype,
-    # has_bias). The same SPIR-V module serves every tile combo;
-    # the tuple is applied as a pipeline spec-constant override at
-    # dispatch time.
-    cache_key = f"slang_conv_bwd_m20p3_{dtype_s}{'_bias' if has_bias else ''}"
+    # M-SF.4: no has_bias in the cache key — the same SPIR-V module
+    # serves both cases; stride_grad_bias is the runtime gate.
+    cache_key = f"slang_conv_bwd_m20p3_{dtype_s}"
 
     # M20.3: Vulkan specialization constant overrides for the tile
     # tuple (constant_id 40-44). One pipeline per tuple, but the same
@@ -602,13 +603,8 @@ def _slang_tile_conv2d_bwd(
     if not grad_out_f32.is_contiguous():
         grad_out_f32 = grad_out_f32.contiguous()
 
-    # Pack push constants: 27 uint fields (no bias) or 28 (with bias)
-    # Layout matches BwdPC in slang_conv_bwd.py.jinja:
-    #   dims (15) + stride_in (4) + stride_w (4) + stride_go (4) = 27
-    #   + _pad_bwd (1) with bias = 28
-    #
-    # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
-    # AOT-passed ``SymInt`` shape / stride metadata coerces cleanly.
+    # M-SF.4: always 28 uint fields — stride_grad_bias replaces _pad_bwd.
+    # The shader gates accumulation at runtime on stride_grad_bias != 0.
     common_fields = (
         int(N),
         int(C_in),
@@ -638,19 +634,23 @@ def _slang_tile_conv2d_bwd(
         int(grad_out_f32.stride(2)),
         int(grad_out_f32.stride(3)),
     )
-    if has_bias:
-        pc = struct.pack("28I", *common_fields, 0)  # _pad_bwd
-    else:
-        pc = struct.pack("27I", *common_fields)
+    # stride_grad_bias = grad_bias.view(-1).stride(0) or 0
+    stride_grad_bias = int(grad_bias.view(-1).stride(0)) if grad_bias is not None else 0
+    pc = struct.pack("28I", *common_fields, stride_grad_bias)
 
     grid_x = (oW + tile_w - 1) // tile_w
     grid_y = (oH + tile_h - 1) // tile_h
     tile_c_count = (C_out + tile_c - 1) // tile_c
     grid_z = N * tile_c_count
 
-    buffers = [input_f32, weight_f32, grad_out_f32, gi_f32, gw_f32]
-    if has_bias:
-        buffers.append(gb_f32.view(-1))
+    # M-SF.4: always pass the grad_bias buffer slot — Vulkan requires all
+    # declared bindings to be bound. The shader skips accumulation when
+    # stride_grad_bias == 0.
+    buffers = [
+        input_f32, weight_f32, grad_out_f32,
+        gi_f32, gw_f32,
+        gb_f32.view(-1) if gb_f32 is not None else torch.empty(1, dtype=torch.float32),
+    ]
 
     compile_and_dispatch(
         src,
@@ -659,7 +659,7 @@ def _slang_tile_conv2d_bwd(
         grid_y,
         grid_z,
         push_constants=pc,
-        num_outputs=2 if not has_bias else 3,
+        num_outputs=3,
         entry="computeMain",
         cache_key=cache_key,
         spec_constants=spec_constants,

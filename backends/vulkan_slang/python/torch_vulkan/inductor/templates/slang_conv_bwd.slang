@@ -82,10 +82,10 @@ struct BwdPC {
     uint stride_go_c;
     uint stride_go_h;
     uint stride_go_w;
-    // Total: 15 + 4 + 4 + 4 = 27 uints = 108B (no bias)
-/*{%*/ if has_bias /*%}*/
-    uint _pad_bwd;  // 28 uints = 112B, well under 128B
-/*{%*/ endif /*%}*/
+    // M-SF.4: stride_grad_bias is always present — gated at runtime by != 0
+    // (replaces the {% if has_bias %} Jinja conditional that produced
+    // 27-uint vs 28-uint struct variants; same pattern as fwd stride_bias).
+    uint stride_grad_bias;  // = grad_bias.view(-1).stride(0) or 0
 };
 
 [[vk::push_constant]] BwdPC pc;
@@ -98,11 +98,11 @@ struct KernelArgs {
     // dX/dW/dB are accumulated atomically; bound as uint so we can CAS on
     // the raw bit pattern. The host pre-zero-fills these tensors so
     // `asfloat(0)==0.0f` is the correct accumulator identity.
+    // M-SF.4: grad_bias is always declared — the runtime gate below
+    // (stride_grad_bias != 0) skips accumulation when has_bias=False.
     RWStructuredBuffer<uint> grad_input;
     RWStructuredBuffer<uint> grad_weight;
-/*{%*/ if has_bias /*%}*/
     RWStructuredBuffer<uint> grad_bias;
-/*{%*/ endif /*%}*/
 };
 // M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
@@ -260,14 +260,15 @@ void computeMain(
     }
 
     // ── Atomic accumulate dB contributions ────────────────────────────
-/*{%*/ if has_bias /*%}*/
-    [unroll]
-    for (uint ci = 0; ci < TILE_C; ci++) {
-        uint co = co_start + ci;
-        if (co >= co_end) break;
-        if (db_local[ci] != 0.0f) {
-            vk_atomic_add(args.grad_bias, co * /*bias stride=1*/1u, db_local[ci]);
+    // M-SF.4: always compiled; runtime-gated by stride_grad_bias (0 = no bias).
+    if (pc.stride_grad_bias != 0u) {
+        [unroll]
+        for (uint ci = 0; ci < TILE_C; ci++) {
+            uint co = co_start + ci;
+            if (co >= co_end) break;
+            if (db_local[ci] != 0.0f) {
+                vk_atomic_add(args.grad_bias, co * pc.stride_grad_bias, db_local[ci]);
+            }
         }
     }
-/*{%*/ endif /*%}*/
 }
