@@ -1,9 +1,8 @@
 # Vulkan-Slang Inductor Backend — Full Pipeline Review & Overhauled Roadmap v15
 
-> **v15 (2026-06-10)** — This document replaces `docs/14-inductor-backend.md`
-> as the active roadmap. v14 is superseded. All v14 milestones are re-scoped
-> under v15 pillars with revised effort estimates and precise file:line
-> ownership based on an actual code-state audit performed on 2026-06-10.
+> **v15 (2026-06-10)** — replaces `docs/14-inductor-backend.md` as the active
+> roadmap. v14 is superseded. Based on a line-by-line code audit of the
+> actual working tree (commit `916712e` + 7 uncommitted modifications).
 
 ---
 
@@ -41,14 +40,14 @@ torch.compile(model, backend="inductor", mode="max-autotune")
   ├─ C++ wrapper compile (AOTI path)
   │     ├─ cpp_wrapper_gpu.py                 ← VulkanCppWrapperGpu
   │     ├─ csrc/aoti_runner_vulkan.cpp        ← AOTIModelContainerRunner
-  │     ├─ csrc/aoti_shims.cpp                ← aoti_torch_*_vulkan symbols
-  │     └─ csrc/aoti_preload.cpp              ← preload library (LD_PRELOAD)
+  │     ├─ csrc/aoti_shims.cpp                ← aoti_torch_*_vulkan C symbols
+  │     └─ csrc/aoti_preload.cpp              ← preload shared library
   │
   └─ CompiledFxGraph / CompiledAOTI dispatch
         └─ runtime/dispatch.py + runtime/batcher.py
 ```
 
-## 1.2 Verified working
+## 1.2 Verified working (audit evidence)
 
 | Layer | Status | Evidence |
 |-------|--------|---------|
@@ -56,7 +55,7 @@ torch.compile(model, backend="inductor", mode="max-autotune")
 | AOTAutograd joint graph (5-step train) | ✅ | commit `675316e` — loss 1.511→1.500 |
 | Post-grad combo fusion (fwd) | ✅ | `test_conv_gn_relu_fused_forward` PASS |
 | Pointwise lowering + fusion | ✅ | `test_binary_ops_match_torch_eager` PASS |
-| Slang conv2d (forward) | ✅ | `test_conv_gn_relu_slang_no_has_bias_jinja` PASS |
+| Slang conv2d forward | ✅ | `slang_conv2d.slang` — no `#ifdef`, bias in ParameterBlock |
 | Slang reductions (45 elementals) | ✅ | `test_bwd_diff_*` suite PASS |
 | bwd_diff table (fwd→bwd) | ✅ | `test_conv_gn_relu_compile_backward_matches_cpu` PASS |
 | SPIR-V codegen (slangc) | ✅ | md5sum verification in CI |
@@ -67,24 +66,35 @@ torch.compile(model, backend="inductor", mode="max-autotune")
 ## 1.3 Gaps (what's missing or broken)
 
 ### Gap 1 — AOTI wrapper does NOT link Vulkan runtime (AOTI.1)
-**Current state**: The generated `.so` in `/tmp/torchinductor_amit/` links
-`libtorch.so` + `libtorch_cpu.so` only. It does **not** link against the
-`aoti_torch` Vulkan symbols or preload `aoti_preload.so`.
+**Current state**: The generated `.so` at `/tmp/torchinductor_amit_<sha>/` is
+built by upstream `CppWrapperCpu`. It links `libtorch.so` + `libtorch_cpu.so`
+only. It does **not** include `csrc/backend/aoti_shims.o` (provides
+`aoti_torch_empty_strided_vulkan`, `aoti_torch_zeros_vulkan`,
+`aoti_torch_ones_vulkan`, `aoti_torch_full_vulkan`,
+`aoti_torch_as_strided_vulkan`, `aoti_torch_delete`,
+`aoti_torch_vulkan_mm_out` as C symbols).
 
 **What happens**: When `CompiledAOTI` loads the `.so` and calls
-`aoti_torch_empty_strided_vulkan`, the symbol is unresolved. Either:
-- `LD_PRELOAD=aoti_preload.so` is set at process level (not at `.so` load),
-  and RTLD_LOCAL prevents the preload symbols from being visible to the
-  child `dlopen`; or
-- The `.so` link line omits `aoti_shims.o` / `aoti_preload.so` entirely.
+`aoti_torch_empty_strided_vulkan`, the symbol is unresolved because:
+1. The `.so` link line does not include `csrc/backend/aoti_shims.o`.
+2. `csrc/aoti_preload.cpp` exists as a shared library but is never injected
+   via `LD_PRELOAD` into the wrapper's `dlopen` context.
+3. The `aoti_torch_*` symbols ARE present in the main `_C.cpython-312...so`
+   (confirmed via `nm -D`), but the wrapper `.so` has no `DT_NEEDED` entry
+   for it and RTLD_LOCAL prevents symbol visibility across `dlopen`.
 
-**Missing piece**: `cpp_wrapper_gpu.py` (or the build step in
-`compile_graph.py`) must emit a link line that includes the Vulkan AOTI
-shim object file or preload library.
+**Missing piece**: `VulkanCppWrapperGpu` (in `cpp_wrapper_gpu.py`) extends
+`CppWrapperCpu` but does NOT override the build step to add
+`csrc/backend/aoti_shims.o` to the extension's `extra_objects`.
 
-**File ownership**: `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` (emit
-`-Wl,--whole-archive` or equivalent), OR `python/torch_vulkan/inductor/compile_graph.py`
-(write the link invocation).
+**File ownership**: `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` (add
+`extra_objects=["csrc/backend/aoti_shims.o"]`), AND
+`python/torch_vulkan/inductor/__init__.py` (where `VulkanCppWrapperGpu` is
+registered at line 809).
+
+**AOT training prerequisite**: Until AOTI.1 is fixed, the AOTI path cannot
+run even a forward pass. The `.so` loads but crashes on the first
+`aoti_torch_empty_strided_vulkan` call with `undefined symbol`.
 
 ### Gap 2 — AOTI run not verified on RDNA1 (AOTI.2)
 **Blocker**: AOTI.1 must close first. Once linked, the wrapper must be
@@ -96,6 +106,11 @@ input gradient all must be < 1e-4 from CPU eager baseline.
 **File ownership**: New regression test in `tests/test_inductor_regression.py`
 under class `TestAOTI_ConvGnTraining`.
 
+**AOT training coverage today**: `test_aoti_three_layer_mlp_no_bias` (forward
+only, no training) and `test_aoti_conv2d_sdpa_model` (xfail). No existing
+test runs Conv+GN backward through AOTI. `test_conv_gn_relu_compile_backward_matches_cpu`
+uses `torch.compile` directly (Python-wrapper path), not AOTI C++ wrapper.
+
 ### Gap 3 — atexit hang after AOTI runs (AOTI.3)
 **Current state**: `timeout 120` → RC=124. The `ThreadPoolExecutor` fix
 (commit `916712e`) addresses `_register()` import-time hang, but the
@@ -105,19 +120,17 @@ cleanup_runtimes() → DeviceRuntime::~DeviceRuntime() → vkDeviceWaitIdle()
   → async compile/slangc thread pools still alive
 ```
 
-**Root cause**: `DeviceRuntime` destructor is synchronous. Any kernel
-still queued (or any slangc subprocess still running) holds `vkDeviceWaitIdle`
+**Root cause**: `DeviceRuntime` destructor is synchronous. Any kernel still
+queued (or slangc subprocess still running) holds `vkDeviceWaitIdle`
 indefinitely.
 
-**Fix direction**: Replace the synchronous destructor drain with
-non-blocking `shutdown(wait=False)` on all executors, plus a `vkQueueWaitIdle`
-with timeout fallback. The `Context::shutdown` patch mentioned in v14 exists
-but is incomplete — the teardown order needs to be: drain executors first,
-then destroy DeviceRuntime.
+**Fix direction**: Replace synchronous destructor drain with
+non-blocking `shutdown(wait=False)` on all executors, plus
+`vkQueueWaitIdle` with 5-second timeout. Teardown order: drain executors
+first, then destroy DeviceRuntime.
 
-**File ownership**: `csrc/backend/DeviceRuntime.cpp` (or wherever the
-singleton lives), `python/torch_vulkan/inductor/runtime/common.py`
-(pool shutdown ordering).
+**File ownership**: `csrc/backend/DeviceRuntime.cpp`,
+`python/torch_vulkan/inductor/runtime/common.py`.
 
 ### Gap 4 — _register_device_module hang (AOTI.4)
 **Current state**: `torch._register_device_module("vulkan", ...)` hangs
@@ -135,8 +148,8 @@ and container RAII (commit `7eaa80ce`) address runtime device-pointer
 resolution, not the import-time deadlock.
 
 **Fix direction**: Defer `fake_impl` registration to first-use, or guard
-the `torch.ops.aten` calls with a `_register_complete` flag. The minimal
-patch is a lazy-init wrapper around `meta_patches/__init__.py`.
+the `torch.ops.aten` calls with a `_register_complete` flag. Minimal patch:
+lazy-init wrapper around `meta_patches/__init__.py`.
 
 **File ownership**: `python/torch_vulkan/inductor/meta_patches/__init__.py`,
 `python/torch_vulkan/inductor/meta_patches/shape_ops.py`,
@@ -148,12 +161,11 @@ patch is a lazy-init wrapper around `meta_patches/__init__.py`.
 accumulating N kernels.
 
 **Root cause**: The current batcher flushes whenever a kernel's output is
-needed by the next node, rather than accumulating a full buffer of
-independent kernels and flushing once.
+needed by the next node, rather than accumulating a full buffer.
 
 **Fix direction**: Change the flush condition from "any dependency" to
-"all dependencies in the current batch are resolved". This requires
-tracking a ready-set per batch, not per kernel.
+"all dependencies in the current batch are resolved". Track a `ready_set`
+per batch.
 
 **File ownership**: `python/torch_vulkan/inductor/runtime/batcher.py`.
 
@@ -161,112 +173,120 @@ tracking a ready-set per batch, not per kernel.
 **Current state**: The `notify_host_write` fix (commit `2d438e4`) is in
 `Allocator::allocate()`, but the recent MAPPED_BIT removal + unmap changes
 (commits `fea31a5`, `a345ea7`) mean the full multi-kernel training path
-has not been re-verified on RDNA1. The concern is: buffer is allocated
-(write), then dispatched (read), then written again — does the HOST→COMPUTE
-barrier fire correctly at each transition?
+has not been re-verified on RDNA1.
 
 **File ownership**: `csrc/backend/Allocator.cpp`, `csrc/backend/VulkanBuffer.cpp`.
 
-### Gap 7 — SLANG.1: Jinja `has_bias` still in slang_conv2d.slang (SLANG.1)
-**Current state**: `slang_conv2d.slang` still has `#ifdef HAS_BIAS`
-preprocessor branches. The Jinja caller (`templates/caller/conv.py`) passes
-`HAS_BIAS` as a string-substituted define. M-SF.4 in v7 claimed this was
-eliminated, but it was re-introduced or never fully migrated.
+### Gap 7 — SLANG.1: `slang_conv_bwd.py.jinja` still loaded for backward conv
+**Current state**: Forward `slang_conv2d.slang` is clean — no `#ifdef`, bias
+in ParameterBlock, runtime-gated by `stride_bias != 0` (M-SF.4 landed).
 
-**Fix direction**: Replace `#ifdef HAS_BIAS` with a Slang `interface
-IBias { bool has_bias; }` generic parameter on the kernel entry point.
-The caller's `ParameterBlock` already has the `has_bias` field — wire it
-to the interface.
+**However**: The backward conv shader is still loaded from
+`slang_conv_bwd.py.jinja` (Python-string Jinja2 template, 225 lines).
+`slang_conv_bwd.slang` exists (11,882 bytes) but is NEVER loaded — the
+caller at `conv.py:448-470` passes `has_bias` as a Jinja variable to
+`.py.jinja`. This is the actual "Jinja for kernel parameters" anti-goal
+violation.
 
-**File ownership**: `python/torch_vulkan/inductor/templates/slang_conv2d.slang`,
+**Fix direction**:
+1. Migrate `slang_conv_bwd.py.jinja` content into `slang_conv_bwd.slang`
+   using Slang `interface IBias { bool has_bias; }` generic on entry point.
+2. Update `conv.py:457` to load `.slang` (already preferred by
+   `_load_slang_template`, but error message says `.py.jinja`).
+3. Delete `slang_conv_bwd.py.jinja`.
+
+**File ownership**: `python/torch_vulkan/inductor/templates/slang_conv_bwd.slang`,
 `python/torch_vulkan/inductor/templates/caller/conv.py`.
 
-### Gap 8 — SLANG.2: tril/triu/masked_fill/where missing from bwd_diff (SLANG.2)
-**Current state**: `bwd_diff_table.py` + `bwd_diff/unary.py` + `bwd_diff/binary.py`
-cover 45 elementals. `tril`, `triu`, `masked_fill`, and `where` (masked
-select) are absent. These block sparse-attention and padding-mask models.
+**Regression**: `TestV14SLANG1_ParameterBlockConv` — both fwd and bwd
+`slang_conv*.slang` compile with no `.py.jinja` fallback.
 
-**Fix direction**: Add `[BackwardDerivative]` annotations in
-`vk_elemental.slang` (or equivalent), register in `bwd_diff_table.py`,
-and add C++ dispatch entries in `csrc/ops/`.
+### Gap 7b — Remaining 10 `.py.jinja` templates (SLANG.1b)
+**Current state**: 11 `.py.jinja` files remain. Priority order for migration:
+
+1. `persistent_pointwise.py.jinja` (139 L — simplest)
+2. `philox_rng.py.jinja` (130 L — simple RNG)
+3. `scatter_atomic.py.jinja` (176 L)
+4. `fft_stockham.py.jinja` (160 L)
+5. `rnn_cell.py.jinja` + `rnn_cell_fused.py.jinja` + `rnn_cell_bwd.py.jinja`
+6. `flash_attention.py.jinja` + `flash_attention_bwd.py.jinja`
+7. `foreach_optimizer.py.jinja` (250 L — algorithm branching, hardest)
+
+**Note**: Several `.slang` files already have Jinja-in-comments
+(`/*{%*/ ... /*%}*/`) for algorithm branching — convert to Slang `interface`
+generics during migration.
+
+**Regression**: `TestV14SLANG1b_NoPyJinja` — asserts zero `.py.jinja`
+files remain in `templates/`.
+
+### Gap 8 — SLANG.2: tril/triu/masked_fill/where missing from bwd_diff
+**Current state**: `bwd_diff_table.py` covers ~45 elementals (activations,
+trig, exp/log, binary pointwise, losses). `tril`, `triu`, `masked_fill`,
+and `where` (masked select) are absent. These block sparse-attention and
+padding-mask models.
+
+**Fix direction**: Add `[BackwardDerivative]` annotations in the elemental
+Slang library, register in `bwd_diff_table.py`. No new C++ dispatch needed
+— `bwd_diff` codegen emits the shader directly.
 
 **File ownership**: `python/torch_vulkan/inductor/bwd_diff_table.py`,
-`python/torch_vulkan/inductor/bwd_diff/unary.py` (or new `masked.py`),
-`python/torch_vulkan/inductor/bwd_lowerings.py`.
+`python/torch_vulkan/inductor/bwd_lowerings.py`,
+`python/torch_vulkan/inductor/bwd_diff/unary.py` (or new `masked.py`).
 
-### Gap 9 — SLANG.3: Spec-constant count validation missing (SLANG.3)
-**Current state**: The pre-slangc AST validator (v7 M-VAL.4) checks brace
-balance, binding contiguity, undefined identifiers, groupshared budget,
-and numthreads product. It does NOT check that `[[vk::constant_id(N)]]`
-spec-constant count matches the C++ `struct` pack size, or that
-`[BackwardDerivative]` entry points have matching fwd/bwd signatures.
+### Gap 9 — SLANG.3: Spec-constant + bwd_diff signature validation
+**Current state**: The pre-slangc AST validator (`slang_validate/` sub-package,
+8 passes, 670 LOC) checks brace balance, binding contiguity, undefined
+identifiers, groupshared budget, and numthreads product. Missing:
+1. `[[vk::constant_id(N)]]` count vs. `ParameterBlock` field count match.
+2. `[BackwardDerivative]` entry points have matching fwd/bwd signatures.
 
-**Fix direction**: Add two checks to `python/torch_vulkan/inductor/slang_validator.py`:
-1. Count `vk::constant_id` usages; compare to `ParameterBlock` field count.
-2. For each `[BackwardDerivative]` entry, verify parameter count matches
-   the forward entry it references.
+**Fix direction**: Add two passes:
+- `slang_validate/spec_constants.py` — count + range check.
+- `slang_validate/bwd_diff_scan.py` — already exists (67 LOC) but only
+  scans for `[BackwardDerivative]` annotations, does not verify signature
+  matching. Extend it.
 
-**File ownership**: `python/torch_vulkan/inductor/slang_validator.py`.
+**File ownership**: `python/torch_vulkan/inductor/slang_validate/bwd_diff_scan.py`,
+new `python/torch_vulkan/inductor/slang_validate/spec_constants.py`.
 
-### Gap 10 — LOWER.1: Fallback audit incomplete (LOWER.1)
-**Current state**: `lowerings/__init__.py` has two active `make_fallback`
-entries:
+### Gap 10 — LOWER.1: Fallback audit (2 active entries)
+**Current state**: `lowerings/__init__.py:477-481` has two active
+`make_fallback` entries:
 ```python
 make_fallback(torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default)
 make_fallback(torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default)
 ```
-These are `_scatter_bwd` operations (tensor index scatter backward).
-Neither has a Vulkan equivalent — they route to CPU aten. On the compile
-path, this is a silent CPU call.
+These are `_scatter_bwd` ops — no Vulkan equivalent. Routes to CPU aten on
+compile path.
 
 **Fix direction**: Add `# ratified-extern: no Vulkan equivalent for
-pool2d_scatter_bwd; CPU fallback is irreducible` comments to both entries,
-documenting the decision. No code change needed — just audit + document.
+pool2d_scatter_bwd; CPU fallback is irreducible` comments.
 
-**File ownership**: `python/torch_vulkan/inductor/lowerings/__init__.py`
-(around line 477).
+**File ownership**: `python/torch_vulkan/inductor/lowerings/__init__.py`.
 
-### Gap 11 — LOWER.3: Conv backward TODO (LOWER.3)
-**Current state**: `conv_backward.py:38` has a TODO:
+### Gap 11 — LOWER.3: Conv backward FX rewrite
+**Current state**: `conv_backward.py` has a TODO at line 38:
 > "a paired FX rewrite lifts it into the template path"
 
 Currently `conv_backward` routes through `aten.convolution_backward` →
-PrivateUse1 extern. The TODO is to add a pre-grad FX rewrite that replaces
+PrivateUse1 extern. The fix is a pre-grad FX rewrite that replaces
 `convolution_backward` with the Slang `bwd_diff(conv_inner_madd)` template
-call directly.
+call, bypassing aten decomposition.
 
-**Why this matters**: Going through aten decomposition adds overhead and
-loses gradient information precision. The template path gives exact bwd_diff
-codegen with `[BackwardDerivative]` annotations already in `slang_conv2d.slang`.
+**Fix direction**: Add `PatternMatcher` pass at
+`fx_passes/patterns/conv_backward_rewrite.py`.
 
-**Fix direction**: Add a `PatternMatcher` pass in
-`fx_passes/patterns/conv_backward_rewrite.py` that matches
-`convolution_backward` → the `conv_bwd_diff` template node.
-
-**File ownership**: `python/torch_vulkan/inductor/fx_passes/patterns/conv_backward_rewrite.py`
-(new file), `python/torch_vulkan/inductor/lowerings/conv_backward.py`.
+**File ownership**: new `python/torch_vulkan/inductor/fx_passes/patterns/conv_backward_rewrite.py`,
+`python/torch_vulkan/inductor/lowerings/conv_backward.py`.
 
 ### Gap 12 — Regression suite gap (REG.1/2/3)
-**Current state**: No v14-specific regression tests exist. The existing
-`test_aoti_*` and `test_conv_gn_*` tests cover some of the same ground,
-but there are no tests that specifically verify:
-- `TestAOTI_WrapperLinksVulkanRuntime` (AOTI.1)
-- `TestAOTI_ConvGnTraining` with grad parity (AOTI.2)
-- `TestV14AOTI3_CleanExit` via subprocess + `timeout` (AOTI.3)
-- `TestV14AOTI4_RegisterNoHang` via timed import (AOTI.4)
-- `TestV14SYNC2_VmaWritePath` multi-kernel write-read cycle (SYNC.2)
-
-**Fix direction**: Add these as new test classes in
-`tests/test_inductor_regression.py`. Use `pytest.mark.skipif` for RDNA1-only
-tests; use `subprocess.Popen` + `timeout` for clean-exit tests.
+No v15-specific regression tests exist for the AOTI/SYNC/SLANG milestones
+listed above. Existing `test_aoti_*` and `test_conv_gn_*` tests cover
+adjacent ground but miss the specific failure modes.
 
 ---
 
 # § 2 — Overhauled v15 Roadmap
-
-v15 restructures v14 into a cleaner dependency graph, re-estimates effort
-based on the actual code-state audit, and adds explicit file:line ownership
-for every item.
 
 ## v15 pillars
 
@@ -274,13 +294,11 @@ for every item.
 |---|--------|------|--------|
 | **V15-AOTI** | AOTI completeness | Generated `.so` resolves `aoti_torch_*_vulkan` at load time, runs Conv+GN fwd+bwd with clean exit. | 3 d |
 | **V15-SYNC** | Synchronization & VMA | Non-blocking atexit teardown, validated multi-kernel VMA write path, batcher flush accumulation. | 1.5 d |
-| **V15-LANG** | Slang language hygiene | Zero Jinja `#ifdef` in `.slang` files, bwd_diff covers masked ops, spec-constant validation complete. | 1.5 d |
+| **V15-LANG** | Slang language hygiene | Zero `.py.jinja` templates remaining, bwd_diff covers masked ops, spec-constant + bwd_diff signature validation complete. | 2 d |
 | **V15-LOWER** | Lowering completeness | Fallback audit ratified, conv backward FX rewrite lands. | 1 d |
 | **V15-REG** | Regression lock | Every milestone above has a regression test. | 0.5 d |
 
-**Total v15 effort: 7.5 working days** (vs. v14's implicit 8.5 d across
-15 items). Reduced because LOWER.2 is already done, and several v14 items
-were over-estimated.
+**Total: 8 working days.**
 
 ## v15 milestones (prioritized execution order)
 
@@ -290,218 +308,222 @@ ops natively. No action needed.
 
 ### Priority 2 — LOWER.1 (0.25 d) → unblocks LOWER.3
 **Action**: Add `# ratified-extern` comments to the two `make_fallback`
-entries in `lowerings/__init__.py:477-481`. No code change.
+entries in `lowerings/__init__.py:477-481`.
 
-**File**: `python/torch_vulkan/inductor/lowerings/__init__.py`
-
-**Regression**: `TestV14LOWER1_FallbackAudit` — asserts that every
-`make_fallback` entry in `__init__.py` has a `# ratified-extern` or
-`# TODO` comment. This test fails if a new fallback is added without
-documentation.
+**Regression**: `TestV14LOWER1_FallbackAudit` — asserts every `make_fallback`
+entry has a `# ratified-extern` or `# TODO` comment.
 
 ### Priority 3 — AOTI.4 (0.5 d) — import hang
-**Action**: Wrap `meta_patches/__init__.py` in a lazy-init guard. The
-`_OP_IMPLS` registration should not execute until `_register()` has
-completed. Add a `_META_PATCHES_READY` flag checked by each module's
-top-level import.
-
-**Files**:
-- `python/torch_vulkan/inductor/meta_patches/__init__.py` — add lazy guard
-- `python/torch_vulkan/inductor/meta_patches/shape_ops.py` — guard `torch.ops.aten.*` calls
-- `python/torch_vulkan/inductor/meta_patches/decomposition_passes.py` — same
+**Action**: Wrap `meta_patches/__init__.py` in a lazy-init guard. Add a
+`_META_PATCHES_READY` flag; each module's top-level import checks it before
+calling `torch.ops.aten.*`.
 
 **Regression**: `TestV14AOTI4_RegisterNoHang` — calls
 `torch._register_device_module("vulkan")` with `timeout=5`, asserts no hang.
 
 ### Priority 4 — AOTI.1 (1 d) — link fix
-**Action**: Modify `cpp_wrapper_gpu.py` (or the compile step in
-`compile_graph.py`) to include `csrc/aoti_shims.o` in the wrapper link
-line. The shim object provides `aoti_torch_empty_strided_vulkan`,
-`aoti_torch_zeros_vulkan`, etc. as C symbols the wrapper can resolve
-directly, eliminating the need for `LD_PRELOAD`.
+**Action**: Add `extra_objects=["csrc/backend/aoti_shims.o"]` to the
+`CppExtension` that `VulkanCppWrapperGpu` builds. The shim object provides
+all `aoti_torch_*_vulkan` C symbols.
 
-**Alternative if linking the shim object is impractical**: Emit a
-`dlopen("aoti_preload.so", RTLD_NOW|RTLD_GLOBAL)` call in the generated
-wrapper source before any `aoti_torch_*` calls. This is more portable.
-
-**Files**:
-- `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` — emit link args
-- OR `python/torch_vulkan/inductor/compile_graph.py` — emit `dlopen` in wrapper src
+**File**: `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` (where the
+`CppExtension` is constructed), `python/torch_vulkan/inductor/__init__.py:809`
+(where `VulkanCppWrapperGpu` is registered).
 
 **Regression**: `TestAOTI_WrapperLinksVulkanRuntime` — loads a minimal
-wrapper `.so`, asserts `aoti_torch_empty_strided_vulkan` is resolvable.
+wrapper `.so`, asserts `aoti_torch_empty_strided_vulkan` resolves.
 
 ### Priority 5 — AOTI.3 (0.5 d) — clean exit
-**Action**: In `DeviceRuntime` destructor (or equivalent teardown path):
-1. Call `executor.shutdown(wait=False)` on all compile/slangc pools.
-2. Call `vkQueueWaitIdle` with 5-second timeout.
-3. If timeout fires, log warning and proceed with destruction.
+**Action**: In `DeviceRuntime` destructor: `shutdown(wait=False)` on all
+executors, then `vkQueueWaitIdle` with 5-second timeout, then proceed.
 
-**Files**:
-- `csrc/backend/DeviceRuntime.cpp` (or wherever singleton is)
-- `python/torch_vulkan/inductor/runtime/common.py` — pool shutdown ordering
+**File**: `csrc/backend/DeviceRuntime.cpp`,
+`python/torch_vulkan/inductor/runtime/common.py`.
 
 **Regression**: `TestV14AOTI3_CleanExit` — subprocess `python -c "..."` with
 `timeout 60`, asserts `returncode == 0`.
 
 ### Priority 6 — SYNC.2 (0.25 d) — VMA write-path
-**Action**: Verify the full multi-kernel training path: allocate buffer,
-`copy_` from CPU, dispatch pointwise kernel reading it, dispatch second
-kernel, read back, assert matches CPU. Test on RDNA1.
+**Action**: Verify full multi-kernel training path on RDNA1: allocate,
+`copy_` from CPU, dispatch pointwise, dispatch second, read back, match CPU.
 
-**Files**: `csrc/backend/Allocator.cpp`, `csrc/backend/VulkanBuffer.cpp`
-
-**Regression**: `TestV14SYNC2_VmaWritePath` — RDNA1-only, skips on Lavapipe.
+**Regression**: `TestV14SYNC2_VmaWritePath` — RDNA1-only, skips Lavapipe.
 
 ### Priority 7 — SYNC.1 (0.5 d) — batcher flush accumulation
-**Action**: Change batcher flush condition from "any dependency" to
-"batch is complete". Track a `ready_set` per batch rather than per kernel.
-A kernel is added to the current batch if all its tensor dependencies are
-already in the batch (or produced by kernels already in the batch).
+**Action**: Track `ready_set` per batch; flush only when batch is complete.
 
-**File**: `python/torch_vulkan/inductor/runtime/batcher.py`
+**Regression**: `TestV14SYNC1_BatchPerf` — MNISTNet, BATCH_DISPATCH=1 ≤ 1.1×
+BATCH_DISPATCH=0.
 
-**Regression**: `TestV14SYNC1_BatchPerf` — MNISTNet, asserts BATCH_DISPATCH=1
-is ≤ 1.1× BATCH_DISPATCH=0 (was 1.8×; target is parity).
-
-### Priority 8 — AOTI.2 (1 d) — wrapper E2E run
-**Action**: After AOTI.1 links correctly, run a 5-step Conv+GN+SGD
-training loop via the AOTI path. Compare all gradients (conv.w, conv.b,
-gn.w, gn.b, input grad) to CPU baseline. Threshold: max diff < 1e-4.
+### Priority 8 — AOTI.2 (1 d) — wrapper E2E run (AFTER AOTI.1)
+**Action**: 5-step Conv+GN+SGD training via AOTI path. All gradients < 1e-4
+from CPU baseline.
 
 **Prerequisites**: AOTI.1 must pass.
 
-**Regression**: `TestAOTI_ConvGnTraining` — 3 sub-tests:
-forward parity, backward parity, 5-step loss monotonic decrease.
+**Regression**: `TestAOTI_ConvGnTraining` — forward parity, backward parity,
+5-step loss monotonic decrease.
 
-### Priority 9 — SLANG.1 (0.5 d) — ParameterBlock has_bias
-**Action**: Replace `#ifdef HAS_BIAS` in `slang_conv2d.slang` with a
-Slang `interface IBias { bool has_bias; }` generic. The kernel entry point
-becomes `shader conv2d<IBias>(...)`. The caller's `ParameterBlock` passes
-`has_bias` via the interface.
+### Priority 9 — SLANG.1 (0.5 d) — migrate slang_conv_bwd.py.jinja → .slang
+**Action**:
+1. Migrate `slang_conv_bwd.py.jinja` → `slang_conv_bwd.slang` with Slang
+   `interface IBias { bool has_bias; }` generic.
+2. Update `conv.py:457` to load `.slang`, remove `has_bias` from Jinja render.
+3. Delete `slang_conv_bwd.py.jinja`.
 
-**Files**:
-- `python/torch_vulkan/inductor/templates/slang_conv2d.slang`
-- `python/torch_vulkan/inductor/templates/caller/conv.py`
+**Regression**: `TestV14SLANG1_ParameterBlockConv` — both fwd and bwd
+`slang_conv*.slang` compile, no `.py.jinja` fallback loaded.
 
-**Regression**: `TestV14SLANG1_ParameterBlockConv` — compiles `slang_conv2d.slang`,
-asserts no `#ifdef`/`#endif` preprocessor directives in the shader.
+### Priority 9b — SLANG.1b (1 d) — migrate remaining 10 .py.jinja → .slang
+Order: persistent_pointwise, philox_rng, scatter_atomic, fft_stockham,
+rnn_cell×3, flash_attention×2, foreach_optimizer.
+
+**Regression**: `TestV14SLANG1b_NoPyJinja` — zero `.py.jinja` files in
+`templates/`.
 
 ### Priority 10 — SLANG.2 (0.5 d) — tril/triu/masked_fill/where bwd_diff
-**Action**: Add `[BackwardDerivative]` for:
-- `tril` / `triu` — mask is zero or one; derivative is zero where mask is zero
-- `masked_fill` — derivative is zero where mask is false, 1 where true
-- `where` (masked select) — derivative routes to the selected branch
+**Action**: Add `aten.tril_backward`, `aten.triu_backward`,
+`aten.masked_fill_backward`, `aten.where_backward` to `bwd_diff_table.py`
+with appropriate `[BackwardDerivative]` Slang annotations.
 
-Register in `bwd_diff_table.py`, add entries in `bwd_lowerings.py`.
-
-**Files**:
-- `python/torch_vulkan/inductor/bwd_diff_table.py`
-- `python/torch_vulkan/inductor/bwd_lowerings.py`
-- `python/torch_vulkan/inductor/bwd_diff/` (new `masked.py` or extend `unary.py`)
-
-**Regression**: `TestV14SLANG2_TrilBackward` — tril + matmul + sum backward
+**Regression**: `TestV14SLANG2_TrilBackward` — tril + matmul + sum bwd
 gradient matches CPU.
 
-### Priority 11 — SLANG.3 (0.5 d) — spec-constant validation
-**Action**: Add two AST validator checks in `slang_validator.py`:
-1. Count `[[vk::constant_id(N)]]` occurrences; assert ≤ max valid N (15).
-2. For each `[BackwardDerivative]` entry, find its forward counterpart
-   and assert parameter count + types match.
+### Priority 11 — SLANG.3 (0.5 d) — spec-constant + bwd_diff signature validation
+**Action**: Extend `slang_validate/bwd_diff_scan.py` to verify parameter
+count/types match between `[BackwardDerivative]` entry and its forward
+counterpart. Add `slang_validate/spec_constants.py` for constant_id count
+vs. ParameterBlock field count.
 
-**File**: `python/torch_vulkan/inductor/slang_validator.py`
-
-**Regression**: `TestV14SLANG3_SpecConstValidator` — feeds a shader with
-mismatched spec-constant count to validator, asserts `RuntimeError`.
+**Regression**: `TestV14SLANG3_SpecConstValidator` — feeds mismatched
+shader, asserts `RuntimeError`.
 
 ### Priority 12 — LOWER.3 (1 d) — conv backward FX rewrite
-**Action**: Add a `PatternMatcher` pass in
-`fx_passes/patterns/conv_backward_rewrite.py` that matches the
-`aten.convolution_backward` subgraph pattern and replaces it with a call
-to the `conv_bwd_diff` Slang template node. This bypasses the aten
-decomposition entirely.
-
-**Files**:
-- `python/torch_vulkan/inductor/fx_passes/patterns/conv_backward_rewrite.py` (new)
-- `python/torch_vulkan/inductor/lowerings/conv_backward.py` (add template path)
+**Action**: Add `PatternMatcher` pass in
+`fx_passes/patterns/conv_backward_rewrite.py` that matches
+`aten.convolution_backward` → `conv_bwd_diff` template node.
 
 **Prerequisites**: LOWER.1 audit complete.
 
-**Regression**: `TestV14LOWER3_ConvBwdTemplate` — asserts that a conv backward
-graph node's `name` field contains `conv_bwd_diff` (template path), not
-`convolution_backward` (aten path).
+**Regression**: `TestV14LOWER3_ConvBwdTemplate` — graph node name contains
+`conv_bwd_diff` (template path), not `convolution_backward` (aten path).
 
 ### Priority 13 — REG.1/2/3 (0.5 d) — regression lock
-**Action**: After each parent milestone passes, add its regression test to
-`tests/test_inductor_regression.py` (if not already added in the milestone
-itself). Run the full suite on RDNA1 and assert zero failures.
+Add all parent milestone tests to `tests/test_inductor_regression.py`.
+Run full suite on RDNA1.
 
 ---
 
-# § 3 — Dependency Graph (v15)
+# § 3 — Dependency Graph
 
 ```
-LOWER.1 (audit fallbacks) ──→ LOWER.3 (conv bwd FX rewrite)
-AOTI.4 (import hang) ──────────────────────────┐
-                                               ├──→ AOTI.1 (link fix) ──→ AOTI.2 (E2E run) ──→ REG.1
-AOTI.3 (clean exit) ──────────────────────────┘         └──→ REG.2 (via AOTI.3)
-SYNC.2 (VMA write) ──────────────────→ REG.3
-SYNC.1 (batcher flush)
-SLANG.1 / SLANG.2 / SLANG.3  ── independent, parallel with AOTI/SYNC
+LOWER.1 ──→ LOWER.3
+AOTI.4 ──────────────────────────┐
+                                 ├──→ AOTI.1 ──→ AOTI.2 ──→ REG.1
+AOTI.3 ──────────────────────────┘         └──→ REG.2 (via AOTI.3)
+SYNC.2 ──────────────────→ REG.3
+SYNC.1
+SLANG.1 → SLANG.1b → SLANG.2 → SLANG.3  (serial within LANG pillar)
 ```
 
 Parallelism:
-- AOTI.4 + AOTI.1 can be worked simultaneously (AOTI.4 unblocks nothing
-  downstream of AOTI.1, but they touch different files).
-- SLANG.1/2/3 + SYNC.1 + LOWER.1 run in parallel with AOTI.4.
+- AOTI.4 + AOTI.1 can run simultaneously (different files, AOTI.4 unblocks
+  nothing downstream of AOTI.1 but both are needed before AOTI.2).
+- SLANG.1/1b/2/3 are serial within the pillar but run in parallel with
+  AOTI/SYNC/LOWER workstreams.
 - LOWER.3 starts after LOWER.1 (1-day overlap).
-- AOTI.2 starts after AOTI.1 (1-day overlap).
-- REG tests written alongside their parent milestones.
 
 ---
 
 # § 4 — File:line ownership map
 
-| File (relative to backends/vulkan_slang/) | Lines | Owner milestone |
-|---|---|---|
+| File | Lines | Milestone |
+|------|-------|-----------|
 | `python/torch_vulkan/inductor/lowerings/__init__.py` | 477-481 | LOWER.1 |
 | `python/torch_vulkan/inductor/meta_patches/__init__.py` | 1-end | AOTI.4 |
 | `python/torch_vulkan/inductor/meta_patches/shape_ops.py` | 1-end | AOTI.4 |
 | `python/torch_vulkan/inductor/meta_patches/decomposition_passes.py` | 1-end | AOTI.4 |
-| `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | 1-300 | AOTI.1 |
-| `python/torch_vulkan/inductor/compile_graph.py` | 1-400 | AOTI.1 |
+| `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | 76-170 | AOTI.1 |
+| `python/torch_vulkan/inductor/__init__.py` | 809 | AOTI.1 |
 | `csrc/backend/DeviceRuntime.cpp` | 1-end | AOTI.3 |
 | `python/torch_vulkan/inductor/runtime/common.py` | 200-379 | AOTI.3 |
 | `csrc/backend/Allocator.cpp` | 1-end | SYNC.2 |
 | `csrc/backend/VulkanBuffer.cpp` | 1-end | SYNC.2 |
 | `python/torch_vulkan/inductor/runtime/batcher.py` | 1-end | SYNC.1 |
-| `python/torch_vulkan/inductor/templates/slang_conv2d.slang` | 1-200 | SLANG.1 |
-| `python/torch_vulkan/inductor/templates/caller/conv.py` | 1-300 | SLANG.1 |
+| `python/torch_vulkan/inductor/templates/slang_conv_bwd.slang` | 1-230 | SLANG.1 |
+| `python/torch_vulkan/inductor/templates/caller/conv.py` | 448-470 | SLANG.1 |
+| `python/torch_vulkan/inductor/templates/*.py.jinja` | 10 files | SLANG.1b |
 | `python/torch_vulkan/inductor/bwd_diff_table.py` | 1-end | SLANG.2 |
 | `python/torch_vulkan/inductor/bwd_lowerings.py` | 1-end | SLANG.2 |
-| `python/torch_vulkan/inductor/bwd_diff/unary.py` | 1-end | SLANG.2 |
-| `python/torch_vulkan/inductor/slang_validator.py` | 1-end | SLANG.3 |
+| `python/torch_vulkan/inductor/slang_validate/bwd_diff_scan.py` | 1-67 | SLANG.3 |
+| `python/torch_vulkan/inductor/slang_validate/spec_constants.py` | new | SLANG.3 |
 | `python/torch_vulkan/inductor/fx_passes/patterns/conv_backward_rewrite.py` | new | LOWER.3 |
 | `python/torch_vulkan/inductor/lowerings/conv_backward.py` | 461 lines | LOWER.3 |
-| `tests/test_inductor_regression.py` | 62,686 lines | REG.1/2/3 |
+| `tests/test_inductor_regression.py` | 62,686 lines | REG |
 
 ---
 
-# § 5 — Anti-goals (carried forward, unchanged)
+# § 5 — Slang Smart-Features Audit Summary
+
+## 5.1 What's already smart (no action needed)
+
+| Feature | Status | Where |
+|---------|--------|-------|
+| ParameterBlock<KernelArgs> on all active templates | ✅ | All `slang_*.slang` files |
+| Spec constants `[[vk::constant_id]]` for tile sizes | ✅ | `slang_conv2d.slang:30-34`, `slang_conv_bwd.slang:40-44`, `slang_mm.slang` |
+| `[Differentiable]` on all elemental fwd shaders | ✅ | `shaders/lib/*.slang` |
+| `[BackwardDerivative]` on 45 elementals | ✅ | `bwd_diff_table.py` |
+| Runtime stride_bias gating (no `#ifdef`) | ✅ | `slang_conv2d.slang:207-208` |
+| Pre-slangc AST validator (8 passes) | ✅ | `slang_validate/` sub-package |
+
+## 5.2 What needs work
+
+| Issue | Severity | Location |
+|-------|----------|----------|
+| `slang_conv_bwd.py.jinja` loaded instead of `.slang` | P0 — anti-goal violation | `conv.py:448-470` |
+| 10 remaining `.py.jinja` templates | P1 — anti-goal | `templates/*.py.jinja` |
+| `tril`/`triu`/`masked_fill`/`where` missing from bwd_diff | P1 — blocks models | `bwd_diff_table.py` |
+| Spec-constant count not validated | P2 — correctness safety | `slang_validate/` |
+| bwd_diff signature matching not validated | P2 — correctness safety | `slang_validate/bwd_diff_scan.py` |
+
+## 5.3 Conv model AOT-training capability
+
+The conv model **CAN be trained** through `torch.compile(backend="inductor")`
+(Python-wrapper path, verified commit `675316e`). It **CANNOT yet be trained**
+through the AOTI C++ wrapper path because:
+
+1. **AOTI.1 blocks everything**: The `.so` is missing `aoti_shims.o` in its
+   link line. Even a single `aoti_torch_empty_strided_vulkan` call fails
+   with `undefined symbol`.
+
+2. **AOTI.2 unverified**: Once AOTI.1 is fixed, the AOTI wrapper has never
+   been exercised with a Conv+GN backward pass.
+
+3. **AOTI.3 blocks CI**: Even if AOTI.1+2 work, the process hangs at exit
+   (`timeout 120` → RC=124), making automated training impossible.
+
+**Minimal path to AOT training**:
+1. Fix AOTI.1 (link `aoti_shims.o`).
+2. Fix AOTI.3 (non-blocking teardown).
+3. Run `TestAOTI_ConvGnTraining` with 5-step Conv+GN+SGD loop.
+4. Verify all 5 gradient tensors < 1e-4 from CPU baseline.
+
+---
+
+# § 6 — Anti-goals (carried forward)
 
 1. No new model-specific `.slang` files — templates only.
 2. No new `aten.<op>_backward` lowerings — backward routes through
    `bwd_diff_table.py` → Slang `[BackwardDerivative]`.
-3. No symptom-fixes in `meta_patches/` — if a fix needs a new primitive,
-   file it as a v15 milestone.
+3. No symptom-fixes in `meta_patches/`.
 4. No CPU fallbacks on the compile path.
 5. No file in `python/torch_vulkan/inductor/` exceeds 800 lines.
 6. No Jinja string substitution for kernel parameters that Slang
-   ParameterBlock + generics can handle.
+   ParameterBlock + generics + interfaces can handle.
 
 ---
 
-# § 6 — Disciplines (carried forward, unchanged)
+# § 7 — Disciplines (carried forward)
 
 1. Every milestone names a regression test in `tests/test_inductor_regression.py`.
 2. Correctness before performance. Gradient parity with CPU is the exit criterion.
@@ -511,70 +533,25 @@ Parallelism:
 
 ---
 
-# § 7 — v14 → v15 delta (what changed)
+# § 8 — v14 → v15 delta
 
 | v14 item | v15 status | Change |
 |---|---|---|
-| AOTI.1 | V15-AOTI.1 | Re-scoped: link via `dlopen` or shim object, not just LD_PRELOAD |
-| AOTI.2 | V15-AOTI.2 | Unchanged |
-| AOTI.3 | V15-AOTI.3 | Root cause clarified: DeviceRuntime destructor drain order |
-| AOTI.4 | V15-AOTI.4 | Root cause clarified: import-time `torch.ops.aten` deadlock |
-| SYNC.1 | V15-SYNC.1 | Root cause clarified: flush condition is per-kernel, not per-batch |
+| AOTI.1 | V15-AOTI.1 | Root cause pinpointed: `aoti_shims.o` missing from `extra_objects` |
+| AOTI.2 | V15-AOTI.2 | Clarified: zero existing AOTI Conv+GN backward tests |
+| AOTI.3 | V15-AOTI.3 | Root cause: DeviceRuntime destructor drain order |
+| AOTI.4 | V15-AOTI.4 | Root cause: import-time `torch.ops.aten` deadlock |
+| SYNC.1 | V15-SYNC.1 | Root cause: flush condition per-kernel vs per-batch |
 | SYNC.2 | V15-SYNC.2 | Re-verify after MAPPED_BIT removal |
-| SLANG.1 | V15-SLANG.1 | Confirmed: `#ifdef HAS_BIAS` still present in slang_conv2d.slang |
+| SLANG.1 | V15-SLANG.1 | **Corrected**: forward is clean; backward `slang_conv_bwd.py.jinja` is the violation |
 | SLANG.2 | V15-SLANG.2 | Unchanged |
-| SLANG.3 | V15-SLANG.3 | Unchanged |
-| LOWER.1 | V15-LOWER.1 | Only 2 active fallbacks; simple ratify + comment |
+| SLANG.3 | V15-SLANG.3 | Extended: bwd_diff signature matching |
+| LOWER.1 | V15-LOWER.1 | Narrowed to 2 specific fallbacks |
 | LOWER.2 | **DONE** | binary.py already removed |
 | LOWER.3 | V15-LOWER.3 | Unchanged |
 | REG.1/2/3 | V15-REG.1/2/3 | Unchanged |
 
-**Removed from v14** (no longer needed):
-- LOWER.2 — already done.
-
-**Added to v15** (gaps discovered during audit):
-- Explicit file:line ownership table (§4).
-- AOTI.1 alternative path (`dlopen` in wrapper source) for portability.
-- LOWER.1 narrowed to 2 specific fallbacks (not "audit all").
-
----
-
-# § 8 — Execution order (v15)
-
-```
-Day 1:
-  AM — LOWER.1 (0.25 d) + SLANG.1 (0.5 d) [parallel]
-  AM — AOTI.4 (0.5 d) [parallel]
-  PM — AOTI.1 (0.5 d of 1 d) [after AOTI.4 start]
-  PM — SLANG.2 (0.5 d) [parallel]
-
-Day 2:
-  AM — AOTI.1 finish (0.5 d remaining)
-  AM — SYNC.2 (0.25 d) + SLANG.3 (0.5 d) [parallel]
-  PM — SYNC.1 (0.5 d of 0.5 d) + LOWER.3 prep (0.5 d) [parallel]
-  PM — AOTI.3 (0.5 d)
-
-Day 3:
-  AM — AOTI.2 (1 d) [after AOTI.1]
-  AM — LOWER.3 (0.5 d of 1 d) [after LOWER.1]
-  PM — LOWER.3 finish (0.5 d)
-  PM — SLANG.1 finish if not done Day 1
-
-Day 4:
-  AM — REG.1 + REG.2 + REG.3 write + verify
-  AM — Full regression suite run on RDNA1
-  PM — v15 closeout, mark all milestones ✅
-```
-
----
-
-# § 9 — Hardware notes (unchanged)
-
-- **GPU**: AMD Radeon RX 5600 XT (NAVI10/RDNA1) at `/dev/dri/renderD128`.
-  Always verify on real hardware; software Vulkan is diagnostic-only.
-- **VMA flags**: `HOST_ACCESS_RANDOM_BIT | MAPPED_BIT` for HostVisible buffers
-  (re-evaluated after recent unmap removal; see SYNC.2).
-- **Wave size**: 64 (RDNA1).
+**New in v15**: SLANG.1b (migrate remaining 10 `.py.jinja` templates).
 
 ---
 
