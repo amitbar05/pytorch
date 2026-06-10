@@ -24,7 +24,9 @@
 //      e. Load V tile. Accumulate O += P @ V per thread.
 //   3. Write output tile.
 
-/*{%*/ set wg_size = head_dim if head_dim <= 256 else 256 /*%}*/
+// M-SF.3: wg_size is a specialization constant (default = min(head_dim, 256)).
+// Caller sets it based on the actual head_dim at dispatch time.
+[[vk::constant_id(50)]] const uint WG_SIZE = 256u;
 // T4.10: BK and BQ are now template kwargs supplied by the caller
 // (defaults BK=64, BQ=32 preserve pre-T4.10 behaviour).
 
@@ -32,7 +34,6 @@
 [[vk::constant_id(10)]] const uint BQ = /*{{*/ BQ /*}}32*/;
 [[vk::constant_id(11)]] const uint BK = /*{{*/ BK /*}}64*/;
 [[vk::constant_id(12)]] const uint HEAD_DIM = /*{{*/ head_dim /*}}64*/;
-static const uint WG_SIZE = HEAD_DIM;
 
 struct PC {
     uint B;           // batch size

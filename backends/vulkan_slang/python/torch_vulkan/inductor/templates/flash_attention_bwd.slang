@@ -49,7 +49,9 @@
 // `buffer_atomic_add_f32`; the lib's CAS path is portable).
 import atomics;
 
-/*{%*/ set wg_size = head_dim if head_dim <= 256 else 256 /*%}*/
+// M9: wg_size is a specialization constant (default = min(head_dim, 256)).
+// Caller sets it based on the actual head_dim at dispatch time.
+[[vk::constant_id(51)]] const uint WG_SIZE = 256u;
 
 // M20.3: Specialization constants for tile shape + workgroup dimensions.
 // HEAD_DIM doubles as the workgroup x-dim — ``numthreads`` references it

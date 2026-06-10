@@ -86,14 +86,14 @@ def _render_flash_attention(
 
     env = Environment()
     tmpl = env.from_string(src)
-    wg_size = min(head_dim, 256)
+    # M9: wg_size is now a [[vk::constant_id]] spec-constant in the shader.
+    # The caller still uses wg_size to size the dispatch grid.
     rendered = tmpl.render(
         head_dim=head_dim,
         head_layout=head_layout,
         is_causal=is_causal,
         num_stages=num_stages,
         output_dtype=output_dtype,
-        wg_size=wg_size,
         BQ=BQ,
         BK=BK,
     )
