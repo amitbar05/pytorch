@@ -61,7 +61,7 @@ def _render_scatter_atomic(
 
     src = _load_slang_template("scatter_atomic")
     if not src:
-        raise RuntimeError("scatter_atomic.py.jinja template not found")
+        raise RuntimeError("scatter_atomic.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -138,7 +138,7 @@ def _dispatch_scatter_atomic(
     # outputs for dirty-buffer / barrier tracking.  Place the output(s)
     # last so the tracking is correct.  Mean-mode binds a second output
     # buffer (the per-target count) immediately after `out` to match the
-    # KernelArgs struct field order in scatter_atomic.py.jinja.
+    # KernelArgs struct field order in scatter_atomic.slang.
     tensors: list[torch.Tensor] = [src_contig, idx_contig, out_contig]
     num_outputs = 1
     if operation == "scatter_reduce_mean":
@@ -175,7 +175,7 @@ def install_external_scatter() -> None:
 
     Intercepts ``aten.gather``, ``aten.scatter_add``, ``aten.scatter.src``,
     and ``aten.index_put`` at the Inductor lowering level and routes them
-    through the ``scatter_atomic.py.jinja`` template instead of the default
+    through the ``scatter_atomic.slang`` template instead of the default
     ExternKernel fallback path.
 
     Analogous to ``install_external_rng()`` for RNG ops.

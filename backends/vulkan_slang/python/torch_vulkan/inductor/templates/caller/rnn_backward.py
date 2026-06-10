@@ -47,7 +47,7 @@ def _render_rnn_cell_bwd(
 
     src = _load_slang_template("rnn_cell_bwd")
     if not src:
-        raise RuntimeError("rnn_cell_bwd.py.jinja template not found")
+        raise RuntimeError("rnn_cell_bwd.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)

@@ -56,7 +56,7 @@ def _render_rnn_cell(
 
     src = _load_slang_template("rnn_cell")
     if not src:
-        raise RuntimeError("rnn_cell.py.jinja template not found")
+        raise RuntimeError("rnn_cell.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -357,7 +357,7 @@ def _render_rnn_cell_fused(
 
     src = _load_slang_template("rnn_cell_fused")
     if not src:
-        raise RuntimeError("rnn_cell_fused.py.jinja template not found")
+        raise RuntimeError("rnn_cell_fused.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)

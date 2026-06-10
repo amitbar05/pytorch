@@ -37,7 +37,7 @@ _TRUST_INDUCTOR = os.environ.get("TORCH_VULKAN_TRUST_INDUCTOR") == "1"
 # the kernel reads bits from ``pc.flags`` to gate optional behaviour.
 #
 # Any change to this layout MUST be mirrored in the matching ``struct PC``
-# block in ``templates/slang_mm.py.jinja`` (and the link-time wrapper in
+# block in ``templates/slang_mm.slang`` (and the link-time wrapper in
 # ``render.py``).
 #
 # Layout: 19 uint + 5 float = 96 bytes (well below the 128 B push-constant
@@ -82,7 +82,7 @@ def _pack_mm_pc(
 ) -> bytes:
     """Pack the monolithic mm PC struct.
 
-    Mirrors ``struct PC`` in ``templates/slang_mm.py.jinja``.  Optional
+    Mirrors ``struct PC`` in ``templates/slang_mm.slang``.  Optional
     fields default to 0 / 0.0 when their corresponding ``MM_FLAG_*`` bit is
     clear, so a single helper serves every mm dispatch (mm / addmm / bmm /
     addmm+gelu).

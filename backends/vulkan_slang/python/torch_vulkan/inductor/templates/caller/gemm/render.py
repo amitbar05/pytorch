@@ -120,7 +120,7 @@ def _render_mm_slang(
 
     src = _load_slang_template("slang_mm")
     if not src:
-        raise RuntimeError("slang_mm.py.jinja template not found")
+        raise RuntimeError("slang_mm.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -238,7 +238,7 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("import mm_tile;")
     lines.append("")
 
-    # A.6: Monolithic PC struct — must match struct PC in slang_mm.py.jinja
+    # A.6: Monolithic PC struct — must match struct PC in slang_mm.slang
     # exactly so a single _pack_mm_pc helper serves both render paths.  The
     # link-time wrapper is gated off today (use_lt=False above) but kept in
     # sync so re-enabling it can't reintroduce a layout divergence.
@@ -326,7 +326,7 @@ def _render_mm_linktime_wrapper_slang(
     lines.append("")
 
     # A.6: Post-module epilogue gates on pc.flags at runtime, matching the
-    # main slang_mm.py.jinja path.  The branches are uniform across the wave
+    # main slang_mm.slang path.  The branches are uniform across the wave
     # (push-constants are wave-uniform on RDNA1) so this collapses to a
     # single scalar test per output element, well outside the K-loop hot
     # path.  Bias buffer presence is still gated on the structural
@@ -482,7 +482,7 @@ def _render_mm_bwd_slang(
 
     src = _load_slang_template("slang_mm_bwd")
     if not src:
-        raise RuntimeError("slang_mm_bwd.py.jinja template not found")
+        raise RuntimeError("slang_mm_bwd.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)

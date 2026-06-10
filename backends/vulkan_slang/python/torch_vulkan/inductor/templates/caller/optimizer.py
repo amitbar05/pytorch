@@ -67,7 +67,7 @@ def _render_foreach_optimizer_slang(
     output_dtype: str = "float",
     parameter_array: bool | None = None,
 ) -> str:
-    """Render the foreach_optimizer.py.jinja template for a given
+    """Render the foreach_optimizer.slang template for a given
     (algorithm, batch_size, output_dtype) combination.
     """
     from jinja2 import Environment
@@ -75,7 +75,7 @@ def _render_foreach_optimizer_slang(
     source_template = _load_slang_template("foreach_optimizer")
     if not source_template:
         raise RuntimeError(
-            "foreach_optimizer.py.jinja template not found — "
+            "foreach_optimizer.slang template not found — "
             "is the Vulkan Slang backend installed correctly?"
         )
     if parameter_array is None:

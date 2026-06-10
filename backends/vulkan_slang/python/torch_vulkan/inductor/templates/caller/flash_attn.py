@@ -82,7 +82,7 @@ def _render_flash_attention(
 
     src = _load_slang_template("flash_attention")
     if not src:
-        raise RuntimeError("flash_attention.py.jinja template not found")
+        raise RuntimeError("flash_attention.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -369,7 +369,7 @@ def _make_tile_flash_attention_fn(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CG.M7 — SDPA backward via flash_attention_bwd.py.jinja
+# CG.M7 — SDPA backward via flash_attention_bwd.slang
 # ═══════════════════════════════════════════════════════════════════════
 
 _flash_attention_bwd_cache: dict[tuple, str] = {}
@@ -399,7 +399,7 @@ def _render_flash_attention_bwd(
 
     src = _load_slang_template("flash_attention_bwd")
     if not src:
-        raise RuntimeError("flash_attention_bwd.py.jinja template not found")
+        raise RuntimeError("flash_attention_bwd.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -626,7 +626,7 @@ def install_external_flash_attention() -> None:
 
     Registers a lowering for ``torch_vulkan::flash_attention_fused`` (the
     custom op that the SDPA FX pattern rewrites to) that dispatches through
-    the flash_attention.py.jinja template instead of the C++ eager extern.
+    the flash_attention.slang template instead of the C++ eager extern.
 
     The template produces both output O and LSE (log-sum-exp). LSE is stored
     as an extra output from the Inductor IR node so AOT Autograd can use it

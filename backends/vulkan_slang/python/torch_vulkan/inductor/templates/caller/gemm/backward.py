@@ -27,7 +27,7 @@ from .render import (
 
 
 # A.6: Backward (single-kernel) PC layout — must mirror ``BwdPC`` in
-# ``templates/slang_mm_bwd.py.jinja``.  19 uints; flags currently only gates
+# ``templates/slang_mm_bwd.slang``.  19 uints; flags currently only gates
 # the batch path (MM_BWD_FLAG_BATCH = 2).
 MM_BWD_FLAG_BATCH = 2
 _MM_BWD_PC_FORMAT = "19I"

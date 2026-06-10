@@ -64,7 +64,7 @@ def _render_fft_stockham(
 
     src = _load_slang_template("fft_stockham")
     if not src:
-        raise RuntimeError("fft_stockham.py.jinja template not found")
+        raise RuntimeError("fft_stockham.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)

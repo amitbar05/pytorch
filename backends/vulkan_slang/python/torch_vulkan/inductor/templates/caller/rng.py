@@ -49,7 +49,7 @@ def _render_philox_rng(
 
     src = _load_slang_template("philox_rng")
     if not src:
-        raise RuntimeError("philox_rng.py.jinja template not found")
+        raise RuntimeError("philox_rng.slang template not found")
 
     env = Environment()
     tmpl = env.from_string(src)
@@ -99,7 +99,7 @@ def _dispatch_philox_rng(
     grid_x = (numel + threadgroup_size - 1) // threadgroup_size
 
     # Build push constants: total_elements, seed_lo, seed_hi, offset, [dropout_p]
-    # Layout matches the PC struct in philox_rng.py.jinja:
+    # Layout matches the PC struct in philox_rng.slang:
     #   uint total_elements; uint seed_lo; uint seed_hi; uint offset; [float dropout_p;]
     if fused_dropout:
         pc = struct.pack("4If", numel, seed_lo, seed_hi, offset, dropout_p)
@@ -292,7 +292,7 @@ def install_external_rng() -> None:
 
     Analogous to ``install_external_mm()`` / ``install_external_addmm()``:
     intercepts the aten ops at the Inductor lowering level and routes them
-    through the ``philox_rng.py.jinja`` template instead of the default
+    through the ``philox_rng.slang`` template instead of the default
     ExternKernel fallback path.
 
     Safe to call multiple times — only installs once.
