@@ -13,14 +13,15 @@ entries. No CPU fallbacks. No Python at deployment.
 
 # Where to work
 
-**The roadmap is [`docs/10-inductor-backend.md`](docs/10-inductor-backend.md).**
-Read **§ v7** at session start — that's the active plan (16 milestones,
-4 pillars, file:line references). Pre-v7 history lives in
+**The roadmap is [`docs/15-inductor-backend.md`](docs/15-inductor-backend.md).**
+Read **§ v15** at session start — that's the active plan (5 pillars, 13 milestones,
+dependency graph, file:line ownership). v7-v14 are closed and are reference-only;
+pre-v7 history lives in
 [`docs/archive/v6.x-snapshot-2026-05-27.md`](docs/archive/v6.x-snapshot-2026-05-27.md);
 search it for prior decisions, don't extend it.
 
-Pick the highest-priority unblocked v7 milestone, ship it, lock a
-regression test, mark it ✅ in the v7 table, move to the next.
+Pick the highest-priority unblocked v15 milestone, ship it, lock a
+regression test, mark it ✅ in the v15 table, move to the next.
 **Never stop to ask if you should continue** — work autonomously until
 manually stopped. If blocked, skip and note why in the roadmap. Don't
 symptom-patch; if a fix needs a new primitive, file it as its own
