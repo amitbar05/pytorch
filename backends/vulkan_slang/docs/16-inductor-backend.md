@@ -391,25 +391,34 @@ suite on RDNA1. Assert:
 # § 4 — Dependency Graph (v16)
 
 ```
-M1 (link fix) ──→ M4 (AOTI.2 E2E) ──→ M18 (REG)
-M2 (import hang) ──→ M4
-M3 (clean exit) ──→ M4
+AOTI pillar:
+  M1 (link aoti_shims.o)
+    → M2 (import hang)
+    → M3 (atexit hang)
+    → M4 (E2E training test)
 
-M5 (conv_bwd has_bias) ──→ M6 (delete .py.jinja) ──→ M7 (rnn_fused+pointwise .slang)
-                                                    ──→ M8 (foreach_optimizer interface)
-                                                         ──→ M9 (flash_attn wg_size)
-                                                              ──→ M10 (rnn direction)
-                                                                   ──→ M11 (validator)
+LANG pillar (DONE: M5, M6):
+  M5 ✅ conv_bwd de-Jinja (stride_grad_bias runtime gate)
+    → M6 ✅ delete 9 stale .py.jinja files + fix error messages
+      → M7 (rnn_cell_fused + persistent_pointwise .slang)
+        → M8 (foreach_optimizer interface)
+          → M9 (flash_attention interface)
+            → M10 (rnn_cell direction interface)
+              → M11 (AST validator extension)
 
-M12 (batcher) ──→ M13 (async compile) ──→ M14 (shape bucketing) ──→ M15 (subgroup)
-M16 (autotune) ← independent, can run parallel with M12-M15
-M17 (persistent kernel) ← after M7
+M7-M11 can proceed in parallel with AOTI M1-M4 (independent code paths).
+
+Performance pillar (parallel):
+  M12 (batcher ready_set) ──→ M13 (async compile double-buffer) ──→ M14 (shape bucketing)
+  M15 (subgroup ops) ← after M12
+  M16 (autotune) ← independent, parallel with M12-M15
+  M17 (persistent kernel) ← after M7
 ```
 
 Parallel streams:
 - **AOTI correctness**: M1, M2, M3 in parallel → M4 → M18
-- **Slang smart**: M5 → M6 → M7/M8/M9/M10/M11 (M8-M10 can parallelize)
-- **Performance**: M12 → M13 → M14 → M15 in series; M16 parallel with M12
+- **Slang smart** (M5-M6 ✅): M7/M8/M9/M10/M11 (M8-M10 can parallelize)
+- **Performance**: M12 → M13 → M14 → M15 in series; M16 parallel with M12; M17 after M7
 - **Regression**: M18 after all correctness milestones pass
 
 ---
