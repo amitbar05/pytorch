@@ -15,11 +15,50 @@ entries. No CPU fallbacks. No Python at deployment.
 
 **The roadmap is [`docs/16-inductor-backend.md`](docs/16-inductor-backend.md).**
 Read **§ v16** at session start — that's the active plan (5 pillars, 18 milestones,
-dependency graph, file:line ownership, Slang smart-feature audit). v7-v15 are
-closed and are reference-only;
-pre-v7 history lives in
-[`docs/archive/v6.x-snapshot-2026-05-27.md`](docs/archive/v6.x-snapshot-2026-05-27.md);
-search it for prior decisions, don't extend it.
+dependency graph, file:line ownership).
+
+## Claude Code worktrees (for human or subagent use)
+Two isolated worktrees exist for parallel milestone execution:
+
+| Branch | Worktree | Entry point |
+|---|---|---|
+| `feat/v16-aoti-correctness` | `/home/amit/code_projects/pytorch/backends/vulkan_slang/.worktrees/v16-aoti` | `cd … && claude` |
+| `feat/v16-lang-smart` | `/home/amit/code_projects/pytorch/backends/vulkan_slang/.worktrees/v16-lang` | `cd … && claude` |
+
+Each worktree has CLAUDE.md with milestone status. When a subagent picks up a
+worktree, read CLAUDE.md first.
+
+## Current status (auto-updated by implementer)
+- ✅ M5: `slang_conv_bwd` de-Jinja — `{% if has_bias %}` → runtime `stride_grad_bias` gate
+- ✅ M6: Delete 9 stale `.py.jinja` files, fix 10 caller error messages
+- 🔧 M1 (AOTI link): hook point identified — `python/torch_vulkan/inductor/cpp_wrapper_gpu.py`
+  needs to pass `extra_objects=["csrc/backend/aoti_shims.o"]` into the CppExtension build.
+  The upstream build path is `torch/_inductor/cpp_builder.py:1896+` (`get_cpp_torch_device_options`
+  returns `libraries`/`ldflags`/`passthrough_args`). AOTI wrapper then calls CppExtension
+  internally. Need to inject via ldflags `-Wl,--whole-archive csrc/backend/aoti_shims.o -Wl,--no-whole-archive`
+  OR add a custom build hook in the vulkan backend's codegen layer. Do not change
+  `torch/_inductor/cpp_builder.py` directly — it lives in `torch/` not `backends/`.
+  Prefer: override `CppWrapperGpu.generate()` build options dict, OR register via
+  `config.aot_inductor.custom_op_libs` (already supported in `get_cpp_torch_device_options`).
+- 🔜 M2: import hang fix (atexit ThreadPoolExecutor drain order)
+- 🔜 M3: atexit hang fix (slangc thread pool)
+- 🔜 M4: Conv+GN E2E training test (depends on M1-M3)
+- 🔜 M7: rnn_cell_fused + persistent_pointwise .py.jinja → .slang
+- 🔜 M8: foreach_optimizer → Slang interface for algorithm
+- 🔜 M9: flash_attention* → Slang interface for wg_size
+- 🔜 M10: rnn_cell* → Slang interface for direction
+- 🔜 M11: extend AST validator
+
+## Build requirements
+- Use `.venv/bin/python` for all Python
+- Use `.venv/bin/python setup.py build_ext --inplace` for build
+- Set `TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3` when building
+
+---
+
+---
+
+# Where to work
 
 Pick the highest-priority unblocked v16 milestone, ship it, lock a
 regression test, mark it ✅ in the v16 table, move to the next.
