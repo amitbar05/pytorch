@@ -212,6 +212,23 @@ def _validate_no_null_storage(key: str, tensors: list[torch.Tensor]) -> bool:
             dev_type = t.device.type
         except Exception:  # noqa: BLE001
             continue
+        # M13/M17.8.d.2: also catch meta-device tensors (AOT autograd
+        # propagates saved-forward tensors with device='meta' during
+        # backward compilation). These are functionally equivalent to
+        # FakeTensors — they have no real storage and will fail at the
+        # C++ dispatch layer with "Tensor has no backing Vulkan buffer".
+        is_meta = False
+        try:
+            is_meta = t.untyped_storage().device.type == "meta"
+        except Exception:
+            # untyped_storage() raises on FunctionalTensor / some tracing wrappers
+            is_meta = True
+        if is_meta:
+            fake_count += 1
+            offenders.append(
+                f"arg{i}: <meta-device tensor> shape={list(t.shape)} dtype={t.dtype}"
+            )
+            continue
         if dev_type not in ("vulkan", "privateuseone"):
             continue
         vulkan_count += 1
@@ -233,7 +250,7 @@ def _validate_no_null_storage(key: str, tensors: list[torch.Tensor]) -> bool:
             offenders.append(
                 f"arg{i}: shape={list(t.shape)} dtype={t.dtype} device={t.device}"
             )
-    # If ALL Vulkan tensors are FakeTensors, we are in AOT Autograd tracing.
+    # If ALL Vulkan/meta tensors are FakeTensors/meta, we are in AOT Autograd tracing.
     # Skip the dispatch — outputs already have correct shapes.
     if fake_count > 0 and fake_count == vulkan_count:
         return True

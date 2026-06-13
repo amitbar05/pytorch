@@ -1,8 +1,7 @@
-// Foreach optimizer template — parameterized over optimizer formula.
+// Foreach optimizer template — M8: runtime algorithm selector replaces Jinja branches.
 //
 // T4.8: Replaces optimizer_ops.cpp body + sgd_batch*.slang / adamw_batch*.slang
-// with a single jinja template parameterized over:
-//   algorithm    — "sgd", "sgd_momentum", "adamw", "lion"
+// with a single template parameterized over:
 //   batch_size   — number of parameters per dispatch (1, 7, 15, 21, 32)
 //   output_dtype — f32, f16, bf16
 //   parameter_array — bool (N+1.5.b). When True, emit
@@ -14,112 +13,76 @@
 //                     ``switch (param_idx)`` cascade to dispatch
 //                     dynamically.
 //
+// M8: Algorithm is now a RUNTIME push-constant selector (uint algorithm)
+// instead of a Jinja conditional.  The kernel body uses a switch on
+// ``pc.algorithm`` (ALG_* constants below) at lines ~160–240.
+//
+//   algorithm == 0: SGD (no momentum, no weight decay)
+//   algorithm == 1: SGD+Momentum (with optional weight decay)
+//   algorithm == 2: AdamW
+//   algorithm == 3: Lion
+//
+// This matches M-SF.4 (slang_conv_bwd.slang) — always declare all buffers,
+// gate usage at runtime.
+//
 // Dispatch: 2D grid.  X = element index (256 threads/wg).
 //                       Y = parameter index (0..n_params-1).
 //
-// Push constants carry per-param config: {numel, lr, wd, [momentum/β₁/β₂/ε]}.
-//
-// N+1.10 / N+1.5.b — Buffer bindings are wrapped in a single
-// ``ParameterBlock<KernelArgs>``.  Slang assigns one descriptorTableSlot
-// per struct field in declaration order (set 0, binding 0..N-1).
-//
-// Layout selection:
-//   * parameter_array=False (default, working path):
-//       Flat ``RWStructuredBuffer<T> param0..paramN-1`` etc., one
-//       binding per buffer with ``descriptorCount=1``.  Per-param
-//       dynamic indexing uses a ``switch (param_idx)`` cascade.  This
-//       is the layout the round-3 N+1.10 ParameterBlock migration
-//       shipped — it stays the working path until N+1.5.a (Python
-//       wiring of ``_jit_dispatch_indexed``) lands.
-//   * parameter_array=True (N+1.5.b, opt-in):
-//       Single ``ParamSlot params[BATCH_SIZE]`` array-of-structs of
-//       buffers; slangc emits ONE binding per buffer family (p, g,
-//       [m,] [v,]) with ``descriptorCount=BATCH_SIZE``.  Requires
-//       VK_EXT_descriptor_indexing on the device AND the C++ runtime
-//       indexed-dispatch path (``_C._jit_dispatch_indexed``).  All
-//       per-param-buffer ``switch (param_idx)`` cascades collapse to
-//       direct ``args.params[param_idx].p[idx]`` indexing.
-
-// Per-param config (packed for GPU alignment).
+// Push constants carry per-param config + algorithm selector.
 // Field order MUST match the Python-side ``struct.pack`` sequence in
 // ``templates/caller/optimizer.py`` (around line 173-193).
+
+// Per-param config (packed for GPU alignment).
+// M8: Always full 7-float layout — no Jinja conditionals.
+// Unused fields are zeroed by the Python packer for algorithms that
+// don't need them (e.g., SGD leaves momentum/beta2/eps at 0).
 struct ParamConfig {
     uint  numel;
     float lr;
     float weight_decay;
-/*{%*/ if algorithm in ("sgd_momentum", "adamw", "lion") /*%}*/
-    float momentum;   // SGD: momentum factor; AdamW: β₁; Lion: β₁
-/*{%*/ endif /*%}*/
-/*{%*/ if algorithm in ("adamw", "lion") /*%}*/
-    // TEST.COV.6.b: β₂ for both AdamW (variance EMA) AND Lion
-    // (momentum EMA). Without the Lion branch here, the shader's
-    // ``cfg.beta2`` reference at the Lion update site failed to
-    // compile with ``error[E30027]: 'beta2' is not a member of
-    // 'ParamConfig'``.
-    float beta2;
-/*{%*/ endif /*%}*/
-/*{%*/ if algorithm == "adamw" /*%}*/
-    float eps;
-/*{%*/ endif /*%}*/
+    float momentum;   // SGD+Momentum: μ; AdamW/Lion: β₁
+    float beta2;      // AdamW/Lion: β₂; SGD: unused
+    float eps;        // AdamW: ε; SGD/Lion: unused
+    float _pad;       // align to 32B (7 floats = 28B, pad to 32B)
 };
 
 struct PushConstants {
     uint n_params;
-    uint _pad0; uint _pad1; uint _pad2;  // align ParamConfig to 16B
+    uint algorithm;   // M8: runtime algorithm selector (see ALG_* below)
+    uint _pad0;
+    uint _pad1;
     ParamConfig cfg[/*{{*/ batch_size /*}}7*/];
 };
 [[vk::push_constant]] PushConstants pc;
 
-// All buffer bindings live in this ParameterBlock.  Field order is the
-// canonical binding order; the dispatch caller passes tensors in the
-// same order.  No `[[vk::binding(N)]]` literals appear anywhere in this
-// template.
-/*{%*/ if parameter_array /*%}*/
-// N+1.5.b — array-of-structs path. slangc emits one binding per
-// buffer family with ``descriptorCount=/*{{*/ batch_size /*}}7*/``.
-struct ParamSlot {
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> p;
-    StructuredBuffer</*{{*/ output_dtype /*}}float*/>   g;
-/*{%*/ if algorithm == "sgd_momentum" /*%}*/
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> m;
-/*{%*/ elif algorithm == "adamw" /*%}*/
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> m;
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> v;
-/*{%*/ elif algorithm == "lion" /*%}*/
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> m;
-/*{%*/ endif /*%}*/
-};
-struct KernelArgs {
-    ParamSlot params[/*{{*/ batch_size /*}}7*/];
-};
-/*{%*/ else /*%}*/
-// Round-3 / N+1.10 flat layout — one binding per buffer
+// M8: All buffer bindings live in this ParameterBlock.
+// Unlike the old Jinja-conditional layout, ALL buffers are always
+// declared — the shader gates reads/writes at runtime.
+// Field order is the canonical binding order; the dispatch caller
+// passes tensors in the same order.  No `[[vk::binding(N)]]` literals
+// appear anywhere in this template.
+// N+1.10 flat layout — one binding per buffer
 // (descriptorCount=1), per-param dynamic dispatch via switch cascade.
+// NOTE: N+1.5.b array-of-structs was removed because Vulkan spec
+// requires array indices to be dynamically uniform; `param_idx` from
+// SV_GroupID.y is NOT uniform across the grid and the driver would
+// need to broadcast. The round-3 switch cascade is the portable path.
 struct KernelArgs {
 /*{%*/ for i in range(batch_size) /*%}*/
     RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> param/*{{*/ i /*}}0*/;
     StructuredBuffer</*{{*/ output_dtype /*}}float*/>   grad/*{{*/ i /*}}0*/;
-/*{%*/ endfor /*%}*/
-/*{%*/ if algorithm == "sgd_momentum" /*%}*/
-/*{%*/ for i in range(batch_size) /*%}*/
     RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> momentum/*{{*/ i /*}}0*/;
-/*{%*/ endfor /*%}*/
-/*{%*/ elif algorithm == "adamw" /*%}*/
-/*{%*/ for i in range(batch_size) /*%}*/
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> m/*{{*/ i /*}}0*/;
-/*{%*/ endfor /*%}*/
-/*{%*/ for i in range(batch_size) /*%}*/
     RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> v/*{{*/ i /*}}0*/;
 /*{%*/ endfor /*%}*/
-/*{%*/ elif algorithm == "lion" /*%}*/
-/*{%*/ for i in range(batch_size) /*%}*/
-    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> momentum/*{{*/ i /*}}0*/;
-/*{%*/ endfor /*%}*/
-/*{%*/ endif /*%}*/
 };
-/*{%*/ endif /*%}*/
 // M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
+
+// M8: Algorithm selector constants (must match Python-side enum).
+#define ALG_SGD            0u
+#define ALG_SGD_MOMENTUM   1u
+#define ALG_ADAMW          2u
+#define ALG_LION           3u
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -131,11 +94,6 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     uint elem = gid.x * 256u + lid.x;
     if (elem >= cfg.numel) return;
 
-/*{%*/ if parameter_array /*%}*/
-    // N+1.5.b — direct array indexing, no switch cascade.
-    float p = (float)args.params[param_idx].p[elem];
-    float g = (float)args.params[param_idx].g[elem];
-/*{%*/ else /*%}*/
     float p, g;
     switch (param_idx) {
 /*{%*/ for i in range(batch_size) /*%}*/
@@ -143,114 +101,88 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
 /*{%*/ endfor /*%}*/
         default: return;
     }
-/*{%*/ endif /*%}*/
 
-/*{%*/ if algorithm in ("sgd", "sgd_momentum") /*%}*/
-    // Weight decay (L2 regularization for SGD variants only).
-    // AdamW/Lion use decoupled weight decay in their update formulas below.
-    if (cfg.weight_decay != 0.0f) {
-        g += cfg.weight_decay * p;
-    }
-/*{%*/ endif /*%}*/
-
-/*{%*/ if algorithm == "sgd" /*%}*/
-    // SGD: p = p - lr * g
-    float p_new = p - cfg.lr * g;
-
-/*{%*/ elif algorithm == "sgd_momentum" /*%}*/
-    // SGD + Momentum: buf = μ * buf + g;  p = p - lr * buf
-/*{%*/ if parameter_array /*%}*/
-    float buf = (float)args.params[param_idx].m[elem];
-    buf = cfg.momentum * buf + g;
-    float p_new = p - cfg.lr * buf;
-    args.params[param_idx].m[elem] = (/*{{*/ output_dtype /*}}float*/)buf;
-/*{%*/ else /*%}*/
-    float buf;
+    // M8: Load momentum/variance buffers unconditionally — the algorithm
+    // selector below gates whether they are used.  This matches M-SF.4.
+    float m_val = 0.0f;
+    float v_val = 0.0f;
     switch (param_idx) {
 /*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: buf = (float)args.momentum/*{{*/ i /*}}0*/[elem]; break;
+        case /*{{*/ i /*}}0*/: m_val = (float)args.momentum/*{{*/ i /*}}0*/[elem]; v_val = (float)args.v/*{{*/ i /*}}0*/[elem]; break;
 /*{%*/ endfor /*%}*/
-        default: buf = 0.0f;
+        default: break;
     }
-    buf = cfg.momentum * buf + g;
-    float p_new = p - cfg.lr * buf;
-    switch (param_idx) {
-/*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: args.momentum/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)buf; break;
-/*{%*/ endfor /*%}*/
-    }
-/*{%*/ endif /*%}*/
 
-/*{%*/ elif algorithm == "adamw" /*%}*/
-    // AdamW: m = β₁*m + (1-β₁)*g;  v = β₂*v + (1-β₂)*g²
-    //        p = p - lr * (m_hat / (√v_hat + ε) + wd * p)
-/*{%*/ if parameter_array /*%}*/
-    float m_val = (float)args.params[param_idx].m[elem];
-    float v_val = (float)args.params[param_idx].v[elem];
-    m_val = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
-    v_val = cfg.beta2 * v_val + (1.0f - cfg.beta2) * g * g;
-    float p_new = p - cfg.lr * (m_val / (sqrt(v_val) + cfg.eps) + cfg.weight_decay * p);
-    args.params[param_idx].m[elem] = (/*{{*/ output_dtype /*}}float*/)m_val;
-    args.params[param_idx].v[elem] = (/*{{*/ output_dtype /*}}float*/)v_val;
-/*{%*/ else /*%}*/
-    float m_val, v_val;
-    switch (param_idx) {
-/*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: m_val = (float)args.m/*{{*/ i /*}}0*/[elem]; v_val = (float)args.v/*{{*/ i /*}}0*/[elem]; break;
-/*{%*/ endfor /*%}*/
-        default: m_val = 0.0f; v_val = 0.0f;
+    // M8: Runtime algorithm dispatch via push-constant selector.
+    // This replaces the old per-algorithm Jinja branches.
+    float p_new;
+    switch (pc.algorithm) {
+        case ALG_SGD: {
+            // SGD: p = p - lr * g  (no weight decay in pure SGD)
+            p_new = p - cfg.lr * g;
+            break;
+        }
+        case ALG_SGD_MOMENTUM: {
+            // SGD+Momentum: buf = μ * buf + g;  p = p - lr * buf
+            float buf = cfg.momentum * m_val + g;
+            p_new = p - cfg.lr * buf;
+            m_val = buf;  // write back momentum
+            break;
+        }
+        case ALG_ADAMW: {
+            // AdamW: m = β₁*m + (1-β₁)*g;  v = β₂*v + (1-β₂)*g²
+            //        p = p - lr * (m_hat / (√v_hat + ε) + wd * p)
+            m_val = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
+            v_val = cfg.beta2 * v_val + (1.0f - cfg.beta2) * g * g;
+            p_new = p - cfg.lr * (m_val / (sqrt(v_val) + cfg.eps) + cfg.weight_decay * p);
+            break;
+        }
+        case ALG_LION: {
+            // Lion: update = β₁ * m + (1-β₁) * g
+            //       p = p - lr * sign(β₁ * m + (1-β₁) * g)
+            //       m = β₂ * m + (1-β₂) * g
+            float update = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
+            m_val = cfg.beta2 * m_val + (1.0f - cfg.beta2) * g;
+            p_new = p - (update > 0.0f ? cfg.lr : -cfg.lr);
+            break;
+        }
+        default: {
+            // Fallback: plain SGD if algorithm selector is invalid
+            p_new = p - cfg.lr * g;
+            break;
+        }
     }
-    m_val = cfg.momentum * m_val + (1.0f - cfg.momentum) * g;
-    v_val = cfg.beta2 * v_val + (1.0f - cfg.beta2) * g * g;
-    float p_new = p - cfg.lr * (m_val / (sqrt(v_val) + cfg.eps) + cfg.weight_decay * p);
-    switch (param_idx) {
-/*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: args.m/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)m_val; args.v/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)v_val; break;
-/*{%*/ endfor /*%}*/
-    }
-/*{%*/ endif /*%}*/
-
-/*{%*/ elif algorithm == "lion" /*%}*/
-    // Lion: update = β₁ * momentum + (1-β₁) * g;  (sign(update))
-    //        p = p - lr * sign(β₁ * momentum + (1-β₁) * g)
-    //        momentum = β₂ * momentum + (1-β₂) * g
-/*{%*/ if parameter_array /*%}*/
-    float buf = (float)args.params[param_idx].m[elem];
-    float update = cfg.momentum * buf + (1.0f - cfg.momentum) * g;
-    float step = (update > 0.0f) ? cfg.lr : -cfg.lr;
-    float p_new = p - step;
-    // Lion β₂ for momentum decay
-    buf = cfg.beta2 * buf + (1.0f - cfg.beta2) * g;
-    args.params[param_idx].m[elem] = (/*{{*/ output_dtype /*}}float*/)buf;
-/*{%*/ else /*%}*/
-    float buf;
-    switch (param_idx) {
-/*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: buf = (float)args.momentum/*{{*/ i /*}}0*/[elem]; break;
-/*{%*/ endfor /*%}*/
-        default: buf = 0.0f;
-    }
-    float update = cfg.momentum * buf + (1.0f - cfg.momentum) * g;
-    float step = (update > 0.0f) ? cfg.lr : -cfg.lr;
-    float p_new = p - step;
-    // Lion β₂ for momentum decay
-    buf = cfg.beta2 * buf + (1.0f - cfg.beta2) * g;
-    switch (param_idx) {
-/*{%*/ for i in range(batch_size) /*%}*/
-        case /*{{*/ i /*}}0*/: args.momentum/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)buf; break;
-/*{%*/ endfor /*%}*/
-    }
-/*{%*/ endif /*%}*/
-
-/*{%*/ endif /*%}*/
 
 /*{%*/ if parameter_array /*%}*/
     args.params[param_idx].p[elem] = (/*{{*/ output_dtype /*}}float*/)p_new;
+    // M8: Write back momentum/variance only when algorithm uses them.
+    // The runtime check avoids unnecessary memory writes for SGD.
+    if (pc.algorithm == ALG_SGD_MOMENTUM || pc.algorithm == ALG_ADAMW || pc.algorithm == ALG_LION) {
+        args.params[param_idx].m[elem] = (/*{{*/ output_dtype /*}}float*/)m_val;
+    }
+    if (pc.algorithm == ALG_ADAMW) {
+        args.params[param_idx].v[elem] = (/*{{*/ output_dtype /*}}float*/)v_val;
+    }
 /*{%*/ else /*%}*/
     switch (param_idx) {
 /*{%*/ for i in range(batch_size) /*%}*/
         case /*{{*/ i /*}}0*/: args.param/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)p_new; break;
 /*{%*/ endfor /*%}*/
+    }
+    // M8: Write back momentum/variance only when algorithm uses them.
+    if (pc.algorithm == ALG_SGD_MOMENTUM || pc.algorithm == ALG_ADAMW || pc.algorithm == ALG_LION) {
+        switch (param_idx) {
+/*{%*/ for i in range(batch_size) /*%}*/
+            case /*{{*/ i /*}}0*/: args.momentum/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)m_val; break;
+/*{%*/ endfor /*%}*/
+        }
+    }
+    if (pc.algorithm == ALG_ADAMW) {
+        switch (param_idx) {
+/*{%*/ for i in range(batch_size) /*%}*/
+            case /*{{*/ i /*}}0*/: args.v/*{{*/ i /*}}0*/[elem] = (/*{{*/ output_dtype /*}}float*/)v_val; break;
+/*{%*/ endfor /*%}*/
+        }
     }
 /*{%*/ endif /*%}*/
 }

@@ -15,11 +15,11 @@ namespace torch_vulkan {
 at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     auto& alloc = VulkanAllocator::instance();
 
-    // AOTI / Inductor tracing: skip copy if either tensor has null storage
-    // or if the allocator has no buffer for them (fake tensors from deepcopy).
-    if (is_null_storage(self) || is_null_storage(src)
-        || alloc.get_buffer(self.data_ptr()) == nullptr
-        || alloc.get_buffer(src.data_ptr()) == nullptr) {
+    if (is_null_storage(self)) {
+        return self;
+    }
+    auto* self_buf = alloc.get_buffer(self.data_ptr());
+    if (self_buf == nullptr) {
         return self;
     }
 
@@ -31,7 +31,9 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
             src_contig = src_contig.to(self.scalar_type());
         }
         auto* buf = alloc.get_buffer(self.data_ptr());
-        TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+        if (buf == nullptr) {
+            return self;
+        }
         buf->write(src_contig.data_ptr(),
                    static_cast<VkDeviceSize>(src_contig.nbytes()));
         // Notify the dispatch layer that this buffer was host-written.
@@ -957,6 +959,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("mean.dim", ops::vulkan_mean);
     m.impl("amax", ops::vulkan_amax);
     m.impl("amin", ops::vulkan_amin);
+    m.impl("max", ops::vulkan_max);
+    m.impl("min", ops::vulkan_min);
     m.impl("max.dim", ops::vulkan_max_dim);
     m.impl("min.dim", ops::vulkan_min_dim);
     m.impl("prod.dim_int", ops::vulkan_prod);

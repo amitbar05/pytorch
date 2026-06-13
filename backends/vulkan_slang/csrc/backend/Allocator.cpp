@@ -29,7 +29,7 @@ std::unique_ptr<vulkan::VulkanBuffer> VulkanAllocator::try_get_cached(VkDeviceSi
         it->second.pop_back();
         if (it->second.empty()) pool_.erase(it);
         cached_bytes_ -= size_class;
-        return buffer;
+            return buffer;
     }
     return nullptr;
 }
@@ -83,20 +83,25 @@ c10::DataPtr VulkanAllocator::allocate(
     // Buffers in pool_ are guaranteed safe to reuse.
 
     if (!buffer) {
-        // M22.9-followup: pull the device-specific VMA allocator. The
-        // existing ``Context::allocator(uint32_t)`` overload (line ~469
-        // of Context.cpp) already supports per-device selection — we
-        // just need to pass the index instead of taking the default.
         buffer = std::make_unique<vulkan::VulkanBuffer>(
             ctx.allocator(static_cast<uint32_t>(device_idx)),
             alloc_size,
             vulkan::BufferType::HostVisible);
     }
-    // Vulkan spec §7.1.2: host writes require a HOST→COMPUTE pipeline
-    // barrier before any GPU dispatch reads the data — even after
-    // vmaFlushAllocation. Without notify_host_write(), the first
-    // dispatch (e.g. fill_ on a torch.zeros/ones tensor) reads stale
-    // pre-init GPU memory, causing silent data corruption.
+
+    // M23.1: zero-initialize ALL buffers before returning them, whether
+    // freshly allocated or recycled from the pool.  Cached buffers retain
+    // stale writes from their previous use; without explicit memset the
+    // next consumer sees garbage (NaN in atomic accumulators, etc.).
+    if (buffer->size() > 0) {
+        void* ptr = buffer->map();
+        std::memset(ptr, 0, static_cast<size_t>(buffer->size()));
+        vmaFlushAllocation(
+            ctx.allocator(static_cast<uint32_t>(device_idx)),
+            buffer->allocation(), 0, buffer->size());
+        buffer->unmap();
+    }
+
     ops::notify_host_write(buffer->buffer());
 
     // Use an opaque ID as the "data pointer"

@@ -38,7 +38,11 @@ def get_sources():
     for d in src_dirs:
         dir_path = root / d
         if dir_path.exists():
-            sources.extend(str(p.relative_to(root)) for p in dir_path.glob("*.cpp"))
+            sources.extend(
+                str(p.relative_to(root))
+                for p in dir_path.glob("*.cpp")
+                if p.name != "aoti_shims.cpp"  # linked via extra_objects below
+            )
     sources.append("csrc/init.cpp")
     # M16.4: build-time validation — model_ops.cpp must not exist.
     _validate_no_model_ops(root)
@@ -117,6 +121,7 @@ setup(
                 ("VMA_DYNAMIC_VULKAN_FUNCTIONS", "1"),
             ],
             extra_compile_args=["-std=c++17"],
+            extra_objects=[str(root_dir / "csrc" / "backend" / "aoti_shims.o")],
         ),
     ],
     cmdclass={"build_ext": ShaderBuildExtension},
