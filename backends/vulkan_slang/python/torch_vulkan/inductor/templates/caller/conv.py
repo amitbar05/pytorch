@@ -539,18 +539,18 @@ def _slang_tile_conv2d_bwd(
         input_f32 = input_t.float().contiguous()
         weight_f32 = weight_t.float().contiguous()
         grad_out_f32 = grad_out.float().contiguous()
-        gi_f32 = torch.empty_like(grad_input, dtype=torch.float32)
-        gw_f32 = torch.empty_like(grad_weight, dtype=torch.float32)
+        gi_f32 = torch.empty_like(grad_input, dtype=torch.float32).zero_()
+        gw_f32 = torch.empty_like(grad_weight, dtype=torch.float32).zero_()
         if has_bias := (grad_bias is not None):
-            gb_f32 = torch.empty_like(grad_bias, dtype=torch.float32)
+            gb_f32 = torch.empty_like(grad_bias, dtype=torch.float32).zero_()
         else:
             gb_f32 = None
     else:
         input_f32 = input_t
         weight_f32 = weight_t
         grad_out_f32 = grad_out
-        gi_f32 = grad_input
-        gw_f32 = grad_weight
+        gi_f32 = grad_input.zero_()
+        gw_f32 = grad_weight.zero_()
         gb_f32 = grad_bias
         has_bias = grad_bias is not None
 
