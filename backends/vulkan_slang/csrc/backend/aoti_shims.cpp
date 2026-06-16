@@ -64,6 +64,45 @@ int aoti_torch_vulkan_mm_out(
 
 extern "C" {
 
+// Forward declaration
+int aoti_torch_empty_strided_vulkan(
+    int64_t ndim, const int64_t* sizes, const int64_t* strides,
+    int32_t dtype, int32_t device_idx, void** out_handle);
+
+// Standard AOTI allocator signature (7 args with device_type).
+// Upstream AOTI runtime calls this instead of the _vulkan variant.
+// We forward to aoti_torch_empty_strided_vulkan ignoring device_type.
+int aoti_torch_empty_strided(
+    int64_t ndim,
+    const int64_t* sizes,
+    const int64_t* strides,
+    int32_t dtype,
+    int32_t device_type,
+    int32_t device_idx,
+    void** out_handle) {
+  // device_type: 0=CPU, 1=CUDA, ...; PrivateUse1 is device_type >= some value.
+  // For non-Vulkan device types, fall through to CPU allocation.
+  // The Vulkan-specific path is aoti_torch_empty_strided_vulkan.
+  if (device_type != 0) {
+    // Unknown device type — delegate to Vulkan path as catch-all for now
+    return aoti_torch_empty_strided_vulkan(ndim, sizes, strides, dtype, device_idx, out_handle);
+  }
+  // CPU allocation
+  try {
+    auto size = at::IntArrayRef(sizes, static_cast<int64_t>(ndim));
+    auto stride = at::IntArrayRef(strides, static_cast<int64_t>(ndim));
+    auto options = at::TensorOptions()
+        .device(at::kCPU)
+        .dtype(static_cast<at::ScalarType>(dtype));
+    auto tensor = at::empty_strided(size, stride, options);
+    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    return 0;
+  } catch (...) {
+    if (out_handle) *out_handle = nullptr;
+    return 1;
+  }
+}
+
 // The AOTI C++ wrapper calls this with the upstream-style 6-arg signature:
 //   (ndim, sizes, strides, dtype, device_idx, &out_handle)
 // Do NOT add size_len/stride_len — the wrapper already passes ndim as
