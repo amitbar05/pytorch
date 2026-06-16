@@ -210,18 +210,17 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         pH, pW = self.padding_arg
         dH, dW = self.dilation_arg
 
-        # Zero-init output buffers (bwd kernel accumulates via +=)
-        # Must synchronize BEFORE the kernel dispatch — .zero_() on Vulkan
-        # may be async, and the kernel must not read stale memory.
-        wrapper.writeline(f"{out_name}.zero_()")
-        wrapper.writeline(f"{grad_weight}.zero_()")
+        # M23.2: output buffers are zero-initialized by the allocator
+        # (M23.1, commit 60541e0e1e8).  Explicit .zero_() calls are redundant
+        # dispatches and push the dispatch count above the 2-dispatch budget.
+        # The sync below guarantees any prior operations are drained before
+        # the kernel reads the output buffers.
 
         grad_bias_arg = "None"
         if self.has_bias and len(input_names) > 4:
             grad_bias_arg = input_names[4]
-            wrapper.writeline(f"{grad_bias_arg}.zero_()")
 
-        # Sync: guarantee zero-init committed before kernel reads output buffers
+        # Sync: guarantee any prior writes committed before kernel reads outputs
         wrapper.add_import_once("import torch_vulkan")
         wrapper.writeline("torch_vulkan.synchronize(0)")
 

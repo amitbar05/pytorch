@@ -628,12 +628,27 @@ def _register_pool_backward() -> None:
         # generates incorrect SPIR-V on Vulkan.
         from .lowerings.pool import avg_pool2d_backward_codegen
 
-        result = avg_pool2d_backward_codegen(
-            grad_output, x, kernel_size, stride, padding, ceil_mode,
-            count_include_pad, divisor_override,
-        )
-        if result is not None:
-            return result
+        # M23.2-spinoff: when the forward output is a DonatedBuffer (e.g.,
+        # conv2d output reused as pool input), the ops.mul/reshape/expand
+        # chain inside avg_pool2d_backward_codegen produces OpsValue nodes
+        # that the lowering framework can't wrap into top-level IR.
+        # Route directly to the scatter_bwd fallback which handles donated
+        # buffers correctly via FallbackKernel.
+        from torch._inductor.ir import StorageBox, DonatedBuffer, TensorBox
+        _x_is_donated = False
+        if isinstance(x, TensorBox):
+            inner = x.data
+            if isinstance(inner, StorageBox):
+                if isinstance(inner.data, DonatedBuffer):
+                    _x_is_donated = True
+
+        if not _x_is_donated:
+            result = avg_pool2d_backward_codegen(
+                grad_output, x, kernel_size, stride, padding, ceil_mode,
+                count_include_pad, divisor_override,
+            )
+            if result is not None:
+                return result
 
         # CODEGEN.2 (overlapping): use scatter_add via custom op.
         # This avoids the old FallbackKernel eager Vulkan path and routes

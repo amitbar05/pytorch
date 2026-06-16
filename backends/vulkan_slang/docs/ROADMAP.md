@@ -195,7 +195,14 @@ driven, Pillar goal). Cache the winner.
 #### E1 — Eliminate the 2 pooling-bwd `make_fallback`s ⛔
 Replace `max_pool2d_scatter_bwd` / `avg_pool2d_scatter_bwd` with Slang
 `scatter_atomic` codegen, or ratify with an upstream-reason comment.
-- **Files**: `lowerings/__init__.py:477,481`, `templates/scatter_atomic.slang`
+- **Sub-item E1.1 (M23.2-spinoff)**: Fixed avg_pool2d_backward `DonatedBuffer`→
+  `OpsValue` crash when conv output is reused as pool input. The codegen path
+  (`avg_pool2d_backward_codegen`) built `ops.mul/reshape/expand` chains that
+  produced bare `OpsValue` nodes the lowering framework can't wrap when the
+  input is a DonatedBuffer. Fix: detect DonatedBuffer and route through the
+  scatter_bwd fallback instead (`bwd_lowerings.py:631-651`). Verified:
+  `test_avg_pool2d_backward_grad_parity` now PASSES on GPU.
+- **Files**: `lowerings/__init__.py:477,481`, `templates/scatter_atomic.slang`, `bwd_lowerings.py:616-651`
 
 #### E2 — Masking backward set for attention/padding ⛔
 Add `[BackwardDerivative]` + `bwd_diff_table` entries for `tril`/`triu`/
