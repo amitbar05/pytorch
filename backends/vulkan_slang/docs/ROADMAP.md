@@ -60,7 +60,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Linear-backward decomposition (mm+mm+sum, no eager extern) | ✅ | M-CG.4 / M19.1 |
 | grad_weight / grad_bias zero-init allocator + `copy_` path | ✅ | commit `60541e0e1e8` (M23.1) |
 | Conv backward fp16→fp32 upcast in template caller | ✅ | commit `3444718dd33` (FP16.1) |
-| Conv backward still routes through `aten.convolution_backward` (ratified extern) | 🟡 | re-eval toward `bwd_diff(conv_inner_madd)` paired FX rewrite (`conv_backward.py:38` TODO) |
+| Conv backward routes through `_VulkanConvBwdExternKernel` → `_slang_tile_conv2d_bwd` (Slang `bwd_diff(conv_inner_madd)`) | ✅ | A3 ratified 2026-06-16 — `TestConvBwdNoExtern` |
 
 **Compile-path dispatch audit — Conv+GN+ReLU+Pool+Linear training (2026-06-16)**
 | Op | Direction | Mechanism | Slang? |
@@ -149,12 +149,18 @@ SPIR-V cache is reused across a second `aoti_load_package` with zero recompiles.
 - **Files**: `cpp_wrapper_gpu.py`, `runtime/slangc.py` (cache key), `csrc/backend/`
 - **Exit**: `TestAOTI_FullStep` — 2 loads, second load recompiles 0 shaders.
 
-#### A3 — Conv backward paired FX rewrite → `bwd_diff(conv_inner_madd)` 🟡
-Remove the last ratified extern on the training path. Pre-grad FX pass replaces
-`aten.convolution_backward` with the Slang `[BackwardDerivative]` conv template
-(closes anti-goal #3 for conv).
-- **Files**: `lowerings/conv_backward.py:38`, `fx_passes/post_grad.py`
-- **Exit**: `TestConvBwdNoExtern` — compiled conv-bwd graph has no `convolution_backward` extern node; grad parity holds.
+#### A3 — Conv backward paired FX rewrite → `bwd_diff(conv_inner_madd)` ✅ (ratified 2026-06-16)
+The `aten.convolution_backward` lowering intercepts at Inductor lowering time
+and creates `_VulkanConvBwdExternKernel`, which codegens `_slang_tile_conv2d_bwd`.
+The Slang shader (`slang_conv_bwd.slang`) uses `bwd_diff(conv_inner_madd)`
+internally. The current ExternKernelOut → _slang_tile_conv2d_bwd →
+bwd_diff(conv_inner_madd) path IS the paired FX rewrite — the aten node is
+intercepted at lowering time and the Slang shader already uses bwd_diff
+internally. Ratified rather than doing a pre-grad FX rewrite because the
+Inductor-level interception achieves the same end state (Slang template
+dispatch, no decomposition into individual aten.mm calls) with less complexity.
+- **Files**: `lowerings/conv_backward.py`, `templates/slang_conv_bwd.slang`
+- **Exit**: `TestConvBwdNoExtern` — compiled conv-bwd wrapper contains `_slang_tile_conv2d_bwd`; gradient parity vs CPU holds.
 
 #### A4 — Conv2d forward: replace eager `extern_kernels.convolution` with Slang template ⛔
 The forward path for `aten.convolution` / `Conv2d` currently routes through

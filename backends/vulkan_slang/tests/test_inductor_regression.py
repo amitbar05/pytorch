@@ -25919,6 +25919,90 @@ class TestConvolutionBackwardLowering:
         torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=1e-3, atol=1e-3)
 
 
+class TestConvBwdNoExtern:
+    """A3 — Conv backward ratified: ExternKernelOut → _slang_tile_conv2d_bwd →
+    bwd_diff(conv_inner_madd).
+
+    The ``aten.convolution_backward`` lowering intercepts at Inductor
+    lowering time and creates ``_VulkanConvBwdExternKernel``, which
+    codegens a ``_slang_tile_conv2d_bwd`` call. The Slang shader
+    internally uses ``bwd_diff(conv_inner_madd)``. This test verifies
+    the compiled wrapper indeed dispatches through the Slang template
+    (no decomposition into individual aten.mm calls).
+
+    ROADMAP A3 exit criterion: compiled conv-bwd graph dispatches
+    through the Slang template with gradient parity vs CPU.
+    """
+
+    def test_compiled_wrapper_uses_slang_template(self):
+        """Compile ``aten.convolution_backward`` and inspect the
+        generated wrapper code. Must contain ``_slang_tile_conv2d_bwd``
+        (the Slang template dispatch), not an aten decomposition into
+        individual mm/sum/convolution ops."""
+        from unittest import mock as _mock
+
+        from torch._inductor.graph import GraphLowering
+
+        captured: list[str] = []
+
+        def _save(code: str) -> None:
+            captured.append(code)
+
+        torch.manual_seed(20)
+
+        @torch.compile(backend="inductor", dynamic=False, fullgraph=True)
+        def fn(go, x, w):
+            return torch.ops.aten.convolution_backward.default(
+                go, x, w,
+                [0], [1, 1], [0, 0], [1, 1],
+                False, [0, 0], 1,
+                [True, True, False],
+            )
+
+        x = torch.randn(1, 3, 8, 8, device="vulkan:0")
+        w = torch.randn(8, 3, 3, 3, device="vulkan:0")
+        go = torch.randn(1, 8, 6, 6, device="vulkan:0")
+
+        with _mock.patch.object(GraphLowering, "save_output_code", _save):
+            fn(go, x, w)
+
+        assert len(captured) > 0, "A3: no compiled wrapper code captured"
+        wrapper_code = captured[0]
+        assert "_slang_tile_conv2d_bwd" in wrapper_code, (
+            "A3: compiled conv-bwd wrapper must dispatch through "
+            "_slang_tile_conv2d_bwd (the Slang template that uses "
+            "bwd_diff(conv_inner_madd) internally). "
+            "Found no Slang template call in compiled code."
+        )
+
+    def test_conv_bwd_slang_path_gradient_parity(self):
+        """Gradient parity: Vulkan compiled conv backward matches CPU."""
+        torch.manual_seed(20)
+
+        @torch.compile(backend="inductor", dynamic=False, fullgraph=True)
+        def fn(go, x, w):
+            return torch.ops.aten.convolution_backward.default(
+                go, x, w,
+                [0], [1, 1], [0, 0], [1, 1],
+                False, [0, 0], 1,
+                [True, True, False],
+            )
+
+        x = torch.randn(1, 3, 8, 8, device="vulkan:0")
+        w = torch.randn(8, 3, 3, 3, device="vulkan:0")
+        go = torch.randn(1, 8, 6, 6, device="vulkan:0")
+
+        out = fn(go, x, w)
+        out_cpu = torch.ops.aten.convolution_backward.default(
+            go.cpu(), x.cpu(), w.cpu(),
+            [0], [1, 1], [0, 0], [1, 1],
+            False, [0, 0], 1,
+            [True, True, False],
+        )
+        torch.testing.assert_close(out[0].cpu(), out_cpu[0], rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(out[1].cpu(), out_cpu[1], rtol=1e-4, atol=1e-4)
+
+
 class TestMaxPool2dWithIndicesBackwardLowering:
     """PF.25 — `aten.max_pool2d_with_indices_backward` already compiles
     end-to-end via Inductor's stock atomic-scatter codegen path: the

@@ -18,6 +18,8 @@ Checks performed (all O(n) in source length):
   7. **Push-constant budget** — struct size ≤ 128 bytes (Vulkan minimum).
   8. **BwdDiff annotation scan** — ``[Differentiable]``/``[BackwardDerivative]``
      pairing check.
+  9. **Spec-constant count** — number of ``[[vk::constant_id(N)]]`` declarations
+     in a single shader must be within valid range (M11).
 
 Usage (called before every ``slangc`` invocation)::
 
@@ -33,6 +35,7 @@ Environment knobs:
   ``TORCH_VULKAN_MAX_NUMTHREADS_PRODUCT=N`` — override limit (default 1024).
   ``TORCH_VULKAN_WAVE_SIZE=N`` — wave size for advisory (default 64).
   ``TORCH_VULKAN_MAX_PUSH_CONSTANT_BYTES=N`` — push-constant budget (default 128).
+  ``TORCH_VULKAN_MAX_SPEC_CONSTANTS=N`` — max spec-constant count (default 64).
 """
 
 from __future__ import annotations
@@ -40,9 +43,10 @@ from __future__ import annotations
 from ._config import _ENABLED, ValidationIssue
 from .bindings import _check_binding_contiguity
 from .braces import _check_brace_balance
-from .bwd_diff_scan import _check_differentiable_pairs
+from .bwd_diff_scan import _check_differentiable_pairs, validate_bwd_diff_signatures
 from .memory import _check_groupshared_budget, _check_numthreads_product
 from .push_constants import _check_push_constant_size
+from .spec_constants import _check_spec_constant_count
 from .symbols import _check_size_symbol_leaks
 from .workgroup import _validate_workgroup_size
 
@@ -74,4 +78,8 @@ def validate_slang_source(src: str) -> list[ValidationIssue]:
         issues.append(ValidationIssue("push_constant", msg))
     for msg in _check_differentiable_pairs(src):
         issues.append(ValidationIssue("bwd_diff", msg))
+    for msg in validate_bwd_diff_signatures(src):
+        issues.append(ValidationIssue("bwd_diff", msg))
+    for msg in _check_spec_constant_count(src):
+        issues.append(ValidationIssue("spec_constant", msg))
     return issues

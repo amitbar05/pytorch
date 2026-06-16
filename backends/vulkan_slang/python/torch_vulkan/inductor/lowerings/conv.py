@@ -431,6 +431,33 @@ def _register_conv_and_pool_lowerings() -> None:
         return ir.TensorBox.create(kernel)
 
     # ═════════════════════════════════════════════════════════════════════
+    # A4: Wire aten.convolution.default → _slang_tile_conv2d via
+    # _VulkanConv2dExternKernel.  Replaces the default
+    # extern_kernels.convolution path (→ eager C++ Vulkan) with the
+    # Slang template dispatch for groups==1, non-transposed, 4D input.
+    # For groups>1 or transposed conv, returns NotImplemented so the
+    # existing fallback paths handle them.
+    # ═════════════════════════════════════════════════════════════════════
+    @register_lowering(aten.convolution.default, type_promotion_kind=None)
+    def _vulkan_aten_convolution(
+        input, weight, bias, stride, padding, dilation,
+        transposed, output_padding, groups,
+    ):
+        if bool(transposed):
+            return NotImplemented
+        if int(groups) != 1:
+            return NotImplemented
+        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
+            return NotImplemented
+        if input.get_device().type != "vulkan":
+            return NotImplemented
+        # Delegate to the existing conv2d custom-op lowering which
+        # creates a _VulkanConv2dExternKernel → _slang_tile_conv2d.
+        return _vulkan_conv2d_with_optional_bias(
+            input, weight, bias, stride, padding, dilation, groups
+        )
+
+    # ═════════════════════════════════════════════════════════════════════
     # M6 Phase 1 — Conv1d compile-path lowering via reshape to Conv2d.
     #
     # Conv1d is lowered by reshaping the 3-D tensors to 4-D (adding a
