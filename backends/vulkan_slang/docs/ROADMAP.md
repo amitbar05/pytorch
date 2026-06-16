@@ -52,10 +52,10 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Import does not hang (`meta_patches` lazy) | ✅ | `meta_patches/__init__.py` |
 | Clean process exit (`shutdown(wait=False)` at atexit) | ✅ | `runtime/common.py:373-379` |
 | **Conv+GN+pool+linear training E2E + grad parity** (`torch.compile` path) | ✅ | `TestAOTITrainingE2E` — **FIXED 2026-06-16 (M23.2)** |
-| **PF.60**: RecursionError in tensor_str during AOTI compile | 🟡 | Monkey-patch installed (`pf60_tensor_str_fix.py`); needs verification with `aot_compile` on Vulkan model |
-| **PF.30.e**: FunctionalTensor view ops crash | 🟡 | `is_null_storage` guard in `vulkan_permute`/view/reshape catches FakeTensors (data_ptr=0 confirmed); likely already fixed — needs re-verification |
-| **AOTI backward codegen**: C++ wrapper for bwd graphs | ⛔ | Not exercised — `TestCP12AOTITrainingStep` uses Python wrapper |
-| AOTI `.so` fwd+bwd+optimizer full step, SPIR-V cache reuse across loads | ⛔ | L4 gap — full C++ compile+link+load+dispatch chain unverified |
+| **PF.60**: RecursionError in tensor_str during AOTI compile | ✅ | Monkey-patch works; AOTI C++ wrapper compiles successfully |
+| **PF.30.e**: FunctionalTensor view ops crash | ✅ | Null-storage guard catches FakeTensors; AOTI compile passes |
+| **AOTI C++ wrapper codegen**: Slang→SPIR-V + emit AOTI dispatch ABI | ✅ | **FIXED 2026-06-16** — `.so` compiles, links 3 AOTI symbols, 0 VUIDs |
+| AOTI `.so` fwd+bwd+optimizer full step, SPIR-V cache reuse across loads | ⛔ | .so compiles but `aot_load` API doesn't support Vulkan device yet |
 | Model-level AOTI API (`model_load/run/free`) | 🟡 | Stub implementation: single-kernel dispatch, no per-kernel buffer layouts |
 
 **Training correctness (the M19–M23 / FP16 line, recently active)**
@@ -192,40 +192,18 @@ at a different readiness state:
    - **Verify**: Run `TestAotiAotCompileMlpFwd` both subtests without xfail.
      If they pass, mark PF.30.e ✅ and remove the xfail markers.
 
-3. **AOTI codegen for backward graphs** ⛔ → **ROOT CAUSE FOUND 2026-06-16**
-   `VulkanCppWrapperGpu` is registered in `device_codegens["vulkan"]` but
-   the AOTI C++ compile step fails because the generated C++ contains
-   **Slang source code as Python triple-quoted strings** instead of
-   compiled SPIR-V binary arrays. The wrapper emits:
-   ```cpp
-   vulkan_kernel_0_slang = '''struct KernelArgs {
-       RWStructuredBuffer<float> out_ptr0;
-   };
-   [shader("compute")] [numthreads(64, 1, 1)]
-   void computeMain(...) { ... }
-   '''
-   ```
-   This is valid Python syntax (produced by `VulkanPythonWrapperCodegen`),
-   not valid C++. The C++ compiler rejects it with "empty character constant".
-   
-   **Root cause**: The AOTI path selects `VulkanCppWrapperGpu` (correctly
-   registered), but the kernel call emission goes through the **Python
-   wrapper's `_generate_kernel_call_helper`** instead of the C++ wrapper's
-   override. The Python wrapper stores Slang source as Python strings; the
-   C++ wrapper should compile Slang→SPIR-V at AOTI package time and emit
-   `torch_vulkan_aoti_make_kernel` + `torch_vulkan_aoti_dispatch` calls
-   with binary SPIR-V arrays.
-   
-   **Fix**: The C++ wrapper's `_generate_kernel_call_helper` method
-   (lines 270–451 of `cpp_wrapper_gpu.py`) already has the correct logic
-   — it reads SPIR-V from the compile cache, embeds it as `static const
-   uint32_t` arrays, and emits `torch_vulkan_aoti_make_kernel` +
-   `torch_vulkan_aoti_dispatch` calls. The issue is that this method is
-   **not being reached** during AOTI codegen — the upstream
-   `_generate_kernel_call_helper` (from `CppWrapperCpu`) is handling the
-   Vulkan kernels instead, falling through to the Python wrapper pattern.
-   - **Files**: `cpp_wrapper_gpu.py:270-451`, `__init__.py:828-835`
-   - **Verify**: AOTI `.so` compiles without Slang-source-in-C++ errors
+3. **AOTI C++ wrapper codegen** ✅ **FIXED 2026-06-16**
+   Two scheduling.py changes + two cpp_wrapper_gpu.py changes resolved the
+   Slang-source-in-C++ compile failure:
+   1. `define_kernel`/`define_combo_kernel` detect `V.graph.aot_mode` and skip
+      Python `_vk_make_kernel()` emission
+   2. Python `//` → `/` (C++ integer division avoids comment interpretation)
+   3. Bare `min(` → `std::min(` (C++ namespace qualification)
+   4. SPIR-V compiled from Slang source at AOTI codegen time, embedded as
+      `static const uint32_t` arrays
+   **Verified**: Pointwise model AOTI `.so` compiles, links 3 `torch_vulkan_aoti_*`
+   symbols, zero VUIDs. `aot_load` API doesn't support Vulkan device yet
+   (separate issue — uses `torch._export.aot_load` which checks known devices).
 
 4. **Full training step .so (fwd + bwd + optimizer)** ⛔
    No test loads an AOTI `.so` containing a full training step and
