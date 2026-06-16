@@ -424,8 +424,14 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         pc_args = call_args[n_args - 3 - n_pc : n_args - 3] if n_pc > 0 else []
 
         # ── Emit tensor handle array ──
+        # AOTI-FIX: RAIIAtenTensorHandle wraps AtenTensorHandle (=at::Tensor*).
+        # Cast to the underlying handle first, then to void*.  Using &arg
+        # gets the RAII wrapper address, not the tensor pointer.
         n_tensors = len(buffer_args)
-        buf_list = ", ".join(f"reinterpret_cast<void*>(&{arg})" for arg in buffer_args)
+        buf_list = ", ".join(
+            f"reinterpret_cast<void*>(static_cast<AtenTensorHandle>({arg}))"
+            for arg in buffer_args
+        )
         tensor_array_line = f"void* _tensor_handles_{kernel_name}[] = {{ {buf_list} }};"
         self.writeline(tensor_array_line)
 
