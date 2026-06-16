@@ -244,6 +244,8 @@ int torch_vulkan_aoti_dispatch(
             num_outputs);
         return 0;
     } catch (const std::exception& e) {
+        fprintf(stderr, "AOTI_DISPATCH ERROR: %s\n", e.what());
+        fflush(stderr);
         set_last_error(std::string("torch_vulkan_aoti_dispatch: ") + e.what());
         return 5;
     } catch (...) {

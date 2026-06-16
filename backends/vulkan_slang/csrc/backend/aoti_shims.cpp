@@ -95,7 +95,7 @@ int aoti_torch_empty_strided(
         .device(at::kCPU)
         .dtype(static_cast<at::ScalarType>(dtype));
     auto tensor = at::empty_strided(size, stride, options);
-    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(tensor)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;
@@ -122,7 +122,7 @@ int aoti_torch_empty_strided_vulkan(
         .dtype(static_cast<at::ScalarType>(dtype));
     auto tensor = at::empty_strided(size, stride, options);
 
-    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(tensor)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;
