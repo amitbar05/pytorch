@@ -239,6 +239,21 @@ Pipeline* PipelineCache::get_or_create(
     uint32_t push_constant_size,
     const std::vector<Pipeline::SpecConstant>& spec_constants) {
 
+    // Key-only lookup: when no SPIR-V is provided (dispatch_shader path),
+    // only look up by key — don't hash null SPIR-V or try to create a
+    // pipeline with zero-size code (triggers VUID-codeSize-01085).
+    if (spirv_code == nullptr || spirv_size == 0) {
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            return it->second.pipeline.get();
+        }
+        throw std::runtime_error(
+            "PipelineCache: key '" + key + "' not found in cache. "
+            "Key-only lookups require a prior make_kernel call to populate "
+            "the cache with compiled SPIR-V."
+        );
+    }
+
     // M-pipeline-4: compute the SPIR-V hash up-front so the fast path
     // can verify (key → entry) actually matches the requested kernel.
     // `spirv_size` is the byte count; the FNV-1a helper takes word
