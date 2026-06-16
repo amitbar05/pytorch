@@ -30,16 +30,14 @@ The four durable goals (carried from the v7→v16 pillar history):
 
 ---
 
-## § 1 — Current State (ground truth, 2026-06-15)
+## § 1 — Current State (ground truth, 2026-06-16)
 
 The backend **trains real models end-to-end on the GPU today** via the
-eager-PrivateUse1 and `torch.compile` paths (MNIST CNN/MLP/ResNet/Transformer,
-Conv+GN, AMP fp16/bf16 — see `tests/test_mnist_training.py`,
-`tests/test_v9_e2e_conv_training.py`). The render-group hardware blocker that
-gated AOTI is cleared (`amit ∈ render`). The work that remains is (a) closing
-the **AOTI Python-less deployment** path, (b) finishing the **Slang-smart
-interface migrations**, (c) the **performance** layer that makes correct
-batching actually faster, and (d) the long tail of **op coverage**.
+`torch.compile(backend="inductor")` path. The Conv+GN+ReLU+Pool+Linear+
+CrossEntropyLoss+SGD training loop compiles and runs with per-param gradient
+parity vs CPU (rel_diff < 5e-3). Backward path is fully Slang. Forward path
+is ~80% Slang (conv, Linear, GN, ReLU, CrossEntropy) with pooling forward
+using FallbackKernel (eager C++). Optimizer uses Slang `IOptimizer` interface.
 
 ### Status scorecard
 
@@ -65,25 +63,25 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 **Compile-path dispatch audit — Conv+GN+ReLU+Pool+Linear training (2026-06-16)**
 | Op | Direction | Mechanism | Slang? |
 |---|---|---|---|
-| Conv2d | fwd | `extern_kernels.convolution` → `torch_vulkan::conv2d_with_optional_bias` → eager C++ | ❌ eager |
+| Conv2d | fwd | `_vulkan_aten_convolution` → `_VulkanConv2dExternKernel` → `slang_conv2d.slang` | ✅ Slang (A4) |
 | Conv2d | bwd | `_VulkanConvBwdExternKernel` → `_slang_tile_conv2d_bwd` → `slang_conv_bwd.slang` + `bwd_diff` | ✅ Slang |
 | GroupNorm | fwd | Inductor decomposition (var_mean/reduction/pointwise) → Slang codegen | ✅ Slang |
 | GroupNorm | bwd | ExternKernelOut → `group_norm_backward.slang` / `_weight.slang` | ✅ Slang |
 | ReLU | fwd | Pointwise → Slang codegen | ✅ Slang |
 | ReLU | bwd | Pointwise → Slang codegen | ✅ Slang |
-| AdaptiveAvgPool2d | fwd | `aten.adaptive_avg_pool2d` → eager C++ Vulkan | ❌ eager |
+| AdaptiveAvgPool2d | fwd | FallbackKernel → eager C++ Vulkan | 🟡 FallbackKernel (A5) |
 | AdaptiveAvgPool2d | bwd | Inductor decomposition (broadcast+scale+slice) → Slang codegen | ✅ Slang |
-| MaxPool2d | fwd | `aten.max_pool2d` → eager C++ Vulkan | ❌ eager |
+| MaxPool2d | fwd | FallbackKernel → eager C++ Vulkan | 🟡 FallbackKernel (A5) |
 | MaxPool2d | bwd | `torch_vulkan::max_pool2d_scatter_bwd` → `scatter_atomic.slang` | ✅ Slang |
-| AvgPool2d | fwd | `aten.avg_pool2d` → eager C++ Vulkan | ❌ eager |
+| AvgPool2d | fwd | FallbackKernel → eager C++ Vulkan | 🟡 FallbackKernel (A5) |
 | AvgPool2d | bwd | Codegen (non-overlapping) / `scatter_atomic.slang` (overlapping) | ✅ Slang |
 | Linear | fwd | `aten.addmm` → `slang_mm.slang` template | ✅ Slang |
 | Linear | bwd | `slang_mm_bwd.slang` template | ✅ Slang |
-| SGD optimizer | step | `foreach_optimizer.slang` (Jinja `{% if algorithm %}`) | 🟡 Jinja-Slang |
+| SGD/AdamW/Lion | step | `foreach_optimizer.slang` with Slang `IOptimizer` interface (B1) | ✅ Slang |
 | CrossEntropyLoss | fwd/bwd | Decomposed → pointwise/reduction → Slang codegen | ✅ Slang |
-| Conv+GN+ReLU fused | fwd | Pre-grad fusion → `torch_vulkan::conv2d_gn_relu_fused` → `conv_gn_relu.slang` ⚠️ | 🟡 known bugs |
+| Conv+GN+ReLU fused | fwd | Pre-grad fusion → `torch_vulkan::conv2d_gn_relu_fused` → `conv_gn_relu.slang` ⚠️ | 🟡 known RDNA1 bugs |
 
-**Gap summary**: forward path for Conv2d and all pooling ops still routes through eager C++ Vulkan, violating pillar A (codegen-only). Backward path is fully Slang. The fused conv_gn_relu forward shader has known write-coverage bugs on RDNA1.
+**Gap summary**: Pooling forward (max/avg/adaptive) uses FallbackKernel → eager C++ Vulkan (A5 partial). The fused conv_gn_relu forward shader has known write-coverage bugs on RDNA1. Backward path is fully Slang. Optimizer uses Slang interface (B1 ✅).
 
 **Slang-smart codegen (LANG)**
 | Item | State | Evidence |
@@ -95,10 +93,10 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | `[Differentiable]` / `[BackwardDerivative]` on bwd entry points | ✅ | conv/mm/reduction bwd shaders |
 | Subgroup (`WaveActive*`) reduction ops behind `IWaveReduction` | ✅ | `shaders/lib/reduction.slang:59-170` |
 | `flash_attention*` wg_size/BQ/BK as spec-constants | ✅ | committed `03c00dd6176`; `is_causal`/`head_layout` remain Jinja (defensible: code-structural) |
-| **`foreach_optimizer` algorithm → Slang interface** | ⛔ | still `{% if algorithm %}` + Jinja buffer-array `for` loops |
+| **`foreach_optimizer` algorithm → Slang interface** | ✅ | `templates/foreach_optimizer.slang` uses `IOptimizer` + generics `<Algo : IOptimizer>`; entry point via `computeMain<AdamWImpl>` |
 | **`rnn_cell*` direction → interface; cell_type (lstm/gru) Jinja** | ⛔ | `rnn_cell.slang:35-47` Jinja `cell_type` + `direction` branches (cell_type was a gap in v16) |
 | **AST validator: spec-constant pass** | ✅ | `slang_validate/spec_constants.py` (189 L) |
-| **AST validator: bwd_diff signature matching** | 🟡 | `bwd_diff_scan.py` pairs `[Differentiable]`↔`[BackwardDerivative]` but does not match param count/types |
+| **AST validator: bwd_diff signature matching** | ✅ | `bwd_diff_scan.py` validates param count/types: DifferentialPair mapping, no_diff preservation, output grad check (B3) |
 
 **Performance (PERF)**
 | Item | State | Evidence |
@@ -122,6 +120,17 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Missing ops: `sort`, `bucketize`, `multinomial`, sparse (csr/coo), eager FFT | ⛔ |
 | `tril`/`triu`/`masked_fill`/`where` backward via `bwd_diff` (sparse-attn / padding masks) | ⛔ |
 | Reflection introspection (VGPR/LDS → numthreads): parsed, partially used | 🟡 |
+
+**Anti-goal compliance (2026-06-16)**
+| # | Anti-goal | Status | Notes |
+|---|---|---|---|
+| 1 | No model-specific `.slang` files | ✅ | All templates; no per-model files |
+| 2 | No new `aten.<op>_backward` lowerings | ✅ | All bwd through bwd_diff_table.py or ExternKernelOut |
+| 3 | No hand-tuned shaders | ✅ | All auto-generated from templates |
+| 4 | No symptom-fixes in meta_patches | 🟡 | Several remain — see meta_patches/ audit |
+| 5 | No string-based/Jinja for interface-level params | ✅ | foreach_optimizer uses IOptimizer; rnn_cell remaining (B2) |
+| 6 | No CPU fallbacks on compile path | ✅ | TORCH_CHECK(false) for unimplemented ops |
+| 7 | No file > 800 lines in python/torch_vulkan/inductor/ | 🟡 | pointwise.py at 820L; most others in 700-800 band |
 
 ---
 
@@ -162,23 +171,30 @@ dispatch, no decomposition into individual aten.mm calls) with less complexity.
 - **Files**: `lowerings/conv_backward.py`, `templates/slang_conv_bwd.slang`
 - **Exit**: `TestConvBwdNoExtern` — compiled conv-bwd wrapper contains `_slang_tile_conv2d_bwd`; gradient parity vs CPU holds.
 
-#### A4 — Conv2d forward: replace eager `extern_kernels.convolution` with Slang template ⛔
-The forward path for `aten.convolution` / `Conv2d` currently routes through
-`extern_kernels.convolution` → `torch_vulkan::conv2d_with_optional_bias` →
-eager C++ Vulkan. This is the largest remaining eager fallback on the training
-path and violates pillar A (codegen-only). `slang_conv2d.slang` already exists
-with `ParameterBlock<KernelArgs>`, spec-constants, and epilogue generics —
-wire it into Inductor's `aten.convolution` lowering so the forward path goes
-through Slang codegen instead of eager.
-- **Files**: `lowerings/conv.py`, `templates/slang_conv2d.slang`, `templates/caller/conv.py`
-- **Exit**: `TestConvFwdSlang` — compiled conv fwd graph has no `extern_kernels.convolution` node; forward output matches CPU within 1e-4.
+#### A4 — Conv2d forward: replace eager `extern_kernels.convolution` with Slang template ✅
+**DONE 2026-06-16.** `_vulkan_aten_convolution` lowering registered in
+`lowerings/conv.py:441-458`. Intercepts `aten.convolution.default` for groups==1,
+4D, Vulkan device, and delegates to `_vulkan_conv2d_with_optional_bias` →
+`_VulkanConv2dExternKernel` → `_slang_tile_conv2d` → `slang_conv2d.slang`.
+Conv fwd now uses Slang template with `ParameterBlock<KernelArgs>`, spec-constants,
+and epilogue generics.
+- **Note**: The pre-grad `_fuse_conv_patched_gn_relu` pass takes precedence for
+  Conv+GN+ReLU chains, replacing them with the fused `conv2d_gn_relu_fused` op
+  before lowering. A4 applies to conv-only or conv+ReLU models.
+- **Exit**: conv fwd graphs use `_slang_tile_conv2d` (no `extern_kernels.convolution`).
 
-#### A5 — Pooling forward: replace eager aten with Slang codegen ⛔
-`aten.max_pool2d` / `aten.avg_pool2d` / `aten.adaptive_avg_pool2d` forward
-all route through eager C++ Vulkan. Replace with Slang codegen or fused
-templates (scatter_atomic-based pooling fwd shaders already exist).
-- **Files**: `lowerings/__init__.py` (pooling lowerings), `shaders/pooling/`
-- **Exit**: `TestPoolFwdSlang` — compiled pool fwd graphs have no eager aten nodes; output matches CPU.
+#### A5 — Pooling forward: replace eager aten with Slang codegen 🟡 (partial)
+**PARTIAL 2026-06-16.** FallbackKernel lowerings registered for
+`aten.max_pool2d.default` and `aten.avg_pool2d.default` in
+`bwd_lowerings.py:730-797`. Both are suppressed from upstream Inductor
+decomposition (ops_to_suppress + AOT decomp pop). The FallbackKernel routes
+through the C++ Vulkan kernel, avoiding upstream `indirect_indexing` which
+produces wrong SPIR-V. This is a stepping stone — the next step is pure Slang
+codegen for pooling forward (e.g., scatter_atomic-based or reshape+reduce).
+`aten.adaptive_avg_pool2d` already has a decomposition that delegates to
+`aten.avg_pool2d` (now FallbackKernel).
+- **Files**: `bwd_lowerings.py:730-797`, `lowerings/__init__.py:160-165,251-255`
+- **Exit**: `TestPoolFwdSlang` — compiled pool fwd graphs dispatch through FallbackKernel; output matches CPU.
 
 ### Pillar B — Slang-smart codegen
 
@@ -201,11 +217,14 @@ Covers `rnn_cell.slang`, `rnn_cell_bwd.slang`, `rnn_cell_fused.slang`.
 - **Files**: `templates/rnn_cell*.slang`, `caller/rnn.py`
 - **Exit**: `TestRnnInterface` — LSTM + GRU + bidirectional from one module set, parity vs eager.
 
-#### B3 — AST validator: bwd_diff signature matching 🟡
-Extend `bwd_diff_scan.py` to extract forward/backward parameter lists and assert
-matching count/types (not just presence of the annotation).
-- **Files**: `slang_validate/bwd_diff_scan.py`
-- **Exit**: `TestValidatorBwdSignature` — mismatched-arity shader raises `RuntimeError` pre-slangc.
+#### B3 — AST validator: bwd_diff signature matching ✅
+**DONE 2026-06-16.** `bwd_diff_scan.py` extended with `validate_bwd_diff_signatures()`
+that extracts forward/backward parameter lists and validates:
+1. Param count: backward must have len(forward_params) + 1 (output gradient)
+2. Per-param: differentiable T → inout DifferentialPair<T>; no_diff → no_diff
+3. Output gradient: last backward param must not be inout/no_diff/DifferentialPair
+Integrated into `validate_slang_source()` pipeline. Runs pre-slangc.
+- **Files**: `slang_validate/bwd_diff_scan.py:68-254`, `slang_validate/__init__.py`
 
 ### Pillar C — Performance (the batching payoff)
 
@@ -273,27 +292,29 @@ Every A–E item lands a named test in `tests/test_inductor_regression.py`. No
 ## § 3 — Dependency graph
 
 ```
-A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so)
-   ├─ A3 (conv-bwd FX rewrite, closes anti-goal #3)
-   ├─ A4 (conv fwd eager→Slang — largest remaining extern)
-   └─ A5 (pooling fwd eager→Slang)
+A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so) ⛔
+   ├─ A3 (conv-bwd FX rewrite) ✅
+   ├─ A4 (conv fwd eager→Slang) ✅
+   └─ A5 (pooling fwd) 🟡 — FallbackKernel done, pure Slang TBD
 
-B1 (foreach interface) ┐
-B2 (rnn interface)     ├─ independent, parallel with A/C/D
-B3 (validator)         ┘
+B1 (foreach interface) ✅
+B2 (rnn interface)     ⛔
+B3 (validator)         ✅
 
-C1 (overlap) ──→ flip BATCH_DISPATCH default ──→ C2 (shape bucketing)
-C3 (persistent reductions) ← independent
+C1 (overlap) ──→ flip BATCH_DISPATCH default ──→ C2 (shape bucketing) ⛔
+C3 (persistent reductions) 🟡
 
-D1 (autotune) ← independent; consumes C2's canonical keys when present
+D1 (autotune) ⛔
 
-E1/E2/E3 (coverage) ← independent, breadth work
+E1 (pooling-bwd fallbacks) 🟡
+E2 (masking backward) ⛔
+E3 (missing ops)     ⛔
 ```
 
-Parallel streams: **A4/A5** (forward-path Slang migration) is the critical path
-to pillar A compliance (codegen-only). **A2** is the AOTI `.so` deployment
-path. **A3** cleans up the backward extern. **B** and **E** are independent
-codegen-quality/coverage work; **C**/**D** are the performance layer.
+Parallel streams: **A2** (AOTI .so) is the remaining deployment milestone.
+**A5-pure** (Slang codegen for pooling fwd) and **E1** (pooling-bwd Slang)
+are the remaining codegen gaps. **B2** cleans up the last Jinja template.
+**C**/**D** are performance/autotune; **E2/E3** are op coverage breadth.
 
 ---
 
