@@ -186,13 +186,6 @@ void cleanup_runtimes() {
 // ── Buffer extraction ───────────────────────────────────────────
 BufferInfo get_buffer_info(const at::Tensor& tensor) {
     auto* buf = VulkanAllocator::instance().get_buffer(tensor.data_ptr());
-    if (!buf || !buf->is_valid()) {
-        fprintf(stderr, "get_buffer_info FAIL: data_ptr=%p device=%s sizes=[", 
-                (void*)tensor.data_ptr(), tensor.device().str().c_str());
-        for (int64_t s : tensor.sizes()) fprintf(stderr, "%ld ", (long)s);
-        fprintf(stderr, "] storage_data_ptr=%p\n", (void*)tensor.storage().data_ptr().get());
-        fflush(stderr);
-    }
     TORCH_CHECK(buf && buf->is_valid(),
                 "Tensor has no backing Vulkan buffer");
     return {buf->buffer(), buf->size()};
