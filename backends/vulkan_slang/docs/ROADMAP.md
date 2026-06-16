@@ -46,11 +46,17 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 **AOT / deployment (AOTI)**
 | Item | State | Evidence |
 |---|---|---|
+| C++ AOTI Runtime ABI (`AotiRuntime.{h,cpp}` — make/dispatch/destroy + T7.4) | ✅ | 8 symbols exported; tested via `TestAotiCppLoader` (5/6 pass, 1 fixed this session) |
 | Link `aoti_shims.o` into wrapper `.so` (14 `aoti_torch_*` symbols) | ✅ | `setup.py:133`, `cpp_wrapper_gpu.py` |
+| C++ wrapper codegen registered (`VulkanCppWrapperGpu` in `device_codegens`) | ✅ | `__init__.py:828-835`; codegen verified (T7.2 tests pass) |
 | Import does not hang (`meta_patches` lazy) | ✅ | `meta_patches/__init__.py` |
 | Clean process exit (`shutdown(wait=False)` at atexit) | ✅ | `runtime/common.py:373-379` |
-| **Conv+GN+pool+linear training E2E + grad parity** (`torch.compile` path) | ✅ | `TestAOTITrainingE2E` (`test_inductor_regression.py:62689`) — **FIXED 2026-06-16 (M23.2)**. Root cause: `gw_box.realize()` in `_get_conv_backward_lowering_impl` (`conv_backward.py:332`) caused the scheduler to discard the ExternKernelOut's weight-gradient writes. Fix: removed `.realize()` calls (matching the sibling `_get_conv2d_backward_custom_op_lowering` pattern at line 430-433). Both `test_conv_gn_relu_grad_match_cpu` and `test_conv_compile_backward_matches_cpu` now PASS on GPU. |
-| AOTI `.so` fwd+bwd+optimizer full step, SPIR-V cache reuse across loads | ⛔ | not exercised end-to-end; ABI shim symbols present (`test_aoti_extern.py`) but no full-training `.so` test |
+| **Conv+GN+pool+linear training E2E + grad parity** (`torch.compile` path) | ✅ | `TestAOTITrainingE2E` — **FIXED 2026-06-16 (M23.2)** |
+| **PF.60**: RecursionError in tensor_str during AOTI compile | 🟡 | Monkey-patch installed (`pf60_tensor_str_fix.py`); needs verification with `aot_compile` on Vulkan model |
+| **PF.30.e**: FunctionalTensor view ops crash | 🟡 | `is_null_storage` guard in `vulkan_permute`/view/reshape catches FakeTensors (data_ptr=0 confirmed); likely already fixed — needs re-verification |
+| **AOTI backward codegen**: C++ wrapper for bwd graphs | ⛔ | Not exercised — `TestCP12AOTITrainingStep` uses Python wrapper |
+| AOTI `.so` fwd+bwd+optimizer full step, SPIR-V cache reuse across loads | ⛔ | L4 gap — full C++ compile+link+load+dispatch chain unverified |
+| Model-level AOTI API (`model_load/run/free`) | 🟡 | Stub implementation: single-kernel dispatch, no per-kernel buffer layouts |
 
 **Training correctness (the M19–M23 / FP16 line, recently active)**
 | Item | State | Evidence |
@@ -153,10 +159,78 @@ had a comment explicitly warning against this pattern — the fix removes the
 `test_conv_compile_backward_matches_cpu` both PASS on GPU (`--gpu`).
 
 #### A2 — AOTI full training step (fwd + bwd + optimizer) in one `.so` ⛔
-Extend A1 to include the optimizer update inside the AOTI package; verify the
-SPIR-V cache is reused across a second `aoti_load_package` with zero recompiles.
-- **Files**: `cpp_wrapper_gpu.py`, `runtime/slangc.py` (cache key), `csrc/backend/`
-- **Exit**: `TestAOTI_FullStep` — 2 loads, second load recompiles 0 shaders.
+
+**2026-06-16 pipeline audit status.** The AOTI pipeline has four layers, each
+at a different readiness state:
+
+| Layer | Component | State | Gap |
+|---|---|---|---|
+| L1 | C++ AOTI Runtime ABI (`AotiRuntime.{h,cpp}`) | ✅ | 8 symbols exported. `make_kernel`/`dispatch`/`destroy` + 4 T7.4 specializations + model-level stub |
+| L2 | AOTI shim symbols (`aoti_shims.o` via `extra_objects`) | ✅ | `empty_strided_vulkan`, `zeros_vulkan`, `mm_out`, `delete` — 14 symbols linked into `_C.so` |
+| L3 | C++ wrapper codegen (`VulkanCppWrapperGpu`) | 🟡 | Registered in `device_codegens["vulkan"]`. SPIR-V embedding works. `_generate_kernel_call_helper` emits init+dispatch. **Not yet exercised with a real C++ compile+link+load cycle.** |
+| L4 | End-to-end `.so` compile+load+dispatch | ⛔ | No test exercises the full chain: Slang source → SPIR-V → embed in C++ → compile `.so` → load via `aot_load_package` → dispatch → verify output. |
+
+**Blocker chain for L4:**
+
+1. **PF.60 — RecursionError in tensor_str during AOTI compile** 🟡
+   Monkey-patch installed (`pf60_tensor_str_fix.py`, activated at
+   `__init__.py:802-803`). May be resolved — the fix detects Vulkan
+   tensors in `_str_intern` and returns a safe placeholder. Not yet
+   verified with `torch._inductor.aot_compile` on a real model.
+   - **Verify**: Run `TestAotiAotCompileMlpFwd.test_aoti_three_layer_mlp_no_bias`
+     without the `xfail` marker. If it passes, PF.60 is resolved.
+
+2. **PF.30.e — FunctionalTensor view ops crash during AOTI fake-trace** 🟡
+   **2026-06-16 analysis**: The `vulkan_permute`/`vulkan_view`/`vulkan_reshape`
+   C++ ops already have null-storage guards (`is_null_storage || is_meta ||
+   !has_storage`). `is_null_storage` checks `storage().data() == nullptr`,
+   which catches FakeTensors (confirmed: FakeTensor with `device=vulkan:0`
+   has `data_ptr=0`). The guard at `shape_ops.cpp:189` returns a null-storage
+   Vulkan tensor, allowing fake-tensor propagation to continue without
+   dispatching a real shader. **This may already be resolved** — the xfail
+   gate needs re-verification with the actual `aot_compile` call.
+   - **Verify**: Run `TestAotiAotCompileMlpFwd` both subtests without xfail.
+     If they pass, mark PF.30.e ✅ and remove the xfail markers.
+
+3. **AOTI codegen for backward graphs** ⛔
+   `VulkanCppWrapperGpu` is tested only for forward (pointwise,
+   reduction, MLP fwd). Backward codegen through the C++ wrapper has
+   not been exercised. The backward path involves `bwd_diff` lowering
+   + `ExternKernelOut` buffer management — the C++ wrapper must emit
+   correct `aoti_torch_empty_strided_vulkan` + `torch_vulkan_aoti_dispatch`
+   sequences for backward kernels.
+   - **Verify**: `TestCP12AOTITrainingStep.test_cp12_backward_aoti_codegen_no_crash`
+     currently tests `torch.compile` (Python wrapper) not the C++
+     wrapper path.
+
+4. **Full training step .so (fwd + bwd + optimizer)** ⛔
+   No test loads an AOTI `.so` containing a full training step and
+   executes it. The three subgraphs (fwd, bwd, optimizer) need to be
+   compiled into a single `.so` with correct buffer lifetime management
+   across subgraphs.
+   - **Files**: `cpp_wrapper_gpu.py`, `runtime/slangc.py` (cache key),
+     `csrc/backend/`
+   - **Exit**: `TestAOTI_FullStep` — single `.so` executes fwd→loss→bwd→step;
+     SPIR-V cache reused across `aoti_load_package` calls with zero recompiles.
+
+5. **AOTI so-load without torch_vulkan on PYTHONPATH** 🟡
+   `TestAotiSoLoadsWithoutTorchVulkanPythonpath` is written and xfail-gated
+   behind PF.60 + PF.30.e + PF.31.b. Once those resolve, this test auto-flips
+   to verify the Python-less load contract — the "AOT" half of the mission.
+
+6. **Model-level AOTI API is a stub** 🟡
+   `AotiRuntime.h` declares `torch_vulkan_aoti_model_load/run/free` with a
+   `kernels.bin` binary format. The implementation exists but `model_run`
+   does simplified single-kernel dispatch — all kernels get the same tensor
+   set, no per-kernel buffer layouts, no intermediate tensor management, no
+   workgroup derivation from tensor shapes. This is a placeholder awaiting
+   real multi-kernel scheduling (P4.x).
+
+7. **Test fix**: `test_aoti_make_kernel_surfaces_errors` assertion ✅ **FIXED 2026-06-16**
+   The old `"rc=" in str(exc.value)` assertion failed because the pybind wrapper
+   now surfaces the C-side human-readable error (`"empty SPIR-V"`). Fixed to
+   `"empty SPIR-V" in str(exc.value)`. The underlying C ABI error contract is
+   working correctly — the test just needed the assertion updated.
 
 #### A3 — Conv backward paired FX rewrite → `bwd_diff(conv_inner_madd)` ✅ (ratified 2026-06-16)
 The `aten.convolution_backward` lowering intercepts at Inductor lowering time
@@ -293,6 +367,13 @@ Every A–E item lands a named test in `tests/test_inductor_regression.py`. No
 
 ```
 A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so) ⛔
+   │                            ├─ A2.1 (PF.60: verify tensor_str fix) 🟡
+   │                            ├─ A2.2 (PF.30.e: FunctionalTensor view ops) ⛔
+   │                            ├─ A2.3 (AOTI backward codegen) ⛔
+   │                            ├─ A2.4 (Training step .so compile+load) ⛔
+   │                            ├─ A2.5 (PYTHONPATH-clear subprocess load) 🟡
+   │                            ├─ A2.6 (SPIR-V cache reuse) ⛔
+   │                            └─ A2.7 (Model-level API: real scheduling) 🟡
    ├─ A3 (conv-bwd FX rewrite) ✅
    ├─ A4 (conv fwd eager→Slang) ✅
    └─ A5 (pooling fwd) 🟡 — FallbackKernel done, pure Slang TBD
@@ -311,10 +392,12 @@ E2 (masking backward) ⛔
 E3 (missing ops)     ⛔
 ```
 
-Parallel streams: **A2** (AOTI .so) is the remaining deployment milestone.
-**A5-pure** (Slang codegen for pooling fwd) and **E1** (pooling-bwd Slang)
-are the remaining codegen gaps. **B2** cleans up the last Jinja template.
-**C**/**D** are performance/autotune; **E2/E3** are op coverage breadth.
+Parallel streams: **A2.1** (PF.60 verify) is the lowest-hanging fruit — one
+test run without xfail. **A2.2** (PF.30.e FunctionalTensor view ops) is the
+active blocker for all downstream AOTI work. **A5-pure** (Slang codegen for
+pooling fwd) and **E1** (pooling-bwd Slang) are the remaining codegen gaps.
+**B2** cleans up the last Jinja template. **C**/**D** are performance/autotune;
+**E2/E3** are op coverage breadth.
 
 ---
 

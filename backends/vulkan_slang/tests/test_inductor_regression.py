@@ -2968,6 +2968,86 @@ class TestCompileStats:
         assert s2["cache_hit_rate"] > 0.0
 
 
+class TestShapeBucketing:
+    """C2 (ROADMAP.md Pillar C): ``template_registry.canonical_shape_class``
+    collapses ``(rank, dtype, layout_class, stride_class)`` into one
+    canonical key *before* template selection, so two shapes that only
+    differ in concrete sizes (but share rank/dtype/layout/broadcast
+    pattern) land on the same slangc ``cache_key`` and never re-invoke
+    slangc twice.
+    """
+
+    def test_same_class_shapes_share_canonical_key(self):
+        from torch_vulkan.inductor.template_registry import canonical_shape_class
+
+        # Two contiguous f32 2-D shapes — different concrete sizes,
+        # same rank/dtype/layout/stride class.
+        a = canonical_shape_class((4, 8), torch.float32, strides=(8, 1))
+        b = canonical_shape_class((128, 256), torch.float32, strides=(256, 1))
+        assert a == b
+
+        # A different rank, or a channels_last/broadcast layout, must NOT
+        # collapse onto the same bucket.
+        c = canonical_shape_class((4, 8, 2), torch.float32, strides=(16, 2, 1))
+        assert c != a
+        d = canonical_shape_class((2, 4, 4, 4), torch.float32, strides=(64, 1, 16, 4))
+        assert d[2] == "channels_last"
+        assert d != a
+
+    def test_same_class_shapes_one_slangc_invocation(self):
+        """Exit criterion: two same-class shapes -> exactly one cold compile."""
+        from torch_vulkan.inductor.inductor_stats import (
+            compile_stats,
+            reset_compile_stats,
+        )
+        from torch_vulkan.inductor.runtime import compile_slang_to_spirv
+        from torch_vulkan.inductor.codegen import OpClass
+        from torch_vulkan.inductor.template_registry import (
+            cache_key_for,
+            canonical_shape_class,
+        )
+
+        reset_compile_stats()
+        pid = os.getpid()
+
+        def src_for(rows: int) -> str:
+            # Source text *functionally* varies with the concrete shape
+            # (mirrors a real templated kernel embedding a tile size /
+            # bound as a literal, not just a comment), so a cache hit here
+            # can only come from sharing the canonical *cache_key* fed to
+            # compile_slang_to_spirv, not from incidental content-hash
+            # identity (comments/whitespace are normalized away before
+            # hashing — see _normalize_slang_source).
+            return (
+                "[[vk::binding(0)]] StructuredBuffer<float> in_ptr0;\n"
+                "[[vk::binding(1)]] RWStructuredBuffer<float> out_ptr0;\n"
+                '[shader("compute")] [numthreads(64,1,1)]\n'
+                "void computeMain(uint3 gtid : SV_DispatchThreadID) {\n"
+                f"  out_ptr0[gtid.x] = in_ptr0[gtid.x] + {pid}.0 + {rows}.0;\n"
+                "}\n"
+            )
+
+        bucket_a = canonical_shape_class((4, 8), torch.float32, strides=(8, 1))
+        bucket_b = canonical_shape_class((128, 256), torch.float32, strides=(256, 1))
+        assert bucket_a == bucket_b
+        key = cache_key_for(OpClass.POINTWISE, bucket_a) + f"_{pid}"
+
+        compile_slang_to_spirv(src_for(4), "computeMain", cache_key=key)
+        s1 = compile_stats()
+        cold_after_first = s1["cold_compiles"]
+        assert cold_after_first >= 1
+
+        # Second, same-class shape (different concrete size, different
+        # source text) reuses the bucketed cache_key -> in-memory hit,
+        # zero additional slangc invocations.
+        compile_slang_to_spirv(src_for(128), "computeMain", cache_key=key)
+        s2 = compile_stats()
+        assert s2["cold_compiles"] == cold_after_first, (
+            "same-class shape triggered a second slangc invocation"
+        )
+        assert s2["in_memory_hits"] >= 1
+
+
 class TestExprPrinterSimplify:
     """`VulkanExprPrinter` filters trivial 0*x / 1*x / 0+x patterns so the
     emitted Slang does not ship dead-code arithmetic the driver would
@@ -27120,7 +27200,9 @@ class TestAotiCppLoader:
 
         with pytest.raises(RuntimeError) as exc:
             _c._aoti_make_kernel(b"", "_bad_spv_key", 1, 0)
-        assert "rc=" in str(exc.value)
+        assert "empty SPIR-V" in str(exc.value), (
+            f"expected error about empty SPIR-V, got: {exc.value}"
+        )
 
     def test_aoti_handle_outlives_repeated_dispatches(self):
         """Same handle services many dispatches without leaking - pipeline
@@ -33541,6 +33623,171 @@ class TestCP3RnnCellTemplate:
         )
         torch.testing.assert_close(
             h_vk.cpu(), h_cpu, rtol=1e-3, atol=1e-5, msg="GRU h_n mismatch vs CPU"
+        )
+
+
+class TestRnnInterface:
+    """B2 — rnn_cell* Jinja `cell_type` branches replaced with a Slang
+    `interface IRnnCell` (generic `<Cell : IRnnCell>`), matching the
+    `IOptimizer` pattern in foreach_optimizer.slang.  `LstmCellImpl` /
+    `GruCellImpl` / `RnnTanhCellImpl` / `RnnReluCellImpl` are selected via
+    the slangc entry-point name, not Jinja string substitution; `direction`
+    was already a runtime push-constant gate (M10) and is unchanged.
+
+    Covers LSTM + GRU + bidirectional LSTM from one module set, parity vs
+    CPU eager — the per-cell-type forward path (rnn_cell.slang) and the
+    fused multi-time-step path (rnn_cell_fused.slang) both route through
+    the same `IRnnCell` interface, so a single parity test per cell type
+    here exercises both `LstmCellImpl`/`GruCellImpl` instantiations.
+    """
+
+    @pytest.mark.gpu
+    def test_rnn_interface_lstm_matches_cpu(self):
+        """LstmCellImpl forward (entry=computeMain<LstmCellImpl>) matches
+        CPU eager reference at rtol=1e-3."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        hidden_size, input_size = 16, 8
+        m_vk = nn.LSTM(input_size, hidden_size, batch_first=True).to("vulkan")
+        m_cpu = nn.LSTM(input_size, hidden_size, batch_first=True).to("cpu")
+        m_cpu.load_state_dict(m_vk.state_dict())
+        m_vk.eval()
+        m_cpu.eval()
+
+        x_vk = torch.randn(3, 6, input_size, device="vulkan")
+        x_cpu = x_vk.detach().cpu()
+
+        with torch.no_grad():
+            out_vk, (h_vk, c_vk) = m_vk(x_vk)
+            out_cpu, (h_cpu, c_cpu) = m_cpu(x_cpu)
+
+        torch.testing.assert_close(
+            out_vk.cpu(), out_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell LstmCellImpl output mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            h_vk.cpu(), h_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell LstmCellImpl h_n mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            c_vk.cpu(), c_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell LstmCellImpl c_n mismatch vs CPU",
+        )
+
+    @pytest.mark.gpu
+    def test_rnn_interface_gru_matches_cpu(self):
+        """GruCellImpl forward (entry=computeMain<GruCellImpl>) matches
+        CPU eager reference at rtol=1e-3.  Exercises the GRU
+        "borrowed c_prev slot" trick (h_prev passed through the
+        IRnnCell.update `c_prev` parameter for non-cell-state cells)."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        hidden_size, input_size = 16, 8
+        m_vk = nn.GRU(input_size, hidden_size, batch_first=True).to("vulkan")
+        m_cpu = nn.GRU(input_size, hidden_size, batch_first=True).to("cpu")
+        m_cpu.load_state_dict(m_vk.state_dict())
+        m_vk.eval()
+        m_cpu.eval()
+
+        x_vk = torch.randn(3, 6, input_size, device="vulkan")
+        x_cpu = x_vk.detach().cpu()
+
+        with torch.no_grad():
+            out_vk, h_vk = m_vk(x_vk)
+            out_cpu, h_cpu = m_cpu(x_cpu)
+
+        torch.testing.assert_close(
+            out_vk.cpu(), out_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell GruCellImpl output mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            h_vk.cpu(), h_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell GruCellImpl h_n mismatch vs CPU",
+        )
+
+    @pytest.mark.gpu
+    def test_rnn_interface_bidirectional_lstm_matches_cpu(self):
+        """Bidirectional LSTM exercises `direction` (the pre-existing M10
+        runtime push-constant gate) together with the new IRnnCell
+        interface — both directions dispatch the same
+        `computeMain<LstmCellImpl>` entry point with `direction` set to
+        0 (forward) and 1 (reverse) respectively."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        hidden_size, input_size = 16, 8
+        m_vk = nn.LSTM(
+            input_size, hidden_size, batch_first=True, bidirectional=True
+        ).to("vulkan")
+        m_cpu = nn.LSTM(
+            input_size, hidden_size, batch_first=True, bidirectional=True
+        ).to("cpu")
+        m_cpu.load_state_dict(m_vk.state_dict())
+        m_vk.eval()
+        m_cpu.eval()
+
+        x_vk = torch.randn(3, 6, input_size, device="vulkan")
+        x_cpu = x_vk.detach().cpu()
+
+        with torch.no_grad():
+            out_vk, (h_vk, c_vk) = m_vk(x_vk)
+            out_cpu, (h_cpu, c_cpu) = m_cpu(x_cpu)
+
+        assert out_vk.shape == (3, 6, 2 * hidden_size)
+        torch.testing.assert_close(
+            out_vk.cpu(), out_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell bidirectional LSTM output mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            h_vk.cpu(), h_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell bidirectional LSTM h_n mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            c_vk.cpu(), c_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell bidirectional LSTM c_n mismatch vs CPU",
+        )
+
+    @pytest.mark.gpu
+    def test_rnn_interface_fused_lstm_long_seq_matches_cpu(self):
+        """T.10-fast fused path (rnn_cell_fused.slang, same IRnnCell
+        interface) over a long sequence — exercises LstmCellImpl inside
+        the groupshared time-step loop, not just the per-step path."""
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        hidden_size, input_size = 16, 8
+        seq_len = 64
+        m_vk = nn.LSTM(input_size, hidden_size, batch_first=True).to("vulkan")
+        m_cpu = nn.LSTM(input_size, hidden_size, batch_first=True).to("cpu")
+        m_cpu.load_state_dict(m_vk.state_dict())
+        m_vk.eval()
+        m_cpu.eval()
+
+        x_vk = torch.randn(2, seq_len, input_size, device="vulkan")
+        x_cpu = x_vk.detach().cpu()
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            with torch.no_grad():
+                return m_vk(x)
+
+        out_vk, (h_vk, c_vk) = fn(x_vk)
+        with torch.no_grad():
+            out_cpu, (h_cpu, c_cpu) = m_cpu(x_cpu)
+
+        torch.testing.assert_close(
+            out_vk.cpu(), out_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell fused LstmCellImpl long-seq output mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            h_vk.cpu(), h_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell fused LstmCellImpl long-seq h_n mismatch vs CPU",
+        )
+        torch.testing.assert_close(
+            c_vk.cpu(), c_cpu, rtol=1e-3, atol=1e-5,
+            msg="IRnnCell fused LstmCellImpl long-seq c_n mismatch vs CPU",
         )
 
 
@@ -62880,3 +63127,73 @@ class TestAOTITrainingE2E:
             assert rel_diff < 5e-3, (
                 f"Gradient mismatch on param {i}: rel_diff={rel_diff:.6e}"
             )
+
+
+class TestMaskingBackward:
+    """E2 — masking backward set for attention/padding (tril/triu/
+    masked_fill/where).
+
+    None of these four ops route through ``bwd_diff_table`` — traced via
+    ``aot_function``, the backward graph for each is the *same forward op*
+    re-applied to ``grad_output`` (``tril(x).backward()`` emits
+    ``aten.tril.default(grad_output)``, not an ``aten.tril_backward``; same
+    for triu/where/masked_fill). So the actual gap was a missing forward
+    lowering: ``aten.tril``/``aten.triu`` had no Inductor lowering (Vulkan
+    or upstream) and would extern-fallback to eager (anti-goal #1). Closed
+    by ``lowerings/masking.py::_register_masking_lowerings``. ``where`` and
+    ``masked_fill.Scalar`` already had working lowerings (upstream
+    ``aten.where`` + the existing ``masked_fill.Scalar`` decomposition in
+    ``lowerings/__init__.py``) — covered here as regression locks.
+    """
+
+    def _grad_parity(self, fn, *cpu_args):
+        def _mk(a, device):
+            t = a.detach().clone().to(device)
+            if a.requires_grad:
+                t.requires_grad_(True)
+            return t
+
+        args_cpu = [_mk(a, "cpu") for a in cpu_args]
+        args_vk = [_mk(a, "vulkan:0") for a in cpu_args]
+
+        out_cpu = fn(*args_cpu)
+        out_cpu.sum().backward()
+
+        compiled = torch.compile(fn, backend="inductor")
+        out_vk = compiled(*args_vk)
+        out_vk.sum().backward()
+
+        torch.testing.assert_close(out_vk.cpu(), out_cpu, rtol=1e-4, atol=1e-5)
+        for ac, av in zip(args_cpu, args_vk):
+            if ac.requires_grad:
+                torch.testing.assert_close(
+                    av.grad.cpu(), ac.grad, rtol=1e-4, atol=1e-5
+                )
+
+    def test_tril_backward_grad_parity(self):
+        torch.manual_seed(0)
+        x = torch.randn(8, 8, requires_grad=True)
+        self._grad_parity(lambda a: torch.tril(a, diagonal=1), x)
+
+    def test_triu_backward_grad_parity(self):
+        torch.manual_seed(0)
+        x = torch.randn(8, 8, requires_grad=True)
+        self._grad_parity(lambda a: torch.triu(a, diagonal=-1), x)
+
+    def test_tril_batched_backward_grad_parity(self):
+        torch.manual_seed(0)
+        x = torch.randn(4, 6, 8, requires_grad=True)
+        self._grad_parity(lambda a: torch.tril(a), x)
+
+    def test_masked_fill_backward_grad_parity(self):
+        torch.manual_seed(0)
+        x = torch.randn(16, requires_grad=True)
+        mask = torch.rand(16) > 0.5
+        self._grad_parity(lambda a, m: a.masked_fill(m, 0.0), x, mask)
+
+    def test_where_backward_grad_parity(self):
+        torch.manual_seed(0)
+        cond = torch.rand(16) > 0.5
+        a = torch.randn(16, requires_grad=True)
+        b = torch.randn(16, requires_grad=True)
+        self._grad_parity(lambda c, x, y: torch.where(c, x, y), cond, a, b)
