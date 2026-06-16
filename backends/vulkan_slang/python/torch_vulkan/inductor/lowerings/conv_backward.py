@@ -329,7 +329,11 @@ def _get_conv_backward_lowering_impl():
         gw_box = _lowerings[aten.empty.memory_format](
             gw_size, dtype=dtype, device=dev
         )
-        gw_box.realize()
+        # M23.2: do NOT call gw_box.realize() — the ExternKernelOut codegen
+        # handles zero-init and scheduling. Pre-realizing causes the scheduler
+        # to treat gw_box as already-finalized, dropping the kernel's writes
+        # (zero gradients / sign-flipped weight grads). Same pattern as
+        # _get_conv2d_backward_custom_op_lowering at line 430-433.
 
         # grad_bias allocation (if needed)
         gb_box = None
@@ -339,7 +343,6 @@ def _get_conv_backward_lowering_impl():
             gb_box = _lowerings[aten.empty.memory_format](
                 gb_size, dtype=dtype, device=dev
             )
-            gb_box.realize()
             kernel_inputs.append(gb_box)
 
         # Create the ExternKernelOut (grad_input is the primary output)
