@@ -105,27 +105,6 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
 
     # ── Header / prefix ──────────────────────────────────────────────
 
-    def write_header(self):
-        """Emit Vulkan-specific includes and forward declarations."""
-        super().write_header()
-        # Vulkan AOTI runtime header — use absolute path since compilation
-        # runs from a temp directory.
-        import torch_vulkan
-        _pkg_dir = os.path.dirname(torch_vulkan.__file__)  # .../python/torch_vulkan
-        _backend_root = os.path.dirname(os.path.dirname(_pkg_dir))  # repo root
-        _csrc_include = os.path.join(_backend_root, "csrc")
-        self.header.splice(
-            f'#include "{os.path.join(_csrc_include, "backend", "AotiRuntime.h")}"\n'
-            "#include <cstdint>\n"
-            "#include <cstring>\n"
-            "#include <vector>\n"
-            "\n"
-            "// Vulkan no-op stream guard for AOTI C++ wrapper compatibility.\n"
-            "struct AOTIVulkanStreamGuard {\n"
-            "    AOTIVulkanStreamGuard(void*, int32_t) {}\n"
-            "};\n"
-        )
-
     def finalize_prefix(self):
         """Emit SPIR-V data arrays and kernel initialization before the
         main prefix (so they're available for all kernel calls)."""
@@ -240,6 +219,17 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             name, device, dtype, shape, stride, allocation_shape, is_pinned
         )
 
+    def codegen_dtype(self, dtype):
+        """Use upstream AOTI dtype getters instead of cached variables.
+
+        Upstream ``CppWrapperCpu.codegen_dtype`` returns
+        ``cached_torch_dtype_<str>`` which is only emitted by the CUDA
+        wrapper path.  Vulkan AOTI wrappers must call the exported
+        ``aoti_torch_dtype_<str>()`` functions.
+        """
+        dtype_str = str(dtype).split(".")[-1]
+        return f"aoti_torch_dtype_{dtype_str}()"
+
     def make_buffer_free(self, buffer) -> str:
         """Emit C++ buffer deallocation."""
         try:
@@ -254,7 +244,28 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             return f"aoti_torch_delete({name}){self.ending}"
         return super().make_buffer_free(buffer)
 
+    def write_header(self):
+        """Emit Vulkan-specific includes and forward declarations."""
+        super().write_header()
+        import torch_vulkan
 
+        _pkg_dir = os.path.dirname(torch_vulkan.__file__)
+        _backend_root = os.path.dirname(os.path.dirname(_pkg_dir))
+        _csrc_include = os.path.join(_backend_root, "csrc")
+        self.header.splice(
+            f'#include "{os.path.join(_csrc_include, "backend", "AotiRuntime.h")}"\n'
+            "#include <cstdint>\n"
+            "#include <cstring>\n"
+            "#include <vector>\n"
+            "\n"
+            "// Forward declarations for Vulkan AOTI shim symbols linked via extra_objects.\n"
+            'extern "C" int aoti_torch_delete(void* handle);\n'
+            "\n"
+            "// Vulkan no-op stream guard for AOTI C++ wrapper compatibility.\n"
+            "struct AOTIVulkanStreamGuard {\n"
+            "    AOTIVulkanStreamGuard(void*, int32_t) {}\n"
+            "};\n"
+        )
 
     def _generate_kernel_call_helper(
         self,
@@ -419,6 +430,13 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             pc_size = "0"
 
         # ── Emit the dispatch call ──
+        # Replace Python // (integer division) with C++ / (also integer
+        # division for integers) to avoid // being interpreted as a C++ comment.
+        # Also qualify bare min() calls as std::min (Python's builtin min
+        # is used in the generated workgroup expressions).
+        def _cpp_safe(arg: str) -> str:
+            return arg.replace("//", "/").replace("min(", "std::min(")
+
         dispatch_line = (
             f"int _rc_{kernel_name} = torch_vulkan_aoti_dispatch(\n"
             f"    {handle_name},\n"
@@ -426,9 +444,9 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             f"    {n_tensors}u,\n"
             f"    {pc_ptr},\n"
             f"    {pc_size},\n"
-            f"    static_cast<uint32_t>({wg_args[0]}),\n"
-            f"    static_cast<uint32_t>({wg_args[1]}),\n"
-            f"    static_cast<uint32_t>({wg_args[2]}),\n"
+            f"    static_cast<uint32_t>({_cpp_safe(wg_args[0])}),\n"
+            f"    static_cast<uint32_t>({_cpp_safe(wg_args[1])}),\n"
+            f"    static_cast<uint32_t>({_cpp_safe(wg_args[2])}),\n"
             f"    {n_outputs}u);"
         )
         self.writeline(dispatch_line)

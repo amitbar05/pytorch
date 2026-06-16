@@ -675,13 +675,19 @@ class VulkanScheduling(SIMDScheduling):
         sub_keys = tuple(sk.config_key for sk, _numel in combo.subkernels)
         combo_config_key = compute_combo_config_key(sub_keys)
 
-        wrapper.header.splice(
-            f"{src_var} = '''{src_code}'''\n"
-            f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
-            f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{combo_config_key}')\n"
-        )
-        # AOTI-FIX: store kernel source for AOTI C++ codegen to compile to SPIR-V
-        _set_kernel_source(wrapper, kernel_name, src_code)
+        # AOTI: when compiling to C++ wrapper (.so), skip the Python emission.
+        # The C++ wrapper's _generate_kernel_call_helper will compile Slang→SPIR-V
+        # and emit torch_vulkan_aoti_make_kernel/dispatch calls inline.
+        if getattr(V.graph, 'aot_mode', False):
+            _set_kernel_source(wrapper, kernel_name, src_code)
+        else:
+            wrapper.header.splice(
+                f"{src_var} = '''{src_code}'''\n"
+                f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
+                f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{combo_config_key}')\n"
+            )
+            # Store kernel source for AOTI C++ codegen (also used by Python path for re-compilation)
+            _set_kernel_source(wrapper, kernel_name, src_code)
         return kernel_name
 
     def define_kernel(
@@ -737,13 +743,16 @@ class VulkanScheduling(SIMDScheduling):
         n_buffers = n_outputs + n_inputs + n_ws
         pc_size_bytes = n_pc * 4
 
-        wrapper.header.splice(
-            f"{src_var} = '''{src_code}'''\n"
-            f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
-            f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{kernel.config_key}')\n"
-        )
-        # AOTI-FIX: store kernel source for AOTI C++ codegen to compile to SPIR-V
-        _set_kernel_source(wrapper, kernel_name, src_code)
+        # AOTI: skip Python emission in C++ wrapper mode
+        if getattr(V.graph, 'aot_mode', False):
+            _set_kernel_source(wrapper, kernel_name, src_code)
+        else:
+            wrapper.header.splice(
+                f"{src_var} = '''{src_code}'''\n"
+                f"{src_var}_key = '{kernel_name}_{src_hash}'\n"
+                f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{kernel.config_key}')\n"
+            )
+            _set_kernel_source(wrapper, kernel_name, src_code)
         return kernel_name
 
     @classmethod
