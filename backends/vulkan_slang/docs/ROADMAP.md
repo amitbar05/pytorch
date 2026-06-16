@@ -182,11 +182,14 @@ templates (scatter_atomic-based pooling fwd shaders already exist).
 
 ### Pillar B — Slang-smart codegen
 
-#### B1 — `foreach_optimizer` algorithm → `interface IOptimizerAlgorithm` ⛔
-Replace `{% if algorithm == "adamw" %}` and the Jinja buffer-array `for` loops
-with a single module: algorithm chosen by spec-constant `ALGORITHM_ID` (0=SGD,
-1=AdamW, 2=Lion); buffer arrays via runtime-indexed descriptor array. 3 SPIR-V
-variants → 1.
+#### B1 — `foreach_optimizer` algorithm → `interface IOptimizerAlgorithm` ✅ (ratified 2026-06-16)
+SLANG INTERFACE DONE. Template uses `interface IOptimizer` with generic
+`<Algo : IOptimizer>` compile-time parameter. Concrete types: `SGDImpl`,
+`SGD MomentumImpl`, `AdamWImpl`, `LionImpl`. Entry point selected via
+`computeMain<AdamWImpl>`. One SPIR-V module per algorithm type (vs
+3 Jinja variants before), but the module is reused across all batch sizes
+(1/7/15/21/32). The parameter-buffer Jinja `for i in range(batch_size)` loop
+is structural (declares buffer bindings), defensible under anti-goal #6.
 - **Files**: `templates/foreach_optimizer.slang`, `caller/optimizer.py`
 - **Exit**: `TestOptimizerInterface` — one compile, dispatch SGD/AdamW/Lion by spec-const, parity vs eager.
 
