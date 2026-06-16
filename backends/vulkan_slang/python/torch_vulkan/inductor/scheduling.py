@@ -680,6 +680,7 @@ class VulkanScheduling(SIMDScheduling):
         # and emit torch_vulkan_aoti_make_kernel/dispatch calls inline.
         if getattr(V.graph, 'aot_mode', False):
             _set_kernel_source(wrapper, kernel_name, src_code)
+            _set_kernel_meta(wrapper, kernel_name, n_buffers, pc_size_bytes, n_pc, n_outputs)
         else:
             wrapper.header.splice(
                 f"{src_var} = '''{src_code}'''\n"
@@ -746,6 +747,7 @@ class VulkanScheduling(SIMDScheduling):
         # AOTI: skip Python emission in C++ wrapper mode
         if getattr(V.graph, 'aot_mode', False):
             _set_kernel_source(wrapper, kernel_name, src_code)
+            _set_kernel_meta(wrapper, kernel_name, n_buffers, pc_size_bytes, n_pc, n_outputs)
         else:
             wrapper.header.splice(
                 f"{src_var} = '''{src_code}'''\n"
@@ -831,6 +833,7 @@ class VulkanScheduling(SIMDScheduling):
 # Mapped on the wrapper object at _kernel_name_to_src so the AOTI C++
 # wrapper can compile Slang→SPIR-V during codegen (not at runtime).
 _KERNEL_NAME_TO_SRC_ATTR = "_kernel_name_to_src"
+_KERNEL_NAME_TO_META_ATTR = "_kernel_name_to_meta"
 
 
 def _set_kernel_source(wrapper, kernel_name: str, src_code: str) -> None:
@@ -843,6 +846,26 @@ def _set_kernel_source(wrapper, kernel_name: str, src_code: str) -> None:
 def get_kernel_source(wrapper, kernel_name: str) -> str | None:
     """Return the Slang source for a kernel name, or None if not found."""
     d = getattr(wrapper, _KERNEL_NAME_TO_SRC_ATTR, None)
+    if d is None:
+        return None
+    return d.get(kernel_name)
+
+
+def _set_kernel_meta(wrapper, kernel_name: str, n_buffers: int, pc_size_bytes: int, n_pc: int, n_outputs: int) -> None:
+    """Store AOTI kernel metadata (buffer/pc counts) on the wrapper."""
+    if not hasattr(wrapper, _KERNEL_NAME_TO_META_ATTR):
+        setattr(wrapper, _KERNEL_NAME_TO_META_ATTR, {})
+    getattr(wrapper, _KERNEL_NAME_TO_META_ATTR)[kernel_name] = {
+        "n_buffers": n_buffers,
+        "pc_size_bytes": pc_size_bytes,
+        "n_pc": n_pc,
+        "n_outputs": n_outputs,
+    }
+
+
+def get_kernel_meta(wrapper, kernel_name: str) -> dict | None:
+    """Return the AOTI kernel metadata dict, or None if not found."""
+    d = getattr(wrapper, _KERNEL_NAME_TO_META_ATTR, None)
     if d is None:
         return None
     return d.get(kernel_name)

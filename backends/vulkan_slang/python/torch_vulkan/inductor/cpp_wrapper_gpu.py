@@ -349,14 +349,25 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             spv_c_name = _spv_key_to_c_name(key)
             self._spv_blobs[key] = spv
 
-            # Determine n_buffers from SPIR-V reflection
+            # Determine n_buffers from SPIR-V reflection, with fallback to
+            # the scheduling codegen's metadata (which knows the exact counts).
             n_buffers = _vk_rt.get_reflected_binding_count(spv)
-            if n_buffers is None:
-                n_buffers = _vk_rt._get_reflected_buffer_count_from_cache_key("") or 0
+            if n_buffers is None or n_buffers == 0:
+                from .scheduling import get_kernel_meta
+                meta = get_kernel_meta(V.graph.wrapper_code, key)
+                if meta is not None:
+                    n_buffers = meta.get("n_buffers", 0)
+                else:
+                    n_buffers = _vk_rt._get_reflected_buffer_count_from_cache_key("") or 0
 
-            # Determine pc_size_bytes
+            # Determine pc_size_bytes — prefer metadata, fall back to inductor_meta
             pc_size_bytes = 0
             n_pc = inductor_meta.get("n_pc", 0) if inductor_meta else 0
+            if n_pc == 0:
+                from .scheduling import get_kernel_meta as _gkma
+                meta = _gkma(V.graph.wrapper_code, key)
+                if meta is not None:
+                    n_pc = meta.get("n_pc", 0)
             if n_pc > 0:
                 pc_size_bytes = n_pc * 4
 
