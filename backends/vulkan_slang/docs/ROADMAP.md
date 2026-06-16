@@ -192,16 +192,40 @@ at a different readiness state:
    - **Verify**: Run `TestAotiAotCompileMlpFwd` both subtests without xfail.
      If they pass, mark PF.30.e ✅ and remove the xfail markers.
 
-3. **AOTI codegen for backward graphs** ⛔
-   `VulkanCppWrapperGpu` is tested only for forward (pointwise,
-   reduction, MLP fwd). Backward codegen through the C++ wrapper has
-   not been exercised. The backward path involves `bwd_diff` lowering
-   + `ExternKernelOut` buffer management — the C++ wrapper must emit
-   correct `aoti_torch_empty_strided_vulkan` + `torch_vulkan_aoti_dispatch`
-   sequences for backward kernels.
-   - **Verify**: `TestCP12AOTITrainingStep.test_cp12_backward_aoti_codegen_no_crash`
-     currently tests `torch.compile` (Python wrapper) not the C++
-     wrapper path.
+3. **AOTI codegen for backward graphs** ⛔ → **ROOT CAUSE FOUND 2026-06-16**
+   `VulkanCppWrapperGpu` is registered in `device_codegens["vulkan"]` but
+   the AOTI C++ compile step fails because the generated C++ contains
+   **Slang source code as Python triple-quoted strings** instead of
+   compiled SPIR-V binary arrays. The wrapper emits:
+   ```cpp
+   vulkan_kernel_0_slang = '''struct KernelArgs {
+       RWStructuredBuffer<float> out_ptr0;
+   };
+   [shader("compute")] [numthreads(64, 1, 1)]
+   void computeMain(...) { ... }
+   '''
+   ```
+   This is valid Python syntax (produced by `VulkanPythonWrapperCodegen`),
+   not valid C++. The C++ compiler rejects it with "empty character constant".
+   
+   **Root cause**: The AOTI path selects `VulkanCppWrapperGpu` (correctly
+   registered), but the kernel call emission goes through the **Python
+   wrapper's `_generate_kernel_call_helper`** instead of the C++ wrapper's
+   override. The Python wrapper stores Slang source as Python strings; the
+   C++ wrapper should compile Slang→SPIR-V at AOTI package time and emit
+   `torch_vulkan_aoti_make_kernel` + `torch_vulkan_aoti_dispatch` calls
+   with binary SPIR-V arrays.
+   
+   **Fix**: The C++ wrapper's `_generate_kernel_call_helper` method
+   (lines 270–451 of `cpp_wrapper_gpu.py`) already has the correct logic
+   — it reads SPIR-V from the compile cache, embeds it as `static const
+   uint32_t` arrays, and emits `torch_vulkan_aoti_make_kernel` +
+   `torch_vulkan_aoti_dispatch` calls. The issue is that this method is
+   **not being reached** during AOTI codegen — the upstream
+   `_generate_kernel_call_helper` (from `CppWrapperCpu`) is handling the
+   Vulkan kernels instead, falling through to the Python wrapper pattern.
+   - **Files**: `cpp_wrapper_gpu.py:270-451`, `__init__.py:828-835`
+   - **Verify**: AOTI `.so` compiles without Slang-source-in-C++ errors
 
 4. **Full training step .so (fwd + bwd + optimizer)** ⛔
    No test loads an AOTI `.so` containing a full training step and
