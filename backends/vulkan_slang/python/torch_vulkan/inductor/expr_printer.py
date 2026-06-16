@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 
 import sympy
 
@@ -125,7 +126,12 @@ class VulkanExprPrinter(ExprPrinter_):
         return str(int(expr))
 
     def _print_Float(self, expr: sympy.Expr) -> str:
-        return f"{float(expr)}f"
+        val = float(expr)
+        if math.isinf(val):
+            return "(1.0/0.0)" if val > 0 else "(-1.0/0.0)"
+        if math.isnan(val):
+            return "asfloat(0x7FC00000u)"
+        return f"{val!r}f"
 
     def _print_Rational(self, expr: sympy.Expr) -> str:
         return f"({float(expr.p)}f / {float(expr.q)}f)"

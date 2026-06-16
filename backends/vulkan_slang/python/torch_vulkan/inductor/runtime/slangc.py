@@ -14,6 +14,8 @@ M22a Stage 3: reflection metrics / SPIR-V baseline / numthreads cluster
 extracted to ``reflection_ext.py``.
 """
 
+from __future__ import annotations
+
 import hashlib
 import os
 import subprocess
@@ -138,7 +140,226 @@ from .reflection_ext import (  # noqa: F401
 )
 
 
-# ── Core compilation ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Modular compilation helpers (extracted from the monolithic inner function)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_compile_command(
+    *,
+    src_path: str,
+    entry: str,
+    out_path: str,
+    refl_path: str,
+    module_includes: list[str],
+    include_paths: tuple[str, ...],
+    src: str,
+) -> list[str]:
+    """Assemble the slangc argv for a single compile invocation."""
+    cmd = [
+        _get_slangc(),
+        src_path,
+        "-target",
+        "spirv",
+        "-entry",
+        entry,
+        "-o",
+        out_path,
+        "-reflection-json",
+        refl_path,
+        "-matrix-layout-row-major",
+        # slangc 2026.7.1 trips on subgroup_ballot capability checks at
+        # ``helpers.wave_active_count_bits`` even though every Vulkan
+        # device we ship to supports subgroupVote/Ballot; the error
+        # path then crashes the compiler in the thread-pool case.
+        # Bypass the static check — runtime SPIR-V is unaffected.
+        "-ignore-capabilities",
+    ]
+    for ip in module_includes:
+        cmd.extend(["-I", ip])
+    cmd.extend(["-I", _SHADERS_LIB_DIR])
+    for ip in include_paths:
+        cmd.extend(["-I", ip])
+
+    # P3.2 / M14: Ensure mm_tile / mm_int8 modules are precompiled for
+    # link-time specialization. The wrapper source already defines tile-size
+    # constants via "static const int" before the import, so Slang's linker
+    # resolves them without additional flags.
+    if "import mm_tile;" in src:
+        _ensure_mm_tile_module()
+    if "import mm_int8;" in src:
+        _ensure_mm_int8_module()
+    return cmd
+
+
+def _run_slangc(
+    cmd: list[str],
+    hash_key: str,
+    timeout_s: float = _SLANGC_TIMEOUT_S,
+) -> subprocess.CompletedProcess:
+    """Run a single slangc invocation, raising SlangCompileTimeout on timeout."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        raise SlangCompileTimeout(
+            key=hash_key,
+            argv=cmd,
+            partial_stdout=(e.stdout or b"").decode("utf-8", errors="replace")
+            if isinstance(e.stdout, bytes)
+            else (e.stdout or ""),
+            partial_stderr=(e.stderr or b"").decode("utf-8", errors="replace")
+            if isinstance(e.stderr, bytes)
+            else (e.stderr or ""),
+        ) from None
+
+
+def _handle_stale_module_cache(
+    src_path: str,
+    out_path: str,
+    refl_path: str,
+    entry: str,
+    hash_key: str,
+    include_paths: tuple[str, ...],
+    src: str,
+    module_includes: list[str],
+) -> subprocess.CompletedProcess:
+    """PF.27.a.1: retry slangc without precompiled module cache on SIGSEGV."""
+    _invalidate_shader_lib_modules()
+    cmd2 = [
+        _get_slangc(),
+        src_path,
+        "-target",
+        "spirv",
+        "-entry",
+        entry,
+        "-o",
+        out_path,
+        "-reflection-json",
+        refl_path,
+        "-matrix-layout-row-major",
+        "-ignore-capabilities",
+        "-I",
+        _SHADERS_LIB_DIR,
+    ]
+    for ip in include_paths:
+        cmd2.extend(["-I", ip])
+    return _run_slangc(cmd2, hash_key)
+
+
+def _read_spv_and_reflection(
+    out_path: str,
+    refl_path: str,
+) -> tuple[bytes, str]:
+    """Read compiled SPIR-V and reflection JSON from disk."""
+    with open(out_path, "rb") as f:
+        spv = f.read()
+    with open(refl_path) as f:
+        return spv, f.read()
+
+
+def _process_reflection(
+    hash_key: str,
+    refl_blob: str,
+    spv: bytes,
+    src: str,
+    config_key: str | None,
+) -> None:
+    """Harvest reflection metrics, check baselines, and possibly recompile."""
+    from torch_vulkan.inductor import config as _cfg
+
+    _reflection_cache[hash_key] = refl_blob
+    _disk_reflection_write(hash_key, refl_blob)
+
+    if not _cfg.reflection_enabled():
+        return
+
+    _harvest_reflection_metrics(hash_key, refl_blob, spv, src, config_key)
+    short_key = hashlib.sha256(spv).hexdigest()[:12]
+    _check_spv_regression(short_key, _reflection_metrics_by_hash.get(hash_key, {}))
+
+    if not _cfg.reflection_routing():
+        return
+
+    metrics = _reflection_metrics_by_hash.get(hash_key, {})
+    vgprs = metrics.get("vgprs")
+    if vgprs is None:
+        return
+
+    current_nt = _parse_numthreads_from_source(src)
+    if current_nt is None:
+        return
+
+    shared_mem = metrics.get("shared_mem")
+    loop_depth = metrics.get("loop_depth")
+    optimal_nt = _pick_numthreads_from_reflection(
+        vgprs, shared_mem, loop_depth, current_nt,
+    )
+    if optimal_nt == current_nt:
+        _optimized_numthreads_by_hash[hash_key] = current_nt
+        return
+
+    # Recompile with optimized numthreads.
+    new_src = _rewrite_numthreads_in_source(src, optimal_nt)
+    _compile_with_optimized_numthreads(
+        new_src, optimal_nt, entry="computeMain", hash_key=hash_key,
+        config_key=config_key, src=src,
+    )
+    _optimized_numthreads_by_hash[hash_key] = optimal_nt
+
+
+def _compile_with_optimized_numthreads(
+    new_src: str,
+    optimal_nt: tuple[int, int, int],
+    *,
+    entry: str,
+    hash_key: str,
+    config_key: str | None,
+    src: str,
+) -> None:
+    """Second-pass compile with rewritten numthreads; replace cached SPV on success."""
+    with tempfile.TemporaryDirectory() as td:
+        new_src_path = os.path.join(td, "kernel_opt.slang")
+        new_out_path = os.path.join(td, "kernel_opt.spv")
+        new_refl_path = os.path.join(td, "kernel_opt.refl.json")
+        with open(new_src_path, "w") as f:
+            f.write(new_src)
+        cmd3 = [
+            _get_slangc(),
+            new_src_path,
+            "-target",
+            "spirv",
+            "-entry",
+            entry,
+            "-o",
+            new_out_path,
+            "-reflection-json",
+            new_refl_path,
+            "-matrix-layout-row-major",
+            "-ignore-capabilities",
+        ]
+        try:
+            proc3 = _run_slangc(cmd3, hash_key)
+        except SlangCompileTimeout:
+            return  # keep Pass-1 SPV
+        if proc3.returncode != 0:
+            return
+
+        with open(new_out_path, "rb") as f:
+            spv2 = f.read()
+        _cache_by_hash[hash_key] = spv2
+        _disk_cache_write(hash_key, spv2)
+
+        try:
+            with open(new_refl_path) as f:
+                refl_blob2 = f.read()
+            _reflection_cache[hash_key] = refl_blob2
+            _disk_reflection_write(hash_key, refl_blob2)
+            from torch_vulkan.inductor import config as _cfg
+            if _cfg.reflection_enabled():
+                _harvest_reflection_metrics(
+                    hash_key, refl_blob2, spv2, new_src, config_key,
+                )
+        except (FileNotFoundError, OSError):
+            pass
 
 
 def _compile_slang_to_spirv_inner(
@@ -148,21 +369,33 @@ def _compile_slang_to_spirv_inner(
     include_paths: tuple[str, ...] = (),
     config_key: str | None = None,
 ) -> bytes:
-    # T.7 (2026-05-08): pre-flight Slang source validation runs FIRST,
-    # before slangc availability probes, tempdir creation, or any file
-    # I/O.  The previous call site (post-tempfile-write but pre-subprocess)
-    # still paid for the OS handles even on guaranteed-fail inputs; the
-    # M15 docstring promised a "fast pre-check" — moving it to the top
-    # delivers that.  Catches brace mismatches, binding gaps, size-symbol
-    # leaks, groupshared budget overruns, and numthreads violations
-    # without ever invoking the SPIR-V compiler.
+    """Compile a single Slang source to SPIR-V with full retry / recompile logic.
+
+    Modularized from the original 250-line function into discrete phases:
+      1. validate source
+      2. prepare command line
+      3. run slangc (with stale-module retry)
+      4. read SPV + reflection
+      5. process reflection (metrics / numthreads recompile)
+      6. update caches + stats
+    """
     from torch_vulkan.inductor.slang_validator import validate_slang_source
 
+    # Phase 0: normalize invalid Slang floating-point literals that the
+    # backend codegen may produce (e.g., -inf/inf from reduction identity
+    # values).  Slang has no `inf` keyword; the valid form is (1.0/0.0)
+    # or (-1.0/0.0) or asfloat(0x7F800000u).
+    import re
+    src = re.sub(r'(?<!\w)(-inf)(?!\w)', '(-1.0/0.0)', src)
+    src = re.sub(r'(?<!\w)(inf)(?!\w)', '(1.0/0.0)', src)
+    src = re.sub(r'\(-\(1\.0/0\.0\)\)', '(-1.0/0.0)', src)
+
+    # Phase 1: fast source validation (no file I/O, no subprocess)
     validation_errors = validate_slang_source(src)
     if validation_errors:
         raise RuntimeError(
-            f"Slang source validation failed for kernel "
-            f"{hash_key[:48]}:\n" + "\n".join(str(e) for e in validation_errors)
+            f"Slang source validation failed for kernel {hash_key[:48]}:\n"
+            + "\n".join(str(e) for e in validation_errors)
         )
 
     if not _slangc_available():
@@ -179,236 +412,50 @@ def _compile_slang_to_spirv_inner(
         refl_path = os.path.join(td, "kernel.refl.json")
         with open(src_path, "w") as f:
             f.write(src)
-        # Precompiled .slang-module dir is searched FIRST so kernels that
-        # `import helpers;` or `import tensor_layout;` resolve to the
-        # serialized IR (no per-kernel reparse). The source dir stays on
-        # the -I list as a fallback for libraries that haven't been
-        # precompiled yet (e.g. when slangc is unavailable in CI).
+
+        # Phase 2: resolve shader-lib module includes
         try:
             module_dir = _ensure_shader_lib_modules()
             module_includes = [module_dir]
         except RuntimeError:
             module_includes = []
-        cmd = [
-            _get_slangc(),
-            src_path,
-            "-target",
-            "spirv",
-            "-entry",
-            entry,
-            "-o",
-            out_path,
-            "-reflection-json",
-            refl_path,
-            "-matrix-layout-row-major",
-            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
-            # ``helpers.wave_active_count_bits`` even though every Vulkan
-            # device we ship to supports subgroupVote/Ballot; the error
-            # path then crashes the compiler in the thread-pool case.
-            # Bypass the static check — runtime SPIR-V is unaffected.
-            "-ignore-capabilities",
-        ]
-        for ip in module_includes:
-            cmd.extend(["-I", ip])
-        cmd.extend(["-I", _SHADERS_LIB_DIR])
-        for ip in include_paths:
-            cmd.extend(["-I", ip])
 
-        # P3.2 / M14: Ensure mm_tile / mm_int8 modules are precompiled for
-        # link-time specialization. The wrapper source already defines tile-size
-        # constants via "static const int" before the import, so Slang's linker
-        # resolves them without additional flags.
-        # We just need the .slang-module to exist on the -I path.
-        if "import mm_tile;" in src:
-            _ensure_mm_tile_module()
-        if "import mm_int8;" in src:
-            _ensure_mm_int8_module()
-
-        # DR.7: track whether precompiled modules were on the include path
-        # so the optional re-compile pass mirrors the same include structure.
+        # Phase 3: compile (with stale-module retry)
+        cmd = _build_compile_command(
+            src_path=src_path,
+            entry=entry,
+            out_path=out_path,
+            refl_path=refl_path,
+            module_includes=module_includes,
+            include_paths=include_paths,
+            src=src,
+        )
         used_module_includes = bool(module_includes)
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=_SLANGC_TIMEOUT_S,
-            )
-        except subprocess.TimeoutExpired as e:
-            raise SlangCompileTimeout(
-                key=hash_key,
-                argv=cmd,
-                partial_stdout=(e.stdout or b"").decode("utf-8", errors="replace")
-                if isinstance(e.stdout, bytes)
-                else (e.stdout or ""),
-                partial_stderr=(e.stderr or b"").decode("utf-8", errors="replace")
-                if isinstance(e.stderr, bytes)
-                else (e.stderr or ""),
-            ) from None
-        # PF.27.a.1: slangc SIGSEGV (rc<0) with the precompiled module
-        # cache on `-I` is a stale-cache symptom — invalidate and retry
-        # once from source. Belt-and-suspenders for the case the
-        # `_slangc_fingerprint` cache key in `precompile_shader_libs`
-        # couldn't catch (ABI-incompatible slangc rebuild with same
-        # stat). Hard-fail on second crash to prevent any retry loop
-        # and to avoid masking non-stale-cache slangc bugs.
+        proc = _run_slangc(cmd, hash_key)
+
         if proc.returncode < 0 and module_includes:
-            _invalidate_shader_lib_modules()
-            used_module_includes = False  # DR.7: retry without module includes
-            cmd2 = [
-                _get_slangc(),
-                src_path,
-                "-target",
-                "spirv",
-                "-entry",
-                entry,
-                "-o",
-                out_path,
-                "-reflection-json",
-                refl_path,
-                "-matrix-layout-row-major",
-            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
-            # ``helpers.wave_active_count_bits`` even though every Vulkan
-            # device we ship to supports subgroupVote/Ballot; the error
-            # path then crashes the compiler in the thread-pool case.
-            # Bypass the static check — runtime SPIR-V is unaffected.
-            "-ignore-capabilities",
-                "-I",
-                _SHADERS_LIB_DIR,
-            ]
-            for ip in include_paths:
-                cmd2.extend(["-I", ip])
-            try:
-                proc = subprocess.run(
-                    cmd2,
-                    capture_output=True,
-                    text=True,
-                    timeout=_SLANGC_TIMEOUT_S,
-                )
-            except subprocess.TimeoutExpired as e:
-                raise SlangCompileTimeout(
-                    key=hash_key,
-                    argv=cmd2,
-                    partial_stdout=(e.stdout or b"").decode("utf-8", errors="replace")
-                    if isinstance(e.stdout, bytes)
-                    else (e.stdout or ""),
-                    partial_stderr=(e.stderr or b"").decode("utf-8", errors="replace")
-                    if isinstance(e.stderr, bytes)
-                    else (e.stderr or ""),
-                ) from None
+            proc = _handle_stale_module_cache(
+                src_path, out_path, refl_path, entry, hash_key,
+                include_paths, src, module_includes,
+            )
+            used_module_includes = False
+
         if proc.returncode != 0:
             raise RuntimeError(
                 f"slangc failed for kernel {hash_key[:8]}:\n{proc.stderr}\n"
                 f"--- source ---\n{src}"
             )
-        with open(out_path, "rb") as f:
-            spv = f.read()
-        try:
-            with open(refl_path) as f:
-                refl_blob = f.read()
-            _reflection_cache[hash_key] = refl_blob
-            _disk_reflection_write(hash_key, refl_blob)
-            # P3.3/M13: harvest reflection metrics when enabled.
-            # Gate on the config flag so TORCH_VULKAN_REFLECTION=0
-            # bypasses the parsing + SPIR-V analysis overhead.
-            from torch_vulkan.inductor import config as _cfg
 
-            if _cfg.reflection_enabled():
-                _harvest_reflection_metrics(hash_key, refl_blob, spv, src, config_key)
-                # M6: check for SPIR-V perf regression vs baseline.
-                short_key = hashlib.sha256(spv).hexdigest()[:12]
-                _check_spv_regression(
-                    short_key, _reflection_metrics_by_hash.get(hash_key, {})
-                )
-            # ── DR.7: Compile-time reflection routing ──────────────
-            # Peek at VGPR count from SPIR-V reflection; if numthreads
-            # should be adjusted for optimal occupancy, rewrite the
-            # source and re-compile. The optimized SPIR-V replaces the
-            # Pass-1 output and is cached under the original hash_key
-            # so subsequent requests skip both passes entirely.
-            if _cfg.reflection_enabled() and _cfg.reflection_routing():
-                metrics = _reflection_metrics_by_hash.get(hash_key, {})
-                vgprs = metrics.get("vgprs")
-                if vgprs is not None:
-                    current_nt = _parse_numthreads_from_source(src)
-                    if current_nt is not None:
-                        shared_mem = metrics.get("shared_mem")
-                        loop_depth = metrics.get("loop_depth")
-                        optimal_nt = _pick_numthreads_from_reflection(
-                            vgprs,
-                            shared_mem,
-                            loop_depth,
-                            current_nt,
-                        )
-                        if optimal_nt != current_nt:
-                            # Rewrite source with optimized numthreads.
-                            new_src = _rewrite_numthreads_in_source(src, optimal_nt)
-                            new_src_path = os.path.join(td, "kernel_opt.slang")
-                            new_out_path = os.path.join(td, "kernel_opt.spv")
-                            new_refl_path = os.path.join(td, "kernel_opt.refl.json")
-                            with open(new_src_path, "w") as f:
-                                f.write(new_src)
-                            cmd3 = [
-                                _get_slangc(),
-                                new_src_path,
-                                "-target",
-                                "spirv",
-                                "-entry",
-                                entry,
-                                "-o",
-                                new_out_path,
-                                "-reflection-json",
-                                new_refl_path,
-                                "-matrix-layout-row-major",
-            # slangc 2026.7.1 trips on subgroup_ballot capability checks at
-            # ``helpers.wave_active_count_bits`` even though every Vulkan
-            # device we ship to supports subgroupVote/Ballot; the error
-            # path then crashes the compiler in the thread-pool case.
-            # Bypass the static check — runtime SPIR-V is unaffected.
-            "-ignore-capabilities",
-                            ]
-                            if used_module_includes:
-                                for ip in module_includes:
-                                    cmd3.extend(["-I", ip])
-                            cmd3.extend(["-I", _SHADERS_LIB_DIR])
-                            for ip in include_paths:
-                                cmd3.extend(["-I", ip])
-                            try:
-                                proc3 = subprocess.run(
-                                    cmd3,
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=_SLANGC_TIMEOUT_S,
-                                )
-                            except subprocess.TimeoutExpired:
-                                # DR.7: Pass-2 timeout → keep Pass-1 SPV.
-                                pass
-                            else:
-                                if proc3.returncode == 0:
-                                    with open(new_out_path, "rb") as f:
-                                        spv = f.read()
-                                    # M11.1: Store optimized numthreads for dispatch grid
-                                    _optimized_numthreads_by_hash[hash_key] = optimal_nt
-                                    try:
-                                        with open(new_refl_path) as f:
-                                            refl_blob2 = f.read()
-                                        _reflection_cache[hash_key] = refl_blob2
-                                        _disk_reflection_write(hash_key, refl_blob2)
-                                        if _cfg.reflection_enabled():
-                                            _harvest_reflection_metrics(
-                                                hash_key,
-                                                refl_blob2,
-                                                spv,
-                                                new_src,
-                                                config_key,
-                                            )
-                                    except (FileNotFoundError, OSError):
-                                        pass
-                        else:
-                            # M11.1: Store Pass-1 numthreads when no change needed
-                            _optimized_numthreads_by_hash[hash_key] = current_nt
+        # Phase 4: read output
+        spv, refl_blob = _read_spv_and_reflection(out_path, refl_path)
+
+        # Phase 5: reflection + optional numthreads recompile
+        try:
+            _process_reflection(hash_key, refl_blob, spv, src, config_key)
         except (FileNotFoundError, OSError):
             pass
+
+    # Phase 6: update stats + caches
     _COMPILE_STATS["cold_compiles"] += 1
     elapsed_us = (time.perf_counter() - t0) * 1e6
     _COMPILE_STATS["cold_compile_us"] += elapsed_us
@@ -419,6 +466,10 @@ def _compile_slang_to_spirv_inner(
     _disk_cache_write(hash_key, spv)
     return spv
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API (unchanged signatures)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def compile_slang_to_spirv(
     src: str,
@@ -487,31 +538,22 @@ def compile_slang_to_spirv(
         if event is None:
             event = threading.Event()
             _in_flight[hash_key] = event
-            we_own = True  # we created it — we must compile and set it
+            we_own = True
 
     if not we_own and not event.is_set():
-        # Another thread owns this hash_key — wait for it.
         event.wait()
         spv = _cache_by_hash.get(hash_key)
         if spv is not None:
             if cache_key is not None:
                 _cache_by_key[cache_key] = spv
             return spv
-        # Edge case: the owning thread failed; fall through to compile.
 
     try:
-        # PF.14: if we're already on a worker of `_ASYNC_POOL`, re-submitting
-        # back to the same pool and blocking on `.result()` deadlocks when
-        # every worker is itself blocked here. Bypass the pool in that case.
         if _PARALLEL_COMPILE and _ASYNC_COMPILE and not _is_in_pool_worker():
             pool = _get_async_pool()
             spv = pool.submit(
                 _wrap_pool_worker(_compile_slang_to_spirv_inner),
-                src,
-                entry,
-                hash_key,
-                include_paths,
-                config_key,
+                src, entry, hash_key, include_paths, config_key,
             ).result()
         else:
             spv = _compile_slang_to_spirv_inner(
@@ -525,7 +567,7 @@ def compile_slang_to_spirv(
         with _in_flight_lock:
             ev = _in_flight.pop(hash_key, None)
             if ev is not None:
-                ev.set()  # wake any waiters
+                ev.set()
 
 
 def batch_compile_slang_to_spirv(
@@ -533,27 +575,11 @@ def batch_compile_slang_to_spirv(
     *,
     max_workers: Optional[int] = None,
 ) -> dict[str, bytes]:
-    """Compile multiple Slang sources to SPIR-V in parallel.  N+1.6.
-
-    Args:
-        specs: List of ``(src, entry, cache_key, include_paths)`` tuples.
-        max_workers: Max ThreadPoolExecutor workers (default: ``_ASYNC_MAX_WORKERS``).
-
-    Returns:
-        Dict mapping ``cache_key`` → SPIR-V bytes.  Already-cached entries
-        are served from the in-memory / on-disk cache without a slangc
-        subprocess.  In-flight dedup prevents duplicate slangc invocations
-        for identical hash keys within the batch.
-
-    Unlike ``prewarm_compile`` (fire-and-forget best-effort), this function
-    always blocks until every spec is compiled and surfaces the first
-    ``RuntimeError`` so callers can fail fast.
-    """
+    """Compile multiple Slang sources to SPIR-V in parallel.  N+1.6."""
     workers = max_workers if max_workers is not None else _ASYNC_MAX_WORKERS
     results: dict[str, bytes] = {}
     pending: list[tuple[str, str, str, tuple[str, ...]]] = []
 
-    # Phase 1: check caches; collect cache misses.
     for src, entry, cache_key, include_paths in specs:
         if cache_key in _cache_by_key:
             results[cache_key] = _cache_by_key[cache_key]
@@ -590,38 +616,21 @@ def batch_compile_slang_to_spirv(
     if not pending:
         return results
 
-    # Phase 2: compile cache misses in parallel.
     errors: list[Exception] = []
 
-    def _compile_one(
-        src: str,
-        entry: str,
-        cache_key: str,
-        include_paths: tuple[str, ...],
-    ) -> Optional[bytes]:
+    def _compile_one(src, entry, cache_key, include_paths):
         try:
             return compile_slang_to_spirv(
-                src,
-                entry=entry,
-                cache_key=cache_key,
-                include_paths=include_paths,
+                src, entry=entry, cache_key=cache_key, include_paths=include_paths,
             )
         except Exception as e:
             errors.append(e)
             return None
 
-    # M-NEW.1: mark batch-executor workers as in-pool so the inner
-    # ``compile_slang_to_spirv`` call takes the bypass path at line ~506
-    # instead of re-submitting to ``_ASYNC_POOL``. Without this guard the
-    # batch workers block on ``_ASYNC_POOL.submit().result()`` while
-    # ``_ASYNC_POOL`` is itself busy serving ``_ensure_shader_lib_modules``
-    # (slangc lib-module precompile under a serial lock) — deadlocking the
-    # autotune+prewarm path on the very first compile of any model with
-    # >1 ``addmm``.
-    wrapped_compile_one = _wrap_pool_worker(_compile_one)
+    wrapped = _wrap_pool_worker(_compile_one)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(wrapped_compile_one, src, entry, ck, ip): ck
+            pool.submit(wrapped, src, entry, ck, ip): ck
             for src, entry, ck, ip in pending
         }
         for fut in futures:
@@ -647,44 +656,15 @@ def _compile_slang_batch_parallel(
     max_workers: int | None = None,
     entry: str = "computeMain",
 ) -> list[bytes]:
-    """Compile multiple (src, cache_key) pairs in parallel.  N+1.6.
-
-    Thin convenience wrapper around ``batch_compile_slang_to_spirv`` for
-    callers that have simple ``(src, cache_key)`` pairs without custom
-    entry-points or include-paths.  Gated by the existing
-    ``TORCH_VULKAN_ASYNC_COMPILE=1`` / ``TORCH_VULKAN_PARALLEL_COMPILE=1``
-    (both default-on) which control the underlying thread-pool dispatch.
-
-    Args:
-        sources: List of ``(slang_src, cache_key)`` pairs.
-        max_workers: Max ThreadPoolExecutor workers (default:
-            ``_MAX_SLANGC_WORKERS``).
-        entry: Slang entry-point name (default ``"computeMain"``).
-
-    Returns:
-        List of SPIR-V byte blobs in the same order as ``sources``.
-        Already-cached entries are served from the in-memory / on-disk
-        cache without a slangc subprocess.
-    """
+    """Compile multiple (src, cache_key) pairs in parallel.  N+1.6."""
     workers = max_workers if max_workers is not None else _MAX_SLANGC_WORKERS
-    specs: list[tuple[str, str, str, tuple[str, ...]]] = []
-    for src, cache_key in sources:
-        specs.append((src, entry, cache_key, ()))
+    specs = [(src, entry, ck, ()) for src, ck in sources]
     result_map = batch_compile_slang_to_spirv(specs, max_workers=workers)
-    # Return in the same order as sources
     return [result_map[ck] for _src, ck in sources]
 
 
 def parse_spec_constants(spv: bytes) -> list[tuple[int, int]]:
-    """Walk a SPIR-V module and return ``[(spec_id, default_uint_value), ...]``.
-
-    Reads `OpDecorate <id> SpecId N` (op 71) and `OpSpecConstant` (op 50)
-    pairs. Default value is the 32-bit literal slangc bakes into the SPV
-    for `[[vk::constant_id(N)]] const uint TILE = K;`. Sufficient for the
-    P0.6 contract: prove the spec constants survived to SPIR-V so a
-    future `VkSpecializationInfo` pass can override them at pipeline-
-    creation time without recompiling slangc.
-    """
+    """Walk a SPIR-V module and return ``[(spec_id, default_uint_value), ...]``."""
     if len(spv) < 20 or spv[0:4] not in (b"\x03\x02\x23\x07", b"\x07\x23\x02\x03"):
         raise ValueError("not a SPIR-V module")
     little = spv[0:4] == b"\x03\x02\x23\x07"
@@ -696,25 +676,23 @@ def parse_spec_constants(spv: bytes) -> list[tuple[int, int]]:
     n_words = len(spv) // 4
     spec_ids: dict[int, int] = {}
     spec_defaults: dict[int, int] = {}
-    i = 5  # skip 5-word header
+    i = 5
     while i < n_words:
         word = w32(i * 4)
         op = word & 0xFFFF
         wc = word >> 16
         if wc == 0:
             break
-        if op == 71 and wc >= 4:  # OpDecorate
+        if op == 71 and wc >= 4:
             target = w32((i + 1) * 4)
             decoration = w32((i + 2) * 4)
-            if decoration == 1:  # SpecId
+            if decoration == 1:
                 spec_ids[target] = w32((i + 3) * 4)
-        elif op == 50 and wc >= 4:  # OpSpecConstant
+        elif op == 50 and wc >= 4:
             result_id = w32((i + 2) * 4)
             spec_defaults[result_id] = w32((i + 3) * 4)
         i += wc
-    out: list[tuple[int, int]] = []
-    for result_id, sid in spec_ids.items():
-        out.append((sid, spec_defaults.get(result_id, 0)))
+    out = [(sid, spec_defaults.get(result_id, 0)) for result_id, sid in spec_ids.items()]
     out.sort()
     return out
 
@@ -725,12 +703,7 @@ def compile_slang_to_spirv_with_reflection(
     cache_key: Optional[str] = None,
     include_paths: tuple[str, ...] = (),
 ) -> tuple[bytes, dict]:
-    """Compile a Slang source and return ``(spv, layout_dict)``.
-
-    Convenience wrapper for callers that want the binding/push-constant
-    layout derived from compiler-truth instead of hand-counted from the
-    source. Fully cached: repeat calls reuse both SPV and reflection.
-    """
+    """Compile a Slang source and return ``(spv, layout_dict)``."""
     spv = compile_slang_to_spirv(
         src, entry=entry, cache_key=cache_key, include_paths=include_paths
     )
@@ -738,7 +711,6 @@ def compile_slang_to_spirv_with_reflection(
     hash_key = hashlib.sha256(
         (entry + "\n" + _normalize_slang_source(src) + inc_tag).encode()
     ).hexdigest()
-    # Lazy import from sibling reflection module within the runtime package.
     from .reflection import get_reflection_json, reflection_layout
 
     refl = get_reflection_json(hash_key)
@@ -748,17 +720,11 @@ def compile_slang_to_spirv_with_reflection(
 
 
 def gc_spirv_cache(max_mib: int) -> dict:
-    """Trim the on-disk SPIR-V cache to ``max_mib`` MiB by deleting LRU entries.
-
-    Returns ``{"removed": int, "kept": int, "bytes_before": int, "bytes_after": int}``.
-    Cache is sharded by 2-char hash prefix; we walk every ``.spv`` file, sort
-    by mtime ascending, and delete oldest until under budget. Safe to call at
-    any time — entries that get re-requested simply re-pay slangc once. P5.7.
-    """
+    """Trim the on-disk SPIR-V cache to ``max_mib`` MiB by deleting LRU entries."""
     if max_mib < 0:
         raise ValueError("max_mib must be >= 0")
     budget = max_mib * 1024 * 1024
-    entries: list[tuple[float, int, str]] = []  # (mtime, size, path)
+    entries: list[tuple[float, int, str]] = []
     cache_dir = _get_disk_cache_dir()
     if os.path.isdir(cache_dir):
         for shard in os.listdir(cache_dir):
@@ -775,7 +741,7 @@ def gc_spirv_cache(max_mib: int) -> dict:
                     continue
                 entries.append((st.st_mtime, st.st_size, path))
     bytes_before = sum(e[1] for e in entries)
-    entries.sort(key=lambda e: e[0])  # oldest first
+    entries.sort(key=lambda e: e[0])
     removed = 0
     bytes_after = bytes_before
     for _, size, path in entries:
