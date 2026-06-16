@@ -62,6 +62,29 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Conv backward fp16→fp32 upcast in template caller | ✅ | commit `3444718dd33` (FP16.1) |
 | Conv backward still routes through `aten.convolution_backward` (ratified extern) | 🟡 | re-eval toward `bwd_diff(conv_inner_madd)` paired FX rewrite (`conv_backward.py:38` TODO) |
 
+**Compile-path dispatch audit — Conv+GN+ReLU+Pool+Linear training (2026-06-16)**
+| Op | Direction | Mechanism | Slang? |
+|---|---|---|---|
+| Conv2d | fwd | `extern_kernels.convolution` → `torch_vulkan::conv2d_with_optional_bias` → eager C++ | ❌ eager |
+| Conv2d | bwd | `_VulkanConvBwdExternKernel` → `_slang_tile_conv2d_bwd` → `slang_conv_bwd.slang` + `bwd_diff` | ✅ Slang |
+| GroupNorm | fwd | Inductor decomposition (var_mean/reduction/pointwise) → Slang codegen | ✅ Slang |
+| GroupNorm | bwd | ExternKernelOut → `group_norm_backward.slang` / `_weight.slang` | ✅ Slang |
+| ReLU | fwd | Pointwise → Slang codegen | ✅ Slang |
+| ReLU | bwd | Pointwise → Slang codegen | ✅ Slang |
+| AdaptiveAvgPool2d | fwd | `aten.adaptive_avg_pool2d` → eager C++ Vulkan | ❌ eager |
+| AdaptiveAvgPool2d | bwd | Inductor decomposition (broadcast+scale+slice) → Slang codegen | ✅ Slang |
+| MaxPool2d | fwd | `aten.max_pool2d` → eager C++ Vulkan | ❌ eager |
+| MaxPool2d | bwd | `torch_vulkan::max_pool2d_scatter_bwd` → `scatter_atomic.slang` | ✅ Slang |
+| AvgPool2d | fwd | `aten.avg_pool2d` → eager C++ Vulkan | ❌ eager |
+| AvgPool2d | bwd | Codegen (non-overlapping) / `scatter_atomic.slang` (overlapping) | ✅ Slang |
+| Linear | fwd | `aten.addmm` → `slang_mm.slang` template | ✅ Slang |
+| Linear | bwd | `slang_mm_bwd.slang` template | ✅ Slang |
+| SGD optimizer | step | `foreach_optimizer.slang` (Jinja `{% if algorithm %}`) | 🟡 Jinja-Slang |
+| CrossEntropyLoss | fwd/bwd | Decomposed → pointwise/reduction → Slang codegen | ✅ Slang |
+| Conv+GN+ReLU fused | fwd | Pre-grad fusion → `torch_vulkan::conv2d_gn_relu_fused` → `conv_gn_relu.slang` ⚠️ | 🟡 known bugs |
+
+**Gap summary**: forward path for Conv2d and all pooling ops still routes through eager C++ Vulkan, violating pillar A (codegen-only). Backward path is fully Slang. The fused conv_gn_relu forward shader has known write-coverage bugs on RDNA1.
+
 **Slang-smart codegen (LANG)**
 | Item | State | Evidence |
 |---|---|---|
@@ -132,6 +155,24 @@ Remove the last ratified extern on the training path. Pre-grad FX pass replaces
 (closes anti-goal #3 for conv).
 - **Files**: `lowerings/conv_backward.py:38`, `fx_passes/post_grad.py`
 - **Exit**: `TestConvBwdNoExtern` — compiled conv-bwd graph has no `convolution_backward` extern node; grad parity holds.
+
+#### A4 — Conv2d forward: replace eager `extern_kernels.convolution` with Slang template ⛔
+The forward path for `aten.convolution` / `Conv2d` currently routes through
+`extern_kernels.convolution` → `torch_vulkan::conv2d_with_optional_bias` →
+eager C++ Vulkan. This is the largest remaining eager fallback on the training
+path and violates pillar A (codegen-only). `slang_conv2d.slang` already exists
+with `ParameterBlock<KernelArgs>`, spec-constants, and epilogue generics —
+wire it into Inductor's `aten.convolution` lowering so the forward path goes
+through Slang codegen instead of eager.
+- **Files**: `lowerings/conv.py`, `templates/slang_conv2d.slang`, `templates/caller/conv.py`
+- **Exit**: `TestConvFwdSlang` — compiled conv fwd graph has no `extern_kernels.convolution` node; forward output matches CPU within 1e-4.
+
+#### A5 — Pooling forward: replace eager aten with Slang codegen ⛔
+`aten.max_pool2d` / `aten.avg_pool2d` / `aten.adaptive_avg_pool2d` forward
+all route through eager C++ Vulkan. Replace with Slang codegen or fused
+templates (scatter_atomic-based pooling fwd shaders already exist).
+- **Files**: `lowerings/__init__.py` (pooling lowerings), `shaders/pooling/`
+- **Exit**: `TestPoolFwdSlang` — compiled pool fwd graphs have no eager aten nodes; output matches CPU.
 
 ### Pillar B — Slang-smart codegen
 
@@ -223,8 +264,10 @@ Every A–E item lands a named test in `tests/test_inductor_regression.py`. No
 ## § 3 — Dependency graph
 
 ```
-A1 (verify AOTI E2E) ──→ A2 (full-step .so) ──→ F1 (lock)
-   └─ A3 (conv-bwd FX rewrite, independent, closes anti-goal #3)
+A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so)
+   ├─ A3 (conv-bwd FX rewrite, closes anti-goal #3)
+   ├─ A4 (conv fwd eager→Slang — largest remaining extern)
+   └─ A5 (pooling fwd eager→Slang)
 
 B1 (foreach interface) ┐
 B2 (rnn interface)     ├─ independent, parallel with A/C/D
@@ -238,9 +281,10 @@ D1 (autotune) ← independent; consumes C2's canonical keys when present
 E1/E2/E3 (coverage) ← independent, breadth work
 ```
 
-Parallel streams: **A** (deployment) is the critical path to "Python-less
-training"; **B** and **E** are independent codegen-quality work; **C**/**D** are
-the performance layer and can run in parallel once A1 confirms the path is green.
+Parallel streams: **A4/A5** (forward-path Slang migration) is the critical path
+to pillar A compliance (codegen-only). **A2** is the AOTI `.so` deployment
+path. **A3** cleans up the backward extern. **B** and **E** are independent
+codegen-quality/coverage work; **C**/**D** are the performance layer.
 
 ---
 
