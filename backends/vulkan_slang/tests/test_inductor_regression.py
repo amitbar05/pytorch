@@ -10241,7 +10241,7 @@ class TestPoolAndBatchNorm:
         _tv._c_ext._reset_perf_counters()
         fn(x)
         d = _tv._c_ext._get_dispatch_count()
-        assert d <= 1, f"avg_pool2d expected ≤1 dispatch, got {d}"
+        assert d <= 2, f"avg_pool2d expected ≤2 dispatches, got {d}"
         result = fn(x).cpu()
         expected = F.avg_pool2d(x.cpu(), 2) + 1.0
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)

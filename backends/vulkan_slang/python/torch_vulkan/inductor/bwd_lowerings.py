@@ -727,6 +727,71 @@ def _register_pool_backward() -> None:
             x, kernel_size, stride, padding, dilation, ceil_mode
         )
 
+    # A5 (2026-06-16) — Forward: aten.max_pool2d and aten.avg_pool2d.
+    # These route through FallbackKernel (C++ Vulkan kernel) to avoid the
+    # upstream Inductor lowerings which use ops.indirect_indexing → wrong
+    # SPIR-V on Vulkan.  This is a stepping stone toward full Slang codegen.
+    #
+    # aten.max_pool2d: upstream is CompositeImplicitAutograd — when not
+    # decomposed by AOT it delegates to max_pool2d_with_indices.  The
+    # suppression in lowerings/__init__.py keeps the raw op alive so our
+    # FallbackKernel intercepts it directly.
+    _vk_max_pool2d_fallback = fallback_handler(
+        aten.max_pool2d.default,
+        add_to_fallback_set=False,
+    )
+
+    @register_lowering(aten.max_pool2d.default, type_promotion_kind=None)
+    def _vulkan_max_pool2d(
+        x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False
+    ):
+        if not _is_vulkan(x):
+            return NotImplemented
+        # Normalize scalar pool args to 2-element lists (same as
+        # max_pool2d_with_indices pattern above).
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size, kernel_size]
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, int):
+            stride = [stride, stride]
+        if isinstance(padding, int):
+            padding = [padding, padding]
+        if isinstance(dilation, int):
+            dilation = [dilation, dilation]
+        return _vk_max_pool2d_fallback(
+            x, kernel_size, stride, padding, dilation, ceil_mode
+        )
+
+    # aten.avg_pool2d: upstream Inductor lowering (_avg_poolnd) uses
+    # make_loader+indirect_indexing for the complex case, producing wrong
+    # SPIR-V.  Override with FallbackKernel.
+    _vk_avg_pool2d_fallback = fallback_handler(
+        aten.avg_pool2d.default,
+        add_to_fallback_set=False,
+    )
+
+    @register_lowering(aten.avg_pool2d.default, type_promotion_kind=None)
+    def _vulkan_avg_pool2d(
+        x, kernel_size, stride=None, padding=0, ceil_mode=False,
+        count_include_pad=True, divisor_override=None,
+    ):
+        if not _is_vulkan(x):
+            return NotImplemented
+        # Normalize scalar pool args to 2-element lists.
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size, kernel_size]
+        if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0):
+            stride = kernel_size
+        elif isinstance(stride, int):
+            stride = [stride, stride]
+        if isinstance(padding, int):
+            padding = [padding, padding]
+        return _vk_avg_pool2d_fallback(
+            x, kernel_size, stride, padding, ceil_mode,
+            count_include_pad, divisor_override,
+        )
+
     # Backward: max_pool2d_with_indices_backward — TRAIN.2.
     #
     # Replaced the FallbackKernel path (C++ GPU shader with int64→uint32

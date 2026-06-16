@@ -157,6 +157,12 @@ def _suppress_upstream_decomps() -> None:
         aten.avg_pool2d_backward.default,
         aten.max_pool2d_with_indices.default,
         aten.max_pool2d_with_indices_backward.default,
+        # A5 (2026-06-16): suppress aten.max_pool2d and aten.avg_pool2d forward
+        # decomp so our FallbackKernel lowerings in bwd_lowerings.py fire instead
+        # of the upstream Inductor lowerings which use ops.indirect_indexing
+        # → wrong SPIR-V on Vulkan.
+        aten.max_pool2d.default,
+        aten.avg_pool2d.default,
         # TRAIN.4 (2026-05-27): suppress upstream nll_loss_backward decomposition
         # so our lowering in lowerings/loss.py can intercept it.
         aten.nll_loss_backward.default,
@@ -242,6 +248,11 @@ def _suppress_upstream_decomps() -> None:
     _aot_decomps.pop(aten.lerp.Tensor, None)
     # M17.3: also pop adaptive_avg_pool2d from AOT decomp table.
     _aot_decomps.pop(aten._adaptive_avg_pool2d.default, None)
+    # A5 (2026-06-16): also pop max_pool2d and avg_pool2d from AOT decomp table
+    # so AOTAutograd does not decompose them before our FallbackKernel lowerings
+    # (in bwd_lowerings.py) fire.
+    _aot_decomps.pop(aten.max_pool2d.default, None)
+    _aot_decomps.pop(aten.avg_pool2d.default, None)
     # M-NEW.14: also pop native_group_norm_backward from the AOT decomp
     # table so AOTAutograd / partitioner do not decompose it before
     # Inductor's lowering layer sees the op (see `ops_to_suppress`
