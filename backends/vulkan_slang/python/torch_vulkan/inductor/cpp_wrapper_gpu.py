@@ -92,6 +92,10 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         self._spv_includes_emitted = False
         super().__init__()
 
+    def _flush_batcher_before_direct_call(self) -> None:
+        """No-op in AOTI mode: the C++ wrapper doesn't use the batcher."""
+        pass
+
     # ── Factory ─────────────────────────────────────────────────────
 
     @staticmethod

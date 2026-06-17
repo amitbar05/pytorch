@@ -272,11 +272,27 @@ at a different readiness state:
    `extern "C"` declaration. Verified: AOTIModelContainerRunnerCpu.run()
    dispatches with both tensors device=vulkan:0, VUID=0.
 
-5. **Full training step .so (fwd + bwd + optimizer)** ⛔
-   Pointwise fwd works through runner. Multi-graph (fwd+bwd+optimizer)
-   and correct output shapes need verification. The three subgraphs need
-   to be compiled into a single `.so` with correct buffer lifetime
-   management across subgraphs.
+5. **AOTI extern-kernel codegen: Python syntax in C++ wrapper** ⛔
+   **DISCOVERED 2026-06-17.** The conv2d/GN/Linear extern-kernel lowerings
+   have custom `codegen` methods that emit Python-style function calls
+   (e.g., `_slang_tile_conv2d(arg4_1, conv_weight, buf1, stride=(1, 1), ...)`).
+   During AOTI compilation, this Python syntax leaks verbatim into the C++
+   wrapper, causing C++ compiler errors (undeclared identifiers, Python
+   tuple literals). Pointwise/reduction kernels don't have this problem —
+   they route through `scheduling.py:define_kernel` which detects
+   `V.graph.aot_mode` and skips Python emission.
+   - **Fix needed**: Each extern-kernel `codegen` method must detect
+     `aot_mode` and emit C++ AOTI dispatch calls with pre-compiled SPIR-V
+     embedded as `static const uint32_t` arrays. SPIR-V can be compiled
+     at codegen time from the template + static shape metadata. After
+     this fix, simple conv models will compile to loadable `.so` files.
+   - **Files**: `lowerings/conv.py:248-290` (codegen), `lowerings/conv_backward.py`,
+     `lowerings/gn_forward_extern.py`, `lowerings/gn_backward_extern.py`,
+     `lowerings/matmul.py`
+   - **Exit**: `TestAOTIConvGNForward` — AOTI `.so` compiles and produces
+     output matching eager forward.
+   - **Prerequisite fix**: `_flush_batcher_before_direct_call` no-op added to
+     `VulkanCppWrapperGpu` (line 95-97 of `cpp_wrapper_gpu.py`).
 
 6. **AOTI so-load without torch_vulkan on PYTHONPATH** 🟡
    `TestAotiSoLoadsWithoutTorchVulkanPythonpath` — prerequisites (PF.60,
@@ -290,6 +306,13 @@ at a different readiness state:
    now surfaces the C-side human-readable error (`"empty SPIR-V"`). Fixed to
    `"empty SPIR-V" in str(exc.value)`. The underlying C ABI error contract is
    working correctly — the test just needed the assertion updated.
+
+8. **Full training step .so (fwd + bwd + optimizer)** ⛔
+   Gated on item 5 (extern-kernel codegen). Once conv/matmul/GN extern kernels
+   emit proper C++ AOTI dispatch, the forward-only `.so` compiles and dispatches.
+   The next step is multi-graph: fwd+bwd+optimizer compiled into a single `.so`
+   with correct buffer lifetime management across subgraphs. The `torch.compile`
+   path already handles this correctly (verified: `TestAOTITrainingE2E` ✅).
 
 #### A3 — Conv backward paired FX rewrite → `bwd_diff(conv_inner_madd)` ✅ (ratified 2026-06-16)
 The `aten.convolution_backward` lowering intercepts at Inductor lowering time
