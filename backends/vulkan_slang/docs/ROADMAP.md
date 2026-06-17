@@ -65,7 +65,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **PF.30.e**: FunctionalTensor view ops crash | ✅ | Null-storage guard catches FakeTensors; AOTI compile passes |
 | **AOTI C++ wrapper codegen**: Slang→SPIR-V + emit AOTI dispatch ABI | ✅ | **FIXED 2026-06-16** — `.so` compiles, links 3 AOTI symbols, 0 VUIDs |
 | **AOTI runner dispatch**: AOTIModelContainerRunnerCpu.run() | ✅ | **FIXED 2026-06-17** — vulkan.h static inline shadow resolved; both tensors on vulkan:0 |
-| AOTI `.so` fwd+bwd+optimizer full step, data correctness | 🟡 | Pointwise fwd verified; shape tracking needs investigation for complex models |
+| AOTI `.so` fwd+bwd+optimizer full step, data correctness | 🟡 | Pointwise fwd verified; extern-kernel codegen blocker (A2.5) — conv/GN/Linear emit Python syntax in C++ wrapper |
 | Model-level AOTI API (`model_load/run/free`) | 🟡 | Stub implementation: single-kernel dispatch, no per-kernel buffer layouts |
 
 **Training correctness (the M19–M23 / FP16 line, recently active)**
