@@ -43,6 +43,15 @@ using FallbackKernel (eager C++). Optimizer uses Slang `IOptimizer` interface.
 
 Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 
+**Warm-up / device profiling (pillar W)**
+| Item | State | Evidence |
+|---|---|---|
+| W1: Hardware microbenchmark (launch latency, mem/LDS BW, atomics, limits) | ✅ | `device_profile.load_or_profile()`; cached at `~/.cache/torch_vulkan/` |
+| W2: Shader-lib + matmul template SPIR-V precompile | ✅ | `hardware_probe.py:_run_level_1_sync()`; on-disk SPIR-V cache |
+| W3: Canonical-shape autotune sweep (mm + conv2d shapes × dtypes) | ✅ | `_run_level_2_autotune()`; populates `~/.cache/torch_vulkan/autotune/` |
+| W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | ⛔ | Warm-up runs without validation by default; need `VK_INSTANCE_LAYERS` opt-in |
+| W5: Per-model warm-up (`prepare_model(model, sample_input)` → 100% SPIR-V cache) | ⛔ | No model-targeted warm-up yet; only canonical shapes |
+
 **AOT / deployment (AOTI)**
 | Item | State | Evidence |
 |---|---|---|
@@ -143,8 +152,69 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 
 ## § 2 — Forward Roadmap (open work, prioritized)
 
-Ordering principle: **correctness/deployment before performance before
-coverage breadth.** Each item names its regression test (Discipline #1).
+Ordering principle: **warm-up before compile, correctness/deployment before
+performance before coverage breadth.** Each item names its regression test
+(Discipline #1).
+
+### Pillar W — Warm-up pipeline (pre-compile prerequisite)
+
+The warm-up phase runs once at process start, **before** any `torch.compile`
+call. It profiles the specific GPU hardware, compiles and caches optimized
+SPIR-V for canonical op shapes, and validates all shaders against the Vulkan
+validation layer. After warm-up, `torch.compile(backend="inductor")` finds
+pre-compiled, hardware-validated, autotuned kernels in the cache — no cold
+slangc latency during training.
+
+This pillar formalizes the **Profile-and-warmup** durable goal (line 29) as
+an explicit first-class pipeline stage: **warm-up → compile (AOT) → train**.
+
+The canonical entry point is `torch_vulkan.prepare_device(level, timeout_s)`.
+Levels: `"quick"` (~5 s, microbench only), `"medium"` (~30 s warm / minutes
+cold, +shader-lib +matmul SPIR-V), `"deep"` (~3 min warm / up to 15 min cold,
++canonical-shape autotune sweep over mm + conv2d shapes × dtypes).
+
+#### W1 — Hardware microbenchmark ✅
+`device_profile.load_or_profile()` captures launch latency, mem BW, LDS BW,
+atomic throughput, device limits. Cached at `~/.cache/torch_vulkan/device_profile_<id>.json`.
+- **Files**: `hardware_probe.py:_run_level_0()`, `device_profile.py`
+- **Exit**: `TestWarmupMicrobench` — profile loads from cache on second call.
+
+#### W2 — Shader-lib + matmul template SPIR-V precompile ✅
+Synchronous precompilation of shader library modules (`shaders/lib/*.slang`)
+and matmul template SPIR-V. Populates the on-disk SPIR-V cache so the first
+compiled wrapper doesn't pay slangc cold-compile latency.
+- **Files**: `hardware_probe.py:_run_level_1_sync()`
+- **Exit**: `TestWarmupShaderLib` — SPIR-V cache populated; second compile
+  reuses cached modules.
+
+#### W3 — Canonical-shape autotune sweep ✅
+Runs `a @ b` and `F.conv2d(x, w, b)` through `torch.compile(backend="inductor")`
+at a grid of shapes × dtypes (fp32, fp16) to populate the per-kernel WG-size
+autotune cache (`~/.cache/torch_vulkan/autotune/*.json`).
+- **Files**: `hardware_probe.py:_run_level_2_autotune()`
+- **Exit**: `TestWarmupAutotune` — WG-size cache populated for canonical shapes;
+  subsequent compile finds cached winners.
+
+#### W4 — Vulkan validation during warm-up ⛔
+The warm-up phase should run with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
++ `TORCH_VULKAN_VUID_AS_ERROR=1` so any shader bugs are caught at warm-up time,
+not mid-training. Currently validation is opt-in and separate from the warm-up
+pipeline — the warm-up runs without validation by default.
+- **Files**: `hardware_probe.py`, `runtime/common.py` (validation layer wiring)
+- **Exit**: `TestWarmupValidation` — `prepare_device(level="deep")` with
+  validation enabled; any VUID from precompiled/autotuned shaders fails the
+  warm-up call. This gates the compile phase: no validated warm-up → no training.
+
+#### W5 — Per-model warm-up (shape-specific precompile) ⛔
+Extend warm-up to accept a model + sample input, trace the model's specific
+ops through the Inductor pipeline (fwd+bwd+optimizer), compile and cache all
+resulting SPIR-V. Turns the generic canonical-shape sweep into a model-targeted
+warm-up that guarantees 100% SPIR-V cache hits for that model's training loop.
+- **Files**: `hardware_probe.py` (new `prepare_model(model, sample_input, …)`
+  entry point)
+- **Exit**: `TestWarmupModel` — `prepare_model(model, sample_input)` populates
+  all SPIR-V needed for that model's training; subsequent `torch.compile(model)`
+  finds 100% cache hits, zero slangc invocations.
 
 ### Pillar A — AOT deployment (highest priority)
 
@@ -355,6 +425,15 @@ Every A–E item lands a named test in `tests/test_inductor_regression.py`. No
 ## § 3 — Dependency graph
 
 ```
+WARM-UP PIPELINE (pre-compile — runs once before any torch.compile)
+├─ W1 (microbench)      ✅
+├─ W2 (shader-lib precompile) ✅
+├─ W3 (autotune sweep)  ✅
+├─ W4 (validation during warm-up) ⛔
+└─ W5 (per-model warm-up) ⛔
+      │
+      │  After warm-up, all downstream pillars find hot caches:
+      ▼
 A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so) ⛔
    │                            ├─ A2.1 (PF.60: verify tensor_str fix) 🟡
    │                            ├─ A2.2 (PF.30.e: FunctionalTensor view ops) ⛔
@@ -381,11 +460,13 @@ E2 (masking backward) ⛔
 E3 (missing ops)     ⛔
 ```
 
-Parallel streams: **A2.1** (PF.60 verify) is the lowest-hanging fruit — one
-test run without xfail. **A2.2** (PF.30.e FunctionalTensor view ops) is the
-active blocker for all downstream AOTI work. **A5-pure** (Slang codegen for
-pooling fwd) and **E1** (pooling-bwd Slang) are the remaining codegen gaps.
-**B2** cleans up the last Jinja template. **C**/**D** are performance/autotune;
+Parallel streams: **W4** (validation during warm-up) gates the entire
+compile path — catch shader bugs at warm-up, not mid-training. **W5**
+(per-model warm-up) guarantees zero cold slangc during training.
+**A2.1** (PF.60 verify) is the lowest-hanging fruit — one test run
+without xfail. **A5-pure** (Slang codegen for pooling fwd) and **E1**
+(pooling-bwd Slang) are the remaining codegen gaps. **B2** cleans up
+the last Jinja template. **C**/**D** are performance/autotune;
 **E2/E3** are op coverage breadth.
 
 ---
@@ -425,6 +506,7 @@ human-readable title is the row; the canonical kebab tag is in the last column.
 
 | # | Stage | Where it lives | Canonical tag |
 |---|-------|----------------|---------------|
+| 0 | Device warm-up / profile | `hardware_probe.py`, `device_profile.py` | `warmup-profile` |
 | 1 | Dynamo trace | `torch/_dynamo` FX capture | `dynamo` |
 | 2 | AOTAutograd graph capture | joint fwd+bwd capture | `aot-autograd-graph-capture` |
 | 3 | AOTAutograd partitioner | fwd/bwd split | `partitioner` |
