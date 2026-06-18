@@ -198,12 +198,13 @@ def _dtype_from_name(name: str):
 
 
 def _run_level_2_autotune() -> dict[str, Any]:
-    """Compile + run canonical mm and conv2d shapes through Inductor.
+    """Compile + run canonical training shapes through Inductor.
 
-    This populates the per-kernel WG-size autotune cache
-    (``~/.cache/torch_vulkan/autotune/*.json``) and the inductor compile cache
-    for the standard training-shape grid. Failures per-shape are logged and
-    counted but never raise — the probe is best-effort.
+    Sweeps mm, conv2d (fwd+bwd), linear (addmm), and bmm at a grid of
+    shapes × dtypes (fp32, fp16) to populate the per-kernel WG-size autotune
+    cache (``~/.cache/torch_vulkan/autotune/*.json``) and the Inductor
+    compile cache. Failures per-shape are logged and counted but never
+    raise — the probe is best-effort.
 
     D1: When TORCH_VULKAN_MM_TILES=expanded (or unset), uses the
     expanded tile config sweep (16 basic + 4 register tiles) so the
@@ -337,6 +338,80 @@ def _run_level_2_autotune_impl() -> dict[str, Any]:
     out["linear_shapes_probed"] = linear_probed
     out["linear_ms"] = (time.perf_counter() - t2) * 1e3
 
+    # D1 — BMM (batched matmul) sweep: common in attention (Q@K^T),
+    # multi-head projections, and batched linear layers.
+    _BMM_PROBE_SHAPES: list[tuple[int, int, int, int]] = [
+        (4, 128, 128, 128),     # small batch, square
+        (8, 64, 512, 64),       # attention: Q@K^T style (heads, seq, head_dim)
+        (2, 256, 256, 256),     # medium batch, square
+        (16, 32, 128, 32),      # many small matmuls
+    ]
+
+    @torch.compile(backend="inductor", dynamic=False)
+    def _bmm(a, b):
+        return torch.bmm(a, b)
+
+    t3 = time.perf_counter()
+    bmm_probed = 0
+    with torch.no_grad():
+        for B, M, N, K in _BMM_PROBE_SHAPES:
+            for dt_name in _MM_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                try:
+                    a = torch.randn(B, M, K, dtype=dt, device="vulkan")
+                    b = torch.randn(B, K, N, dtype=dt, device="vulkan")
+                    _ = _bmm(a, b)
+                    bmm_probed += 1
+                except Exception as e:
+                    _log.warning(
+                        "bmm probe (B=%d,M=%d,N=%d,K=%d,%s) failed: %s",
+                        B, M, N, K, dt_name, e,
+                    )
+                    out["failures"].append(
+                        f"bmm[B={B},M={M},N={N},K={K},{dt_name}]: {type(e).__name__}"
+                    )
+    out["bmm_shapes_probed"] = bmm_probed
+    out["bmm_ms"] = (time.perf_counter() - t3) * 1e3
+
+    # D1 — Conv2d backward sweep: compiles both fwd and bwd by running a
+    # loss.backward() through a tiny Conv2d module. This populates the
+    # autotune cache for conv backward templates (slang_conv_bwd + bwd_diff).
+    _CONV_BWD_PROBE_SHAPES: list[tuple[int, int, int, int, int, int]] = [
+        (2, 32, 64, 16, 16, 3),    # medium conv
+        (1, 64, 128, 32, 32, 3),   # larger spatial
+        (2, 16, 32, 8, 8, 1),      # 1×1 conv backward
+    ]
+
+    t4 = time.perf_counter()
+    conv_bwd_probed = 0
+    for B, Cin, Cout, H, W, K in _CONV_BWD_PROBE_SHAPES:
+        for dt_name in _CONV_PROBE_DTYPES:
+            dt = _dtype_from_name(dt_name)
+            try:
+                conv = torch.nn.Conv2d(
+                    Cin, Cout, K, padding=K // 2, device="vulkan"
+                )
+                if dt == torch.float16:
+                    conv = conv.half()
+                compiled_conv = torch.compile(conv, backend="inductor", dynamic=False)
+                x = torch.randn(B, Cin, H, W, dtype=dt, device="vulkan")
+                y = compiled_conv(x)
+                loss = y.sum()
+                loss.backward()
+                conv.zero_grad(set_to_none=True)
+                conv_bwd_probed += 1
+            except Exception as e:
+                _log.warning(
+                    "conv bwd probe (B=%d,Cin=%d,Cout=%d,H=%d,W=%d,K=%d,%s) failed: %s",
+                    B, Cin, Cout, H, W, K, dt_name, e,
+                )
+                out["failures"].append(
+                    f"conv_bwd[B={B},Cin={Cin},Cout={Cout},H={H},W={W},K={K},{dt_name}]:"
+                    f" {type(e).__name__}"
+                )
+    out["conv_bwd_shapes_probed"] = conv_bwd_probed
+    out["conv_bwd_ms"] = (time.perf_counter() - t4) * 1e3
+
     return out
 
 
@@ -469,9 +544,12 @@ def _profile_device_impl(
             mm_n = result["autotune"].get("mm_shapes_probed", 0)
             conv_n = result["autotune"].get("conv_shapes_probed", 0)
             lin_n = result["autotune"].get("linear_shapes_probed", 0)
+            bmm_n = result["autotune"].get("bmm_shapes_probed", 0)
+            cbd_n = result["autotune"].get("conv_bwd_shapes_probed", 0)
             print(
                 f"  level 2 (autotune sweep) : {result['level_2_ms']:>8.0f} ms"
-                f" (mm={mm_n} conv={conv_n} linear={lin_n} failures={f})"
+                f" (mm={mm_n} conv={conv_n} linear={lin_n}"
+                f" bmm={bmm_n} conv_bwd={cbd_n} failures={f})"
             )
 
     result["total_ms"] = (time.perf_counter() - t_total) * 1e3
