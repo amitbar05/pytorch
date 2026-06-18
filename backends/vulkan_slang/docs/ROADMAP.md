@@ -508,6 +508,12 @@ candidates are stripped via `_install_vulkan_autotune_cuda_filter()`.
 - `_run_level_2_autotune()` auto-enables expanded mode during warm-up sweep
 - All configs pass the wave64 single-wave filter on RDNA1
 
+**D1 warm-up shape sweep (2026-06-18):** Level-2 autotune now covers:
+- MM: 12 shapes × 2 dtypes (square, tall-skinny, short-wide, batched, small)
+- Conv: 8 shapes × 2 dtypes (1×1, 3×3, 5×5 kernels, first-layer, large-batch)
+- Linear: 4 shapes × 2 dtypes (addmm — FFN/MLP blocks)
+- Total: 48 autotune probe combos (was 14)
+
 **Remaining**: Conv tile config autotune (`tuned_conv`), flash attention tile configs,
 and V.choices integration for non-MM templates.
 - **Files**: `vulkan_template.py:175-224`, `dispatch.py:584-703`,
