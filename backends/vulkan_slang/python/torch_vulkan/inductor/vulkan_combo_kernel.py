@@ -224,18 +224,14 @@ class VulkanComboKernel:
         # subkernels, so a 1-element fill in the same bucket as a
         # 4096-element compute just idles on threads > 1 — overhead
         # is negligible compared to a standalone dispatch (30-60 us).
+        # C6.4v2: use just two buckets (small/large) to maximize
+        # fusion.  The per-subkernel bounds check ensures correctness
+        # regardless of numel mismatch.  Cap at 8 subkernels per combo
+        # to bound if/else chain overhead.
         def _numel_magnitude_key(n: int) -> str:
-            if n <= 64:
-                return "tiny"        # ≤ 1 wave
-            if n <= 256:
-                return "xs"          # ≤ 4 waves
             if n <= 4096:
-                return "sm"          # ≤ 16 WGs @256 TGS
-            if n <= 16384:
-                return "md"          # ≤ 64 WGs
-            if n <= 65536:
-                return "lg"          # ≤ 256 WGs
-            return "xl"              # > 256 WGs
+                return "small"
+            return "large"
 
         buckets: dict[str, list[BaseSchedulerNode]] = defaultdict(list)
         for node in orphans:
@@ -335,6 +331,33 @@ class VulkanComboKernel:
                 consumed.add(oi)
                 if bucket is not None:
                     buckets.pop(key, None)
+                continue
+
+            # C6.4v2: cap subkernels at MAX_COMBO_SUBKERNELS to bound
+            # if/else chain overhead in the generated Slang shader.
+            # Larger buckets are split into chunks.
+            MAX_COMBO_SUBKERNELS = 8
+            if len(bucket) > MAX_COMBO_SUBKERNELS:
+                for chunk_start in range(0, len(bucket), MAX_COMBO_SUBKERNELS):
+                    chunk = bucket[chunk_start:chunk_start + MAX_COMBO_SUBKERNELS]
+                    if len(chunk) >= 2:
+                        try:
+                            group_snode = ForeachKernelSchedulerNode(
+                                chunk[0].scheduler,
+                                list(chunk),
+                                use_custom_partition_algo=True,
+                                enable_autotune=False,
+                            )
+                            result.append(group_snode)
+                        except Exception:
+                            result.extend(chunk)
+                    else:
+                        result.extend(chunk)
+                    for bn in chunk:
+                        bi = orphan_index.get(id(bn))
+                        if bi is not None:
+                            consumed.add(bi)
+                buckets.pop(key, None)
                 continue
 
             # Create a ForeachKernelSchedulerNode for this bucket.
