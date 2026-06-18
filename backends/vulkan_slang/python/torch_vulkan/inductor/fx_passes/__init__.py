@@ -155,6 +155,15 @@ def _make_vulkan_pass() -> object:
         with ad-hoc fallbacks for not-yet-registered passes."""
 
         def __call__(self, gm: "torch.fx.GraphModule") -> None:
+            # Upstream's GraphTransformObserver.apply_graph_pass passes
+            # self.gm.graph (the Graph) not self.gm (the GraphModule).
+            # Unwrap if we received a plain Graph.
+            import torch.fx
+            if isinstance(gm, torch.fx.Graph):
+                gm = gm.owning_module
+            if gm is None:
+                return  # graph has no owning module
+
             from .functional import (
                 _fuse_optimizer_step_to_foreach,
             )

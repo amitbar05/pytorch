@@ -28,15 +28,14 @@ def _vulkan_post_fusion_pass(nodes):
 
     if not _vk_cfg.aggressive_fusion():
         return nodes
-    # T5.4: Respect upstream combo_kernels flag.
-    # When combo_kernels=False, the scheduler has already been told not to
-    # create ForeachKernelSchedulerNode instances.  _coalesce_orphan_pointwise
-    # creates additional ForeachKernelSchedulerNode wrappers, so it MUST also
-    # be disabled — otherwise combo kernels leak through with broken
-    # topological ordering (e.g., buf10 used before its definition in a
-    # dual-GN rsqrt combo placed between conv1 and conv2).
-    if hasattr(_ic, "combo_kernels") and not _ic.combo_kernels:
-        return nodes
+    # Note: we DO run _coalesce_orphan_pointwise even when
+    # upstream combo_kernels=False.  The upstream flag only gates the
+    # scheduler's own vertical/horizontal fusion; our custom pass runs
+    # AFTER that fusion and has its own dependency validation (Phase 2
+    # safety filter in _coalesce_orphan_pointwise).  Disabling it when
+    # combo_kernels=False (the old T5.4 Phase A gate) had the side
+    # effect of killing ALL orphan coalescing, not just upstream combo
+    # kernels.
     return _VCK._coalesce_orphan_pointwise(nodes)
 
 
@@ -866,6 +865,12 @@ def _legacy_register() -> None:
 
     if hasattr(_ic, "b2b_gemm_pass"):
         _ic.b2b_gemm_pass = True
+
+    # Set post_grad_custom_pre_pass so Inductor invokes our FX pattern
+    # fusion pass during compilation.  register_backend_for_device stores
+    # the pass in custom_backend_passes, but that dict is never read by
+    # the post_grad pipeline — only config.post_grad_custom_pre_pass is.
+    _ic.post_grad_custom_pre_pass = _make_vulkan_pass()
 
     # T5.4 Phase A: combo_kernels disabled (TR.20).
     # The upstream combo-kernel fusion path has a stale name_to_fused_node
