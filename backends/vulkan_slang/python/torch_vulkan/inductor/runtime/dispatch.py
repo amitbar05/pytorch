@@ -7,7 +7,9 @@ and AOTI model export.
 
 import hashlib
 import os
+import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -537,7 +539,11 @@ def make_vulkan_kernel(
                 )
 
         stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-        return kernel if not stats_enabled else _wrap_stats(key, kernel)
+        kernel_closure = kernel if not stats_enabled else _wrap_stats(key, kernel)
+        return _maybe_autotune_wg(
+            kernel_closure, src, key, n_pc, n_outputs, spv,
+            indexed_fn, _pc_buf, _pc_pack_into,
+        )
 
     # ── flat path: every binding has descriptorCount == 1 ──
     dispatch_fn = _get_jit_dispatch()
@@ -551,7 +557,11 @@ def make_vulkan_kernel(
             )
 
         stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-        return kernel if not stats_enabled else _wrap_stats(key, kernel)
+        kernel_closure = kernel if not stats_enabled else _wrap_stats(key, kernel)
+        return _maybe_autotune_wg(
+            kernel_closure, src, key, n_pc, n_outputs, spv,
+            dispatch_fn, _pc_buf, _pc_pack_into,
+        )
 
     # With push constants. The wrapper (`kernel/header.py:call_kernel`)
     # emits ordered_args as ``[bufs..., sizevars..., dyn_numels..., wg_x,
@@ -576,7 +586,68 @@ def make_vulkan_kernel(
         )
 
     stats_enabled = os.environ.get("TORCH_VULKAN_INDUCTOR_STATS") == "1"
-    return kernel if not stats_enabled else _wrap_stats(key, kernel)
+    kernel_closure = kernel if not stats_enabled else _wrap_stats(key, kernel)
+    return _maybe_autotune_wg(
+        kernel_closure, src, key, n_pc, n_outputs, spv,
+        dispatch_fn, _pc_buf, _pc_pack_into,
+    )
+
+
+def _maybe_autotune_wg(
+    default_closure,
+    src: str,
+    key: str,
+    n_pc: int,
+    n_outputs: int,
+    spv: bytes,
+    dispatch_fn,
+    pc_buf,
+    pc_pack_into,
+):
+    """Gate: if WG autotune is enabled, benchmark; else check disk cache.
+
+    When ``TORCH_VULKAN_WG_AUTOTUNE=1`` (warm-up), benchmarks alternative
+    WG sizes and caches the winner to disk.  When the env var is NOT set
+    (training), checks the disk cache for a previously-saved winner and
+    returns the recompiled closure if found — giving the training run the
+    benefit of warm-up WG tuning without paying benchmark cost.
+    """
+    import hashlib
+
+    # Source hash for cache lookups (structural, WG-size independent)
+    src_hash = hashlib.sha256(src.encode()).hexdigest()[:12]
+
+    if _wg_autotune_enabled():
+        # Warm-up mode: benchmark and persist
+        tuned = _autotune_kernel_wg(
+            src, key, n_pc, n_outputs, spv,
+            dispatch_fn, pc_buf, pc_pack_into,
+        )
+        if tuned is not None:
+            return tuned
+        return default_closure
+
+    # Training mode: check disk cache
+    if src_hash in _WG_AUTOTUNE_CACHE:
+        cached_wg = _WG_AUTOTUNE_CACHE[src_hash]
+    else:
+        _WG_AUTOTUNE_CACHE.update(_load_wg_cache())
+        cached_wg = _WG_AUTOTUNE_CACHE.get(src_hash)
+
+    if cached_wg is not None:
+        orig_match = _NUMTHREADS_RE.search(src)
+        if orig_match:
+            orig_nt = orig_match.group(0)
+            orig_wg = _extract_wg_from_numthreads(orig_nt)
+            if cached_wg != orig_wg:
+                tuned = _build_kernel_for_wg(
+                    src, orig_nt, cached_wg, key, n_pc, n_outputs,
+                    dispatch_fn, pc_buf, pc_pack_into,
+                )
+                if tuned is not None:
+                    return tuned
+
+    return default_closure
 
 
 def make_vulkan_kernel_via_aoti(
@@ -793,3 +864,205 @@ def export_aoti_model(
         )
     finally:
         _c._aoti_model_free(model_handle)
+
+
+# ── D1: Workgroup-size autotune ───────────────────────────────────────
+
+
+_WG_AUTOTUNE_CACHE: dict[str, int] = {}
+_WG_DISK_CACHE_DIR = Path.home() / ".cache" / "torch_vulkan" / "wg_autotune"
+_NUMTHREADS_RE = re.compile(r"\[numthreads\(\d+,\s*\d+,\s*\d+\)\]")
+
+
+def _wg_autotune_enabled() -> bool:
+    """Check if WG-size autotune is active (env var or warm-up sweep)."""
+    return os.environ.get("TORCH_VULKAN_WG_AUTOTUNE", "") == "1"
+
+
+def _load_wg_cache() -> dict[str, int]:
+    """Load persistent WG-size cache from disk."""
+    cache: dict[str, int] = {}
+    try:
+        _WG_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in _WG_DISK_CACHE_DIR.iterdir():
+            if entry.suffix == ".json":
+                try:
+                    import json
+                    data = json.loads(entry.read_text())
+                    if isinstance(data, dict) and "best_wg" in data:
+                        cache[entry.stem] = data["best_wg"]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return cache
+
+
+def _save_wg_cache(src_hash: str, best_wg: int) -> None:
+    """Persist a WG-size winner to disk."""
+    try:
+        import json
+        _WG_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _WG_DISK_CACHE_DIR / f"{src_hash}.json"
+        path.write_text(json.dumps({"best_wg": best_wg}))
+    except Exception:
+        pass
+
+
+def _autotune_kernel_wg(
+    src: str,
+    key: str,
+    n_pc: int,
+    n_outputs: int,
+    spv: bytes,
+    dispatch_fn,
+    pc_buf,
+    pc_pack_into,
+) -> "callable":
+    """Benchmark alternative WG sizes for a kernel and return the fastest.
+
+    Modifies the ``[numthreads(...)]`` line in the Slang source, recompiles
+    to SPIR-V, creates dispatchable closures, benchmarks each variant, and
+    returns the fastest closure.  Results are cached per source-hash so
+    subsequent calls for the same kernel shape short-circuit.
+
+    Only activates for 1D workgroups (``[numthreads(X, 1, 1)]``).
+    Multi-dim or indexed-dispatch kernels are returned as-is.
+    """
+    import hashlib
+    from statistics import median
+
+    from .slangc import compile_slang_to_spirv
+
+    # Only autotune 1D workgroups — multi-dim WGs have complex occupancy
+    orig_match = _NUMTHREADS_RE.search(src)
+    if not orig_match:
+        return None
+    orig_nt = orig_match.group(0)
+    # Check it's [numthreads(X, 1, 1)]
+    if ", 1, 1)]" not in orig_nt:
+        return None
+
+    # Source hash for cache keying (structural, independent of WG size)
+    src_hash = hashlib.sha256(src.encode()).hexdigest()[:12]
+
+    # Check cache
+    if src_hash in _WG_AUTOTUNE_CACHE:
+        cached_wg = _WG_AUTOTUNE_CACHE[src_hash]
+        if cached_wg != _extract_wg_from_numthreads(orig_nt):
+            # Recompile with cached winner
+            return _build_kernel_for_wg(
+                src, orig_nt, cached_wg, key, n_pc, n_outputs,
+                dispatch_fn, pc_buf, pc_pack_into,
+            )
+
+    # Candidate WG sizes — wave-aligned on both wave32 and wave64
+    # Filter to sizes that are ≤ the original (reducing WG size is safe;
+    # increasing it risks exceeding device limits)
+    orig_wg = _extract_wg_from_numthreads(orig_nt)
+    candidates = [w for w in (64, 128, 256, 512) if w != orig_wg and w <= orig_wg]
+    if len(candidates) < 2:
+        return None  # not enough candidates to be worth it
+
+    # Build benchmark closures for each candidate
+    closures = {}  # wg_size -> callable
+    for wg in candidates:
+        k = _build_kernel_for_wg(
+            src, orig_nt, wg, f"{key}_wg{wg}", n_pc, n_outputs,
+            dispatch_fn, pc_buf, pc_pack_into,
+        )
+        if k is not None:
+            closures[wg] = k
+
+    if len(closures) < 2:
+        return None
+
+    # Benchmark: 2 warmup iterations, ~5 ms timing budget
+    best_wg = orig_wg
+    best_ms = float("inf")
+    warmup = 2
+    rep_ms = 5.0
+
+    for wg, call_fn in closures.items():
+        samples: list[float] = []
+        try:
+            for _ in range(warmup):
+                call_fn()
+            t0 = time.perf_counter()
+            while (time.perf_counter() - t0) * 1000.0 < rep_ms:
+                start = time.perf_counter()
+                call_fn()
+                samples.append((time.perf_counter() - start) * 1000.0)
+            if not samples:
+                call_fn()
+                start = time.perf_counter()
+                call_fn()
+                samples.append((time.perf_counter() - start) * 1000.0)
+            med = median(samples)
+            if med < best_ms:
+                best_ms = med
+                best_wg = wg
+        except Exception:
+            continue
+
+    # Cache the winner
+    _WG_AUTOTUNE_CACHE[src_hash] = best_wg
+
+    # If the original was fastest, return None (caller uses default)
+    if best_wg == orig_wg:
+        return None
+
+    # Return the winning closure
+    return closures.get(best_wg)
+
+
+def _extract_wg_from_numthreads(nt_str: str) -> int:
+    """Extract total thread count from [numthreads(X, Y, Z)]."""
+    import re
+    m = re.search(r"numthreads\((\d+),\s*(\d+),\s*(\d+)\)", nt_str)
+    if m:
+        return int(m.group(1)) * int(m.group(2)) * int(m.group(3))
+    return 256
+
+
+def _build_kernel_for_wg(
+    src: str,
+    orig_nt: str,
+    wg: int,
+    key: str,
+    n_pc: int,
+    n_outputs: int,
+    dispatch_fn,
+    pc_buf,
+    pc_pack_into,
+) -> "callable | None":
+    """Build a dispatchable closure for a specific WG size.
+
+    Replaces ``[numthreads(X, 1, 1)]`` with ``[numthreads(wg, 1, 1)]``,
+    recompiles to SPIR-V, and returns a closure with the same shape as
+    ``make_vulkan_kernel``'s output.
+    """
+    import struct
+    from .slangc import compile_slang_to_spirv
+
+    new_src = src.replace(orig_nt, f"[numthreads({wg}, 1, 1)]")
+    try:
+        new_spv = compile_slang_to_spirv(new_src, cache_key=key)
+    except Exception:
+        return None
+
+    if n_pc == 0:
+        def kernel(*args):
+            dispatch_fn(
+                key, new_spv, list(args[:-3]),
+                args[-3], args[-2], args[-1], b"", n_outputs,
+            )
+    else:
+        def kernel(*args):
+            pc_buf_copy = bytearray(n_pc * 4)
+            struct.Struct(f"{n_pc}I").pack_into(pc_buf_copy, 0, *args[-(3 + n_pc):-3])
+            dispatch_fn(
+                key, new_spv, list(args[:-(3 + n_pc)]),
+                args[-3], args[-2], args[-1], bytes(pc_buf_copy), n_outputs,
+            )
+    return kernel

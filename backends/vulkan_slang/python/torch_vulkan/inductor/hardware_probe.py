@@ -216,6 +216,12 @@ def _run_level_2_autotune() -> dict[str, Any]:
     if _prev_mm_tiles is None:
         os.environ["TORCH_VULKAN_MM_TILES"] = "expanded"
 
+    # D1: enable WG-size autotune during warm-up (benchmarks numthreads
+    # variants for every pointwise/reduction kernel)
+    _prev_wg = os.environ.get("TORCH_VULKAN_WG_AUTOTUNE")
+    if _prev_wg is None:
+        os.environ["TORCH_VULKAN_WG_AUTOTUNE"] = "1"
+
     try:
         return _run_level_2_autotune_impl()
     finally:
@@ -223,6 +229,10 @@ def _run_level_2_autotune() -> dict[str, Any]:
             del os.environ["TORCH_VULKAN_MM_TILES"]
         else:
             os.environ["TORCH_VULKAN_MM_TILES"] = _prev_mm_tiles
+        if _prev_wg is None:
+            del os.environ["TORCH_VULKAN_WG_AUTOTUNE"]
+        else:
+            os.environ["TORCH_VULKAN_WG_AUTOTUNE"] = _prev_wg
 
 
 def _run_level_2_autotune_impl() -> dict[str, Any]:
