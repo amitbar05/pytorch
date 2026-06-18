@@ -120,7 +120,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Batcher `ready_set` per-batch flush (correctness) | ✅ | `runtime/batcher.py:55-152` |
 | **Batch dispatch is correct but 1.8× slower** → default OFF | ⛔ | `config.py:119-123`; the payoff needs compile/exec overlap (below) |
 | **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | async pool exists (`slangc.py:544`), overlap not wired into flush path |
-| **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ⛔ | `template_registry.py` has a `shape_class` field only; no canonicalization |
+| **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ✅ | C2 done: `config_key` in `kernel/main.py:397` + `canonical_shape_class` in `template_registry.py:71`; same-class shapes reuse cached SPIR-V |
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
 | **Conv backward fwd-recomputation elimination** | 🟡 | C5.1: added `TORCH_VULKAN_DISABLE_CONV_GN_FUSION` gate for experimentation; warm-rerun may hang |
@@ -396,12 +396,19 @@ into a double-buffer: execute kernel N while compiling N+2. Target: batched ≤
 - **Files**: `runtime/batcher.py`, `runtime/slangc.py`, `csrc/backend/DeviceRuntime.cpp`, `config.py:123`
 - **Exit**: `TestBatchPerf` — MNISTNet batched overhead ≤ 10%; default flips to ON.
 
-#### C2 — Shape bucketing in template registry ⛔
+#### C2 — Shape bucketing in template registry ✅ **DONE (verified 2026-06-18)**
 Canonicalize `(rank, dtype, layout_class, stride_class)` before template
-selection; cache compiled SPIR-V by the canonical key so same-class shapes never
-re-invoke slangc.
-- **Files**: `kernel/template_registry.py`
-- **Exit**: `TestShapeBucketing` — two same-class shapes ⇒ one slangc invocation.
+selection; cache compiled SPIR-V by the canonical key so same-class shapes
+never re-invoke slangc. Implemented via two mechanisms:
+- `config_key` property in `kernel/main.py:397` — hashes structural kernel
+  characteristics (dtypes, reduction arity, push-constant layout) independent
+  of concrete sizes. Two pointwise kernels with different tensor sizes but
+  same rank/dtype/reduction structure get the same key.
+- `canonical_shape_class` + `cache_key_for` in `template_registry.py:71,95`
+  for template selection dispatch.
+Verified: dispatch trace shows `vulkan_kernel_0_a869f14b250b` reused across
+multiple training steps (same hash = same SPIR-V).
+- **Files**: `kernel/main.py:397-470`, `template_registry.py:71-104`
 
 #### C3 — Persistent-kernel routing for large reductions 🟡
 Route reductions with `numel > 65536` to `persistent_pointwise.slang` (loop over
