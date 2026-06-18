@@ -494,36 +494,33 @@ not from GN backward itself. The GN backward is well-optimized.
 ### Pillar D — Autotune
 
 #### D1 — Wire Slang templates into Inductor autotune 🟡
-**PARTIAL (2026-06-18).** MM autotune already works via `install_external_mm()`:
-14 variants (4 basic × 2 stages + 3 register × 2 stages) registered into
-Inductor's `external_matmul` and benchmarked by `tuned_mm`. VUID-rejecting
-candidates are stripped via `_install_vulkan_autotune_cuda_filter()`.
+**SUBSTANTIAL (2026-06-18).** MM autotune works via `install_external_mm()`:
+10 default + 40 expanded variants registered into Inductor's `external_matmul`
+and benchmarked by `tuned_mm`. VUID-rejecting candidates stripped via
+`_install_vulkan_autotune_cuda_filter()`.
 
-**D1 expanded tile sweep (2026-06-18):** Two-tier tile config system:
-- Default: 4 basic + 1 register tile configs (10 variants with 2 stages) — fast cold compile
-- Expanded (`TORCH_VULKAN_MM_TILES=expanded`): 16 basic + 4 register (40 variants) — full sweep
-  covering square (8×8), tall-skinny (4×16), short-wide (16×4) aspect ratios
-  with fine-grain K-tile exploration (4/8/12/16/24/32/48/64) and register-tile
-  variants at 2 occupancy levels (64 and 16 VGPRs/thread).
-- `_run_level_2_autotune()` auto-enables expanded mode during warm-up sweep
-- All configs pass the wave64 single-wave filter on RDNA1
+**Warm-up coverage: 14 → 96 probe combos across 8 categories:**
+| Category | Shapes × dtypes | Combos |
+|----------|----------------|--------|
+| MM | 12 × 2 | 24 |
+| Conv fwd | 8 × 2 | 16 |
+| Linear (addmm) | 4 × 2 | 8 |
+| BMM | 4 × 2 | 8 |
+| Conv bwd | 3 × 2 | 6 |
+| GN/Softmax/GELU | 9 × 2 | 18 |
+| Conv tile sweep | 8 × 2 | 16 |
 
-**D1 warm-up shape sweep (2026-06-18):** Level-2 autotune now covers:
-- MM: 12 shapes × 2 dtypes (square, tall-skinny, short-wide, batched, small)
-- Conv fwd: 8 shapes × 2 dtypes (1×1, 3×3, 5×5 kernels, first-layer, large-batch)
-- Linear: 4 shapes × 2 dtypes (addmm — FFN/MLP blocks)
-- BMM: 4 shapes × 2 dtypes (torch.bmm — attention/multi-head projections)
-- Conv bwd: 3 shapes × 2 dtypes (loss.backward through nn.Conv2d)
-- GN/Softmax/GELU: 18 combos (reduction + pointwise templates)
-- Conv tile: 16 extra combos (tile_w × tile_h × tile_c variants)
-- Total: 96 autotune probe combos (was 14)
+**WG-size autotune (2026-06-18):** `make_vulkan_kernel` benchmarks
+alternative `[numthreads(X, 1, 1)]` values (64, 128, 256, 512) for every
+pointwise/reduction kernel during warm-up. Winners cached to
+`~/.cache/torch_vulkan/wg_autotune/`. Training picks up cached winners
+without benchmark cost. Gated via `TORCH_VULKAN_WG_AUTOTUNE=1` (auto-set
+by warm-up).
+
+**Conv tile config autotune (2026-06-18):** `TORCH_VULKAN_CONV_TILE` env
+var controls conv2d tiles (both Python + AOTI codegen). Sweeps 4 configs.
 
 **Remaining**: Flash attention tile configs, V.choices for non-MM templates.
-
-**D1 conv tile config sweep (2026-06-18):** `TORCH_VULKAN_CONV_TILE` env var
-controls conv2d tile config (both Python-wrapper and AOTI codegen). Warm-up
-sweeps 4 tile configs × 2 shapes × 2 dtypes = 16 extra probes. Format:
-`tile_w x tile_h x tile_c` (e.g. `"16x8x4"`). Default (8,8,8).
 - **Files**: `vulkan_template.py:175-224`, `dispatch.py:584-703`,
   `hardware_probe.py:174-224`, `install.py:117-159`
 - **Exit**: `TestAutotuneMMExpanded` — with `TORCH_VULKAN_MM_TILES=expanded`,
