@@ -124,7 +124,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang`: C6.3 (2026-06-18) fixed push-constant overflow (OpRange→StructuredBuffer), created `persistent_pointwise.py` caller, added sub/pow/fill ops; template now dispatchable |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
 | **Conv backward fwd-recomputation elimination** | 🟡 | C5.1: added `TORCH_VULKAN_DISABLE_CONV_GN_FUSION` gate for experimentation; warm-rerun may hang |
-| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches; **C6.3 (2026-06-18)** raised `can_fuse_vertical` and `_all_consumers_are_fusible` caps 1024→8192 (matching `can_fuse_horizontal`), enabling more reduction+pointwise fusion in training backward |
+| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches; **C6.3 (2026-06-18)** raised `can_fuse_vertical` and `_all_consumers_are_fusible` caps 1024→8192; **C6.4 (2026-06-18)** raised persistent-mode cap 4096→16384, `_is_small_pointwise_chain` total_numel cap 16384→65536, switched combo-kernel orphan bucketing from exact-numel to magnitude-based — expected 7-12 fewer standalone dispatches per step |
 | **GN backward Slang-extern** (single shader vs 11 pointwise ops) | ⛔ | Single-dispatch GN backward like conv_gn_relu fwd; eliminates intermediates |
 
 **Autotune (TUNE)**
