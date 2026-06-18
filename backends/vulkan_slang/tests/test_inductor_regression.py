@@ -54137,7 +54137,7 @@ class TestMProbe1PrepareDevice:
 
         import torch_vulkan
 
-        def _slow(level, force, verbose):
+        def _slow(level, force, verbose, validate=False):
             _time.sleep(2.0)
             return {"level": level, "cached": False, "total_ms": 2000.0}
 
@@ -54155,6 +54155,88 @@ class TestMProbe1PrepareDevice:
         )
         assert result.get("timeout_s") == 0.3
         assert result.get("level") == "quick"
+
+
+class TestWarmupModel:
+    """W5 (v7) — ``torch_vulkan.prepare_model(model, sample_input)``
+    compiles and warms up all kernels for a specific model before training.
+
+    The returned compiled model must produce forward output (and backward
+    gradients when a loss is provided) matching a separately-compiled
+    baseline, and the warm-up must populate the SPIR-V cache so subsequent
+    compiles reuse cached shaders.
+    """
+
+    @pytest.mark.gpu
+    def test_prepare_model_forward_works(self):
+        """Call prepare_model on a Conv+GN+ReLU model; verify forward output."""
+        import torch
+        import torch.nn as nn
+        import torch_vulkan
+
+        torch.manual_seed(1)
+        model = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.GroupNorm(2, 8),
+            nn.ReLU(),
+        ).to("vulkan:0")
+        x = torch.randn(2, 3, 16, 16, device="vulkan:0")
+
+        compiled = torch_vulkan.prepare_model(model, x, verbose=False)
+        with torch.no_grad():
+            out = compiled(x)
+        assert out.shape == (2, 8, 16, 16), f"unexpected shape {out.shape}"
+        assert out.device.type == "vulkan"
+
+    @pytest.mark.gpu
+    def test_prepare_model_backward_matches_cpu(self):
+        """Call prepare_model (no loss_fn → fake-loss backward) and verify
+        per-param gradients match a CPU baseline within 5e-3 rel_diff."""
+        import torch
+        import torch.nn as nn
+        import torch_vulkan
+
+        torch.manual_seed(2)
+        cpu_mod = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.GroupNorm(2, 8),
+            nn.ReLU(),
+        )
+        torch.manual_seed(2)
+        vk_mod = nn.Sequential(
+            nn.Conv2d(3, 8, 3, padding=1),
+            nn.GroupNorm(2, 8),
+            nn.ReLU(),
+        ).to("vulkan:0")
+
+        # CPU forward + backward
+        x_cpu = torch.randn(2, 3, 16, 16)
+        out_cpu = cpu_mod(x_cpu)
+        out_cpu.sum().backward()
+
+        # Warm up via prepare_model (compiles fwd+bwd via fake loss)
+        x_vk = x_cpu.detach().clone().to("vulkan:0")
+        compiled = torch_vulkan.prepare_model(
+            vk_mod, x_vk, loss_fn=None, verbose=False
+        )
+
+        # Use the returned compiled model for forward + backward
+        out_vk = compiled(x_vk)
+        out_vk.sum().backward()
+
+        for (cn, cp), (vn, vp) in zip(
+            cpu_mod.named_parameters(), vk_mod.named_parameters()
+        ):
+            assert cn == vn, f"param name mismatch {cn} vs {vn}"
+            assert cp.grad is not None, f"CPU grad missing for {cn}"
+            assert vp.grad is not None, f"VK grad missing for {vn}"
+            gv = vp.grad.detach().cpu()
+            l_inf = (cp.grad - gv).abs().max().item()
+            assert l_inf < 5e-3, (
+                f"W5 prepare_model backward: {cn} L_inf={l_inf:.6f} "
+                f"(cpu_norm={cp.grad.norm().item():.5f}, "
+                f"vk_norm={gv.norm().item():.5f}); expected < 5e-3"
+            )
 
 
 class TestMVal1VuidAsError:

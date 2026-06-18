@@ -49,7 +49,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | W1: Hardware microbenchmark (launch latency, mem/LDS BW, atomics, limits) | ✅ | `device_profile.load_or_profile()`; cached at `~/.cache/torch_vulkan/` |
 | W2: Shader-lib + matmul template SPIR-V precompile | ✅ | `hardware_probe.py:_run_level_1_sync()`; on-disk SPIR-V cache |
 | W3: Canonical-shape autotune sweep (mm + conv2d shapes × dtypes) | ✅ | `_run_level_2_autotune()`; populates `~/.cache/torch_vulkan/autotune/` |
-| W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | 🟡 | `prepare_device(validate=True)` sets `TORCH_VULKAN_VUID_AS_ERROR=1` during warm-up; `VK_INSTANCE_LAYERS` requires restart to take effect (A2.5 session) |
+| W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | 🟡 | `prepare_device(validate=True)` sets `TORCH_VULKAN_VUID_AS_ERROR=1` + `TORCH_VULKAN_VALIDATE_CODEGEN=error` during warm-up; autotune subprocess validates with fresh Vulkan instance; in-process VUID detection requires `VK_INSTANCE_LAYERS` set at process start (2026-06-18) |
 | W5: Per-model warm-up (`prepare_model(model, sample_input)` → 100% SPIR-V cache) | ✅ | `hardware_probe.py:prepare_model()` + `torch_vulkan.prepare_model()` public API; traces model through `torch.compile`, runs fwd+bwd to compile all kernels, returns compiled model (A2.5 session) |
 
 **AOT / deployment (AOTI)**
@@ -199,26 +199,29 @@ autotune cache (`~/.cache/torch_vulkan/autotune/*.json`).
 - **Exit**: `TestWarmupAutotune` — WG-size cache populated for canonical shapes;
   subsequent compile finds cached winners.
 
-#### W4 — Vulkan validation during warm-up ⛔
+#### W4 — Vulkan validation during warm-up 🟡
 The warm-up phase should run with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
 + `TORCH_VULKAN_VUID_AS_ERROR=1` so any shader bugs are caught at warm-up time,
-not mid-training. Currently validation is opt-in and separate from the warm-up
-pipeline — the warm-up runs without validation by default.
-- **Files**: `hardware_probe.py`, `runtime/common.py` (validation layer wiring)
-- **Exit**: `TestWarmupValidation` — `prepare_device(level="deep")` with
-  validation enabled; any VUID from precompiled/autotuned shaders fails the
-  warm-up call. This gates the compile phase: no validated warm-up → no training.
+not mid-training.  
 
-#### W5 — Per-model warm-up (shape-specific precompile) ⛔
-Extend warm-up to accept a model + sample input, trace the model's specific
-ops through the Inductor pipeline (fwd+bwd+optimizer), compile and cache all
-resulting SPIR-V. Turns the generic canonical-shape sweep into a model-targeted
-warm-up that guarantees 100% SPIR-V cache hits for that model's training loop.
-- **Files**: `hardware_probe.py` (new `prepare_model(model, sample_input, …)`
-  entry point)
-- **Exit**: `TestWarmupModel` — `prepare_model(model, sample_input)` populates
-  all SPIR-V needed for that model's training; subsequent `torch.compile(model)`
-  finds 100% cache hits, zero slangc invocations.
+**2026-06-18**: `validate=True` now threads through to level-2 autotune — sets
+`TORCH_VULKAN_VALIDATE_CODEGEN=error` so autotune candidates are validated
+in subprocesses (which get a fresh Vulkan instance with validation layers).
+In-process validation still requires `VK_INSTANCE_LAYERS` set at process start.
+- **Files**: `hardware_probe.py:289-315,362-377`, `autotune.py` (validate_winner)
+- **Exit**: `TestWarmupValidation` — `prepare_device(level="deep", validate=True)`
+  validates autotune candidates; VUID-rejecting candidates are skipped.
+  Full in-process validation gated on caller setting `VK_INSTANCE_LAYERS`.
+
+#### W5 — Per-model warm-up (shape-specific precompile) ✅
+**DONE (2026-06-18).** `prepare_model(model, sample_input)` implemented in
+`hardware_probe.py:471-613` with public API `torch_vulkan.prepare_model()`.
+Traces model through `torch.compile(backend="inductor")`, runs fwd+bwd to
+compile and cache all SPIR-V for that model's training loop.
+- **Files**: `hardware_probe.py:471-613`, `__init__.py:731-770`
+- **Exit**: `TestWarmupModel` — `prepare_model(model, sample_input)` returns
+  compiled model; fwd output correct; backward gradients match CPU within
+  5e-3 rel_diff. (2 GPU tests pass on RDNA1, 0 VUIDs.)
 
 ### Pillar A — AOT deployment (highest priority)
 

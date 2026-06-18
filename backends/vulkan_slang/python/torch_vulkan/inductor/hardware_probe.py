@@ -307,7 +307,7 @@ def profile_device(
                     "Vulkan validation layer)"
                 )
     try:
-        return _profile_device_impl(level, force, verbose)
+        return _profile_device_impl(level, force, verbose, validate=validate)
     finally:
         if _prev_vuid is not None:
             os.environ["TORCH_VULKAN_VUID_AS_ERROR"] = _prev_vuid
@@ -319,6 +319,7 @@ def _profile_device_impl(
     level: int,
     force: bool,
     verbose: bool,
+    validate: bool = False,
 ) -> dict[str, Any]:
     """Internal implementation of profile_device (after validation env setup)."""
     if not force:
@@ -361,7 +362,22 @@ def _profile_device_impl(
 
     if level >= LEVEL_DEEP:
         t = time.perf_counter()
-        result["autotune"] = _run_level_2_autotune()
+        # W4: When validate=True, enable autotune validation so the
+        # autotune subprocesses run with VK_INSTANCE_LAYERS active.
+        # The subprocess gets a fresh Vulkan instance and CAN enable
+        # validation layers even when the parent did not.
+        _prev_validate_codegen = os.environ.get("TORCH_VULKAN_VALIDATE_CODEGEN")
+        if validate:
+            os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"] = "error"
+            if verbose:
+                print("  (level 2 will validate autotune candidates in subprocess)")
+        try:
+            result["autotune"] = _run_level_2_autotune()
+        finally:
+            if _prev_validate_codegen is not None:
+                os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"] = _prev_validate_codegen
+            elif "TORCH_VULKAN_VALIDATE_CODEGEN" in os.environ:
+                del os.environ["TORCH_VULKAN_VALIDATE_CODEGEN"]
         result["level_2_ms"] = (time.perf_counter() - t) * 1e3
         if verbose:
             f = len(result["autotune"].get("failures", []))
