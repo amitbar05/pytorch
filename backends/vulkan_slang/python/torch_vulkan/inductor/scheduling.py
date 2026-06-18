@@ -280,7 +280,13 @@ class VulkanScheduling(SIMDScheduling):
         if config.aggressive_fusion():
             rnumel_fuse_cap = 256
             if config.persistent_pointwise() and _wave64_persistent_ok():
-                rnumel_fuse_cap = 1024
+                # C6 (2026-06-18): raise cap from 1024 → 8192 to fuse
+                # reductions in training backward passes (GN backward has
+                # rnumel = oH*oW = up to 16384 for 128×128 images).
+                # Persistent pointwise handles large rnumel via looping
+                # (each thread processes multiple elements), so the
+                # wave-cooperative reduction's LDS usage is bounded.
+                rnumel_fuse_cap = 8192
         if node1.is_reduction() and not node2.is_reduction():
             if (
                 rnumel1 != 1
