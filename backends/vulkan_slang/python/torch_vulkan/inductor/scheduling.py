@@ -847,7 +847,15 @@ class VulkanScheduling(SIMDScheduling):
         numel = kernel_features.numel
         if not isinstance(numel, sympy.Integer):
             return kernels
-        if int(numel) > 4096:
+        # C6.4 (2026-06-18): raise persistent-mode cap from 4096→16384.
+        # The grid-stride loop in _emit_persistent_grid_stride_loop
+        # already handles larger numel by scaling WG count with CU count
+        # (M11.4), so the only cost is a modulo operation per element.
+        # Raising the cap lets more pointwise chains benefit from the
+        # persistent dispatch amortization — fill/copy/inplace ops with
+        # intermediate tensor sizes (e.g. 64×64=4096 to 128×128=16384)
+        # now get grid-stride wrapping instead of standalone dispatches.
+        if int(numel) > 16384:
             return kernels
 
         for kernel in kernels:

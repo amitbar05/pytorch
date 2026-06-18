@@ -207,19 +207,46 @@ class VulkanComboKernel:
             return nodes
 
         # --- Phase 2: group orphans by compatible grid size ---
-        # Two pointwise ops can share a combo kernel when they have the same
-        # numel (same workgroup grid).  Threadgroup size differences are
-        # handled by the combo kernel codegen which uses the maximum TGS
-        # across all subkernels.
+        # C6.4 (2026-06-18): previously bucketed by exact numel, which
+        # prevented fill/copy ops (often 1-4 elements) from fusing with
+        # nearby pointwise compute ops (64-4096 elements).  The combo
+        # kernel already handles mixed numels via per-subkernel bounds
+        # checks (``_vk_gtid < {numel}u``) and the grid builder uses
+        # ``max(wg_count)`` across all subkernels.  Switching to
+        # magnitude-based bucketing lets fill/copy/inplace ops land in
+        # the same combo dispatch as their neighbouring compute ops,
+        # eliminating standalone micro-dispatches.
         from collections import defaultdict
 
-        # Key: numel string.  Pointwise nodes with the same numel are
-        # co-schedulable in a single combo kernel dispatch.
+        # Key: magnitude bucket.  Pointwise nodes within the same
+        # order-of-magnitude are co-schedulable in a single combo
+        # kernel dispatch.  The grid builder uses max WGs across all
+        # subkernels, so a 1-element fill in the same bucket as a
+        # 4096-element compute just idles on threads > 1 — overhead
+        # is negligible compared to a standalone dispatch (30-60 us).
+        def _numel_magnitude_key(n: int) -> str:
+            if n <= 64:
+                return "tiny"        # ≤ 1 wave
+            if n <= 256:
+                return "xs"          # ≤ 4 waves
+            if n <= 4096:
+                return "sm"          # ≤ 16 WGs @256 TGS
+            if n <= 16384:
+                return "md"          # ≤ 64 WGs
+            if n <= 65536:
+                return "lg"          # ≤ 256 WGs
+            return "xl"              # > 256 WGs
+
         buckets: dict[str, list[BaseSchedulerNode]] = defaultdict(list)
         for node in orphans:
             _, (numel, rnumel) = node.group
-            numel_str = str(numel)
-            buckets[numel_str].append(node)
+            # numel is a sympy expression; extract integer or fall back to str
+            try:
+                n_int = int(numel)
+            except (TypeError, ValueError):
+                n_int = 1  # dynamic — treat as tiny
+            key = _numel_magnitude_key(n_int)
+            buckets[key].append(node)
 
         # Safety filter: within each bucket, remove nodes that have an
         # ordering constraint with another bucket member.  Two orphan
@@ -296,7 +323,12 @@ class VulkanComboKernel:
                 # Already consumed by a prior bucket emission.
                 continue
 
-            key = str(node.group[1][0])
+            # C6.4: use magnitude-based key (matching Phase 2 bucketing)
+            try:
+                n_int = int(node.group[1][0])
+            except (TypeError, ValueError):
+                n_int = 1
+            key = _numel_magnitude_key(n_int)
             bucket = buckets.get(key)
             if bucket is None or len(bucket) < 2:
                 result.append(node)

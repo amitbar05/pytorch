@@ -655,8 +655,13 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         # Also check: even with many ops, don't go beyond a total numel
         # that would produce excessive register pressure from live
         # variables across all ops in the fused kernel.
-        # Cap total numel at ~16K to stay safe.
-        max_total_numel = 16384
+        # C6.4 (2026-06-18): raise cap from 16384→65536. The persistent
+        # grid-stride loop already handles larger numel by looping;
+        # register pressure from live variables is bounded by the number
+        # of ops (max 64 iterations/thread × ~4 registers/iter = 256 VGPRs,
+        # within RDNA1 budget). This allows more ops in the loss backward
+        # (GN backward sub/mul/sum chains) to fuse.
+        max_total_numel = 65536
 
         return per_thread_iters <= iter_cap and total_numel <= max_total_numel
 
