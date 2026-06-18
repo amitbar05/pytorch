@@ -150,8 +150,7 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
             f"{weight}, {gi_out}, {G})"
         )
         self.codegen_size_asserts(wrapper)
-        wrapper.add_import_once("import torch_vulkan")
-        wrapper.writeline("torch_vulkan.synchronize(0)")
+        # C1.2: after-sync is redundant — single-queue in-order execution
 
 
 class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
@@ -259,5 +258,4 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
                 f"compute_weight=True, compute_bias={compute_bias_str})"
             )
         self.codegen_size_asserts(wrapper)
-        wrapper.add_import_once("import torch_vulkan")
-        wrapper.writeline("torch_vulkan.synchronize(0)")
+        # C1.2: after-sync is redundant — single-queue in-order execution

@@ -220,10 +220,9 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         if self.has_bias and len(input_names) > 4:
             grad_bias_arg = input_names[4]
 
-        # Sync: guarantee any prior writes committed before kernel reads outputs
-        wrapper.add_import_once("import torch_vulkan")
-        wrapper.writeline("torch_vulkan.synchronize(0)")
-
+        # C1.2: before-sync is redundant — _flush_batcher_before_direct_call()
+        # already submitted prior dispatches, and Vulkan single-queue in-order
+        # execution guarantees they complete before this kernel runs.
         self.codegen_comment(wrapper)
         wrapper.writeline(
             f"_slang_tile_conv2d_bwd("
@@ -235,11 +234,9 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
             f"grad_bias={grad_bias_arg})"
         )
         self.codegen_size_asserts(wrapper)
-        # TRAIN-SYNC: force GPU pipeline drain after bwd kernel
-        # so downstream consumers (optimizer reading .grad)
-        # see committed writes, not stale zeros.
-        wrapper.add_import_once("import torch_vulkan")
-        wrapper.writeline("torch_vulkan.synchronize(0)")
+        # C1.2: after-sync is redundant — Vulkan single-queue in-order
+        # execution guarantees downstream dispatches wait for this kernel.
+        # The optimizer's foreach dispatch goes to the same queue.
 
 
 def _get_conv_backward_lowering_impl():
