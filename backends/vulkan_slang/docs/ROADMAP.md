@@ -123,7 +123,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ⛔ | `template_registry.py` has a `shape_class` field only; no canonicalization |
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
-| **Conv backward fwd-recomputation elimination** | ⛔ | Profiled 2026-06-18; slang_conv2d re-run in backward; ~1 heavy dispatch |
+| **Conv backward fwd-recomputation elimination** | 🟡 | C5.1: added `TORCH_VULKAN_DISABLE_CONV_GN_FUSION` gate for experimentation; warm-rerun may hang |
 | **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches in GN/conv3d bwd |
 | **GN backward Slang-extern** (single shader vs 11 pointwise ops) | ⛔ | Single-dispatch GN backward like conv_gn_relu fwd; eliminates intermediates |
 
@@ -419,11 +419,17 @@ pass would recover ~2-3ms per step.
 - **Exit**: `TestGNBwdFused` — GN backward uses ≤3 dispatches (vs 11 today);
   gradient parity vs CPU holds.
 
-#### C5 — Conv backward forward-recomputation elimination ⛔
+#### C5 — Conv backward forward-recomputation elimination 🟡 **C5.1 PARTIAL 2026-06-18**
 The conv backward path re-runs `slang_conv2d` (conv forward) as part of gradient
-computation. This adds one heavy dispatch per backward pass. The forward result
-should be cached and reused instead of recomputed.
-- **Files**: `lowerings/conv_backward.py`, `bwd_diff/`
+computation because the fused `conv_gn_relu` shader doesn't store the intermediate
+conv+bias output. This adds one heavy dispatch per backward pass.
+
+**C5.1 (2026-06-18)**: Added `TORCH_VULKAN_DISABLE_CONV_GN_FUSION` config gate
+(default 0 = fusion enabled). When set to 1, the pre-grad fusion pass skips
+conv+GN+ReLU fusion, using separate `slang_conv2d` + GN dispatches. This
+eliminates the backward recomputation but trades 1 extra forward dispatch.
+Note: warm re-runs with fusion disabled may hang (scheduler deadlock TBD).
+- **Files**: `config.py:539-554`, `fx_passes/post_grad.py:724-726`
 - **Exit**: `TestConvBwdNoRecompute` — backward path contains zero conv-fwd
   dispatches; output unchanged.
 
