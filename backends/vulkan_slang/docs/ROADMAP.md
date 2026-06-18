@@ -124,7 +124,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
 | **Conv backward fwd-recomputation elimination** | ⛔ | Profiled 2026-06-18; slang_conv2d re-run in backward; ~1 heavy dispatch |
-| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 partial fix: rnumel cap 1024→8192 enables persistent reduction+pointwise fusion for training backward |
+| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches in GN/conv3d bwd |
 | **GN backward Slang-extern** (single shader vs 11 pointwise ops) | ⛔ | Single-dispatch GN backward like conv_gn_relu fwd; eliminates intermediates |
 
 **Autotune (TUNE)**
@@ -438,8 +438,15 @@ dispatch overhead per step.
 1024 → 8192 (`scheduling.py:283`). This enables the persistent pointwise
 kernel to fuse pointwise + reduction chains (e.g., loss backward `sum` +
 element-wise ops) into fewer dispatches. Verified gradient parity passes.
-Remaining: fill/copy/inplace micro-dispatch fusion and elimination.
-- **Files**: `scheduling.py:279-291`, `combo_kernel/`
+
+**C6.2 (2026-06-18)**: Removed 5 redundant `.zero_()` calls across
+GN backward and conv3d backward (`gn_backward_extern.py:143,240,242`,
+`conv3d_backward.py:74,75,80`). Each emitted a separate `copy_fill_fwd`
+GPU dispatch. The M23.1 allocator already zero-initializes buffers.
+Also switched conv3d from `aten.full` (alloc+fill dispatch) to
+`empty.memory_format` (zero-init by allocator, no dispatch).
+Remaining: ~8 micro-copy/inplace dispatches for gradient accumulation.
+- **Files**: `gn_backward_extern.py`, `conv3d_backward.py`, `scheduling.py:279-291`
 - **Exit**: `TestTinyKernelFusion` — per-step dispatch count ≤20 (vs 30 today);
   no standalone `copy_fill_fwd`/`copy_strided_copy_fwd` dispatches.
 
