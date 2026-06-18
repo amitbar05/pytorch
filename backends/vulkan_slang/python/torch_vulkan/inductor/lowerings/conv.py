@@ -191,6 +191,27 @@ def _register_conv_and_pool_lowerings() -> None:
             return buf
         return x
 
+    def _resolve_conv_tile(shape_hint: tuple = ()) -> tuple[int, int, int]:
+        """Resolve conv2d tile config from TORCH_VULKAN_CONV_TILE env var.
+
+        Format: ``tile_w x tile_h x tile_c`` (e.g. ``"16x16x8"``).
+        Default: (8, 8, 8).  Threads are computed from tiles:
+        threads_w = tile_w, threads_h = tile_h (1:1 mapping for simplicity).
+
+        D1: Enables per-shape conv tile autotune during warm-up sweep.
+        """
+        import os
+
+        env = os.environ.get("TORCH_VULKAN_CONV_TILE", "")
+        if env:
+            try:
+                parts = env.split("x")
+                tw, th, tc = int(parts[0]), int(parts[1]), int(parts[2])
+                return tw, th, tc
+            except (ValueError, IndexError):
+                pass
+        return 8, 8, 8
+
     class _VulkanConv2dExternKernel(ir.ExternKernelOut):
         """ExternKernelOut that dispatches conv2d via the slang_conv2d template.
 
@@ -287,6 +308,13 @@ def _register_conv_and_pool_lowerings() -> None:
             epilogue_kwarg = f', epilogue="{self.epilogue}"' if self.epilogue else ""
 
             self.codegen_comment(wrapper)
+            tw, th, tc = _resolve_conv_tile()
+            tile_kwargs = ""
+            if tw != 8 or th != 8 or tc != 8:
+                tile_kwargs = (
+                    f", tile_w={tw}, tile_h={th}, tile_c={tc}"
+                    f", threads_w={tw}, threads_h={th}"
+                )
             wrapper.writeline(
                 f"_slang_tile_conv2d("
                 f"{input_t}, {weight_t}, {out_name}, "
@@ -294,7 +322,8 @@ def _register_conv_and_pool_lowerings() -> None:
                 f"padding=({pH}, {pW}), "
                 f"dilation=({dH}, {dW}), "
                 f"bias={bias_t}"
-                f"{epilogue_kwarg})"
+                f"{epilogue_kwarg}"
+                f"{tile_kwargs})"
             )
             self.codegen_size_asserts(wrapper)
 
@@ -339,8 +368,8 @@ def _register_conv_and_pool_lowerings() -> None:
             epilogue = _validate_epilogue_struct(self.epilogue)
             dtype_s = "float32"  # Inductor IR is always float32
 
-            tile_w = tile_h = tile_c = 8
-            threads_w = threads_h = 16
+            tile_w, tile_h, tile_c = _resolve_conv_tile()
+            threads_w, threads_h = tile_w, tile_h  # 1-thread-per-output mapping
 
             # 2. Render Slang source
             slang_src = _render_conv2d_slang(

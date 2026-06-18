@@ -481,6 +481,62 @@ def _run_level_2_autotune_impl() -> dict[str, Any]:
     out["gelu_shapes_probed"] = gelu_probed
     out["reduction_ms"] = (time.perf_counter() - t5) * 1e3
 
+    # D1 — Conv2d tile config sweep: try different tile_w × tile_h × tile_c
+    # combinations for a small set of canonical conv shapes.  The env var
+    # TORCH_VULKAN_CONV_TILE controls the tile config in the conv lowering.
+    # Dynamo is reset between tile configs to force a fresh compile.
+    _CONV_TILE_CONFIGS: list[tuple[int, int, int]] = [
+        (8, 8, 8),    # default — square
+        (16, 8, 4),   # wide tile, shallow channels
+        (4, 16, 4),   # tall tile, shallow channels
+        (8, 8, 16),   # square, deep channels
+    ]
+    # Use a subset of conv probe shapes for the tile sweep (avoid
+    # blowing the time budget — 4 tiles × 2 shapes × 2 dtypes = 16 extra).
+    _TILE_SWEEP_SHAPES = _CONV_PROBE_SHAPES[:2]
+
+    t6 = time.perf_counter()
+    tile_probed = 0
+    prev_tile_env = os.environ.get("TORCH_VULKAN_CONV_TILE")
+    try:
+        for B, Cin, Cout, H, W, K, stride, padding in _TILE_SWEEP_SHAPES:
+            for dt_name in _CONV_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                for tw, th, tc in _CONV_TILE_CONFIGS:
+                    try:
+                        os.environ["TORCH_VULKAN_CONV_TILE"] = f"{tw}x{th}x{tc}"
+                        torch._dynamo.reset()
+
+                        @torch.compile(backend="inductor", dynamic=False)
+                        def _conv_tile(x, w, b):
+                            import torch.nn.functional as F
+                            return F.conv2d(x, w, b, stride=stride, padding=padding)
+
+                        x = torch.randn(B, Cin, H, W, dtype=dt, device="vulkan")
+                        w = torch.randn(Cout, Cin, K, K, dtype=dt, device="vulkan")
+                        b = torch.zeros(Cout, dtype=dt, device="vulkan")
+                        with torch.no_grad():
+                            _ = _conv_tile(x, w, b)
+                        tile_probed += 1
+                    except Exception as e:
+                        _log.warning(
+                            "conv tile probe (tile=%dx%dx%d, shape=%d,%d,%d,%d,%d,%d) failed: %s",
+                            tw, th, tc, B, Cin, Cout, H, W, K, e,
+                        )
+                        out["failures"].append(
+                            f"conv_tile[{tw}x{th}x{tc},"
+                            f"B={B},Cin={Cin},Cout={Cout},H={H},W={W},K={K}]:"
+                            f" {type(e).__name__}"
+                        )
+    finally:
+        if prev_tile_env is not None:
+            os.environ["TORCH_VULKAN_CONV_TILE"] = prev_tile_env
+        elif "TORCH_VULKAN_CONV_TILE" in os.environ:
+            del os.environ["TORCH_VULKAN_CONV_TILE"]
+
+    out["conv_tile_shapes_probed"] = tile_probed
+    out["conv_tile_ms"] = (time.perf_counter() - t6) * 1e3
+
     return out
 
 
