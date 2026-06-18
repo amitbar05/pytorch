@@ -493,13 +493,27 @@ not from GN backward itself. The GN backward is well-optimized.
 
 ### Pillar D — Autotune
 
-#### D1 — Wire Slang templates into Inductor autotune ⛔
-Register `VulkanTemplateKernel` choices into `V.choices` via device-specific
-`tuned_mm` / `tuned_conv` / `tuned_flash_attention` overrides; 3–5 tile configs
-each; benchmark on RDNA1; reject any candidate that emits a VUID (validation-
-driven, Pillar goal). Cache the winner.
-- **Files**: `kernel/template_registry.py`, new `tuned_*` hooks
-- **Exit**: `TestAutotuneMM` — best-of-N tile config chosen and cached; VUID candidate rejected.
+#### D1 — Wire Slang templates into Inductor autotune 🟡
+**PARTIAL (2026-06-18).** MM autotune already works via `install_external_mm()`:
+14 variants (4 basic × 2 stages + 3 register × 2 stages) registered into
+Inductor's `external_matmul` and benchmarked by `tuned_mm`. VUID-rejecting
+candidates are stripped via `_install_vulkan_autotune_cuda_filter()`.
+
+**D1 expanded tile sweep (2026-06-18):** Two-tier tile config system:
+- Default: 4 basic + 1 register tile configs (10 variants with 2 stages) — fast cold compile
+- Expanded (`TORCH_VULKAN_MM_TILES=expanded`): 16 basic + 4 register (40 variants) — full sweep
+  covering square (8×8), tall-skinny (4×16), short-wide (16×4) aspect ratios
+  with fine-grain K-tile exploration (4/8/12/16/24/32/48/64) and register-tile
+  variants at 2 occupancy levels (64 and 16 VGPRs/thread).
+- `_run_level_2_autotune()` auto-enables expanded mode during warm-up sweep
+- All configs pass the wave64 single-wave filter on RDNA1
+
+**Remaining**: Conv tile config autotune (`tuned_conv`), flash attention tile configs,
+and V.choices integration for non-MM templates.
+- **Files**: `vulkan_template.py:175-224`, `dispatch.py:584-703`,
+  `hardware_probe.py:174-224`, `install.py:117-159`
+- **Exit**: `TestAutotuneMMExpanded` — with `TORCH_VULKAN_MM_TILES=expanded`,
+  all tile configs registered and autotune sweeps 40 variants per mm shape.
 
 ### Pillar E — Op coverage (breadth, ongoing)
 

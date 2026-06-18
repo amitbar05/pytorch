@@ -172,31 +172,59 @@ class SlangTemplate(KernelTemplate):
 # thread accumulates an (M_PER_THREAD, N_PER_THREAD) sub-tile in registers.
 # WG_M * WG_N must still fit the 1024 cap.
 # M17.1: Restricted to single-wave workgroups (<= 64 threads on wave64)
-# due to a slangc 2026.5.2 barrier bug on multi-wave workgroups.
-# The 1-output-per-thread path only uses 8x8 tiles.
+# D1: Two-tier tile-config sets for Vulkan matmul autotune.
+# Small default set (fast cold compile, 8 basic + 2 register = 20 variants
+# with 2 num_stages each). Use TORCH_VULKAN_MM_TILES=expanded or
+# TORCH_VULKAN_MAX_AUTOTUNE=2 to enable the larger sweep.
 _MM_TILE_CONFIGS = [
+    # Square 8×8 (WG=64): good general-purpose
     (8, 8, 8),
     (8, 8, 16),
     (8, 8, 32),
     (8, 8, 64),
 ]
 
+# Expanded set: 16 basic tile configs covering square, tall-skinny, and
+# short-wide shapes. Enables fine-grain K-tile exploration and aspect-ratio
+# optimization. Activate with TORCH_VULKAN_MM_TILES=expanded.
+_MM_TILE_CONFIGS_EXPANDED = [
+    # Square 8×8 (WG=64): 8 K-tile variants
+    (8, 8, 4),
+    (8, 8, 8),
+    (8, 8, 12),
+    (8, 8, 16),
+    (8, 8, 24),
+    (8, 8, 32),
+    (8, 8, 48),
+    (8, 8, 64),
+    # Tall-skinny 4×16 (WG=64): good for large-M/small-N matmuls
+    (4, 16, 8),
+    (4, 16, 16),
+    (4, 16, 32),
+    (4, 16, 64),
+    # Short-wide 16×4 (WG=64): good for small-M/large-N matmuls
+    (16, 4, 8),
+    (16, 4, 16),
+    (16, 4, 32),
+    (16, 4, 64),
+]
+
 # Register-tiled configs: (TILE_M, TILE_N, TILE_K, M_PER_THREAD, N_PER_THREAD).
-# Workgroup size is (TILE_M / M_PER_THREAD) × (TILE_N / N_PER_THREAD); each
-# thread holds an (M_PER_THREAD, N_PER_THREAD) accumulator block. This is
-# the hardware-friendly pattern: large output tiles + small workgroups +
-# big register reuse cuts global memory traffic by `M_PER_THREAD *
-# N_PER_THREAD` for the same K-loop iteration.
-# M17.1: Restricted to single-wave workgroups (<= 64 threads on wave64).
-# Register-tiled configs keep the workgroup within one wave while increasing
-# the output tile per workgroup.
+# WG = (TILE_M/M_PER_THREAD) × (TILE_N/N_PER_THREAD) = 64 on wave64.
+# M17.1: Restricted to single-wave workgroups (barrier bug).
 _MM_REGISTER_TILE_CONFIGS = [
-    # (64, 64) tile, 8×8 = 64 threads (1 wave64), each holds 8×8 = 64 outputs
+    # (64, 64) tile: 8×8=64 threads, each holds 8×8=64 outputs
     (64, 64, 16, 8, 8),
-    # (64, 32) tile, 8×4 = 32 threads, each holds 8×8 = 64 outputs
-    (64, 32, 16, 8, 8),
-    # (32, 64) tile, 4×8 = 32 threads, each holds 8×8 = 64 outputs
-    (32, 64, 16, 8, 8),
+]
+
+_MM_REGISTER_TILE_CONFIGS_EXPANDED = [
+    # (64, 64) tile: 8×8=64 threads, each holds 8×8=64 outputs  (64 VGPRs/thread)
+    (64, 64, 16, 8, 8),
+    (64, 64, 32, 8, 8),
+    # (32, 32) tile: 8×8=64 threads, each holds 4×4=16 outputs  (16 VGPRs/thread)
+    # Better occupancy than 64×64 — more wave slots, smaller tile per WG.
+    (32, 32, 16, 4, 4),
+    (32, 32, 32, 4, 4),
 ]
 
 _slang_mm_template: Optional[SlangTemplate] = None

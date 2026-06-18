@@ -17,7 +17,9 @@ if TYPE_CHECKING:
 
 from ....vulkan_template import (
     _MM_REGISTER_TILE_CONFIGS,
+    _MM_REGISTER_TILE_CONFIGS_EXPANDED,
     _MM_TILE_CONFIGS,
+    _MM_TILE_CONFIGS_EXPANDED,
 )
 from ....vulkan_template_caller import (
     _dtype_to_slang,
@@ -591,19 +593,31 @@ def _pick_tile_configs() -> list[tuple[int, int, int]]:
     and non-wave-aligned shapes — the M27 in-process validator rejects
     those anyway, so emitting them only wastes ~10 s of slangc per
     config per cold compile.
+
+    D1: TORCH_VULKAN_MM_TILES=expanded uses the larger
+    _MM_TILE_CONFIGS_EXPANDED set (16 configs → 32 with 2 num_stages)
+    for warm-up / autotune sweep. Default uses 4 configs.
     """
     env = os.environ.get("TORCH_VULKAN_MM_TILES", "")
     if env:
-        configs = []
-        for part in env.split(","):
-            part = part.strip()
-            if part:
-                try:
-                    tm, tn, tk = (int(x) for x in part.split("x"))
-                    configs.append((tm, tn, tk))
-                except ValueError:
-                    pass
-        return configs if configs else _MM_TILE_CONFIGS
+        # D1: explicit tile list via env (e.g. "8x8x16,16x4x32")
+        if env == "expanded":
+            source = _MM_TILE_CONFIGS_EXPANDED
+        else:
+            configs = []
+            for part in env.split(","):
+                part = part.strip()
+                if part:
+                    try:
+                        tm, tn, tk = (int(x) for x in part.split("x"))
+                        configs.append((tm, tn, tk))
+                    except ValueError:
+                        pass
+            if configs:
+                return configs
+            source = _MM_TILE_CONFIGS
+    else:
+        source = _MM_TILE_CONFIGS
 
     # N+1.12: wave32 prefers smaller tiles, wave64 prefers single-wave.
     # M17.1: On wave64 (RDNA1), restrict to tile configs where the workgroup
@@ -620,17 +634,17 @@ def _pick_tile_configs() -> list[tuple[int, int, int]]:
         # effectively wave-aligned for the canonical 8×8 tile set.
         return [
             c
-            for c in _MM_TILE_CONFIGS
+            for c in source
             if c[0] * c[1] <= sgs and (c[0] * c[1]) % sgs == 0
         ]
     if sgs == 32:
         # Wave32: prefer max(TILE_M, TILE_N) <= 32 AND wave-aligned.
         return [
             c
-            for c in _MM_TILE_CONFIGS
+            for c in source
             if max(c[0], c[1]) <= 32 and (c[0] * c[1]) % sgs == 0
         ]
-    return _MM_TILE_CONFIGS
+    return source
 
 
 def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
@@ -661,6 +675,13 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
     if os.environ.get("TORCH_VULKAN_NO_REGISTER_TILE") == "1":
         return []
 
+    # D1: expanded register-tile sweep when TORCH_VULKAN_MM_TILES=expanded.
+    reg_source = (
+        _MM_REGISTER_TILE_CONFIGS_EXPANDED
+        if os.environ.get("TORCH_VULKAN_MM_TILES") == "expanded"
+        else _MM_REGISTER_TILE_CONFIGS
+    )
+
     # N+1.12: wave32/wave64 filter register-tile configs.
     # M17.1: On wave64, only single-wave workgroups work (barrier bug).
     sgs = _get_device_subgroup_size()
@@ -674,19 +695,19 @@ def _pick_register_tile_configs() -> list[tuple[int, int, int, int, int]]:
         # sub-wave WGs trigger M27 advisory rejection.
         return [
             c
-            for c in _MM_REGISTER_TILE_CONFIGS
+            for c in reg_source
             if _wg_threads(c) == sgs
         ]
     if sgs == 32:
         # Wave32: register-heavy gate AND wave alignment.
         return [
             c
-            for c in _MM_REGISTER_TILE_CONFIGS
+            for c in reg_source
             if c[3] * c[4] <= 16
             and _wg_threads(c) > 0
             and _wg_threads(c) % sgs == 0
         ]
-    return _MM_REGISTER_TILE_CONFIGS
+    return reg_source
 
 
 # ═══════════════════════════════════════════════════════════════════════════

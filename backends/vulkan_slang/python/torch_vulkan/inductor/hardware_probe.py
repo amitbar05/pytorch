@@ -178,7 +178,30 @@ def _run_level_2_autotune() -> dict[str, Any]:
     (``~/.cache/torch_vulkan/autotune/*.json``) and the inductor compile cache
     for the standard training-shape grid. Failures per-shape are logged and
     counted but never raise — the probe is best-effort.
+
+    D1: When TORCH_VULKAN_MM_TILES=expanded (or unset), uses the
+    expanded tile config sweep (16 basic + 4 register tiles) so the
+    autotune cache has per-shape winners for the full tile space.
+    Set TORCH_VULKAN_MM_TILES=default to use only the small default set.
     """
+    import torch
+
+    # D1: enable expanded tile sweep for warm-up autotune
+    _prev_mm_tiles = os.environ.get("TORCH_VULKAN_MM_TILES")
+    if _prev_mm_tiles is None:
+        os.environ["TORCH_VULKAN_MM_TILES"] = "expanded"
+
+    try:
+        return _run_level_2_autotune_impl()
+    finally:
+        if _prev_mm_tiles is None:
+            del os.environ["TORCH_VULKAN_MM_TILES"]
+        else:
+            os.environ["TORCH_VULKAN_MM_TILES"] = _prev_mm_tiles
+
+
+def _run_level_2_autotune_impl() -> dict[str, Any]:
+    """Internal: runs the actual autotune probe (after env setup)."""
     import torch
 
     out: dict[str, Any] = {
