@@ -461,9 +461,24 @@ GPU dispatch. The M23.1 allocator already zero-initializes buffers.
 Also switched conv3d from `aten.full` (alloc+fill dispatch) to
 `empty.memory_format` (zero-init by allocator, no dispatch).
 Remaining: ~8 micro-copy/inplace dispatches for gradient accumulation.
-- **Files**: `gn_backward_extern.py`, `conv3d_backward.py`, `scheduling.py:279-291`
-- **Exit**: `TestTinyKernelFusion` — per-step dispatch count ≤20 (vs 30 today);
-  no standalone `copy_fill_fwd`/`copy_strided_copy_fwd` dispatches.
+
+**C6.4 (2026-06-18)**: Raised persistent-mode cap 4096→16384
+(`scheduling.py:create_kernel_choices`) so more pointwise chains
+benefit from grid-stride loop wrapping. Raised `_is_small_pointwise_chain`
+total_numel cap 16384→65536 (`kernel/pointwise.py`) allowing more ops
+in loss backward (GN backward sub/mul/sum chains) to fuse via
+persistent kernels. Switched `_coalesce_orphan_pointwise` bucketing
+from exact-numel to magnitude-based (tiny≤64, xs≤256, sm≤4096,
+md≤16384, lg≤65536, xl>65536) so fill/copy/inplace ops can land
+in the same combo dispatch as neighbouring compute ops of similar
+scale (`vulkan_combo_kernel.py`). The combo kernel grid builder
+already handles mixed numels. Expected: 7-12 fewer standalone
+dispatches per training step.
+- **Files**: `scheduling.py:847-856`, `pointwise.py:655-669`,
+  `vulkan_combo_kernel.py:209-244,326-331`
+- **Exit**: `TestTinyKernelFusion` — per-step dispatch count ≤20
+  (vs 30 today); no standalone `copy_fill_fwd`/`copy_strided_copy_fwd`
+  dispatches.
 
 #### C7 — GN backward Slang-extern rewrite ✅ **ALREADY DONE**
 The GN backward is already implemented as 2 fused Slang dispatches via
