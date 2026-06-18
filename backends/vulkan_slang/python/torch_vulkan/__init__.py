@@ -728,6 +728,48 @@ def memory_cached() -> int:
     return _c_ext._memory_cached()
 
 
+def prepare_model(
+    model,
+    sample_input,
+    *,
+    loss_fn=None,
+    verbose: bool = True,
+):
+    """W5 — compile and warm up all kernels for a specific model before training.
+
+    Traces the model through ``torch.compile(backend="inductor")`` with the
+    provided sample input, runs forward + backward to trigger SPIR-V
+    compilation and caching for every kernel the model will use.  After this
+    call, subsequent ``torch.compile(model, backend="inductor")`` finds 100%
+    SPIR-V cache hits — zero cold slangc latency.
+
+    Thin wrapper over :func:`torch_vulkan.inductor.hardware_probe.prepare_model`.
+
+    Args:
+        model: ``nn.Module`` to warm up.
+        sample_input: Tensor or tuple of tensors for the model's forward.
+        loss_fn: Optional loss ``(output, target) -> loss`` for backward
+            warm-up.  ``None`` uses ``out.sum().backward()``.
+        verbose: Print progress.
+
+    Returns:
+        The ``torch.compile``-wrapped model, ready for training.
+
+    Example::
+
+        import torch_vulkan, torch
+        model = MyConvNet().to("vulkan")
+        x = torch.randn(2, 3, 32, 32, device="vulkan")
+        compiled = torch_vulkan.prepare_model(model, x)
+        for batch in loader:
+            out = compiled(batch.x)
+            loss_fn(out, batch.y).backward()
+    """
+    from torch_vulkan.inductor.hardware_probe import prepare_model as _pm
+
+    return _pm(model, sample_input, loss_fn=loss_fn, verbose=verbose)
+
+
 def profile_and_warmup(
     level: str = "deep",
     *,

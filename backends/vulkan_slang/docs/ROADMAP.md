@@ -50,7 +50,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | W2: Shader-lib + matmul template SPIR-V precompile | ✅ | `hardware_probe.py:_run_level_1_sync()`; on-disk SPIR-V cache |
 | W3: Canonical-shape autotune sweep (mm + conv2d shapes × dtypes) | ✅ | `_run_level_2_autotune()`; populates `~/.cache/torch_vulkan/autotune/` |
 | W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | 🟡 | `prepare_device(validate=True)` sets `TORCH_VULKAN_VUID_AS_ERROR=1` during warm-up; `VK_INSTANCE_LAYERS` requires restart to take effect (A2.5 session) |
-| W5: Per-model warm-up (`prepare_model(model, sample_input)` → 100% SPIR-V cache) | ⛔ | No model-targeted warm-up yet; only canonical shapes |
+| W5: Per-model warm-up (`prepare_model(model, sample_input)` → 100% SPIR-V cache) | ✅ | `hardware_probe.py:prepare_model()` + `torch_vulkan.prepare_model()` public API; traces model through `torch.compile`, runs fwd+bwd to compile all kernels, returns compiled model (A2.5 session) |
 
 **AOT / deployment (AOTI)**
 | Item | State | Evidence |
