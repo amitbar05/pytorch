@@ -412,6 +412,75 @@ def _run_level_2_autotune_impl() -> dict[str, Any]:
     out["conv_bwd_shapes_probed"] = conv_bwd_probed
     out["conv_bwd_ms"] = (time.perf_counter() - t4) * 1e3
 
+    # D1 — Reduction/pointwise sweep: GroupNorm, Softmax, GELU.
+    # These are the most common non-matmul ops in training (norm layers,
+    # attention softmax, activation functions).  Compiling them during
+    # warm-up populates the SPIR-V cache for the reduction and pointwise
+    # kernel templates, which otherwise compile cold on the first step.
+    _REDUCTION_PROBE_SHAPES: list[tuple[int, int, int, int]] = [
+        (2, 16, 32, 32),    # small GN
+        (4, 32, 16, 16),    # medium GN
+        (2, 64, 8, 8),      # large channels, small spatial
+    ]
+
+    @torch.compile(backend="inductor", dynamic=False)
+    def _gn(x, weight, bias):
+        return torch.nn.functional.group_norm(x, 4, weight, bias)
+
+    @torch.compile(backend="inductor", dynamic=False)
+    def _softmax(x):
+        return torch.nn.functional.softmax(x, dim=-1)
+
+    @torch.compile(backend="inductor", dynamic=False)
+    def _gelu(x):
+        return torch.nn.functional.gelu(x)
+
+    t5 = time.perf_counter()
+    gn_probed = softmax_probed = gelu_probed = 0
+    with torch.no_grad():
+        # GroupNorm
+        for B, C, H, W in _REDUCTION_PROBE_SHAPES:
+            for dt_name in _MM_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                try:
+                    x = torch.randn(B, C, H, W, dtype=dt, device="vulkan")
+                    w = torch.ones(C, dtype=dt, device="vulkan")
+                    b = torch.zeros(C, dtype=dt, device="vulkan")
+                    _ = _gn(x, w, b)
+                    gn_probed += 1
+                except Exception as e:
+                    _log.warning("gn probe failed: %s", e)
+                    out["failures"].append(f"gn: {type(e).__name__}")
+
+        # Softmax (reduction along last dim — common in attention)
+        for shape in [(2, 8, 128, 128), (4, 16, 256, 256), (2, 64, 512)]:
+            for dt_name in _MM_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                try:
+                    x = torch.randn(*shape, dtype=dt, device="vulkan")
+                    _ = _softmax(x)
+                    softmax_probed += 1
+                except Exception as e:
+                    _log.warning("softmax probe failed: %s", e)
+                    out["failures"].append(f"softmax: {type(e).__name__}")
+
+        # GELU (pointwise activation — common in transformer FFN)
+        for shape in [(128, 512), (256, 1024), (64, 2048)]:
+            for dt_name in _MM_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                try:
+                    x = torch.randn(*shape, dtype=dt, device="vulkan")
+                    _ = _gelu(x)
+                    gelu_probed += 1
+                except Exception as e:
+                    _log.warning("gelu probe failed: %s", e)
+                    out["failures"].append(f"gelu: {type(e).__name__}")
+
+    out["gn_shapes_probed"] = gn_probed
+    out["softmax_shapes_probed"] = softmax_probed
+    out["gelu_shapes_probed"] = gelu_probed
+    out["reduction_ms"] = (time.perf_counter() - t5) * 1e3
+
     return out
 
 
@@ -546,10 +615,15 @@ def _profile_device_impl(
             lin_n = result["autotune"].get("linear_shapes_probed", 0)
             bmm_n = result["autotune"].get("bmm_shapes_probed", 0)
             cbd_n = result["autotune"].get("conv_bwd_shapes_probed", 0)
+            red_n = (
+                result["autotune"].get("gn_shapes_probed", 0)
+                + result["autotune"].get("softmax_shapes_probed", 0)
+                + result["autotune"].get("gelu_shapes_probed", 0)
+            )
             print(
                 f"  level 2 (autotune sweep) : {result['level_2_ms']:>8.0f} ms"
                 f" (mm={mm_n} conv={conv_n} linear={lin_n}"
-                f" bmm={bmm_n} conv_bwd={cbd_n} failures={f})"
+                f" bmm={bmm_n} conv_bwd={cbd_n} reduct={red_n} failures={f})"
             )
 
     result["total_ms"] = (time.perf_counter() - t_total) * 1e3
