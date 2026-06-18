@@ -1,42 +1,45 @@
-// Persistent pointwise micro-batching template (.slang migration from .py.jinja)
+// Persistent pointwise micro-batching template
 //
 // Grid-stride loop kernel that processes multiple small pointwise
 // operations in a single dispatch. One kernel stays resident and loops
 // over all N operations.
 //
-// M-SF.3: buffer pools use fixed compile-time upper bounds (MAX_*)
-// instead of Jinja {% for %} loops, which Slang cannot express in
-// struct definitions. The runtime loop iterates only over pc.num_ops.
-// Unused buffer slots are simply not referenced.
+// C6.3 (2026-06-18): OpRange data moved from push constants to a
+// StructuredBuffer to avoid the 128B push-constant limit on RDNA1.
+// 32 OpRange entries × 24B = 768B, which exceeds maxPushConstantsSize.
+// Now only 16B of push constants (total_elements, num_ops,
+// num_input_bufs, num_output_bufs).
 
-// M-SF.3: fixed upper bounds for buffer pools
+// Fixed upper bounds for buffer pools
 [[vk::constant_id(42)]] const uint MAX_INPUT_BUFFERS = 8u;
 [[vk::constant_id(43)]] const uint MAX_OUTPUT_BUFFERS = 8u;
 [[vk::constant_id(44)]] const uint THREADS = 64u;
+[[vk::constant_id(45)]] const uint MAX_OPS = 32u;
 
 struct OpRange {
     uint start_idx;   // offset into the flat element space
     uint numel;       // number of elements for this op
-    uint op_type;     // operation selector (0=copy, 1=relu, 2=sigmoid, ...)
+    uint op_type;     // operation selector (0=identity, 1=relu, 2=sigmoid, ...)
     uint in_buf_id;   // input buffer binding index (0..MAX_INPUT_BUFFERS-1)
     uint out_buf_id;  // output buffer binding index (0..MAX_OUTPUT_BUFFERS-1)
     float scalar;     // scalar argument (e.g. alpha for mul, beta for add)
 };
 
+// C6.3: Push constants reduced to 16B (fits in RDNA1 128B limit).
 struct PushConstants {
     uint total_elements;   // sum of all numels
     uint num_ops;          // number of OpRange entries
     uint num_input_bufs;   // actual count (<= MAX_INPUT_BUFFERS)
     uint num_output_bufs;  // actual count (<= MAX_OUTPUT_BUFFERS)
-    OpRange ranges[32];    // upper bound: 32 op ranges per dispatch
 };
 [[vk::push_constant]] PushConstants pc;
 
 struct KernelArgs {
     StructuredBuffer<float> in_bufs[MAX_INPUT_BUFFERS];
     RWStructuredBuffer<float> out_bufs[MAX_OUTPUT_BUFFERS];
+    // C6.3: OpRange data lives in a storage buffer, not push constants.
+    StructuredBuffer<OpRange> op_ranges;
 };
-// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
 
 // Operation implementations
@@ -80,6 +83,25 @@ float op_identity(float x, OpRange cfg) {
     return x;
 }
 
+// C6.3: New ops for loss backward support
+[ForceInline]
+float op_sub(float x, OpRange cfg) {
+    // sub: x - scalar.  Uses scalar field for the subtrahend.
+    return x - cfg.scalar;
+}
+
+[ForceInline]
+float op_pow(float x, OpRange cfg) {
+    // pow: x ^ scalar.  Uses scalar field for the exponent.
+    return pow(x, cfg.scalar);
+}
+
+[ForceInline]
+float op_fill(float x, OpRange cfg) {
+    // fill: output = scalar (ignore input x)
+    return cfg.scalar;
+}
+
 // Dispatch helper: apply a single op to one element
 [ForceInline]
 float apply_op(float x, OpRange cfg) {
@@ -91,6 +113,9 @@ float apply_op(float x, OpRange cfg) {
         case 4u: return op_gelu_tanh(x, cfg);
         case 5u: return op_add_scalar(x, cfg);
         case 6u: return op_mul_scalar(x, cfg);
+        case 7u: return op_sub(x, cfg);
+        case 8u: return op_pow(x, cfg);
+        case 9u: return op_fill(x, cfg);
         default: return x;
     }
 }
@@ -109,15 +134,16 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         uint offset = 0u;
         uint op_idx = pc.num_ops;  // sentinel
         for (uint o = 0u; o < pc.num_ops; o++) {
-            if (i >= pc.ranges[o].start_idx && i < pc.ranges[o].start_idx + pc.ranges[o].numel) {
+            OpRange cfg = args.op_ranges[o];
+            if (i >= cfg.start_idx && i < cfg.start_idx + cfg.numel) {
                 op_idx = o;
-                offset = pc.ranges[o].start_idx;
+                offset = cfg.start_idx;
                 break;
             }
         }
         if (op_idx >= pc.num_ops) continue;  // shouldn't happen
 
-        OpRange cfg = pc.ranges[op_idx];
+        OpRange cfg = args.op_ranges[op_idx];
         uint local_i = i - offset;
 
         // Read input (runtime dispatch on in_buf_id)

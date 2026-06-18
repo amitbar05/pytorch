@@ -450,8 +450,10 @@ class VulkanScheduling(SIMDScheduling):
         # due to tiling incompatibility), override if the reduction's
         # rnumel fits within the wave budget.  This allows patterns like
         # GN + ReLU + GlobalAvg to fuse into a single kernel.
-        # M-PERF.6 (2026-05-19): same cap-raise logic as can_fuse_horizontal —
-        # wave64 + persistent_pointwise lifts the ceiling to 1024.
+        # C6.3 (2026-06-18): cap raised to 8192 (matching can_fuse_horizontal)
+        # to fuse training backward reductions (rnumel up to 16384 for
+        # 128×128 images) with pointwise tails. Persistent pointwise
+        # handles large rnumel via grid-stride looping.
         if not base:
             _, (numel1, rnumel1) = node1.group
             _, (numel2, rnumel2) = node2.group
@@ -459,7 +461,7 @@ class VulkanScheduling(SIMDScheduling):
             if config.aggressive_fusion():
                 rnumel_fuse_cap = 256
                 if config.persistent_pointwise() and _wave64_persistent_ok():
-                    rnumel_fuse_cap = 1024
+                    rnumel_fuse_cap = 8192
             if node1.is_reduction() and not node2.is_reduction():
                 if (
                     rnumel1 != 1
@@ -510,16 +512,17 @@ class VulkanScheduling(SIMDScheduling):
             return False
 
         # Same wave-budget cap policy as M9.8 + M-PERF.6: 64 default,
-        # 256 with aggressive fusion, 1024 with wave64 + persistent
-        # pointwise.  Reduction consumers fold into the upstream kernel
-        # iff their ``rnumel`` fits this cap.
+        # 256 with aggressive fusion, 8192 with wave64 + persistent
+        # pointwise (C6.3, matching can_fuse_horizontal).  Reduction
+        # consumers fold into the upstream kernel iff their ``rnumel``
+        # fits this cap.
         from . import config as _config
 
         rnumel_fuse_cap = 64
         if _config.aggressive_fusion():
             rnumel_fuse_cap = 256
             if _config.persistent_pointwise() and _wave64_persistent_ok():
-                rnumel_fuse_cap = 1024
+                rnumel_fuse_cap = 8192
 
         # Find all scheduler nodes that consume node1's buffers
         try:

@@ -121,10 +121,10 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **Batch dispatch is correct but 1.8× slower** → default OFF | 🟡 | C1 partially addressed: async precompile reduces cold-start penalty; batch overhead bottleneck remains |
 | **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | C1.1 async precompile + C1.2 removed 4 redundant GPU syncs; full batch dispatch overlap remains |
 | **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ✅ | C2 done: `config_key` in `kernel/main.py:397` + `canonical_shape_class` in `template_registry.py:71`; same-class shapes reuse cached SPIR-V |
-| **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
+| **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang`: C6.3 (2026-06-18) fixed push-constant overflow (OpRange→StructuredBuffer), created `persistent_pointwise.py` caller, added sub/pow/fill ops; template now dispatchable |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
 | **Conv backward fwd-recomputation elimination** | 🟡 | C5.1: added `TORCH_VULKAN_DISABLE_CONV_GN_FUSION` gate for experimentation; warm-rerun may hang |
-| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches in GN/conv3d bwd |
+| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | 🟡 | C6.1 rnumel cap↑ + C6.2 removed 5 redundant .zero_() dispatches; **C6.3 (2026-06-18)** raised `can_fuse_vertical` and `_all_consumers_are_fusible` caps 1024→8192 (matching `can_fuse_horizontal`), enabling more reduction+pointwise fusion in training backward |
 | **GN backward Slang-extern** (single shader vs 11 pointwise ops) | ⛔ | Single-dispatch GN backward like conv_gn_relu fwd; eliminates intermediates |
 
 **Autotune (TUNE)**
