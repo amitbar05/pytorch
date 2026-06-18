@@ -53801,16 +53801,17 @@ class TestM192PersistentPointwise:
         )
 
     def test_enable_skipped_for_large_numel(self):
-        """Large pointwise (numel > 4096) is left alone — the
+        """Large pointwise (numel > 16384) is left alone — the
         per-dispatch overhead the persistent loop amortises is already
-        negligible relative to the kernel runtime above the threshold."""
+        negligible relative to the kernel runtime above the threshold.
+        C6.4 (2026-06-18): cap raised from 4096→16384."""
         from unittest import mock
 
         os.environ["TORCH_VULKAN_PERSISTENT_POINTWISE"] = "1"
 
         sch = self._make_scheduling()
         fake_kernels = [self._make_fake_kernel()]
-        features = self._make_fake_features(numel=8192)
+        features = self._make_fake_features(numel=32768)
 
         with mock.patch(
             "torch._inductor.codegen.simd.SIMDScheduling.create_kernel_choices",
@@ -53819,8 +53820,8 @@ class TestM192PersistentPointwise:
             sch.create_kernel_choices(features, [], {})
 
         assert fake_kernels[0]._persistent_mode is False, (
-            "M19.2 regression: _enable_persistent_mode() fired on a "
-            "numel=8192 kernel — must be skipped above the 4096-element "
+            "M19.2/C6.4 regression: _enable_persistent_mode() fired on a "
+            "numel=32768 kernel — must be skipped above the 16384-element "
             "threshold"
         )
 
