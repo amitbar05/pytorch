@@ -510,9 +510,11 @@ candidates are stripped via `_install_vulkan_autotune_cuda_filter()`.
 
 **D1 warm-up shape sweep (2026-06-18):** Level-2 autotune now covers:
 - MM: 12 shapes × 2 dtypes (square, tall-skinny, short-wide, batched, small)
-- Conv: 8 shapes × 2 dtypes (1×1, 3×3, 5×5 kernels, first-layer, large-batch)
+- Conv fwd: 8 shapes × 2 dtypes (1×1, 3×3, 5×5 kernels, first-layer, large-batch)
 - Linear: 4 shapes × 2 dtypes (addmm — FFN/MLP blocks)
-- Total: 48 autotune probe combos (was 14)
+- BMM: 4 shapes × 2 dtypes (torch.bmm — attention/multi-head projections)
+- Conv bwd: 3 shapes × 2 dtypes (loss.backward through nn.Conv2d)
+- Total: 62 autotune probe combos (was 14, then 48)
 
 **Remaining**: Conv tile config autotune (`tuned_conv`), flash attention tile configs,
 and V.choices integration for non-MM templates.
