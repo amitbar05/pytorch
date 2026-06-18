@@ -122,6 +122,10 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | async pool exists (`slangc.py:544`), overlap not wired into flush path |
 | **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ⛔ | `template_registry.py` has a `shape_class` field only; no canonicalization |
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
+| **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
+| **Conv backward fwd-recomputation elimination** | ⛔ | Profiled 2026-06-18; slang_conv2d re-run in backward; ~1 heavy dispatch |
+| **Tiny-kernel fusion** (fill/copy/inplace 13 dispensers, 45% of total) | ⛔ | Profiled 2026-06-18; wg=(1,1,1); ~4ms overhead |
+| **GN backward Slang-extern** (single shader vs 11 pointwise ops) | ⛔ | Single-dispatch GN backward like conv_gn_relu fwd; eliminates intermediates |
 
 **Autotune (TUNE)**
 | Item | State | Evidence |
@@ -404,6 +408,42 @@ Route reductions with `numel > 65536` to `persistent_pointwise.slang` (loop over
 chunks in one workgroup) from `bwd_diff_table.py`.
 - **Files**: `bwd_diff_table.py`, `templates/persistent_pointwise.slang`
 - **Exit**: `TestPersistentReduction` — large `sum`/`mean` parity + dispatch-count drop.
+
+#### C4 — GN backward kernel fusion ⛔
+**PROFILED 2026-06-18.** GN backward is decomposed into **11 individual kernels**
+(sub, mul, 3×sum, fill, expand, fill, pow, mul_scalar, mul). Each is a tiny
+pointwise/reduction dispatch. These should be fused into 1-2 kernels (like
+`conv_gn_relu_fused` handles forward). Eliminating 10 dispatches per backward
+pass would recover ~2-3ms per step.
+- **Files**: `bwd_lowerings_norm.py`, `bwd_diff_table.py`, `combo_kernel/`
+- **Exit**: `TestGNBwdFused` — GN backward uses ≤3 dispatches (vs 11 today);
+  gradient parity vs CPU holds.
+
+#### C5 — Conv backward forward-recomputation elimination ⛔
+The conv backward path re-runs `slang_conv2d` (conv forward) as part of gradient
+computation. This adds one heavy dispatch per backward pass. The forward result
+should be cached and reused instead of recomputed.
+- **Files**: `lowerings/conv_backward.py`, `bwd_diff/`
+- **Exit**: `TestConvBwdNoRecompute` — backward path contains zero conv-fwd
+  dispatches; output unchanged.
+
+#### C6 — Tiny-kernel fusion (fill, copy, inplace-add) ⛔
+**PROFILED 2026-06-18.** Each training step includes **13 tiny dispatches**
+for fill (5×), copy_strided (4×), and binary_add_inplace (4×), nearly all with
+`wg=(1,1,1)`. These account for 45% of dispatch count but <5% of FLOPs.
+Fusing them into the surrounding compute kernels would eliminate ~4ms of
+dispatch overhead per step.
+- **Files**: `combo_kernel/`, `scheduling.py` (fusion heuristics)
+- **Exit**: `TestTinyKernelFusion` — per-step dispatch count ≤20 (vs 30 today);
+  no standalone `copy_fill_fwd`/`copy_strided_copy_fwd` dispatches.
+
+#### C7 — GN backward Slang-extern rewrite (from decomposed ops to single shader) ⛔
+**RELATED TO C4.** Instead of decomposing GN backward into 11 pointwise ops,
+write a single Slang shader that computes the full GN backward in one dispatch
+(mirrors the approach used for conv_gn_relu forward fusion). This eliminates
+both the dispatch overhead AND the intermediate buffer allocations.
+- **Files**: New `templates/gn_backward_fused.slang`, `lowerings/gn_backward_extern.py`
+- **Exit**: `TestGNBwdSlang` — GN backward is 1 dispatch; parity vs eager holds.
 
 ### Pillar D — Autotune
 
