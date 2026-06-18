@@ -80,6 +80,11 @@ public void vk_atomic_add(RWStructuredBuffer<uint> buf, uint idx, float value) {
         desired = asuint(asfloat(expected) + value);
         InterlockedCompareExchange(buf[idx], expected, desired, original);
     } while (original != expected);
+    // RDNA1 memory model: ensure the successful store is visible to
+    // other wavefronts before they read. Without this, concurrent
+    // CAS loops on the same address can observe stale values and
+    // silently drop contributions, corrupting dW/dX accumulators.
+    DeviceMemoryBarrier();
 }
 
 [ForceInline]

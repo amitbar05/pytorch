@@ -263,6 +263,7 @@ def profile_device(
     *,
     force: bool = False,
     verbose: bool = False,
+    validate: bool = False,
 ) -> dict[str, Any]:
     """Run the hardware probe at the requested level.
 
@@ -274,6 +275,10 @@ def profile_device(
         level: 0 (microbench), 1 (+ compile prewarm), or 2 (+ autotune sweep).
         force: re-run even if the marker says the level is already complete.
         verbose: print per-stage progress to stdout (useful from the CLI).
+        validate: when True, enable ``TORCH_VULKAN_VUID_AS_ERROR=1`` during
+            warm-up so that any VUID emitted by pre-compiled or autotuned
+            shaders fails the warm-up call. Warns if VK_INSTANCE_LAYERS is
+            not also set (Vulkan validation requires restart to take effect).
 
     Returns:
         ``{"level": int, "cached": bool, ...stage results}``.
@@ -281,6 +286,41 @@ def profile_device(
     if level not in (LEVEL_QUICK, LEVEL_MEDIUM, LEVEL_DEEP):
         raise ValueError(f"profile_device level must be 0, 1, or 2 (got {level!r})")
 
+    # W4: Vulkan validation during warm-up.
+    # When validate=True, set TORCH_VULKAN_VUID_AS_ERROR=1 for the duration
+    # so any shader bugs surface at warm-up time.  Note: VK_INSTANCE_LAYERS
+    # is read at Vulkan instance creation time (during import torch_vulkan)
+    # so it cannot be changed here — we just warn if it's missing.
+    _prev_vuid = os.environ.get("TORCH_VULKAN_VUID_AS_ERROR")
+    _validation_active = False
+    if validate:
+        os.environ["TORCH_VULKAN_VUID_AS_ERROR"] = "1"
+        _validation_active = True
+        if verbose:
+            _layers = os.environ.get("VK_INSTANCE_LAYERS", "")
+            if _layers and "validation" in _layers.lower():
+                print("  VUID-as-error + Vulkan validation layers: ON")
+            else:
+                print(
+                    "  VUID-as-error: ON "
+                    "(VK_INSTANCE_LAYERS not set — restart required for full "
+                    "Vulkan validation layer)"
+                )
+    try:
+        return _profile_device_impl(level, force, verbose)
+    finally:
+        if _prev_vuid is not None:
+            os.environ["TORCH_VULKAN_VUID_AS_ERROR"] = _prev_vuid
+        elif "TORCH_VULKAN_VUID_AS_ERROR" in os.environ:
+            del os.environ["TORCH_VULKAN_VUID_AS_ERROR"]
+
+
+def _profile_device_impl(
+    level: int,
+    force: bool,
+    verbose: bool,
+) -> dict[str, Any]:
+    """Internal implementation of profile_device (after validation env setup)."""
     if not force:
         status = _read_probe_status()
         if status and int(status.get("completed_level", -1)) >= level:

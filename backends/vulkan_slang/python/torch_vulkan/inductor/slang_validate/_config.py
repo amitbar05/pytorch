@@ -39,6 +39,7 @@ _WAVE_SIZE = int(os.environ.get("TORCH_VULKAN_WAVE_SIZE", "64"))
 _MAX_PUSH_CONSTANT_BYTES = int(
     os.environ.get("TORCH_VULKAN_MAX_PUSH_CONSTANT_BYTES", "128")
 )
+_MAX_SPEC_CONSTANTS = int(os.environ.get("TORCH_VULKAN_MAX_SPEC_CONSTANTS", "64"))
 
 # ── Regex patterns (compiled once) ─────────────────────────────────────────
 _RE_BINDING = re.compile(r"\[\[vk::binding\((\d+)\)\]\]")

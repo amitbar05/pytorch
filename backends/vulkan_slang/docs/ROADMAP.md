@@ -49,7 +49,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | W1: Hardware microbenchmark (launch latency, mem/LDS BW, atomics, limits) | ✅ | `device_profile.load_or_profile()`; cached at `~/.cache/torch_vulkan/` |
 | W2: Shader-lib + matmul template SPIR-V precompile | ✅ | `hardware_probe.py:_run_level_1_sync()`; on-disk SPIR-V cache |
 | W3: Canonical-shape autotune sweep (mm + conv2d shapes × dtypes) | ✅ | `_run_level_2_autotune()`; populates `~/.cache/torch_vulkan/autotune/` |
-| W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | ⛔ | Warm-up runs without validation by default; need `VK_INSTANCE_LAYERS` opt-in |
+| W4: Vulkan validation layer during warm-up (catch bugs at warm-up, not training) | 🟡 | `prepare_device(validate=True)` sets `TORCH_VULKAN_VUID_AS_ERROR=1` during warm-up; `VK_INSTANCE_LAYERS` requires restart to take effect (A2.5 session) |
 | W5: Per-model warm-up (`prepare_model(model, sample_input)` → 100% SPIR-V cache) | ⛔ | No model-targeted warm-up yet; only canonical shapes |
 
 **AOT / deployment (AOTI)**
@@ -65,7 +65,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | **PF.30.e**: FunctionalTensor view ops crash | ✅ | Null-storage guard catches FakeTensors; AOTI compile passes |
 | **AOTI C++ wrapper codegen**: Slang→SPIR-V + emit AOTI dispatch ABI | ✅ | **FIXED 2026-06-16** — `.so` compiles, links 3 AOTI symbols, 0 VUIDs |
 | **AOTI runner dispatch**: AOTIModelContainerRunnerCpu.run() | ✅ | **FIXED 2026-06-17** — vulkan.h static inline shadow resolved; both tensors on vulkan:0 |
-| AOTI `.so` fwd+bwd+optimizer full step, data correctness | 🟡 | Pointwise fwd verified; extern-kernel codegen blocker (A2.5) — conv/GN/Linear emit Python syntax in C++ wrapper |
+| AOTI `.so` fwd+bwd+optimizer full step, data correctness | 🟡 | Pointwise fwd verified; extern-kernel codegen 🟡 (conv/Linear/GN fwd+bwd wired for AOTI, optimizer deferred — A2.5 session) |
 | Model-level AOTI API (`model_load/run/free`) | 🟡 | Stub implementation: single-kernel dispatch, no per-kernel buffer layouts |
 
 **Training correctness (the M19–M23 / FP16 line, recently active)**
@@ -276,27 +276,22 @@ at a different readiness state:
    `extern "C"` declaration. Verified: AOTIModelContainerRunnerCpu.run()
    dispatches with both tensors device=vulkan:0, VUID=0.
 
-5. **AOTI extern-kernel codegen: Python syntax in C++ wrapper** ⛔
-   **DISCOVERED 2026-06-17.** The conv2d/GN/Linear extern-kernel lowerings
-   have custom `codegen` methods that emit Python-style function calls
-   (e.g., `_slang_tile_conv2d(arg4_1, conv_weight, buf1, stride=(1, 1), ...)`).
-   During AOTI compilation, this Python syntax leaks verbatim into the C++
-   wrapper, causing C++ compiler errors (undeclared identifiers, Python
-   tuple literals). Pointwise/reduction kernels don't have this problem —
-   they route through `scheduling.py:define_kernel` which detects
-   `V.graph.aot_mode` and skips Python emission.
-   - **Fix needed**: Each extern-kernel `codegen` method must detect
-     `aot_mode` and emit C++ AOTI dispatch calls with pre-compiled SPIR-V
-     embedded as `static const uint32_t` arrays. SPIR-V can be compiled
-     at codegen time from the template + static shape metadata. After
-     this fix, simple conv models will compile to loadable `.so` files.
-   - **Files**: `lowerings/conv.py:248-290` (codegen), `lowerings/conv_backward.py`,
-     `lowerings/gn_forward_extern.py`, `lowerings/gn_backward_extern.py`,
-     `lowerings/matmul.py`
-   - **Exit**: `TestAOTIConvGNForward` — AOTI `.so` compiles and produces
-     output matching eager forward.
-   - **Prerequisite fix**: `_flush_batcher_before_direct_call` no-op added to
-     `VulkanCppWrapperGpu` (line 95-97 of `cpp_wrapper_gpu.py`).
+5. **AOTI extern-kernel codegen: Python syntax in C++ wrapper** 🟡
+   **PARTIALLY FIXED 2026-06-18 (A2.5 session).** Each extern-kernel `codegen`
+   method now checks `V.graph.aot_mode` before emitting Python calls.
+   When in AOTI mode, it calls a new `emit_aoti_extern_dispatch()` helper in
+   `VulkanCppWrapperGpu` that compiles the Slang template to SPIR-V at
+   codegen time, stores it as an embedded `static const uint32_t` array,
+   and emits C++ code calling `torch_vulkan_aoti_make_kernel` + `dispatch`
+   with pre-computed push constants from the IR layout info.
+
+   **Wired**: conv2d fwd+bwd, matmul, GN fwd+bwd (input + weight).
+   **Not yet wired**: conv3d fwd+bwd, optimizer (raises NotImplementedError —
+   `foreach_optimizer.slang` uses Slang `interface` generics that need
+   per-algorithm SPIR-V precompile).
+
+   Remaining work: GPU test verification of the AOTI `.so` compile path
+   (pointwise-only AOTI compile works; extern-kernel AOTI needs GPU testing).
 
 6. **AOTI so-load without torch_vulkan on PYTHONPATH** 🟡
    `TestAotiSoLoadsWithoutTorchVulkanPythonpath` — prerequisites (PF.60,

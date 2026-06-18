@@ -172,7 +172,15 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
             )
 
     def codegen(self, wrapper):
-        """Emit a call to ``_slang_tile_conv2d_bwd`` in the generated wrapper."""
+        """Emit a call to ``_slang_tile_conv2d_bwd`` in the generated wrapper.
+
+        A2.5: When ``V.graph.aot_mode`` is True, emits C++ AOTI dispatch
+        calls with pre-compiled SPIR-V instead of Python function calls.
+        """
+        if getattr(V.graph, 'aot_mode', False):
+            self._codegen_aoti(wrapper)
+            return
+
         # M-NEW.12: flush batcher before this direct Vulkan dispatch.
         # Batched pointwise/foreach kernels queued before this ExternKernelOut
         # (e.g., ReLU backward mask for Conv-GN-ReLU chains) must be flushed
@@ -237,6 +245,98 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         # C1.2: after-sync is redundant — Vulkan single-queue in-order
         # execution guarantees downstream dispatches wait for this kernel.
         # The optimizer's foreach dispatch goes to the same queue.
+
+    def _codegen_aoti(self, wrapper):
+        """Emit C++ AOTI dispatch for conv2d backward via pre-compiled SPIR-V."""
+        from torch._inductor.virtualized import V
+
+        from ...templates.caller.conv import _render_conv_bwd_slang
+
+        input_names = [inp.codegen_reference() for inp in self.inputs]
+        out_name = self.codegen_reference()
+
+        input_t = input_names[0]
+        weight_t = input_names[1]
+        grad_out = input_names[2]
+        grad_weight = input_names[3]
+        grad_bias = input_names[4] if self.has_bias and len(input_names) > 4 else None
+
+        in_layout = self.inputs[0].get_layout()
+        w_layout = self.inputs[1].get_layout()
+        go_layout = self.inputs[2].get_layout()
+        out_layout = self.get_layout()
+
+        N, C_in, iH, iW = in_layout.size
+        C_out, C_in_w, kH, kW = w_layout.size
+        sH, sW = self.stride_arg
+        pH, pW = self.padding_arg
+        dH, dW = self.dilation_arg
+        oH, oW = go_layout.size[2], go_layout.size[3]
+
+        tile_w = tile_h = tile_c = 8
+        threads_w = threads_h = 16
+
+        slang_src = _render_conv_bwd_slang(
+            tile_w=tile_w, tile_h=tile_h, tile_c=tile_c,
+            threads_w=threads_w, threads_h=threads_h,
+        )
+
+        dtype_s = "f32"
+        cache_key = f"slang_conv_bwd_m20p3_{dtype_s}"
+
+        in_stride = in_layout.stride
+        w_stride = w_layout.stride
+        go_stride = go_layout.stride
+
+        common_fields = [
+            int(N), int(C_in), int(C_out),
+            int(iH), int(iW), int(oH), int(oW),
+            int(kH), int(kW),
+            int(sH), int(sW), int(pH), int(pW),
+            int(dH), int(dW),
+            int(in_stride[0]), int(in_stride[1]),
+            int(in_stride[2]), int(in_stride[3]),
+            int(w_stride[0]), int(w_stride[1]),
+            int(w_stride[2]), int(w_stride[3]),
+            int(go_stride[0]), int(go_stride[1]),
+            int(go_stride[2]), int(go_stride[3]),
+        ]
+        stride_grad_bias = 1 if grad_bias is not None else 0
+        pc_values = list(common_fields) + [stride_grad_bias]
+
+        grid_x = (int(oW) + tile_w - 1) // tile_w
+        grid_y = (int(oH) + tile_h - 1) // tile_h
+        tile_c_count = (int(C_out) + tile_c - 1) // tile_c
+        grid_z = int(N) * tile_c_count
+
+        # buffers: input_f32, weight_f32, grad_out_f32, gi_f32, gw_f32, gb_f32
+        buffer_names = [input_t, weight_t, grad_out, out_name, grad_weight]
+        if grad_bias:
+            buffer_names.append(grad_bias)
+        else:
+            buffer_names.append("_conv_bwd_dummy_gb")
+
+        output_allocations = [
+            {"name": out_name, "shape": [int(s) for s in out_layout.size],
+             "stride": [int(s) for s in out_layout.stride], "dtype": "float32"},
+        ]
+        if not grad_bias:
+            output_allocations.append({
+                "name": "_conv_bwd_dummy_gb",
+                "shape": [1], "stride": [1], "dtype": "float32",
+            })
+
+        wrapper.emit_aoti_extern_dispatch(
+            slang_src=slang_src,
+            cache_key=cache_key,
+            buffer_names=buffer_names,
+            pc_values=pc_values,
+            grid_x=grid_x,
+            grid_y=grid_y,
+            grid_z=grid_z,
+            num_outputs=3,
+            output_allocations=output_allocations,
+        )
 
 
 def _get_conv_backward_lowering_impl():

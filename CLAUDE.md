@@ -14,48 +14,46 @@ style / anti-goal rules. Don't conflate the two scopes.
 
 | Doing what? | Read this |
 |-------------|-----------|
-| Any backend (vulkan_slang) work — almost always | **`backends/vulkan_slang/CLAUDE.md`** and **`backends/vulkan_slang/docs/10-inductor-backend.md § v7`** |
-| Open question on which roadmap item to pick | Roadmap § v7 (4 pillars, 16 milestones, file:line refs) |
-| Triage of a pre-v7 milestone or audit | `backends/vulkan_slang/docs/archive/v6.x-snapshot-2026-05-27.md` (then `10-inductor-backend-history.md` for v6.1 closeouts) |
+| Any backend (vulkan_slang) work — almost always | **`backends/vulkan_slang/CLAUDE.md`** and **`backends/vulkan_slang/docs/ROADMAP.md`** |
+| Open question on which roadmap item to pick | `ROADMAP.md § 2` (pillars A–F, file:line + regression test per item) |
+| Triage of a closed milestone or past audit | `backends/vulkan_slang/docs/10-inductor-backend-history.md`, then `docs/archive/v6.x-snapshot-2026-05-27.md` |
 | Upstream `torch/_inductor/` change | This file, § *Upstream Inductor reference* below |
 
 ---
 
 # Roadmap-driven workflow
 
-**`backends/vulkan_slang/docs/10-inductor-backend.md` is the canonical source
-of truth for what to work on.** Start every session by reading **§ v7** —
-the 4-pillar plan with 16 milestones, file:line references, and
-per-milestone status. Pre-v7 history is archived at
-`backends/vulkan_slang/docs/archive/v6.x-snapshot-2026-05-27.md`; search
-it for prior decisions, don't extend it.
+**`backends/vulkan_slang/docs/ROADMAP.md` is the single canonical source
+of truth for what to work on.** Start every session by reading it: § 1 is the
+current-state scorecard, § 2 the prioritized forward plan (pillars A–F).
+It replaced the old `docs/10/14/15/16-inductor-backend.md` series +
+`codegen-optimization-roadmap.md` (deleted 2026-06-15). Closed-milestone history
+is `docs/10-inductor-backend-history.md`; pre-v7 is `docs/archive/`. Search those
+for prior decisions, don't extend them.
 
 Loop:
-1. Pick the highest-priority unblocked v7 milestone.
-2. Implement → write a regression test → mark ✅ in the v7 milestone
-   table → move to the next.
+1. Pick the highest-priority unblocked ROADMAP.md item.
+2. Implement → write a regression test → mark ✅ in the ROADMAP.md
+   scorecard → move to the next.
 3. Work autonomously; don't pause to ask "should I continue".
-4. Blocked? Skip, note the blocker in the roadmap, take the next item.
+4. Blocked? Skip, note the blocker in ROADMAP.md, take the next item.
 5. Found a gap too big for the current change? Add it as a new sub-item
-   under the right v7 pillar (clear title, what's missing, rough effort).
+   under the right ROADMAP.md pillar (clear title, what's missing, rough effort).
 6. Don't symptom-patch in `meta_patches/` — that directory exists as
-   anti-goal #5; if a fix needs a new primitive, file a v7 sub-item for
+   anti-goal #4; if a fix needs a new primitive, file a roadmap sub-item for
    the primitive instead.
 
-## v7 active pillars (snapshot 2026-05-27)
+## Durable pillar goals
 
 | # | Pillar | Goal |
 |---|--------|------|
-| **M-CG** | Codegen-only Inductor backend | No `extern_kernels.X` to aten / PrivateUse1 eager Vulkan inside compiled wrappers. No "if device != vulkan: aten fallback" branches inside custom-op impls that the compile path can hit. |
-| **M-SF** | Smart Slang feature usage | ParameterBlock + generics + interfaces + `[BackwardDerivative]` + spec consts + reflection metadata. String-substituted Jinja is the exception. |
-| **M-VAL** | Validation-driven codegen | Vulkan validation layer mandatory in tests (`TORCH_VULKAN_VUID_AS_ERROR=1`); VUID during autotune → rejected candidate; VUID on landed kernel → test failure. |
-| **M-PROBE** | Profile-and-warmup canonical entry | `torch_vulkan.prepare_device(level, timeout_s)` once at process start — pay the cold cost up front so `torch.compile` after that is fast. |
+| **Codegen-only** | No `extern_kernels.X` to aten / PrivateUse1 eager Vulkan inside compiled wrappers. No "if device != vulkan: aten fallback" branches inside custom-op impls that the compile path can hit. |
+| **Slang-smart** | ParameterBlock + generics + interfaces + `[BackwardDerivative]` + spec consts + reflection metadata. String-substituted Jinja is the exception. |
+| **Validation-driven** | Vulkan validation layer mandatory in tests (`TORCH_VULKAN_VUID_AS_ERROR=1`); VUID during autotune → rejected candidate; VUID on landed kernel → test failure. |
+| **Profile-and-warmup** | `torch_vulkan.prepare_device(level, timeout_s)` once at process start — pay the cold cost up front so `torch.compile` after that is fast. |
 
-The full v7 milestone table (16 items with file:line references and
-effort estimates) lives in
-`backends/vulkan_slang/docs/10-inductor-backend.md § v7`. Everything
-below the divider in that doc is the frozen v6.x reference appendix —
-do not extend it.
+The prioritized open-work breakdown (pillars A–F, each item with file:line +
+named regression test) lives in `backends/vulkan_slang/docs/ROADMAP.md § 2`.
 
 ---
 

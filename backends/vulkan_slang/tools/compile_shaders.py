@@ -2,6 +2,7 @@
 """Compile Slang shaders to SPIR-V and embed as C++ byte arrays."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,12 +10,26 @@ from pathlib import Path
 
 SHADER_DIR = Path(__file__).parent.parent / "shaders"
 OUTPUT_DIR = Path(__file__).parent.parent / "csrc" / "generated"
-SLANGC = os.environ.get("SLANGC", "slangc")
+_project_root = Path(__file__).resolve().parent.parent
+_default_slangc = str(_project_root / "third_party" / "slang" / "build" / "bin" / "slangc")
+SLANGC = os.environ.get("SLANGC", _default_slangc)
 
 
 def find_shaders():
     """Find all .slang files recursively."""
     return sorted(SHADER_DIR.rglob("*.slang"))
+
+
+def has_entry_point(slang_path: Path, entry_point: str) -> bool:
+    """Check if a Slang file defines a specific entry point function."""
+    try:
+        content = slang_path.read_text()
+        # Match function definitions like: void computeMain(...), [shader("compute")] void bwd_computeMain(...)
+        # Also handle [Differentiable] and [BackwardDerivative] attributes.
+        pattern = rf"^(?:\[.*?\]\s+)*\b(?:void|int|float|uint|bool)\s+{re.escape(entry_point)}\s*\("
+        return bool(re.search(pattern, content, re.MULTILINE))
+    except Exception:
+        return False
 
 
 def compile_to_spirv(slang_path: Path, entry_point: str, output_path: Path):
@@ -27,8 +42,9 @@ def compile_to_spirv(slang_path: Path, entry_point: str, output_path: Path):
         "-o", str(output_path),
         "-matrix-layout-row-major",
     ]
-    # Add include paths for imports
+    # Add include paths for imports: shaders/ (top-level) + shaders/lib/ (module files)
     cmd.extend(["-I", str(SHADER_DIR)])
+    cmd.extend(["-I", str(SHADER_DIR / "lib")])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -66,7 +82,11 @@ def main():
 
     shaders = find_shaders()
     # Skip common/ modules (they're imported, not compiled directly)
-    shaders = [s for s in shaders if "common/" not in str(s)]
+    # Skip shaders/lib/ (pure Slang module files with no computeMain entry point)
+    # Skip shaders/reduction.slang (top-level re-export alias, not a kernel)
+    shaders = [s for s in shaders if "common/" not in str(s)
+               and "shaders/lib/" not in str(s)
+               and str(s) != str(SHADER_DIR / "reduction.slang")]
 
     if not shaders:
         print("No shaders found to compile.")
@@ -102,12 +122,14 @@ def main():
         else:
             fail_count += 1
 
-        # Try backward entry point if it exists
-        spv_bwd_path = OUTPUT_DIR / f"{var_base}_bwd.spv"
-        if compile_to_spirv(shader, "bwd_computeMain", spv_bwd_path):
-            c_code = spirv_to_c_array(spv_bwd_path, f"{var_base}_bwd")
-            header_parts.append(c_code)
-            header_parts.append("")
+        # Only try backward entry point if the shader defines it
+        if has_entry_point(shader, "bwd_computeMain"):
+            spv_bwd_path = OUTPUT_DIR / f"{var_base}_bwd.spv"
+            if compile_to_spirv(shader, "bwd_computeMain", spv_bwd_path):
+                c_code = spirv_to_c_array(spv_bwd_path, f"{var_base}_bwd")
+                header_parts.append(c_code)
+                header_parts.append("")
+        # else: no bwd entry point; silently skip (expected for many shaders)
 
     header_parts.append("}} // namespace torch_vulkan::shaders")
 

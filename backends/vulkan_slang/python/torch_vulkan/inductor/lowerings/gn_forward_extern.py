@@ -121,6 +121,11 @@ class _VulkanGNFwdExternKernel(_ir_module.ExternKernelOut):
             )
 
     def codegen(self, wrapper):
+        # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
+        if getattr(V.graph, 'aot_mode', False):
+            self._codegen_aoti(wrapper)
+            return
+
         wrapper._flush_batcher_before_direct_call()
 
         wrapper.add_import_once(
@@ -167,3 +172,78 @@ class _VulkanGNFwdExternKernel(_ir_module.ExternKernelOut):
         self.codegen_size_asserts(wrapper)
         wrapper.add_import_once("import torch_vulkan")
         wrapper.writeline("torch_vulkan.synchronize(0)")
+
+    def _codegen_aoti(self, wrapper):
+        """Emit C++ AOTI dispatch for GN forward via pre-compiled SPIR-V."""
+        import os
+        import struct
+
+        names = [inp.codegen_reference() for inp in self.inputs]
+        out_name = self.codegen_reference()
+        inp_name = names[0]
+        weight_name = names[1]
+        bias_name = names[2]
+        save_mean_name = names[3] if len(names) > 3 else None
+        save_rstd_name = names[4] if len(names) > 4 else None
+
+        G = self.num_groups
+        eps = self.eps
+        in_layout = self.inputs[0].get_layout()
+        N, C, H, W = [int(s) for s in in_layout.size]
+        channels_per_group = C // G
+        spatial_size = H * W
+        group_size = channels_per_group * spatial_size
+        num_rows = N * G
+
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        shader_path = os.path.join(
+            this_dir, "..", "..", "..", "..", "..",
+            "shaders", "normalization", "group_norm.slang",
+        )
+        with open(shader_path) as f:
+            src = f.read()
+
+        pc_bytes = struct.pack("5If", G, group_size, num_rows,
+                               channels_per_group, spatial_size, float(eps))
+        pc_values = list(struct.unpack(f"{len(pc_bytes) // 4}I", pc_bytes))
+        cache_key = f"group_norm_fused_{G}_{channels_per_group}_{spatial_size}_f32_m17"
+
+        buffer_names = [inp_name, weight_name, bias_name, out_name]
+        if save_mean_name:
+            buffer_names.append(save_mean_name)
+        else:
+            buffer_names.append("_gn_fwd_dummy_mean")
+        if save_rstd_name:
+            buffer_names.append(save_rstd_name)
+        else:
+            buffer_names.append("_gn_fwd_dummy_rstd")
+
+        out_layout = self.get_layout()
+        output_allocations = [{
+            "name": out_name,
+            "shape": [int(s) for s in out_layout.size],
+            "stride": [int(s) for s in out_layout.stride],
+            "dtype": "float32",
+        }]
+        if not save_mean_name:
+            output_allocations.append({
+                "name": "_gn_fwd_dummy_mean", "shape": [num_rows],
+                "stride": [1], "dtype": "float32",
+            })
+        if not save_rstd_name:
+            output_allocations.append({
+                "name": "_gn_fwd_dummy_rstd", "shape": [num_rows],
+                "stride": [1], "dtype": "float32",
+            })
+
+        wrapper.emit_aoti_extern_dispatch(
+            slang_src=src,
+            cache_key=cache_key,
+            buffer_names=buffer_names,
+            pc_values=pc_values,
+            grid_x=num_rows,
+            grid_y=1,
+            grid_z=1,
+            num_outputs=1,
+            output_allocations=output_allocations,
+        )

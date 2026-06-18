@@ -83,7 +83,7 @@ struct BwdPC {
     uint stride_go_h;
     uint stride_go_w;
     // M-SF.4: stride_grad_bias is always present — gated at runtime by != 0
-    // (replaces the {% if has_bias %} Jinja conditional that produced
+    // (replaces the legacy has_bias Jinja conditional that produced
     // 27-uint vs 28-uint struct variants; same pattern as fwd stride_bias).
     uint stride_grad_bias;  // = grad_bias.view(-1).stride(0) or 0
 };

@@ -2,6 +2,11 @@
 
 Provides rendering, dispatch, and installation for the foreach optimizer Slang
 template (SGD, SGD+momentum, AdamW, Lion).
+
+B1: Uses Slang interface IOptimizer with compile-time specialization.
+A single Jinja variable ``algorithm_type`` selects the concrete type
+(e.g. "AdamWImpl") — no per-line ``{% if algorithm %}`` branches.
+All push constants and buffers are packed uniformly regardless of algorithm.
 """
 
 from __future__ import annotations
@@ -24,6 +29,37 @@ from ...vulkan_template import _load_slang_template
 # slot).  We pre-select a few common sizes; callers pick the smallest
 # size that fits their parameter count.
 _OPTIMIZER_BATCH_SIZES = (1, 7, 15, 21, 32)
+
+# ── B1: Algorithm name → Slang concrete type mapping ──────────────────────
+# External callers use the legacy string names; internally we map to the
+# Slang interface concrete type names used by the generic entry point.
+_ALGORITHM_TO_TYPE: dict[str, str] = {
+    "sgd": "SGDImpl",
+    "sgd_momentum": "SGD MomentumImpl",
+    "adamw": "AdamWImpl",
+    "lion": "LionImpl",
+}
+
+# Reverse mapping for introspection / debug.
+_TYPE_TO_ALGORITHM: dict[str, str] = {v: k for k, v in _ALGORITHM_TO_TYPE.items()}
+
+
+def _resolve_algorithm_type(algorithm: str) -> str:
+    """Map a legacy algorithm name to the Slang concrete type name.
+
+    Accepts both legacy names ("sgd", "adamw", etc.) and the Slang type
+    names ("SGDImpl", "AdamWImpl", etc.) for forward compatibility.
+    Returns the Slang type name.
+    """
+    if algorithm in _ALGORITHM_TO_TYPE:
+        return _ALGORITHM_TO_TYPE[algorithm]
+    if algorithm in _TYPE_TO_ALGORITHM:
+        return algorithm
+    raise ValueError(
+        f"Unknown optimizer algorithm: '{algorithm}'. "
+        f"Expected one of: {list(_ALGORITHM_TO_TYPE.keys())} "
+        f"or {list(_ALGORITHM_TO_TYPE.values())}"
+    )
 
 
 def _foreach_use_parameter_array() -> bool:
@@ -62,13 +98,18 @@ def _foreach_use_parameter_array() -> bool:
 
 
 def _render_foreach_optimizer_slang(
-    algorithm: str,
+    algorithm_type: str,
     batch_size: int,
     output_dtype: str = "float",
     parameter_array: bool | None = None,
 ) -> str:
     """Render the foreach_optimizer.slang template for a given
-    (algorithm, batch_size, output_dtype) combination.
+    (algorithm_type, batch_size, output_dtype) combination.
+
+    B1: ``algorithm_type`` is the Slang concrete type name (e.g. "AdamWImpl").
+    It is substituted once as the generic argument to ``computeMain<...>``
+    and as the qualifier in ``Algo::step(...)`` — no per-line algorithm
+    branching in the template.
     """
     from jinja2 import Environment
 
@@ -83,7 +124,7 @@ def _render_foreach_optimizer_slang(
     env = Environment()
     tmpl = env.from_string(source_template)
     return tmpl.render(
-        algorithm=algorithm,
+        algorithm_type=algorithm_type,
         batch_size=batch_size,
         output_dtype=output_dtype,
         parameter_array=parameter_array,
@@ -91,14 +132,68 @@ def _render_foreach_optimizer_slang(
 
 
 def _foreach_cache_key(
-    algorithm: str,
+    algorithm_type: str,
     batch_size: int,
     output_dtype: str,
     parameter_array: bool,
 ) -> str:
-    """Build the SPIR-V / pipeline cache key for a foreach variant."""
+    """Build the SPIR-V / pipeline cache key for a foreach variant.
+
+    B1: Uses ``algorithm_type`` (Slang concrete type name) instead of
+    legacy algorithm string.
+    """
     suffix = "_pa" if parameter_array else ""
-    return f"slang_foreach_{algorithm}_{batch_size}_{output_dtype}{suffix}"
+    return f"slang_foreach_{algorithm_type}_{batch_size}_{output_dtype}{suffix}"
+
+
+# ── B1: Always-packed push-constant layout ────────────────────────────────
+# The ParamConfig struct in the template is always 7 floats (28 B, padded to
+# 32 B).  We pack all 7 fields for every algorithm; unused fields are 0.0f.
+
+_PARAM_CONFIG_FORMAT = "Iffffff"      # numel + 6 floats (the 7th is _pad)
+_FULL_HEADER_FORMAT = "4I"             # n_params + 3 uint _pad
+
+
+def _pack_push_constants(
+    n_params: int,
+    batch_size: int,
+    numels: list[int],
+    lr: list[float],
+    weight_decay: list[float],
+    momentum: list[float] | None = None,
+    beta2: list[float] | None = None,
+    eps: list[float] | None = None,
+) -> bytes:
+    """Pack push constants in the B1 uniform layout.
+
+    Always packs the full ParamConfig (7 fields) for each param.
+    Unused fields are zero-filled.  Padding slots beyond n_params
+    are also zero-filled.
+    """
+    pc_parts: list[bytes] = []
+    pc_parts.append(struct.pack(_FULL_HEADER_FORMAT, n_params, 0, 0, 0))
+
+    mom_list = momentum if momentum is not None else [0.0] * n_params
+    b2_list = beta2 if beta2 is not None else [0.0] * n_params
+    eps_list = eps if eps is not None else [0.0] * n_params
+
+    for i in range(n_params):
+        pc_parts.append(struct.pack(
+            _PARAM_CONFIG_FORMAT,
+            numels[i],
+            lr[i],
+            weight_decay[i],
+            mom_list[i],
+            b2_list[i],
+            eps_list[i],
+            0.0,  # _pad
+        ))
+
+    # Pad remaining ParamConfig slots for unused entries.
+    for _ in range(n_params, batch_size):
+        pc_parts.append(struct.pack(_PARAM_CONFIG_FORMAT, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    return b"".join(pc_parts)
 
 
 def _slang_foreach_optimizer(
@@ -123,7 +218,10 @@ def _slang_foreach_optimizer(
     batching params into groups ≤ `batch_size` and providing the
     rendered source / cache_key.
 
-    All per-param scalar lists must have length equal to `len(params)`.
+    B1: All buffers (param, grad, momentum, v) are ALWAYS provided.
+    Momentum/V buffers are padded with dummies when the algorithm
+    doesn't use them.  Push constants are always the full 7-float layout.
+    ``num_outputs`` is always ``n_params * 3`` (param + momentum + v).
     """
     n_params = len(params)
     assert n_params <= batch_size, (
@@ -131,12 +229,14 @@ def _slang_foreach_optimizer(
         f"rendered batch_size {batch_size}"
     )
 
+    algorithm_type = _resolve_algorithm_type(algorithm)
+
     if src is None or cache_key is None:
         use_pa = _foreach_use_parameter_array()
         src = _render_foreach_optimizer_slang(
-            algorithm, batch_size, output_dtype, parameter_array=use_pa
+            algorithm_type, batch_size, output_dtype, parameter_array=use_pa
         )
-        cache_key = _foreach_cache_key(algorithm, batch_size, output_dtype, use_pa)
+        cache_key = _foreach_cache_key(algorithm_type, batch_size, output_dtype, use_pa)
 
     # Validate all params have the same shape and dtype.
     numel = params[0].numel()
@@ -153,74 +253,50 @@ def _slang_foreach_optimizer(
                 f"got {dtype} vs {p.dtype}"
             )
 
-    # Build push constants.
-    # Layout: uint n_params, uint _pad[3], then ParamConfig[n].
-    pc_parts: list[bytes] = []
-    pc_parts.append(struct.pack("4I", n_params, 0, 0, 0))
+    # ── B1: Always pack full push constants ───────────────────────────
+    default_lr = [0.01] * n_params
+    default_wd = [0.0] * n_params
 
-    default_lr = [0.01]
-    default_wd = [0.0]
-    default_momentum = [0.9]
-    default_beta2 = [0.999]
-    default_eps = [1e-8]
+    numels = [p.numel() for p in params]
+    lr_list = list(lr) if lr is not None else default_lr
+    wd_list = list(weight_decay) if weight_decay is not None else default_wd
+    mom_list = list(momentum) if momentum is not None else [0.0] * n_params
+    b2_list = list(beta2) if beta2 is not None else [0.0] * n_params
+    eps_list = list(eps) if eps is not None else [0.0] * n_params
 
-    lr_list = lr if lr is not None else default_lr * n_params
-    wd_list = weight_decay if weight_decay is not None else default_wd * n_params
-    mom_list = momentum if momentum is not None else default_momentum * n_params
-    b2_list = beta2 if beta2 is not None else default_beta2 * n_params
-    eps_list = eps if eps is not None else default_eps * n_params
+    pc_bytes = _pack_push_constants(
+        n_params, batch_size, numels, lr_list, wd_list,
+        momentum=mom_list, beta2=b2_list, eps=eps_list,
+    )
 
-    for i in range(n_params):
-        pc_parts.append(struct.pack("If", params[i].numel(), lr_list[i]))
-        pc_parts.append(struct.pack("f", wd_list[i]))
-        if algorithm in ("sgd_momentum", "adamw", "lion"):
-            pc_parts.append(struct.pack("f", mom_list[i]))
-        if algorithm == "adamw":
-            pc_parts.append(struct.pack("f", b2_list[i]))
-            pc_parts.append(struct.pack("f", eps_list[i]))
-        if algorithm == "lion":
-            pc_parts.append(struct.pack("f", b2_list[i]))
-
-    # Pad remaining ParamConfig slots for unused entries.
-    for _ in range(n_params, batch_size):
-        pc_parts.append(struct.pack("Iff", 0, 0.0, 0.0))
-        if algorithm in ("sgd_momentum", "adamw", "lion"):
-            pc_parts.append(struct.pack("f", 0.0))
-        if algorithm == "adamw":
-            pc_parts.append(struct.pack("f", 0.0))
-            pc_parts.append(struct.pack("f", 0.0))
-        if algorithm == "lion":
-            pc_parts.append(struct.pack("f", 0.0))
-
-    pc_bytes = b"".join(pc_parts)
-
-    # Build buffer list: [param0, grad0, param1, grad1, ...].
-    # Padding slots use a real-storage dummy (size 1, not 0) because the
-    # runtime rejects null-storage tensors at dispatch (PF.51).
+    # ── B1: Always build all 4 buffer types per param ─────────────────
+    # Dummy tensor for padding slots.
     dummy = pool_acquire_scratch((1,), dtype, params[0].device)
     if dummy is None:
         dummy = torch.empty(1, device=params[0].device, dtype=dtype)
-    buffers: list[torch.Tensor] = []
-    for i in range(n_params):
-        buffers.append(params[i])
-        buffers.append(grads[i])
-    for _ in range(n_params, batch_size):
-        buffers.append(dummy)  # param slot
-        buffers.append(dummy)  # grad slot
 
     def _pad(lst: list[torch.Tensor] | None) -> list[torch.Tensor]:
         if lst is None:
             return [dummy] * batch_size
         return list(lst) + [dummy] * (batch_size - len(lst))
 
-    # Add momentum / v buffers — always batch_size entries.
-    if algorithm == "sgd_momentum":
-        buffers.extend(_pad(momentum_bufs))
-    elif algorithm == "adamw":
-        buffers.extend(_pad(momentum_bufs))
-        buffers.extend(_pad(v_bufs))
-    elif algorithm == "lion":
-        buffers.extend(_pad(momentum_bufs))
+    buffers: list[torch.Tensor] = []
+    # Interleave: param0, grad0, momentum0, v0, param1, grad1, ...
+    for i in range(n_params):
+        buffers.append(params[i])
+        buffers.append(grads[i])
+        buffers.append(
+            momentum_bufs[i] if momentum_bufs is not None else dummy
+        )
+        buffers.append(
+            v_bufs[i] if v_bufs is not None else dummy
+        )
+    # Padding slots for batch_size - n_params.
+    for _ in range(n_params, batch_size):
+        buffers.append(dummy)  # param
+        buffers.append(dummy)  # grad
+        buffers.append(dummy)  # momentum
+        buffers.append(dummy)  # v
 
     # Grid: X = elements per param, Y = n_params.
     threadgroup_size = 256
@@ -228,14 +304,10 @@ def _slang_foreach_optimizer(
     grid_y = n_params
     grid_z = 1
 
-    # num_outputs: all param buffers + momentum/v buffers are mutated.
-    num_outputs = n_params
-    if algorithm == "sgd_momentum":
-        num_outputs += n_params
-    elif algorithm == "adamw":
-        num_outputs += 2 * n_params
-    elif algorithm == "lion":
-        num_outputs += n_params
+    # B1: Always 3 outputs per param (param + momentum + v).
+    # The C++ runtime uses SPIR-V reflection to identify which bindings
+    # are storage buffers with write access; the count is for validation.
+    num_outputs = n_params * 3
 
     compile_and_dispatch(
         src,
@@ -256,18 +328,23 @@ def _slang_foreach_optimizer(
 class _SlangForeachOptimizer:
     """Picklable callable for a rendered foreach optimizer template.
 
-    Each instance is bound to a specific (algorithm, batch_size,
+    Each instance is bound to a specific (algorithm_type, batch_size,
     output_dtype) combination.  The `__call__` signature takes tensor
     lists and scalar lists and dispatches the template, automatically
     batching across multiple dispatches if there are more params than
     `batch_size`.
 
-    Source is cached at module level per (algorithm, batch_size, output_dtype)
-    so multiple instances with the same key share the rendered source.
+    B1: ``algorithm_type`` is the Slang concrete type name (e.g. "AdamWImpl").
+    ``algorithm`` (legacy string) is accepted and mapped internally.
+
+    Source is cached at module level per (algorithm_type, batch_size,
+    output_dtype) so multiple instances with the same key share the
+    rendered source.
     """
 
     __slots__ = (
         "algorithm",
+        "algorithm_type",
         "batch_size",
         "output_dtype",
         "__name__",
@@ -279,28 +356,29 @@ class _SlangForeachOptimizer:
 
     def __init__(self, algorithm: str, batch_size: int, output_dtype: str = "float"):
         self.algorithm = algorithm
+        self.algorithm_type = _resolve_algorithm_type(algorithm)
         self.batch_size = batch_size
         self.output_dtype = output_dtype
-        self.__name__ = f"slang_foreach_{algorithm}_{batch_size}_{output_dtype}"
+        self.__name__ = f"slang_foreach_{self.algorithm_type}_{batch_size}_{output_dtype}"
         self._src: str | None = None
         self._cache_key: str | None = None
         self._ensure_source()
 
     def _ensure_source(self) -> None:
         use_pa = _foreach_use_parameter_array()
-        key = (self.algorithm, self.batch_size, self.output_dtype, use_pa)
+        key = (self.algorithm_type, self.batch_size, self.output_dtype, use_pa)
         cached = _SlangForeachOptimizer._src_cache.get(key)
         if cached is not None:
             self._src, self._cache_key = cached
             return
         self._src = _render_foreach_optimizer_slang(
-            self.algorithm,
+            self.algorithm_type,
             self.batch_size,
             self.output_dtype,
             parameter_array=use_pa,
         )
         self._cache_key = _foreach_cache_key(
-            self.algorithm, self.batch_size, self.output_dtype, use_pa
+            self.algorithm_type, self.batch_size, self.output_dtype, use_pa
         )
         _SlangForeachOptimizer._src_cache[key] = (self._src, self._cache_key)
 
@@ -321,6 +399,10 @@ class _SlangForeachOptimizer:
 
         If there are more params than `batch_size`, dispatches in
         multiple batches automatically.
+
+        B1: ``momentum_bufs`` and ``v_bufs`` are optional; the low-level
+        dispatch creates dummy buffers when they are None (for algorithms
+        like SGD that don't use state).
         """
         n = len(params)
         bs = self.batch_size
@@ -379,10 +461,14 @@ def _pick_foreach_optimizer_caller(
     batch_size large enough to cover `n_params`.
 
     Returns the smallest pre-defined batch_size ≥ n_params.
+
+    B1: ``algorithm`` accepts both legacy names ("sgd", "adamw", ...)
+    and Slang type names ("SGDImpl", "AdamWImpl", ...).
     """
+    alg_type = _resolve_algorithm_type(algorithm)
     for bs in _OPTIMIZER_BATCH_SIZES:
         if bs >= n_params:
-            key = f"{algorithm}_{bs}_{output_dtype}"
+            key = f"{alg_type}_{bs}_{output_dtype}"
             caller = _foreach_default_callers.get(key)
             if caller is None:
                 caller = _SlangForeachOptimizer(algorithm, bs, output_dtype)
@@ -390,7 +476,7 @@ def _pick_foreach_optimizer_caller(
             return caller
     # Fallback: use the largest predefined size.
     bs = _OPTIMIZER_BATCH_SIZES[-1]
-    key = f"{algorithm}_{bs}_{output_dtype}"
+    key = f"{alg_type}_{bs}_{output_dtype}"
     caller = _foreach_default_callers.get(key)
     if caller is None:
         caller = _SlangForeachOptimizer(algorithm, bs, output_dtype)
@@ -433,10 +519,13 @@ def install_external_optimizer() -> None:
 
 def _collect_optimizer_prewarm_specs() -> list[tuple[str, str]]:
     """Render (cache_key, slang_src) pairs for the common optimizer
-    template variants."""
+    template variants.
+
+    B1: Uses Slang type names (SGDImpl, etc.) for cache keys and rendering.
+    """
     specs: list[tuple[str, str]] = []
     dtypes = ("float", "half")
-    algorithms = ("sgd", "sgd_momentum", "adamw", "lion")
+    algorithms = ("SGDImpl", "SGD MomentumImpl", "AdamWImpl", "LionImpl")
     use_pa = _foreach_use_parameter_array()
     for alg in algorithms:
         for bs in _OPTIMIZER_BATCH_SIZES:

@@ -108,6 +108,8 @@ at::Tensor vulkan_mean(const at::Tensor& self, at::OptionalIntArrayRef dim,
                        bool keepdim, std::optional<at::ScalarType> dtype);
 at::Tensor vulkan_amax(const at::Tensor& self, at::IntArrayRef dim, bool keepdim);
 at::Tensor vulkan_amin(const at::Tensor& self, at::IntArrayRef dim, bool keepdim);
+at::Tensor vulkan_max(const at::Tensor& self);
+at::Tensor vulkan_min(const at::Tensor& self);
 std::tuple<at::Tensor, at::Tensor> vulkan_max_dim(const at::Tensor& self, int64_t dim, bool keepdim);
 std::tuple<at::Tensor, at::Tensor> vulkan_max_dim_out(const at::Tensor& self, int64_t dim, bool keepdim,
                                                        at::Tensor& values_out, at::Tensor& indices_out);

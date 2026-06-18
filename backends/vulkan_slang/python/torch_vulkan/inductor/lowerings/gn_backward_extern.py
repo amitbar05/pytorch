@@ -104,6 +104,11 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
         )
 
     def codegen(self, wrapper):
+        # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
+        if getattr(V.graph, 'aot_mode', False):
+            self._codegen_aoti(wrapper)
+            return
+
         # M-NEW.12: flush batcher before this direct Vulkan dispatch.
         # Without this flush, any batched kernel (e.g., ReLU backward
         # pointwise) whose output feeds into this GN backward runs AFTER
@@ -151,6 +156,75 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
         )
         self.codegen_size_asserts(wrapper)
         # C1.2: after-sync is redundant — single-queue in-order execution
+
+    def _codegen_aoti(self, wrapper):
+        """Emit C++ AOTI dispatch for GN backward (grad_input) via SPIR-V."""
+        import os
+
+        from torch._inductor.virtualized import V
+
+        names = [inp.codegen_reference() for inp in self.inputs]
+        out_name = self.codegen_reference()
+
+        grad_out = names[0]
+        inp = names[1]
+        mean = names[2]
+        rstd = names[3]
+        weight = names[4] if self._has_weight else "None"
+        gi_out = names[-1]
+
+        G = self.num_groups
+        go_layout = self.inputs[0].get_layout()
+        N = int(go_layout.size[0])
+        C = int(go_layout.size[1])
+        HxW = int(go_layout.size[2]) * int(go_layout.size[3])
+
+        cpg = C // G
+        group_size = cpg * HxW
+        num_rows = N * G
+        has_weight = 1 if self._has_weight else 0
+
+        # Read shader source
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        shader_path = os.path.join(
+            this_dir, "..", "..", "..", "..", "..",
+            "shaders", "normalization", "group_norm_backward.slang",
+        )
+        with open(shader_path) as f:
+            src = f.read()
+
+        pc_values = [num_rows, group_size, G, cpg, HxW, has_weight]
+        cache_key = f"gn_bwd_input_{G}_{cpg}_{HxW}_f32_m22_6"
+
+        buffer_names = [grad_out, inp, mean, rstd]
+        if self._has_weight:
+            buffer_names.append(weight)
+        else:
+            buffer_names.append("_gn_bwd_dummy_w")
+        buffer_names.append(gi_out)
+
+        out_layout = self.get_layout()
+        output_allocations = [
+            {"name": gi_out, "shape": [int(s) for s in out_layout.size],
+             "stride": [int(s) for s in out_layout.stride], "dtype": "float32"},
+        ]
+        if not self._has_weight:
+            output_allocations.append({
+                "name": "_gn_bwd_dummy_w",
+                "shape": [1], "stride": [1], "dtype": "float32",
+            })
+
+        wrapper.emit_aoti_extern_dispatch(
+            slang_src=src,
+            cache_key=cache_key,
+            buffer_names=buffer_names,
+            pc_values=pc_values,
+            grid_x=num_rows,
+            grid_y=1,
+            grid_z=1,
+            num_outputs=1,
+            output_allocations=output_allocations,
+        )
 
 
 class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
@@ -204,6 +278,11 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
             )
 
     def codegen(self, wrapper):
+        # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
+        if getattr(V.graph, 'aot_mode', False):
+            self._codegen_aoti(wrapper)
+            return
+
         # M-NEW.12: flush batcher before this direct Vulkan dispatch
         # (same pattern as _VulkanGNBwdInputExternKernel above).
         wrapper._flush_batcher_before_direct_call()
@@ -258,4 +337,68 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
                 f"compute_weight=True, compute_bias={compute_bias_str})"
             )
         self.codegen_size_asserts(wrapper)
+
+    def _codegen_aoti(self, wrapper):
+        """Emit C++ AOTI dispatch for GN backward (grad_weight/grad_bias)."""
+        import os
+
+        from torch._inductor.virtualized import V
+
+        names = [inp.codegen_reference() for inp in self.inputs]
+        out_name = self.codegen_reference()
+
+        grad_out = names[0]
+        inp = names[1]
+        mean = names[2]
+        rstd = names[3]
+        gw_out = names[4]
+        G = self.num_groups
+
+        gb_arg = names[5] if self.compute_bias and len(names) > 5 else None
+
+        go_layout = self.inputs[0].get_layout()
+        N = int(go_layout.size[0])
+        C = int(go_layout.size[1])
+        HxW = int(go_layout.size[2]) * int(go_layout.size[3])
+
+        cpg = C // G
+        group_size = cpg * HxW
+        num_rows = N * G
+        compute_bias = 1 if self.compute_bias else 0
+
+        # Read shader source
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        shader_path = os.path.join(
+            this_dir, "..", "..", "..", "..", "..",
+            "shaders", "normalization", "group_norm_backward_weight.slang",
+        )
+        with open(shader_path) as f:
+            src = f.read()
+
+        pc_values = [num_rows, group_size, C, HxW, G, cpg, compute_bias]
+        cache_key = f"gn_bwd_weight_{G}_{cpg}_{HxW}_f32_m22_6"
+
+        buffer_names = [grad_out, inp, mean, rstd, gw_out]
+        if gb_arg:
+            buffer_names.append(gb_arg)
+
+        out_layout = self.get_layout()
+        output_allocations = [{
+            "name": out_name,
+            "shape": [int(s) for s in out_layout.size],
+            "stride": [int(s) for s in out_layout.stride],
+            "dtype": "float32",
+        }]
+
+        wrapper.emit_aoti_extern_dispatch(
+            slang_src=src,
+            cache_key=cache_key,
+            buffer_names=buffer_names,
+            pc_values=pc_values,
+            grid_x=C,
+            grid_y=1,
+            grid_z=1,
+            num_outputs=1,
+            output_allocations=output_allocations,
+        )
         # C1.2: after-sync is redundant — single-queue in-order execution

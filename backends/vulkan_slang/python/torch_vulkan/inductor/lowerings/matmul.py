@@ -145,7 +145,14 @@ def _register_mm_lowering() -> None:
             """Emit a call to ``_slang_tile_mm`` for the Slang tile path,
             or delegate to standard ``ExternKernelOut.codegen`` for the
             ``aten.mm.out`` fallback path.
+
+            A2.5: When ``V.graph.aot_mode`` is True, emits C++ AOTI dispatch
+            calls with pre-compiled SPIR-V instead of Python function calls.
             """
+            if getattr(V.graph, 'aot_mode', False):
+                self._codegen_aoti(wrapper)
+                return
+
             # M-NEW.12: flush batcher before direct Vulkan dispatch
             wrapper._flush_batcher_before_direct_call()
 
@@ -169,6 +176,89 @@ def _register_mm_lowering() -> None:
                 self.codegen_size_asserts(wrapper)
             else:
                 super().codegen(wrapper)
+
+        def _codegen_aoti(self, wrapper):
+            """Emit C++ AOTI dispatch for tiled matmul via pre-compiled SPIR-V."""
+            import struct
+
+            from torch._inductor.virtualized import V
+
+            from ...templates.caller.gemm.render import _render_mm_slang
+            from ...templates.caller.gemm.dispatch import _pack_mm_pc
+
+            input_names = [inp.codegen_reference() for inp in self.inputs]
+            out_name = self.codegen_reference()
+
+            a_layout = self.inputs[0].get_layout()
+            b_layout = self.inputs[1].get_layout()
+            out_layout = self.get_layout()
+
+            M, K = a_layout.size
+            _, N = b_layout.size
+
+            tile_m = self._tile_m or 64
+            tile_n = self._tile_n or 64
+            tile_k = self._tile_k or 16
+            num_stages = self._num_stages or 2
+            m_per_thread = self._m_per_thread or 1
+            n_per_thread = self._n_per_thread or 1
+
+            dtype_s = "f32"
+            slang_src = _render_mm_slang(
+                tile_m, tile_n, tile_k,
+                dtype_a=dtype_s, dtype_b=dtype_s, dtype_c=dtype_s,
+                dtype_acc="float",
+                num_stages=num_stages,
+                m_per_thread=m_per_thread,
+                n_per_thread=n_per_thread,
+                epilogue_struct=None,
+                use_module=False,
+            )
+
+            cache_key = (
+                f"slang_mm_{tile_m}_{tile_n}_{tile_k}_s{num_stages}"
+                f"_r{m_per_thread}x{n_per_thread}_{dtype_s}_n111_a6"
+            )
+
+            stride_a_m = int(a_layout.stride[0])
+            stride_a_k = int(a_layout.stride[1]) if len(a_layout.stride) > 1 else 1
+            stride_b_k = int(b_layout.stride[0])
+            stride_b_n = int(b_layout.stride[1]) if len(b_layout.stride) > 1 else 1
+            out_stride_m = int(out_layout.stride[0])
+            out_stride_n = int(out_layout.stride[1]) if len(out_layout.stride) > 1 else 1
+
+            pc = _pack_mm_pc(
+                int(M), int(N), int(K),
+                stride_a_m, stride_a_k,
+                stride_b_k, stride_b_n,
+                out_stride_m, out_stride_n,
+                int(tile_m), int(tile_n), int(tile_k),
+                int(m_per_thread), int(n_per_thread),
+            )
+            pc_values = list(struct.unpack(f"{len(pc) // 4}I", pc))
+
+            grid_x = (int(N) + tile_n - 1) // tile_n
+            grid_y = (int(M) + tile_m - 1) // tile_m
+
+            buffer_names = [input_names[0], input_names[1], out_name]
+            output_allocations = [{
+                "name": out_name,
+                "shape": [int(s) for s in out_layout.size],
+                "stride": [int(s) for s in out_layout.stride],
+                "dtype": "float32",
+            }]
+
+            wrapper.emit_aoti_extern_dispatch(
+                slang_src=slang_src,
+                cache_key=cache_key,
+                buffer_names=buffer_names,
+                pc_values=pc_values,
+                grid_x=grid_x,
+                grid_y=grid_y,
+                grid_z=1,
+                num_outputs=1,
+                output_allocations=output_allocations,
+            )
 
     @register_lowering(aten.mm, type_promotion_kind=None)
     def _vulkan_mm(tensor1, tensor2, *, layout=None):

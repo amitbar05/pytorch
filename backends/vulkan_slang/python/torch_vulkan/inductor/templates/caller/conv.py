@@ -174,7 +174,6 @@ def _slang_tile_conv2d_gn_relu(
         int(sW),
         int(pH),
         int(pW),
-        int(1),  # groups (groups==1 supported by this template)
         int(dH),
         int(dW),
         int(input_t.stride(0)),
@@ -649,7 +648,12 @@ def _slang_tile_conv2d_bwd(
     buffers = [
         input_f32, weight_f32, grad_out_f32,
         gi_f32, gw_f32,
-        gb_f32.view(-1) if gb_f32 is not None else torch.empty(1, dtype=torch.float32),
+        # A1 (2026-06-16): the dummy grad_bias slot for the bias=False case
+        # must live on the Vulkan device — a CPU ``torch.empty`` here reaches
+        # the dispatch as a tensor with no backing Vulkan buffer and aborts
+        # the compiled conv backward (Conv2d(bias=False) training path).
+        gb_f32.view(-1) if gb_f32 is not None
+        else torch.empty(1, dtype=torch.float32, device=input_f32.device),
     ]
 
     compile_and_dispatch(

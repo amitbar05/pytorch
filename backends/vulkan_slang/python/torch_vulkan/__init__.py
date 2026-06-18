@@ -733,6 +733,7 @@ def profile_and_warmup(
     *,
     force: bool = False,
     verbose: bool = True,
+    validate: bool = False,
 ) -> dict:
     """Profile the Vulkan device and warm up shader / autotune caches.
 
@@ -742,12 +743,15 @@ def profile_and_warmup(
 
     Args:
         level: one of ``"quick"`` (~5 s — microbench only), ``"medium"``
-            (~30 s warm / minutes cold — adds shader-lib + matmul-template
-            SPIR-V prewarm), or ``"deep"`` (~3 min warm / up to ~15 min
-            cold — adds an autotune sweep over canonical mm and conv2d
-            shapes).  Default ``"deep"`` because if the caller asked for
-            ``profile_and_warmup`` they want the full set.
-        force: re-run even if a cached status marker says the requested
+            (~30 s warm / minutes cold — adds shader-lib + matmul template
+            prewarm), or ``"deep"`` (~3 min warm / up to 15 min cold —
+            adds an autotune sweep). Default ``"deep"``.
+        force: re-run even when the on-disk marker says the level is already
+            complete.
+        verbose: print per-stage progress to stdout.
+        validate: when True, enable ``TORCH_VULKAN_VUID_AS_ERROR=1`` during
+            warm-up so any shader bugs surface at warm-up time, not
+            mid-training.
             level is already complete.  Useful after a driver or slangc
             upgrade.
         verbose: print per-stage progress (default ``True`` since this
@@ -793,7 +797,7 @@ def profile_and_warmup(
             )
         lvl = _level_map[lvl_key]
 
-    return profile_device(level=lvl, force=force, verbose=verbose)
+    return profile_device(level=lvl, force=force, verbose=verbose, validate=validate)
 
 
 def prepare_device(
@@ -802,6 +806,7 @@ def prepare_device(
     timeout_s: float = 900.0,
     force: bool = False,
     verbose: bool = True,
+    validate: bool = False,
 ) -> dict:
     """Profile the Vulkan device + warm up shader / autotune caches (v7 API).
 
@@ -832,6 +837,9 @@ def prepare_device(
             level is already complete. Useful after a driver or
             slangc upgrade.
         verbose: print per-stage progress (default ``True``).
+        validate: when True, enable ``TORCH_VULKAN_VUID_AS_ERROR=1`` during
+            warm-up so any shader bugs surface at warm-up time, not
+            mid-training. (default ``False``).
 
     Returns:
         Dict with ``"level"``, ``"cached"``, per-stage timings, and the
@@ -848,7 +856,7 @@ def prepare_device(
             train_step(compiled, batch)
     """
     if timeout_s is None or timeout_s <= 0 or timeout_s == float("inf"):
-        return profile_and_warmup(level=level, force=force, verbose=verbose)
+        return profile_and_warmup(level=level, force=force, verbose=verbose, validate=validate)
 
     import threading
     import time as _time
@@ -864,7 +872,7 @@ def prepare_device(
     def _runner() -> None:
         try:
             container["result"] = profile_and_warmup(
-                level=level, force=force, verbose=verbose
+                level=level, force=force, verbose=verbose, validate=validate
             )
         except BaseException as e:  # noqa: BLE001 — surfaced via container
             exc_container.append(e)

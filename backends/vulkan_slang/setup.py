@@ -23,6 +23,15 @@ _root_pytorch = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root_pytorch in sys.path:
     sys.path.remove(_root_pytorch)
 
+# Ensure venv-local tools (ninja, slangc, etc.) are on PATH before any
+# build backend probes the environment.
+_venv_bin = str(Path(__file__).parent / ".venv" / "bin")
+if os.path.isdir(_venv_bin):
+    os.environ.setdefault("PATH", _venv_bin + os.pathsep + os.environ.get("PATH", ""))
+    # Also prepend to the current PATH for this process
+    if _venv_bin not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _venv_bin + os.pathsep + os.environ["PATH"]
+
 # Enable parallel compilation
 os.environ.setdefault("MAX_JOBS", str(os.cpu_count() or 4))
 

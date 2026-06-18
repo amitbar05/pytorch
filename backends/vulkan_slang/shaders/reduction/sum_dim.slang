@@ -16,8 +16,6 @@ struct Params {
 [[vk::binding(1)]] RWStructuredBuffer<float> out;
 [[vk::push_constant]] Params params;
 
-import helpers;
-
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void computeMain(
@@ -31,21 +29,23 @@ void computeMain(
 
     uint base = row * params.row_size;
 
-    // Each thread accumulates multiple elements (for row_size > 256).
-    // Wave-reduce the per-thread partial via WaveActiveSum (subgroup_arithmetic).
+    // Each thread accumulates multiple elements (for row_size > 256)
     float acc = 0.0f;
     for (uint i = local_id; i < params.row_size; i += 256) {
         acc += input[base + i];
     }
 
-    // M15.1: WaveActiveSum replaces the 7-step shared-memory tree
-    // reduction.  One instruction + one barrier (below) replaces the
-    // prior 7-barrier smem loop.  Requires subgroup_arithmetic, which
-    // RDNA1 provides via Vulkan 1.2+ GroupNonUniformArithmetic.
-    float lane_sum = wg_reduce_wave<OpSum>(acc, local_id, 256u, VK_SUBGROUP_SIZE);
+    sdata[local_id] = acc;
+    GroupMemoryBarrierWithGroupSync();
 
-    // Thread 0 writes the workgroup result.
-    if (local_id == 0u) {
-        out[row] = lane_sum;
+    // Tree reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (local_id < s)
+            sdata[local_id] += sdata[local_id + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (local_id == 0) {
+        out[row] = sdata[0];
     }
 }

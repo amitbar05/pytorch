@@ -63,6 +63,7 @@ def _run_layer_direction_fused(
     out_seq: torch.Tensor,
     h_last_ld: torch.Tensor,
     c_last_ld: torch.Tensor | None,
+    direction: int = 0,
 ) -> None:
     """Dispatch one fused (layer, direction) — one kernel call.
 
@@ -75,6 +76,7 @@ def _run_layer_direction_fused(
         out_seq: Output buffer [batch, seq_len, hidden_size] (pre-allocated).
         h_last_ld: Final hidden state buffer [batch, hidden_size] (pre-allocated).
         c_last_ld: Final cell state buffer [batch, hidden_size] (LSTM only, else None).
+        direction: 0=forward, 1=reverse (M10 IRnnDirection).
     """
     fused_caller(
         x_seq=x_seq,
@@ -87,6 +89,7 @@ def _run_layer_direction_fused(
         out_seq=out_seq,
         h_last=h_last_ld,
         c_last=c_last_ld,
+        direction=direction,
     )
 
 
@@ -312,6 +315,7 @@ def run_rnn_via_template(
                     out_seq=out_ld,
                     h_last_ld=h_last_ld,
                     c_last_ld=c_last_ld,
+                    direction=direction,
                 )
 
                 # Write into the main output tensor (interleave directions).

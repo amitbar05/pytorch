@@ -16,24 +16,104 @@
 //
 // M-SF.3: THREADS is a specialization constant (default 64).
 // HIDDEN_SIZE is a compile-time constant for groupshared array bounds.
+//
+// B2: cell_type (lstm/gru/rnn_tanh/rnn_relu) was a Jinja structural
+// branch.  Replaced with the same `interface IRnnCell` used by
+// rnn_cell.slang (LstmCellImpl / GruCellImpl / RnnTanhCellImpl /
+// RnnReluCellImpl) — the cell type is now selected via the slangc
+// entry-point name (``computeMain<LstmCellImpl>`` etc.), not Jinja.
+// `direction` was already a runtime push-constant gate (M10
+// IRnnDirection) — anti-goal #5 compliant as-is, unchanged here.
 
-{% if cell_type == "lstm" %}
-{# LSTM constants #}
-{% set gate_size = 4 %}
-{% set has_cell_state = true %}
-{% elif cell_type == "gru" %}
-{# GRU constants #}
-{% set gate_size = 3 %}
-{% set has_cell_state = false %}
-{% elif cell_type == "rnn_tanh" %}
-{# RNN-tanh constants #}
-{% set gate_size = 1 %}
-{% set has_cell_state = false %}
-{% elif cell_type == "rnn_relu" %}
-{# RNN-relu constants #}
-{% set gate_size = 1 %}
-{% set has_cell_state = false %}
-{% endif %}
+import pointwise;
+
+// ── Cell interface (shared shape with rnn_cell.slang) ──────────────────
+interface IRnnCell {
+    static const int GATE_SIZE;
+    static const bool HAS_CELL_STATE;
+
+    static void update(
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/],
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    );
+}
+
+struct LstmCellImpl : IRnnCell {
+    static const int GATE_SIZE = 4;
+    static const bool HAS_CELL_STATE = true;
+
+    static void update(
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/],
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    ) {
+        float i = sigmoid_fwd(ih_gate[0] + hh_gate[0]);
+        float f = sigmoid_fwd(ih_gate[1] + hh_gate[1]);
+        float g = tanh_fwd(ih_gate[2] + hh_gate[2]);
+        float o = sigmoid_fwd(ih_gate[3] + hh_gate[3]);
+        c_new = f * c_prev + i * g;
+        h_new = o * tanh_fwd(c_new);
+    }
+};
+
+struct GruCellImpl : IRnnCell {
+    static const int GATE_SIZE = 3;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/],
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    ) {
+        // c_prev carries h_prev[hid] for non-cell-state cells (see the
+        // entry-point comment) — GRU needs h_prev directly for the
+        // (1-z)*n + z*h_prev mix.
+        float r = sigmoid_fwd(ih_gate[0] + hh_gate[0]);
+        float z = sigmoid_fwd(ih_gate[1] + hh_gate[1]);
+        float n = tanh_fwd(ih_gate[2] + r * hh_gate[2]);
+        h_new = (1.0f - z) * n + z * c_prev;
+        c_new = 0.0f;
+    }
+};
+
+struct RnnTanhCellImpl : IRnnCell {
+    static const int GATE_SIZE = 1;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/],
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    ) {
+        h_new = tanh_fwd(ih_gate[0] + hh_gate[0]);
+        c_new = 0.0f;
+    }
+};
+
+struct RnnReluCellImpl : IRnnCell {
+    static const int GATE_SIZE = 1;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/],
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    ) {
+        h_new = relu_fwd(ih_gate[0] + hh_gate[0]);
+        c_new = 0.0f;
+    }
+};
 
 struct PC {
     uint hidden_size;
@@ -47,6 +127,7 @@ struct PC {
     uint stride_out_tbatch; // stride between time steps in output = hidden_size
     uint stride_out_batch;  // stride between batch elements in output = seq_len * hidden_size
     uint has_bias;          // boolean: 0=no bias, 1=has bias
+    uint direction;         // M10: 0=forward, 1=reverse
 };
 
 [[vk::push_constant]] PC pc;
@@ -55,29 +136,21 @@ struct PC {
 // Actual value is provided at dispatch time by the caller.
 [[vk::constant_id(40)]] const uint THREADS = 64u;
 // Groupshared memory size is a compile-time constant (Vulkan requirement).
-// We use a single fixed upper bound; c_shared is unused for non-LSTM but
-// the memory cost is small (hidden_size * 4 bytes, typically <= 4KB).
+// We use a single fixed upper bound; c_shared is allocated unconditionally
+// — for non-cell-state cells it is simply unused (small, fixed LDS cost).
 [[vk::constant_id(41)]] const uint HIDDEN_SIZE = 1024u;
 
 struct KernelArgs {
-    StructuredBuffer<{{ dtype }}> x_seq;      // [seq_len, batch, input_size]
-    StructuredBuffer<{{ dtype }}> h0;          // [batch, hidden_size]
-{% if has_cell_state %}
-    StructuredBuffer<{{ dtype }}> c0;          // [batch, hidden_size]
-{% else %}
-    StructuredBuffer<{{ dtype }}> _c0_dummy;   // unused placeholder (groupshared budget)
-{% endif %}
-    StructuredBuffer<{{ dtype }}> w_ih;        // [gate_size*hidden_size, input_size]
-    StructuredBuffer<{{ dtype }}> w_hh;        // [gate_size*hidden_size, hidden_size]
-    StructuredBuffer<{{ dtype }}> b_ih;        // [gate_size*hidden_size]
-    StructuredBuffer<{{ dtype }}> b_hh;        // [gate_size*hidden_size]
-    RWStructuredBuffer<{{ dtype }}> out_seq;   // [batch, seq_len, hidden_size]
-    RWStructuredBuffer<{{ dtype }}> h_last;    // [batch, hidden_size]
-{% if has_cell_state %}
-    RWStructuredBuffer<{{ dtype }}> c_last;    // [batch, hidden_size]
-{% else %}
-    RWStructuredBuffer<{{ dtype }}> _c_last_dummy; // unused placeholder
-{% endif %}
+    StructuredBuffer</*{{*/ dtype /*}}float*/> x_seq;      // [seq_len, batch, input_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> h0;          // [batch, hidden_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> c0;          // [batch, hidden_size] (LSTM) or dummy
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_ih;        // [gate_size*hidden_size, input_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> w_hh;        // [gate_size*hidden_size, hidden_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> b_ih;        // [gate_size*hidden_size]
+    StructuredBuffer</*{{*/ dtype /*}}float*/> b_hh;        // [gate_size*hidden_size]
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> out_seq;   // [batch, seq_len, hidden_size]
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> h_last;    // [batch, hidden_size]
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> c_last;    // [batch, hidden_size] (LSTM) or dummy
 };
 // M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
 [[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
@@ -88,20 +161,17 @@ struct KernelArgs {
 // M-SF.3: size is the specialization constant HIDDEN_SIZE (Vulkan requires
 // compile-time constant array bound).  pc.hidden_size must be <= HIDDEN_SIZE.
 groupshared float h_shared[HIDDEN_SIZE];
-{% if has_cell_state %}
 groupshared float c_shared[HIDDEN_SIZE];
-{% endif %}
 
-// Activation helpers
-
-[ForceInline]
-float _sigmoid(float v) {
-    return 0.5f + 0.5f * tanh(v * 0.5f);
-}
-
+// ── Entry point ───────────────────────────────────────────────────────
+// B2: Generic over <Cell : IRnnCell>; cell type selected via the
+// slangc entry-point name (``entry="computeMain<LstmCellImpl>"``).
+// For non-LSTM cells, h_shared[hid] is passed as the "c_prev" argument
+// to Cell::update() (see rnn_cell.slang's GRU comment) so GruCellImpl
+// can read the previous hidden state without a second interface method.
 [shader("compute")]
 [numthreads(THREADS, 1, 1)]
-void computeMain(uint3 gtid : SV_DispatchThreadID,
+void computeMain<Cell : IRnnCell>(uint3 gtid : SV_DispatchThreadID,
                  uint3 lid : SV_GroupThreadID,
                  uint3 gid : SV_GroupID) {
     uint batch = gid.x;
@@ -114,21 +184,29 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
     // Load initial state into groupshared memory
     uint h_batch_off = batch * pc.stride_h_batch;
     h_shared[hid] = (float)args.h0[h_batch_off + hid];
-{% if has_cell_state %}
-    c_shared[hid] = (float)args.c0[h_batch_off + hid];
-{% endif %}
+    if (Cell.HAS_CELL_STATE) {
+        c_shared[hid] = (float)args.c0[h_batch_off + hid];
+    }
     GroupMemoryBarrierWithGroupSync();
 
     uint out_batch_off = batch * pc.stride_out_batch;
 
     // Time-step loop
     for (uint t = 0u; t < pc.seq_len; t++) {
-        float ih_gate[{{ gate_size }}];
-        float hh_gate[{{ gate_size }}];
+        float ih_gate[/*{{*/ gate_size_max /*}}4*/];
+        float hh_gate[/*{{*/ gate_size_max /*}}4*/];
 
-        uint x_t_off = t * pc.stride_x_tbatch + batch * pc.stride_x_batch;
+        // M10: IRnnDirection — input index computed from direction push constant.
+        // For reverse (pc.direction == 1u), read x_seq in reverse order without
+        // requiring the caller to pre-flip the input tensor.
+        uint x_t_off;
+        if (pc.direction == 0u) {
+            x_t_off = t * pc.stride_x_tbatch + batch * pc.stride_x_batch;
+        } else {
+            x_t_off = (pc.seq_len - 1u - t) * pc.stride_x_tbatch + batch * pc.stride_x_batch;
+        }
 
-        for (uint g = 0u; g < {{ gate_size }}u; g++) {
+        for (uint g = 0u; g < (uint)Cell.GATE_SIZE; g++) {
             uint gate_row = g * pc.hidden_size + hid;
 
             float acc_ih = 0.0f;
@@ -152,41 +230,22 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
             }
         }
 
-{% if cell_type == "lstm" %}
-        // LSTM cell update
-        float i = _sigmoid(ih_gate[0] + hh_gate[0]);
-        float f = _sigmoid(ih_gate[1] + hh_gate[1]);
-        float gate = tanh(ih_gate[2] + hh_gate[2]);
-        float o = _sigmoid(ih_gate[3] + hh_gate[3]);
-        float c_new = f * c_shared[hid] + i * gate;
-        float h_new = o * tanh(c_new);
-{% elif cell_type == "gru" %}
-        // GRU cell update
-        float r = _sigmoid(ih_gate[0] + hh_gate[0]);
-        float z = _sigmoid(ih_gate[1] + hh_gate[1]);
-        float n = tanh(ih_gate[2] + r * hh_gate[2]);
-        float h_new = (1.0f - z) * n + z * h_shared[hid];
-{% elif cell_type == "rnn_tanh" %}
-        // RNN-tanh cell update
-        float h_new = tanh(ih_gate[0] + hh_gate[0]);
-{% elif cell_type == "rnn_relu" %}
-        // RNN-relu cell update
-        float val = ih_gate[0] + hh_gate[0];
-        float h_new = (val > 0.0f) ? val : 0.0f;
-{% endif %}
+        float c_prev_val = Cell.HAS_CELL_STATE ? c_shared[hid] : h_shared[hid];
+        float h_new, c_new;
+        Cell.update(ih_gate, hh_gate, c_prev_val, h_new, c_new);
 
-        args.out_seq[out_batch_off + t * pc.stride_out_tbatch + hid] = ({{ dtype }})h_new;
+        args.out_seq[out_batch_off + t * pc.stride_out_tbatch + hid] = (/*{{*/ dtype /*}}float*/)h_new;
 
         h_shared[hid] = h_new;
-{% if has_cell_state %}
-        c_shared[hid] = c_new;
-{% endif %}
+        if (Cell.HAS_CELL_STATE) {
+            c_shared[hid] = c_new;
+        }
 
         GroupMemoryBarrierWithGroupSync();
     }
 
-    args.h_last[h_batch_off + hid] = (float)h_shared[hid];
-{% if has_cell_state %}
-    args.c_last[h_batch_off + hid] = (float)c_shared[hid];
-{% endif %}
+    args.h_last[h_batch_off + hid] = (/*{{*/ dtype /*}}float*/)h_shared[hid];
+    if (Cell.HAS_CELL_STATE) {
+        args.c_last[h_batch_off + hid] = (/*{{*/ dtype /*}}float*/)c_shared[hid];
+    }
 }

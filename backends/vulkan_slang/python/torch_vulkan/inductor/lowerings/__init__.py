@@ -452,6 +452,7 @@ def register() -> None:
     )
     from .fft import _register_fft_lowerings
     from .loss import _register_loss_lowerings
+    from .masking import _register_masking_lowerings
     from .matmul import (
         _register_bmm_lowering,
         _register_linear_backward_decomposition,
@@ -691,6 +692,9 @@ def register() -> None:
     # registers — registration is in bwd_lowerings.py via _register_bwd_lowerings().
     _register_embedding_bag_forward()
     _register_fft_lowerings()
+    # E2: tril/triu forward lowerings — backward reuses the same op
+    # (see masking.py docstring), so this also closes the backward gap.
+    _register_masking_lowerings()
     _register_scatter_family_lowerings()
     # M16.2: bool-mask read (`x[mask]`) — eager override (PrivateUse1)
     # decomposes to nonzero + index_select; Inductor lowering falls back

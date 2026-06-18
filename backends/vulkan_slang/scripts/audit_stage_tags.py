@@ -33,7 +33,7 @@ from typing import Iterable
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _BACKEND_ROOT = os.path.normpath(os.path.join(_SCRIPTS_DIR, ".."))
-_ROADMAP = os.path.join(_BACKEND_ROOT, "docs", "10-inductor-backend.md")
+_ROADMAP = os.path.join(_BACKEND_ROOT, "docs", "ROADMAP.md")
 _PYTHON = os.path.join(_BACKEND_ROOT, "python")
 _CSRC = os.path.join(_BACKEND_ROOT, "csrc")
 _TESTS = os.path.join(_BACKEND_ROOT, "tests")

@@ -1,17 +1,16 @@
 # Owner(s): ["module: inductor"]
-import unittest
 from unittest.mock import MagicMock
 
 import sympy
+
 import torch
 from torch._inductor.codegen.memory_planning import (
     Allocation,
     LiveRange,
     LiveRanges,
     MemoryPlanner,
-    TemporalSplit,
 )
-from torch._inductor.test_case import TestCase, run_tests
+from torch._inductor.test_case import run_tests, TestCase
 
 
 def _mock_buffer(name, device="cuda", dtype=torch.float32, shape=(4, 4)):

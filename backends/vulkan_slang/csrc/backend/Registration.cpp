@@ -15,11 +15,15 @@ namespace torch_vulkan {
 at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     auto& alloc = VulkanAllocator::instance();
 
-    if (is_null_storage(self)) {
-        return self;
-    }
-    auto* self_buf = alloc.get_buffer(self.data_ptr());
-    if (self_buf == nullptr) {
+    // A1 (2026-06-16): only skip genuinely-storageless (fake / meta) tensors.
+    // The previous ``get_buffer(self.data_ptr()) == nullptr → return`` guard
+    // was correct only for the H2D direction (self = Vulkan). For the D2H
+    // (Vulkan→CPU) direction ``self`` is the CPU *destination*, which never
+    // has a Vulkan buffer, so that guard silently skipped EVERY ``.cpu()``
+    // readback — leaving the CPU tensor uninitialized and corrupting all
+    // host-side results. Each direction below validates the buffer on its own
+    // Vulkan-side tensor instead.
+    if (is_null_storage(self) || is_null_storage(src)) {
         return self;
     }
 
@@ -67,14 +71,18 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
         const at::Tensor& src_read = src.is_contiguous() ? src : src.contiguous();
         if (src_read.scalar_type() == self.scalar_type()) {
             auto* buf = alloc.get_buffer(src_read.data_ptr());
-            TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+            if (buf == nullptr) {
+                return self;  // fake / storageless src during tracing
+            }
             buf->read(self.data_ptr(),
                       static_cast<VkDeviceSize>(self.nbytes()));
         } else {
             // Read into a temp CPU tensor with src's dtype, then convert
             auto tmp = at::empty(src_read.sizes(), src_read.options().device(c10::kCPU));
             auto* buf = alloc.get_buffer(src_read.data_ptr());
-            TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+            if (buf == nullptr) {
+                return self;  // fake / storageless src during tracing
+            }
             buf->read(tmp.data_ptr(),
                       static_cast<VkDeviceSize>(tmp.nbytes()));
             self.copy_(tmp);

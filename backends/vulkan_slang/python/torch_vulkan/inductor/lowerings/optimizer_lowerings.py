@@ -84,7 +84,18 @@ def _register_optimizer_lowerings() -> None:
             self.scalar_kwargs = scalar_kwargs
 
         def codegen(self, wrapper):
-            """Emit a call to ``_pick_foreach_optimizer_caller`` in the wrapper."""
+            """Emit a call to ``_pick_foreach_optimizer_caller`` in the wrapper.
+
+            NOTE: AOTI mode not yet supported for optimizer — raises an
+            error when V.graph.aot_mode is True.  The optimizer is a
+            post-training step that can be deferred to the Python runtime.
+            """
+            if getattr(V.graph, 'aot_mode', False):
+                raise NotImplementedError(
+                    "Optimizer AOTI codegen not yet implemented. "
+                    "Run optimizer step in Python after AOTI forward+backward."
+                )
+
             # M-NEW.12: flush batcher before direct Vulkan dispatch
             wrapper._flush_batcher_before_direct_call()
 

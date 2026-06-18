@@ -478,6 +478,152 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             f"}}"
         )
 
+    # ── AOTI extern-kernel dispatch ──────────────────────────────────
+
+    def emit_aoti_extern_dispatch(
+        self,
+        slang_src: str,
+        cache_key: str,
+        buffer_names: "list[str]",
+        pc_values: "list[int]",
+        grid_x: int,
+        grid_y: int,
+        grid_z: int,
+        num_outputs: int,
+        output_allocations: "list[dict] | None" = None,
+    ) -> None:
+        """Emit C++ AOTI dispatch for an extern kernel with embedded SPIR-V.
+
+        Compiles the Slang source to SPIR-V at codegen time, stores it in
+        ``self._spv_blobs``, and emits C++ code that calls
+        ``torch_vulkan_aoti_make_kernel`` + ``torch_vulkan_aoti_dispatch``
+        with the precompiled SPIR-V.
+
+        Called from extern-kernel ``codegen()`` methods when
+        ``V.graph.aot_mode`` is True, replacing the Python function-call
+        emission that would leak Python syntax into the C++ wrapper.
+        """
+        from .runtime.slangc import compile_slang_to_spirv
+
+        # 1. Compile Slang → SPIR-V (uses disk + in-memory cache, threadsafe)
+        try:
+            spv = compile_slang_to_spirv(slang_src, cache_key=cache_key)
+        except Exception as e:
+            raise RuntimeError(
+                f"AOTI extern-kernel SPIR-V compilation failed for key "
+                f"'{cache_key}': {e}"
+            ) from e
+
+        spv_c_name = _spv_key_to_c_name(cache_key)
+        self._spv_blobs[cache_key] = spv
+
+        # 2. Determine n_buffers from SPIR-V reflection
+        n_buffers = _vk_rt.get_reflected_binding_count(spv)
+        if n_buffers is None or n_buffers == 0:
+            n_buffers = len(buffer_names)
+
+        # 3. Emit output buffer allocations if requested
+        if output_allocations:
+            for alloc in output_allocations:
+                name = alloc["name"]
+                shape = alloc["shape"]
+                stride = alloc["stride"]
+                dtype_str = alloc.get("dtype", "float32")
+                shape_str = ", ".join(str(s) for s in shape)
+                stride_str = ", ".join(str(s) for s in stride)
+                self.writeline(
+                    f"AtenTensorHandle {name}_handle;"
+                )
+                self.writeline(
+                    f"int64_t _shape_{name}[] = {{ {shape_str} }};"
+                )
+                self.writeline(
+                    f"int64_t _stride_{name}[] = {{ {stride_str} }};"
+                )
+                n_dims = len(shape)
+                self.writeline(
+                    f"AOTI_TORCH_ERROR_CODE_CHECK("
+                    f"aoti_torch_empty_strided_vulkan("
+                    f"{n_dims}, _shape_{name}, _stride_{name}, "
+                    f"aoti_torch_dtype_{dtype_str}(), "
+                    f"0, &{name}_handle));"
+                )
+                self.writeline(
+                    f"RAIIAtenTensorHandle {name}({name}_handle);"
+                )
+
+        # 4. Emit buffer handle array for the dispatch
+        n_tensors = len(buffer_names)
+        buf_list = ", ".join(
+            f"reinterpret_cast<void*>(static_cast<AtenTensorHandle>({arg}))"
+            for arg in buffer_names
+        )
+        self.writeline(
+            f"void* _tensor_handles_{spv_c_name}[] = {{ {buf_list} }};"
+        )
+
+        # 5. Emit push constant data
+        if pc_values:
+            pc_str = ", ".join(str(v) for v in pc_values)
+            pc_size = len(pc_values)
+            self.writeline(
+                f"uint32_t _pc_{spv_c_name}[{pc_size}] = {{ {pc_str} }};"
+            )
+            pc_ptr = f"_pc_{spv_c_name}"
+            pc_size_bytes = f"sizeof(_pc_{spv_c_name})"
+        else:
+            pc_ptr = "nullptr"
+            pc_size_bytes = "0"
+
+        # 6. Compute number of push constants for metadata
+        n_pc = len(pc_values)
+        pc_meta_bytes = n_pc * 4 if n_pc > 0 else 0
+
+        self._spv_metadata[cache_key] = {
+            "n_buffers": n_buffers,
+            "pc_size_bytes": pc_meta_bytes,
+        }
+
+        # 7. Emit kernel handle + make_kernel (once)
+        handle_name = f"_handle_{spv_c_name}"
+        init_line = (
+            f"// Extern kernel: {cache_key}\n"
+            f"static AotiVulkanKernelHandle* {handle_name} = nullptr;\n"
+            f"if ({handle_name} == nullptr) {{\n"
+            f"    int rc = torch_vulkan_aoti_make_kernel(\n"
+            f"        {spv_c_name}_data, {len(spv) // 4},\n"
+            f'        "{cache_key}",\n'
+            f"        {n_buffers}u, {pc_meta_bytes}u,\n"
+            f"        &{handle_name});\n"
+            f"    if (rc != 0) {{\n"
+            f'        throw std::runtime_error("Failed to create extern Vulkan kernel: "\n'
+            f"            + std::string(torch_vulkan_aoti_last_error()));\n"
+            f"    }}\n"
+            f"}}"
+        )
+        self.writeline(init_line)
+
+        # 8. Emit dispatch call
+        dispatch_line = (
+            f"int _rc_{spv_c_name} = torch_vulkan_aoti_dispatch(\n"
+            f"    {handle_name},\n"
+            f"    _tensor_handles_{spv_c_name},\n"
+            f"    {n_tensors}u,\n"
+            f"    {pc_ptr},\n"
+            f"    {pc_size_bytes},\n"
+            f"    static_cast<uint32_t>({grid_x}),\n"
+            f"    static_cast<uint32_t>({grid_y}),\n"
+            f"    static_cast<uint32_t>({grid_z}),\n"
+            f"    {num_outputs}u);"
+        )
+        self.writeline(dispatch_line)
+        self.writeline(
+            f"if (_rc_{spv_c_name} != 0) {{\n"
+            f'    throw std::runtime_error("Extern Vulkan dispatch failed: "\n'
+            f"        + std::string(torch_vulkan_aoti_last_error()));\n"
+            f"}}"
+        )
+
     # ── Stream / device management ───────────────────────────────────
 
     def write_get_raw_stream(self, device_idx: int, graph_name: str) -> str:

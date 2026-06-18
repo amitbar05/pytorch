@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 
 _ROADMAP_PATH = os.path.normpath(os.path.join(
-    os.path.dirname(__file__), "..", "docs", "10-inductor-backend.md"
+    os.path.dirname(__file__), "..", "docs", "ROADMAP.md"
 ))
 
 

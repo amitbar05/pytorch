@@ -255,7 +255,14 @@ def _register_conv_and_pool_lowerings() -> None:
 
             M17.2: When ``self.epilogue`` is set, the ``epilogue`` kwarg
             is emitted, routing through the fused conv+activation path.
+
+            A2.5: When ``V.graph.aot_mode`` is True, emits C++ AOTI dispatch
+            calls with pre-compiled SPIR-V instead of Python function calls.
             """
+            if getattr(V.graph, 'aot_mode', False):
+                self._codegen_aoti(wrapper)
+                return
+
             # M-NEW.12: flush batcher before direct Vulkan dispatch
             wrapper._flush_batcher_before_direct_call()
 
@@ -288,6 +295,141 @@ def _register_conv_and_pool_lowerings() -> None:
                 f"{epilogue_kwarg})"
             )
             self.codegen_size_asserts(wrapper)
+
+        def _codegen_aoti(self, wrapper):
+            """Emit C++ AOTI dispatch for conv2d forward via pre-compiled SPIR-V.
+
+            Replicates the flow of ``_slang_tile_conv2d`` from
+            ``templates/caller/conv.py`` but emits C++ code instead of
+            Python dispatch calls.  Renders the Slang template, compiles to
+            SPIR-V, and emits ``torch_vulkan_aoti_make_kernel`` + ``dispatch``.
+            """
+            import struct
+
+            from torch._inductor.virtualized import V
+
+            from ...templates.caller.conv import (
+                _render_conv2d_slang,
+                _validate_epilogue_struct,
+                _dtype_to_slang,
+            )
+
+            # 1. Collect buffer names and layout info
+            input_names = [inp.codegen_reference() for inp in self.inputs]
+            out_name = self.codegen_reference()
+
+            input_t = input_names[0]
+            weight_t = input_names[1]
+            bias_t = input_names[2] if len(input_names) > 2 else None
+
+            in_layout = self.inputs[0].get_layout()
+            w_layout = self.inputs[1].get_layout()
+            out_layout = self.get_layout()
+
+            N, C_in, iH, iW = in_layout.size
+            C_out, C_in_w, kH, kW = w_layout.size
+            sH, sW = self.stride_arg
+            pH, pW = self.padding_arg
+            dH, dW = self.dilation_arg
+            oH, oW = out_layout.size[2], out_layout.size[3]
+
+            has_bias = bias_t is not None
+            epilogue = _validate_epilogue_struct(self.epilogue)
+            dtype_s = "float32"  # Inductor IR is always float32
+
+            tile_w = tile_h = tile_c = 8
+            threads_w = threads_h = 16
+
+            # 2. Render Slang source
+            slang_src = _render_conv2d_slang(
+                tile_w=tile_w,
+                tile_h=tile_h,
+                tile_c=tile_c,
+                threads_w=threads_w,
+                threads_h=threads_h,
+                has_bias=has_bias,
+                epilogue_struct=epilogue,
+            )
+
+            cache_key = (
+                f"slang_conv2d_{tile_w}x{tile_h}x{tile_c}"
+                f"_t{threads_w}x{threads_h}_{dtype_s}"
+                f"{'_' + epilogue if epilogue else ''}_msf5"
+            )
+
+            # 3. Compute push constants (matching _slang_tile_conv2d layout)
+            in_stride = in_layout.stride
+            w_stride = w_layout.stride
+            out_stride = out_layout.stride
+
+            pc_values = [
+                int(N), int(C_in), int(C_out),
+                int(iH), int(iW), int(oH), int(oW),
+                int(kH), int(kW),
+                int(sH), int(sW), int(pH), int(pW),
+                1,  # groups
+                int(dH), int(dW),
+                int(in_stride[0]), int(in_stride[1]),
+                int(in_stride[2]), int(in_stride[3]),
+                int(w_stride[0]), int(w_stride[1]),
+                int(w_stride[2]), int(w_stride[3]),
+                int(out_stride[0]), int(out_stride[1]),
+                int(out_stride[2]), int(out_stride[3]),
+                int(tile_w), int(tile_h), int(tile_c),
+            ]
+            # stride_bias = 1 if bias present, else 0
+            stride_bias = 1 if has_bias else 0
+            pc_values.append(stride_bias)
+
+            # 4. Compute grid
+            grid_x = (int(oW) + tile_w - 1) // tile_w
+            grid_y = (int(oH) + tile_h - 1) // tile_h
+            tile_c_count = (int(C_out) + tile_c - 1) // tile_c
+            grid_z = int(N) * tile_c_count
+
+            # 5. Collect buffer names in the order the shader expects:
+            #    input, weight, bias?, output
+            buffer_names = [input_t, weight_t]
+            if has_bias:
+                buffer_names.append(bias_t)
+            else:
+                # Dummy bias — allocated below
+                buffer_names.append("_conv_dummy_bias")
+            buffer_names.append(out_name)
+
+            # 6. Allocate output and dummy bias (if needed)
+            output_allocations = []
+            if not has_bias:
+                output_allocations.append({
+                    "name": "_conv_dummy_bias",
+                    "shape": [1],
+                    "stride": [1],
+                    "dtype": "float32",
+                })
+            output_allocations.append({
+                "name": out_name,
+                "shape": [int(s) for s in out_layout.size],
+                "stride": [int(s) for s in out_layout.stride],
+                "dtype": "float32",
+            })
+
+            # 7. Emit AOTI dispatch
+            entry = (
+                f"computeMain<{epilogue}>"
+                if epilogue is not None
+                else "computeMain<OpIdentity>"
+            )
+            wrapper.emit_aoti_extern_dispatch(
+                slang_src=slang_src,
+                cache_key=cache_key,
+                buffer_names=buffer_names,
+                pc_values=pc_values,
+                grid_x=grid_x,
+                grid_y=grid_y,
+                grid_z=grid_z,
+                num_outputs=1,
+                output_allocations=output_allocations,
+            )
 
     # M-pipeline-2: this lowering targets a CUSTOM op
     # (``torch_vulkan::conv2d_with_optional_bias``) whose ``OpOverload``

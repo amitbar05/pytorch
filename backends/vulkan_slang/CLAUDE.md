@@ -13,9 +13,15 @@ entries. No CPU fallbacks. No Python at deployment.
 
 # Where to work
 
-**The roadmap is [`docs/16-inductor-backend.md`](docs/16-inductor-backend.md).**
-Read **§ v16** at session start — that's the active plan (5 pillars, 18 milestones,
-dependency graph, file:line ownership).
+**The roadmap is [`docs/ROADMAP.md`](docs/ROADMAP.md)** — the single canonical,
+consolidated plan (replaces the old `docs/10/14/15/16-inductor-backend.md` series
+and `docs/codegen-optimization-roadmap.md`, all deleted 2026-06-15). Read it at
+session start: § 1 is the current-state scorecard, § 2 is the prioritized forward
+roadmap (pillars A–F with file:line + regression test per item), § 3 the
+dependency graph. Closed-milestone history lives in
+[`docs/10-inductor-backend-history.md`](docs/10-inductor-backend-history.md)
+and `docs/archive/`. **Do not fork a new numbered roadmap — edit `ROADMAP.md`
+in place.**
 
 ## Claude Code worktrees (for human or subagent use)
 Two isolated worktrees exist for parallel milestone execution:
@@ -28,26 +34,12 @@ Two isolated worktrees exist for parallel milestone execution:
 Each worktree has CLAUDE.md with milestone status. When a subagent picks up a
 worktree, read CLAUDE.md first.
 
-## Current status (auto-updated by implementer)
-- ✅ M5: `slang_conv_bwd` de-Jinja — `{% if has_bias %}` → runtime `stride_grad_bias` gate
-- ✅ M6: Delete 9 stale `.py.jinja` files, fix 10 caller error messages
-- 🔧 M1 (AOTI link): hook point identified — `python/torch_vulkan/inductor/cpp_wrapper_gpu.py`
-  needs to pass `extra_objects=["csrc/backend/aoti_shims.o"]` into the CppExtension build.
-  The upstream build path is `torch/_inductor/cpp_builder.py:1896+` (`get_cpp_torch_device_options`
-  returns `libraries`/`ldflags`/`passthrough_args`). AOTI wrapper then calls CppExtension
-  internally. Need to inject via ldflags `-Wl,--whole-archive csrc/backend/aoti_shims.o -Wl,--no-whole-archive`
-  OR add a custom build hook in the vulkan backend's codegen layer. Do not change
-  `torch/_inductor/cpp_builder.py` directly — it lives in `torch/` not `backends/`.
-  Prefer: override `CppWrapperGpu.generate()` build options dict, OR register via
-  `config.aot_inductor.custom_op_libs` (already supported in `get_cpp_torch_device_options`).
-- 🔜 M2: import hang fix (atexit ThreadPoolExecutor drain order)
-- 🔜 M3: atexit hang fix (slangc thread pool)
-- 🔜 M4: Conv+GN E2E training test (depends on M1-M3)
-- 🔜 M7: rnn_cell_fused + persistent_pointwise .py.jinja → .slang
-- 🔜 M8: foreach_optimizer → Slang interface for algorithm
-- 🔜 M9: flash_attention* → Slang interface for wg_size
-- 🔜 M10: rnn_cell* → Slang interface for direction
-- 🔜 M11: extend AST validator
+## Current status
+Live status is the scorecard in [`docs/ROADMAP.md § 1`](docs/ROADMAP.md). The
+backend trains real models E2E on GPU today (eager + `torch.compile`); the open
+work is the AOTI Python-less `.so` path (pillar A), the remaining Slang-smart
+interface migrations — `foreach_optimizer`, `rnn_cell` (pillar B) — the batching
+perf payoff and autotune (pillars C/D), and op-coverage breadth (pillar E).
 
 ## Build requirements
 - Use `.venv/bin/python` for all Python
@@ -56,80 +48,24 @@ worktree, read CLAUDE.md first.
 
 ---
 
----
+# How to work
 
-# Where to work
-
-Pick the highest-priority unblocked v16 milestone, ship it, lock a
-regression test, mark it ✅ in the v16 table, move to the next.
-**Never stop to ask if you should continue** — work autonomously until
-manually stopped. If blocked, skip and note why in the roadmap. Don't
-symptom-patch; if a fix needs a new primitive, file it as its own
-roadmap item.
-
-## v7 pillars (snapshot)
-
-1. **M-CG** — codegen-only Inductor backend. No `extern_kernels.X` to
-   aten / PrivateUse1 eager Vulkan inside compiled wrappers. No
-   "if device != vulkan: aten fallback" branches inside custom-op impls
-   that the compile path can hit.
-2. **M-SF** — smart Slang feature usage. ParameterBlock + generics +
-   interfaces + spec constants + `[BackwardDerivative]` + reflection.
-   String-substituted Jinja is the exception.
-3. **M-VAL** — validation-driven codegen. Vulkan validation layer
-   mandatory in tests (`TORCH_VULKAN_VUID_AS_ERROR=1`); VUID during
-   autotune → rejected candidate; VUID on landed kernel → test failure.
-4. **M-PROBE** — `torch_vulkan.prepare_device(level, timeout_s)` is the
-   canonical entry point. Run it once at process start; `torch.compile`
-   after that is fast.
-
-## What's already closed (v7)
-
-* **M-CG.1, M-CG.2** ✅ — Explore-agent audit (2026-05-27): zero
-  genuine eager-fallback leaks on the compile path. See § v7 audit
-  evidence in the roadmap.
-* **M-VAL.1** ✅ — VUID counter pybind + autouse fixture; **default-on**
-  after M-VAL.3 closed the residual best-practices backlog (zero VUIDs
-  across 9 catalog models). Opt-out: `TORCH_VULKAN_VUID_AS_ERROR=0`.
-* **M-VAL.3** ✅ — Best-practices VUID sweep across 9 catalog models
-  (2026-05-27). Sweep harness at `agent_space/m21_3_validation_sweep.py`.
-  Result: zero VUIDs, all prior P0/P1 VUIDs (M21.3.01, M21.3.02,
-  EAGER.1.b, M-cpp-new-6) fully closed.
-* **M-SF.1** ✅ — ParameterBlock<KernelArgs> at 100% coverage on all
-  actively-used templates (2026-05-27).  The 2 stale `.py.jinja` files
-  with manual bindings were deleted; `.slang` is the canonical format.
-* **M-CG.4** ✅ — M19.1 linear-backward decomposition (2026-05-27).
-  Replaces the 7-8 dispatch C++ eager extern with mm+mm+sum primitives
-  routing through Slang kernels.  Unblocked by M22.13 mm transpose-a fix.
-* **M-VAL.2** ✅ — Per-kernel autotune VUID gate (2026-05-27).
-  `get_codegen_validation_mode()` defaults to `error` when
-  `TORCH_VULKAN_VUID_AS_ERROR` is not "0" — autotune candidates
-  emitting VUIDs are rejected via `RuntimeError`.
-* **M-SF.2** ✅ — [BackwardDerivative] on combine_sum_nan +
-  combine_prod_nan in vk_reduction.slang (2026-05-27).  Reduction
-  coverage: 2→4 ops; total 45 manual derivatives across hot elementals.
-* **M-SF.3** ✅ — Spec constants + ParameterBlock now compatible
-  (2026-05-27).  Removed CG.M14 constraint in kernel/header.py; all
-  pointwise/reduction kernels can now use `[[vk::constant_id(N)]]`.
-* **M-VAL.4** ✅ — Pre-slangc static AST validator (2026-05-27).
-  Already integrated at slangc.py:161 (M22.1.i); raises RuntimeError
-  on any codegen mistake before subprocess invocation.
-* **M-SF.4** ✅ — Jinja has_bias eliminated from conv templates;
-  mm render defaults to link-time module path (2026-05-27).
-* **M-SF.5** ✅ — num_atomics reflection field wired into WG sizing
-  heuristic; 8/8 fields now used for smart Slang features (2026-05-27).
-* **M-PROBE.1, M-PROBE.2, M-PROBE.3** ✅ — prepare_device() API,
-  auto_probe_on_import off, timeout enforcement (2026-05-27).
-
-🎉 **All 16 v7 milestones closed.** The v7 roadmap is complete.
+Pick the highest-priority unblocked item from [`docs/ROADMAP.md § 2`](docs/ROADMAP.md)
+(pillars A–F), ship it, lock its named regression test, mark it ✅ in the
+ROADMAP.md scorecard, move to the next. **Never stop to ask if you should
+continue** — work autonomously until manually stopped. If blocked, skip and note
+why in ROADMAP.md. Don't symptom-patch; if a fix needs a new primitive, file it
+as its own roadmap sub-item. The four durable pillar goals (codegen-only,
+Slang-smart, validation-driven, profile-and-warmup) and the anti-goals /
+discipline are restated in ROADMAP.md §§ 4–5.
 
 ## Companion docs
 
 | Doc | Purpose |
 |-----|---------|
-| [`docs/10-inductor-backend.md`](docs/10-inductor-backend.md) | **The roadmap.** § v7 is the active plan. |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | **The roadmap.** Single canonical source — current-state scorecard + forward plan. |
+| [`docs/10-inductor-backend-history.md`](docs/10-inductor-backend-history.md) | Closed-milestone history (v6.x → v16, M18–M23, FP16). |
 | [`docs/archive/v6.x-snapshot-2026-05-27.md`](docs/archive/v6.x-snapshot-2026-05-27.md) | Frozen pre-v7 audit logs, milestone closeouts, reconciliations. |
-| [`docs/codegen-optimization-roadmap.md`](docs/codegen-optimization-roadmap.md) | Op coverage + Slang feature exploitation tracker. |
 | [`docs/how-to-compile-and-codegen.md`](docs/how-to-compile-and-codegen.md) | Pipeline reference (compile APIs, dispatch tables). |
 | [`docs/inductor-pipeline-analysis.md`](docs/inductor-pipeline-analysis.md) | Architecture overview, Slang/Vulkan integration. |
 | [`docs/agent-prompt-implement-plan.md`](docs/agent-prompt-implement-plan.md) | Copy-paste prompt for spawning sub-agents. |

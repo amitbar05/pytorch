@@ -48,6 +48,7 @@ struct PC {
     uint sW;
     uint pH;
     uint pW;
+    uint groups;
     uint dH;
     uint dW;
     // Strides for input (NCHW): [C_in*iH*iW, iH*iW, iW, 1]
@@ -73,8 +74,10 @@ struct PC {
     uint tile_c;
     // M-SF.4: always present — gated at runtime by stride_bias != 0
     uint stride_bias;
-    uint _pad; // keep struct size aligned
 };
+// PC struct is 32 uints = 128 bytes, exactly at Vulkan's guaranteed minimum
+// maxPushConstantsSize.  The old _pad field pushed us to 132 bytes, which some
+// drivers silently truncate — dropping stride_bias and corrupting bias adds.
 
 [[vk::push_constant]] PC pc;
 
