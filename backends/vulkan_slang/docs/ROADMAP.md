@@ -119,7 +119,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 |---|---|---|
 | Batcher `ready_set` per-batch flush (correctness) | ✅ | `runtime/batcher.py:55-152` |
 | **Batch dispatch is correct but 1.8× slower** → default OFF | 🟡 | C1 partially addressed: async precompile reduces cold-start penalty; batch overhead bottleneck remains |
-| **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | async pool exists (`slangc.py:544`), overlap not wired into flush path |
+| **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | C1.1 async precompile + C1.2 removed 4 redundant GPU syncs; full batch dispatch overlap remains |
 | **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ✅ | C2 done: `config_key` in `kernel/main.py:397` + `canonical_shape_class` in `template_registry.py:71`; same-class shapes reuse cached SPIR-V |
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
 | **GN backward kernel fusion** (11 tiny kernels → 1-2 fused) | ⛔ | Profiled 2026-06-18; 11 dispatches for sub/mul/sum/fill/expand/pow; ~2-3ms overhead |
