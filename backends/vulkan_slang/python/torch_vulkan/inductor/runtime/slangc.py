@@ -570,6 +570,50 @@ def compile_slang_to_spirv(
                 ev.set()
 
 
+def async_precompile_slang(
+    src: str,
+    *,
+    entry: str = "computeMain",
+    cache_key: str = "",
+    include_paths: tuple[str, ...] = (),
+) -> None:
+    """Submit Slang→SPIR-V compilation to the async pool without blocking (C1).
+
+    The compilation runs in a background thread and populates the in-memory
+    and on-disk SPIR-V caches.  Subsequent calls to :func:`compile_slang_to_spirv`
+    with the same source will find the cached result and return instantly.
+
+    If the async pool is unavailable (``_ASYNC_COMPILE=0``), this is a no-op
+    — the first synchronous ``compile_slang_to_spirv`` call will pay the cost.
+    """
+    if not _ASYNC_COMPILE:
+        return
+    inc_tag = "" if not include_paths else "\nINC=" + "|".join(include_paths)
+    sgs_tag = _get_device_subgroup_size_tag()
+    lib_tag = _shader_lib_import_hash(src)
+    hash_key = hashlib.sha256(
+        (entry + "\n" + _normalize_slang_source(src) + inc_tag + sgs_tag + lib_tag).encode()
+    ).hexdigest()
+    if hash_key in _cache_by_hash:
+        return  # Already compiled
+    spv = _disk_cache_read(hash_key)
+    if spv is not None:
+        _cache_by_hash[hash_key] = spv
+        if cache_key:
+            with _cache_lock:
+                _cache_by_key[cache_key] = spv
+        return  # Already on disk
+    with _in_flight_lock:
+        if hash_key in _in_flight:
+            return  # Already being compiled
+    pool = _get_async_pool()
+    pool.submit(
+        _wrap_pool_worker(_compile_slang_to_spirv_inner),
+        src, entry, hash_key, include_paths, cache_key,
+    )
+    # Intentionally do NOT call .result() — fire-and-forget
+
+
 def batch_compile_slang_to_spirv(
     specs: list[tuple[str, str, str, tuple[str, ...]]],
     *,

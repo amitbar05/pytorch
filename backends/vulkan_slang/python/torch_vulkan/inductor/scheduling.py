@@ -695,6 +695,16 @@ class VulkanScheduling(SIMDScheduling):
             )
             # Store kernel source for AOTI C++ codegen (also used by Python path for re-compilation)
             _set_kernel_source(wrapper, kernel_name, src_code)
+            # C1: start async slangc compilation immediately
+            try:
+                from .runtime.slangc import async_precompile_slang
+                async_precompile_slang(
+                    src_code,
+                    entry="computeMain",
+                    cache_key=f"{kernel_name}_{src_hash}",
+                )
+            except Exception:
+                pass  # Best-effort
         return kernel_name
 
     def define_kernel(
@@ -761,6 +771,17 @@ class VulkanScheduling(SIMDScheduling):
                 f"{kernel_name} = _vk_make_kernel({src_var}, {src_var}_key, {n_buffers}, {pc_size_bytes}, {n_pc}, {n_outputs}, config_key='{kernel.config_key}')\n"
             )
             _set_kernel_source(wrapper, kernel_name, src_code)
+            # C1: start async slangc compilation immediately so the
+            # first dispatch finds cached SPIR-V (hot-path latency).
+            try:
+                from .runtime.slangc import async_precompile_slang
+                async_precompile_slang(
+                    src_code,
+                    entry="computeMain",
+                    cache_key=f"{kernel_name}_{src_hash}",
+                )
+            except Exception:
+                pass  # Best-effort: if pool is busy, sync compile handles it
         return kernel_name
 
     @classmethod
