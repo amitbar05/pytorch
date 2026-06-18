@@ -122,7 +122,9 @@ class _VulkanGNFwdExternKernel(_ir_module.ExternKernelOut):
 
     def codegen(self, wrapper):
         # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
-        if getattr(V.graph, 'aot_mode', False):
+        from torch._inductor import graph as _inductor_graph
+
+        if getattr(_inductor_graph.V.graph, 'aot_mode', False):
             self._codegen_aoti(wrapper)
             return
 

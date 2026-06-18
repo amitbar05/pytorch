@@ -105,11 +105,14 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
 
     def codegen(self, wrapper):
         # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
-        if getattr(V.graph, 'aot_mode', False):
+        from torch._inductor import graph as _inductor_graph
+
+        if getattr(_inductor_graph.V.graph, 'aot_mode', False):
             self._codegen_aoti(wrapper)
             return
 
         # M-NEW.12: flush batcher before this direct Vulkan dispatch.
+        # (first instance in gn_backward_extern.py)
         # Without this flush, any batched kernel (e.g., ReLU backward
         # pointwise) whose output feeds into this GN backward runs AFTER
         # this synchronous dispatch → GN backward reads stale/zero data
@@ -279,7 +282,9 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
 
     def codegen(self, wrapper):
         # A2.5: AOTI mode — emit C++ dispatch calls instead of Python
-        if getattr(V.graph, 'aot_mode', False):
+        from torch._inductor import graph as _inductor_graph
+
+        if getattr(_inductor_graph.V.graph, 'aot_mode', False):
             self._codegen_aoti(wrapper)
             return
 

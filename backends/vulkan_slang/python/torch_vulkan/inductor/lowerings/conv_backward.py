@@ -177,7 +177,9 @@ class _VulkanConvBwdExternKernel(_ir_module.ExternKernelOut):
         A2.5: When ``V.graph.aot_mode`` is True, emits C++ AOTI dispatch
         calls with pre-compiled SPIR-V instead of Python function calls.
         """
-        if getattr(V.graph, 'aot_mode', False):
+        from torch._inductor import graph as _inductor_graph
+
+        if getattr(_inductor_graph.V.graph, 'aot_mode', False):
             self._codegen_aoti(wrapper)
             return
 

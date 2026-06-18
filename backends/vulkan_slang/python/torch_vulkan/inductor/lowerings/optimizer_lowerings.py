@@ -90,7 +90,9 @@ def _register_optimizer_lowerings() -> None:
             error when V.graph.aot_mode is True.  The optimizer is a
             post-training step that can be deferred to the Python runtime.
             """
-            if getattr(V.graph, 'aot_mode', False):
+            from torch._inductor import graph as _inductor_graph
+
+            if getattr(_inductor_graph.V.graph, 'aot_mode', False):
                 raise NotImplementedError(
                     "Optimizer AOTI codegen not yet implemented. "
                     "Run optimizer step in Python after AOTI forward+backward."
