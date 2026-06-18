@@ -140,7 +140,9 @@ class _VulkanGNBwdInputExternKernel(_ir_module.ExternKernelOut):
 
         G = self.num_groups
 
-        wrapper.writeline(f"{gi_out}.zero_()")
+        # M23.2: output buffers are zero-initialized by the allocator
+        # (M23.1, commit 60541e0e1e8).  Explicit .zero_() calls are redundant
+        # dispatches (each emits a copy_fill_fwd GPU dispatch).
         self.codegen_comment(wrapper)
         wrapper.writeline(
             f"_dispatch_group_norm_backward_slang("
@@ -237,10 +239,8 @@ class _VulkanGNBwdWeightExternKernel(_ir_module.ExternKernelOut):
         if self.compute_bias and len(names) > 5:
             gb_arg = names[5]
 
-        wrapper.writeline(f"{gw_out}.zero_()")
-        if self.compute_bias and gb_arg != "None":
-            wrapper.writeline(f"{gb_arg}.zero_()")
-
+        # M23.2: output buffers are zero-initialized by the allocator.
+        # Explicit .zero_() calls are redundant GPU dispatches.
         self.codegen_comment(wrapper)
 
         compute_bias_str = "True" if self.compute_bias else "False"

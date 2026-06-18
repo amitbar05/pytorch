@@ -70,14 +70,14 @@ def _get_conv3d_backward_extern_kernel_class():
             pD, pH, pW = self.padding_arg
             dD, dH, dW = self.dilation_arg
 
-            # Zero-init output buffers (bwd kernel accumulates via +=)
-            wrapper.writeline(f"{out_name}.zero_()")
-            wrapper.writeline(f"{grad_weight}.zero_()")
+            # M23.2: output buffers are zero-initialized by the allocator
+            # (M23.1, commit 60541e0e1e8).  Explicit .zero_() calls are redundant
+            # GPU dispatches.
 
             grad_bias_arg = "None"
             if self.has_bias and len(input_names) > 4:
                 grad_bias_arg = input_names[4]
-                wrapper.writeline(f"{grad_bias_arg}.zero_()")
+                # M23.2: zero-init handled by allocator at allocation time
 
             self.codegen_comment(wrapper)
             wrapper.writeline(
@@ -175,12 +175,13 @@ def _get_conv3d_backward_lowering_impl():
             device=dev, dtype=dtype, size=gi_size, stride=gi_stride
         )
 
-        # Pre-allocate grad_weight as a zero buffer
+        # M23.2: pre-allocate grad_weight with empty.memory_format (trusts
+        # zero-initialized allocator) instead of aten.full (emits fill dispatch).
         from torch._inductor.lowering import lowerings as _lowerings
 
         gw_size = [C_out, C_in, kD, kH, kW]
-        gw_box = _lowerings[aten.full.default](
-            gw_size, 0.0, dtype=dtype, device=dev
+        gw_box = _lowerings[aten.empty.memory_format](
+            gw_size, dtype=dtype, device=dev
         )
 
         # grad_bias allocation (if needed)
@@ -188,8 +189,8 @@ def _get_conv3d_backward_lowering_impl():
         kernel_inputs = [input, weight, grad_output, gw_box]
         if has_bias:
             gb_size = [int(w_sizes[0])]
-            gb_box = _lowerings[aten.full.default](
-                gb_size, 0.0, dtype=dtype, device=dev
+            gb_box = _lowerings[aten.empty.memory_format](
+                gb_size, dtype=dtype, device=dev
             )
             kernel_inputs.append(gb_box)
 
@@ -206,8 +207,8 @@ def _get_conv3d_backward_lowering_impl():
         gi_box = ir.TensorBox.create(kernel)
 
         # Build output tuple matching aten.convolution_backward signature
-        empty_box = _lowerings[aten.full.default](
-            [1], 0.0, dtype=dtype, device=dev
+        empty_box = _lowerings[aten.empty.memory_format](
+            [1], dtype=dtype, device=dev
         )
         result_gi = gi_box if need_gi else empty_box
         result_gw = gw_box if need_gw else empty_box
