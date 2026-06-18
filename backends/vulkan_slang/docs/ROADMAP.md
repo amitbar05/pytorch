@@ -514,10 +514,16 @@ candidates are stripped via `_install_vulkan_autotune_cuda_filter()`.
 - Linear: 4 shapes × 2 dtypes (addmm — FFN/MLP blocks)
 - BMM: 4 shapes × 2 dtypes (torch.bmm — attention/multi-head projections)
 - Conv bwd: 3 shapes × 2 dtypes (loss.backward through nn.Conv2d)
-- Total: 62 autotune probe combos (was 14, then 48)
+- GN/Softmax/GELU: 18 combos (reduction + pointwise templates)
+- Conv tile: 16 extra combos (tile_w × tile_h × tile_c variants)
+- Total: 96 autotune probe combos (was 14)
 
-**Remaining**: Conv tile config autotune (`tuned_conv`), flash attention tile configs,
-and V.choices integration for non-MM templates.
+**Remaining**: Flash attention tile configs, V.choices for non-MM templates.
+
+**D1 conv tile config sweep (2026-06-18):** `TORCH_VULKAN_CONV_TILE` env var
+controls conv2d tile config (both Python-wrapper and AOTI codegen). Warm-up
+sweeps 4 tile configs × 2 shapes × 2 dtypes = 16 extra probes. Format:
+`tile_w x tile_h x tile_c` (e.g. `"16x8x4"`). Default (8,8,8).
 - **Files**: `vulkan_template.py:175-224`, `dispatch.py:584-703`,
   `hardware_probe.py:174-224`, `install.py:117-159`
 - **Exit**: `TestAutotuneMMExpanded` — with `TORCH_VULKAN_MM_TILES=expanded`,
