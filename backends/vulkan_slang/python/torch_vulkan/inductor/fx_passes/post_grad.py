@@ -721,8 +721,10 @@ def install_conv_patched_gn_relu_fusion() -> None:
             model_, torch.fx.GraphModule
         ):
             try:
-                fused = _fuse_conv_patched_gn_relu(model_)
-                _FUSE_CONV_PATCHED_GN_RELU_COUNTER[0] += fused
+                from torch_vulkan.inductor import config as _vk_cfg
+                if not _vk_cfg.disable_conv_gn_fusion():
+                    fused = _fuse_conv_patched_gn_relu(model_)
+                    _FUSE_CONV_PATCHED_GN_RELU_COUNTER[0] += fused
             except Exception as e:  # pragma: no cover
                 import logging
 

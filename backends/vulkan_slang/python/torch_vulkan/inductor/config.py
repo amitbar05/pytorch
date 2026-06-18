@@ -536,6 +536,24 @@ def aggressive_fusion() -> bool:
     return _AGGRESSIVE_FUSION
 
 
+# C5 (2026-06-18): gate conv+GN+ReLU forward fusion.  The fused shader
+# doesn't store the intermediate conv+bias output, which forces AOTAutograd
+# to recompute it during backward (one extra slang_conv2d dispatch).
+# Training workloads may prefer separate dispatches to avoid recomputation.
+# Set ``TORCH_VULKAN_DISABLE_CONV_GN_FUSION=1`` to disable the fused path.
+_DISABLE_CONV_GN_FUSION = os.environ.get("TORCH_VULKAN_DISABLE_CONV_GN_FUSION", "0") != "0"
+
+
+def disable_conv_gn_fusion() -> bool:
+    """Whether conv+GN+ReLU forward fusion is disabled (C5 gate).
+
+    Default False (fusion enabled). Set TORCH_VULKAN_DISABLE_CONV_GN_FUSION=1
+    to disable — trades 1 extra forward dispatch for eliminating 1 backward
+    recomputation dispatch.
+    """
+    return _DISABLE_CONV_GN_FUSION
+
+
 def max_storage_bufs_override() -> Optional[int]:
     """Override for max storage buffer bindings per kernel (N+1.5.c).
 
