@@ -118,7 +118,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Item | State | Evidence |
 |---|---|---|
 | Batcher `ready_set` per-batch flush (correctness) | ✅ | `runtime/batcher.py:55-152` |
-| **Batch dispatch is correct but 1.8× slower** → default OFF | ⛔ | `config.py:119-123`; the payoff needs compile/exec overlap (below) |
+| **Batch dispatch is correct but 1.8× slower** → default OFF | 🟡 | C1 partially addressed: async precompile reduces cold-start penalty; batch overhead bottleneck remains |
 | **Async-compile double-buffer overlap** (exec kernel N while compiling N+2) | 🟡 | async pool exists (`slangc.py:544`), overlap not wired into flush path |
 | **Shape bucketing** in template registry (canonicalize → cache SPIR-V) | ✅ | C2 done: `config_key` in `kernel/main.py:397` + `canonical_shape_class` in `template_registry.py:71`; same-class shapes reuse cached SPIR-V |
 | **Persistent kernel routing** for large reductions (numel>65536) | 🟡 | `persistent_pointwise.slang` exists; not wired in `bwd_diff_table.py` |
@@ -388,13 +388,20 @@ Integrated into `validate_slang_source()` pipeline. Runs pre-slangc.
 
 ### Pillar C — Performance (the batching payoff)
 
-#### C1 — Async-compile / dispatch overlap → make `BATCH_DISPATCH=1` win ⛔
+#### C1 — Async-compile / dispatch overlap → make `BATCH_DISPATCH=1` win 🟡 **C1.1 PARTIAL 2026-06-18**
 M12 made batched dispatch *correct* but it is 1.8× slower (`385ms→676ms`
 MNISTNet) because setup/teardown is serial. Wire the existing async slangc pool
-into a double-buffer: execute kernel N while compiling N+2. Target: batched ≤
-1.1× unbatched, then flip the default to ON.
-- **Files**: `runtime/batcher.py`, `runtime/slangc.py`, `csrc/backend/DeviceRuntime.cpp`, `config.py:123`
-- **Exit**: `TestBatchPerf` — MNISTNet batched overhead ≤ 10%; default flips to ON.
+into a double-buffer: execute kernel N while compiling N+2.
+
+**C1.1 (2026-06-18)**: Added `async_precompile_slang()` in `slangc.py` and
+call it from `define_kernel`/`define_combo_kernel` in `scheduling.py`.
+When a kernel is defined during Inductor codegen, slangc compilation starts
+immediately in the thread pool (fire-and-forget). By the time the first
+training step dispatches the kernel, the SPIR-V is already cached. This
+eliminates the ~47ms cold-start slangc latency per unique kernel shape.
+Remaining: full batch-dispatch overlap (execute N while compiling N+2) to
+bring batch overhead from 1.8× down to ≤1.1×.
+- **Files**: `runtime/slangc.py:573-614`, `scheduling.py:698-710,764-775`
 
 #### C2 — Shape bucketing in template registry ✅ **DONE (verified 2026-06-18)**
 Canonicalize `(rank, dtype, layout_class, stride_class)` before template
