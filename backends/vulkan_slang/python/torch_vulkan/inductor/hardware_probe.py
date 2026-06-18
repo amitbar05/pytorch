@@ -51,19 +51,45 @@ LEVEL_DEEP = 2
 # Canonical shapes for the level-2 autotune sweep. Sized to land in the
 # ~3-minute budget on RDNA1 (16 CU, 1024 max WG). Shapes are powers-of-two
 # multiples of 64 so they wave-align cleanly on both wave32 and wave64.
+# D1: Expanded to cover square, tall-skinny, short-wide, batched, and
+# large-dimension mm shapes plus 1×1/3×3/5×5 conv kernels.
 _MM_PROBE_SHAPES: list[tuple[int, int, int]] = [
+    # Training-typical square matmuls
     (128, 128, 128),
     (512, 512, 512),
     (1024, 1024, 1024),
     (2048, 2048, 2048),
+    # Tall-skinny (common in attention: Q@K^T with large seq_len)
+    (2048, 128, 128),
+    (4096, 256, 256),
+    # Short-wide (common in FFN: hidden @ weight^T)
+    (128, 2048, 128),
+    (256, 4096, 256),
+    # Batched dim-2 (common for small-batch Linear in training)
+    (64, 512, 256),
+    (256, 256, 1024),
+    # Small matmuls (common in GN/LN weight grad, loss backward)
+    (32, 32, 32),
+    (8, 32, 64),
 ]
 _MM_PROBE_DTYPES: tuple[str, ...] = ("float32", "float16")
 
 # (B, Cin, Cout, H, W, K, stride, padding)
+# D1: Expanded to cover 1×1, 3×3, 5×5 kernels at common training resolutions.
 _CONV_PROBE_SHAPES: list[tuple[int, int, int, int, int, int, int, int]] = [
+    # Standard 3×3 conv (ResNet / VGG style)
     (1, 32, 64, 32, 32, 3, 1, 1),
-    (1, 64, 128, 32, 32, 3, 1, 1),
-    (1, 128, 128, 16, 16, 3, 1, 1),
+    (2, 64, 128, 32, 32, 3, 1, 1),
+    (2, 128, 128, 16, 16, 3, 1, 1),
+    # 1×1 conv (bottleneck / projection — very common)
+    (2, 64, 64, 32, 32, 1, 1, 0),
+    (2, 128, 256, 16, 16, 1, 1, 0),
+    # 5×5 conv (larger receptive field)
+    (1, 32, 64, 28, 28, 5, 1, 2),
+    # Small conv (first-layer style, few channels)
+    (2, 3, 16, 64, 64, 3, 1, 1),
+    # Large batch conv
+    (4, 64, 64, 32, 32, 3, 1, 1),
 ]
 _CONV_PROBE_DTYPES: tuple[str, ...] = ("float32", "float16")
 
@@ -184,8 +210,6 @@ def _run_level_2_autotune() -> dict[str, Any]:
     autotune cache has per-shape winners for the full tile space.
     Set TORCH_VULKAN_MM_TILES=default to use only the small default set.
     """
-    import torch
-
     # D1: enable expanded tile sweep for warm-up autotune
     _prev_mm_tiles = os.environ.get("TORCH_VULKAN_MM_TILES")
     if _prev_mm_tiles is None:
@@ -274,6 +298,44 @@ def _run_level_2_autotune_impl() -> dict[str, Any]:
                         f" {type(e).__name__}"
                     )
     out["conv_ms"] = (time.perf_counter() - t1) * 1e3
+
+    # D1 — Linear (addmm) sweep: input @ weight.T + bias.
+    # This is the most common op in transformer FFN and MLP blocks.
+    # Uses a subset of MM shapes converted to linear-compatible dims.
+    _LINEAR_PROBE_SHAPES: list[tuple[int, int, int]] = [
+        (128, 512, 256),   # small batch, medium hidden
+        (64, 2048, 512),   # tiny batch, large hidden
+        (256, 256, 1024),  # medium batch, deep hidden
+        (32, 1024, 4096),  # tiny batch, large FFN
+    ]
+
+    @torch.compile(backend="inductor", dynamic=False)
+    def _linear(input_t, weight, bias):
+        return torch.nn.functional.linear(input_t, weight, bias)
+
+    t2 = time.perf_counter()
+    linear_probed = 0
+    with torch.no_grad():
+        for B, in_features, out_features in _LINEAR_PROBE_SHAPES:
+            for dt_name in _MM_PROBE_DTYPES:
+                dt = _dtype_from_name(dt_name)
+                try:
+                    inp = torch.randn(B, in_features, dtype=dt, device="vulkan")
+                    wt = torch.randn(out_features, in_features, dtype=dt, device="vulkan")
+                    bias = torch.zeros(out_features, dtype=dt, device="vulkan")
+                    _ = _linear(inp, wt, bias)
+                    linear_probed += 1
+                except Exception as e:
+                    _log.warning(
+                        "linear probe (B=%d,in=%d,out=%d,%s) failed: %s",
+                        B, in_features, out_features, dt_name, e,
+                    )
+                    out["failures"].append(
+                        f"linear[B={B},in={in_features},out={out_features},{dt_name}]:"
+                        f" {type(e).__name__}"
+                    )
+    out["linear_shapes_probed"] = linear_probed
+    out["linear_ms"] = (time.perf_counter() - t2) * 1e3
 
     return out
 
@@ -406,9 +468,10 @@ def _profile_device_impl(
             f = len(result["autotune"].get("failures", []))
             mm_n = result["autotune"].get("mm_shapes_probed", 0)
             conv_n = result["autotune"].get("conv_shapes_probed", 0)
+            lin_n = result["autotune"].get("linear_shapes_probed", 0)
             print(
                 f"  level 2 (autotune sweep) : {result['level_2_ms']:>8.0f} ms"
-                f" (mm={mm_n} conv={conv_n} failures={f})"
+                f" (mm={mm_n} conv={conv_n} linear={lin_n} failures={f})"
             )
 
     result["total_ms"] = (time.perf_counter() - t_total) * 1e3
