@@ -232,10 +232,20 @@ increases** (6.63 → 8.62). Bisected 2026-06-19 (repro
   recompute / relu-mask / GN-bwd / conv-bwd chain; a still-needed buffer is
   aliased/overwritten. (`allow_buffer_reuse=False` can't be used to confirm —
   that path hits a separate `_jit_dispatch` TypeError, itself a bug.)
-- **Next**: dump the stacked backward (`agent_space/dump_noresid.py`), find which
-  exact-reuse alias clobbers a live recompute/GN-stats buffer; likely needs the
-  same WAR-safety guard as S2.0-reuse but for same-size internal aliases on the
-  conv-bwd recompute path.
+- **Two layers confirmed 2026-06-20** (forcing `make_buffer_reuse` to never
+  alias — allocate-fresh for every reuse):
+  1. **Buffer aliasing causes the explosion** — with aliasing off, the worst
+     grad rel drops from `5.6e+03` → **`1.0`** (explosion gone). So a same-shape
+     Inductor exact/reinterpret alias on the recompute/GN-bwd chain is being
+     written while still live (WAR hazard the runtime misses). Needs a *narrow*
+     WAR-safe guard (the global no-alias is too broad + perf-costly).
+  2. **A second, bounded bug remains** — even with no aliasing, `block.conv2.weight`
+     grad is rel `1.0` wrong (~zero or sign-flipped). Specific to stacked
+     same-resolution conv+GN; absent in `small_cnn` (pool-separated). Likely the
+     conv-bwd recompute or the relu+GN-bwd mask fusion mid-stack.
+- **Next**: (a) identify the specific hazardous alias in
+  `agent_space/noresid_bwd.txt` and guard just it; (b) root-cause the residual
+  conv2-grad error separately.
 - **Exit**: `test_resnet_block_conv_gn_residual_fc` — Vulkan loss decreases and
   tracks CPU within 50%.
 
