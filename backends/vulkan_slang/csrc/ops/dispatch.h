@@ -25,6 +25,16 @@ struct DeviceRuntime {
     // Used for smart barrier insertion: barrier only emitted when a read depends on a prior write.
     std::unordered_set<VkBuffer> dirty_buffers;
 
+    // S2.0d: VkBuffers *read* (as inputs) by dispatches in the current deferred
+    // command buffer. A later dispatch that *writes* one of these (e.g. an
+    // Inductor exact-reuse alias re-using a just-read buffer as a new output)
+    // is a write-after-read hazard. ``dirty_buffers`` only tracks writes, so
+    // WAR was previously unguarded — the write could race the prior read,
+    // corrupting gradients in stacked conv+GN backward graphs with heavy
+    // same-shape buffer reuse. Cleared together with ``dirty_buffers`` whenever
+    // a barrier is emitted.
+    std::unordered_set<VkBuffer> read_buffers;
+
     // Tracks VkBuffers written by the CPU host (via vkMapMemory/memcpy in
     // VulkanBuffer::write) since the last flush. A dispatch that reads any
     // of these buffers must first emit a HOST → COMPUTE pipeline barrier so

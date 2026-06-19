@@ -123,7 +123,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | ID | Defect | Severity |
 |---|---|---|
 | **S2.0** | Conv+GN CNN training (Linear & 1×1-conv heads): `buf7` combo inversion + wrong conv `grad_bias` (output reuse) + `StorageBox` unwrap crash + 4D grad_out assumption. | ✅ **FIXED 2026-06-19** (S2.0a/reuse/b/c) |
-| **S2.0d** | ResNet residual block training diverges (loss ↑). Compiles past S2.0, but `relu(out+identity)` backward is wrong. | 🔴 open |
+| **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **Residual** `relu(out+identity)` fan-out still explodes → S2.0d-resid. | 🟡 partial |
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper still leaks `extern_kernels.mm` + `aten._adaptive_avg_pool2d_backward` — codegen-only pillar breach (orthogonal to S2.0 correctness). | 🟡 P1 |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | 🟡 perf |
 
@@ -211,7 +211,25 @@ element count disagrees, so genuine shape errors still fail loudly).
 - **Exit (all S2.0)**: `test_small_cnn_conv_gn_relu_linear_head` +
   `test_small_cnn_conv_gn_relu_fc` + `test_simple_cnn_conv_maxpool_fc`.
 
-#### S2.0d — ⛔ Stacked conv+GN+ReLU backward explodes (NOT the residual)
+#### S2.0d — 🟡 Stacked conv+GN+ReLU backward — WAR-barrier miss (FIXED); residual still open
+**FIXED 2026-06-20 for the non-residual case.** Root cause: the C++ smart
+barrier (`dispatch.cpp`) tracked only *writes* (`dirty_buffers`) and emitted a
+barrier when a dispatch touched a previously-written buffer (RAW/WAW). A buffer
+*read* by one extern dispatch (conv-bwd / GN-bwd) and then *written* by a later
+one — via Inductor same-shape exact-reuse aliasing — was a **write-after-read
+hazard with no barrier**, so the write raced the read and gradients exploded.
+Fix: track read buffers (`read_buffers`), emit a barrier (combined
+`SHADER_READ|WRITE` mask) when an output overlaps a prior read, at both dispatch
+sites. `test_stacked_conv_gn_backward_war` ✅; `noresid` grad parity `5e-6`;
+perf-neutral (barriers only fire on real hazards); 0 regressions.
+**Still open — S2.0d-resid**: the residual `relu(out+identity)` model still
+explodes (`5.4e5`, unchanged by the WAR fix) — a *separate* hazard in the
+fan-out gradient accumulation (identity = stem output, consumed by conv1 *and*
+the add). Next: dump the residual backward, find the unguarded accumulation
+hazard (likely an in-place add where the WAR/RAW classification of in-place
+buffers needs care).
+
+Original diagnosis (retained for reference):
 `test_resnet_block_conv_gn_residual_fc` compiles+runs (past S2.0a–c) but **loss
 increases** (6.63 → 8.62). Bisected 2026-06-19 (repro
 `agent_space/check_resnet_bisect.py`):

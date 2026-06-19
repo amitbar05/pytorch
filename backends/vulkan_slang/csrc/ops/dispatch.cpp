@@ -111,6 +111,7 @@ void end_batch_dispatch() {
         rt.stream->flush_async();
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on batch end
     }
@@ -237,6 +238,7 @@ void dispatch_shader(
         rt.stream->flush_async();
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
@@ -375,19 +377,35 @@ void dispatch_shader(
         g_barrier_count++;
     }
 
-    // Smart barrier: only emit if this dispatch reads a buffer written by a previous dispatch.
-    // Check if any current tensor overlaps with the dirty set from prior dispatches.
+    // Smart barrier: emit when this dispatch has a hazard against a prior one.
+    //   RAW / WAW — any of this dispatch's buffers was *written* before
+    //               (``dirty_buffers``); covers reads and writes of dirty bufs.
+    //   WAR (S2.0d) — any *output* buffer of this dispatch was *read* before
+    //               (``read_buffers``). Inductor exact-reuse aliasing turns a
+    //               just-read buffer into a new output, so without this the
+    //               write races the prior read (gradient corruption in stacked
+    //               conv+GN backward). The barrier uses a combined access mask
+    //               so it serialises against prior reads *and* writes.
+    uint32_t first_output = (num_outputs < n) ? (n - num_outputs) : 0;
     bool needs_barrier = false;
     for (uint32_t i = 0; i < n && !needs_barrier; ++i) {
         if (rt.dirty_buffers.count(vk_buffers_arr[i])) {
             needs_barrier = true;
         }
     }
+    for (uint32_t i = first_output; i < n && !needs_barrier; ++i) {
+        if (rt.read_buffers.count(vk_buffers_arr[i])) {
+            needs_barrier = true;  // WAR
+        }
+    }
     if (needs_barrier) {
-        cmd.memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        cmd.memory_barrier(
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();
         g_barrier_count++;
-    } else if (!rt.dirty_buffers.empty()) {
+    } else if (!rt.dirty_buffers.empty() || !rt.read_buffers.empty()) {
         g_barrier_skip_count++;
     }
 
@@ -407,10 +425,13 @@ void dispatch_shader(
         fflush(stderr);
     }
 
-    // Mark output buffers dirty (last num_outputs tensors are outputs).
-    uint32_t first_output = (num_outputs < n) ? (n - num_outputs) : 0;
-    for (uint32_t i = first_output; i < n; ++i) {
-        rt.dirty_buffers.insert(vk_buffers_arr[i]);
+    // Mark output buffers dirty; track input buffers as read (S2.0d WAR).
+    for (uint32_t i = 0; i < n; ++i) {
+        if (i >= first_output) {
+            rt.dirty_buffers.insert(vk_buffers_arr[i]);
+        } else {
+            rt.read_buffers.insert(vk_buffers_arr[i]);
+        }
     }
 
     // Track buffers for WAR hazard detection
@@ -479,6 +500,7 @@ void dispatch_shader_indexed(
         // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }
@@ -562,26 +584,39 @@ void dispatch_shader_indexed(
         g_barrier_count++;
     }
 
+    // S2.0d: RAW/WAW (dirty_buffers) + WAR (output overlaps a prior read).
+    uint32_t first_output = (num_outputs < n) ? (n - num_outputs) : 0;
     bool needs_barrier = false;
     for (uint32_t i = 0; i < n && !needs_barrier; ++i) {
         if (rt.dirty_buffers.count(vk_buffers_arr[i])) {
             needs_barrier = true;
         }
     }
+    for (uint32_t i = first_output; i < n && !needs_barrier; ++i) {
+        if (rt.read_buffers.count(vk_buffers_arr[i])) {
+            needs_barrier = true;  // WAR
+        }
+    }
     if (needs_barrier) {
-        cmd.memory_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        cmd.memory_barrier(
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();
         g_barrier_count++;
-    } else if (!rt.dirty_buffers.empty()) {
+    } else if (!rt.dirty_buffers.empty() || !rt.read_buffers.empty()) {
         g_barrier_skip_count++;
     }
 
     cmd.dispatch(num_workgroups_x, num_workgroups_y, num_workgroups_z);
 
-    // Mark output buffers dirty (last num_outputs tensors).
-    uint32_t first_output = (num_outputs < n) ? (n - num_outputs) : 0;
-    for (uint32_t i = first_output; i < n; ++i) {
-        rt.dirty_buffers.insert(vk_buffers_arr[i]);
+    // Mark output buffers dirty; track inputs as read (S2.0d WAR).
+    for (uint32_t i = 0; i < n; ++i) {
+        if (i >= first_output) {
+            rt.dirty_buffers.insert(vk_buffers_arr[i]);
+        } else {
+            rt.read_buffers.insert(vk_buffers_arr[i]);
+        }
     }
     for (uint32_t i = 0; i < n; ++i) {
         rt.stream->track_buffer(vk_buffers_arr[i]);
@@ -616,6 +651,7 @@ void flush_stream() {
             rt.desc_pool->reset();
         }
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset (flush)
     }
@@ -687,6 +723,7 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
         // M-cpp-new-2: async reset (see comment in `dispatch_shader`).
         rt.desc_pool->reset_async(rt.stream->fence());
         rt.dirty_buffers.clear();
+        rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
         rt.desc_set_cache.clear();  // M17.5: clear on pool reset
     }

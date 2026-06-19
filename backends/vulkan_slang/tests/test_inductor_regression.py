@@ -60893,6 +60893,43 @@ class TestTrain8ConvTrainingSweep:
 
         self._run_sweep(CnnLinearHead, x_shape=(4, 3, 16, 16))
 
+    def test_stacked_conv_gn_backward_war(self):
+        """S2.0d — two conv+GN+ReLU stages at the same spatial resolution.
+
+        Without a pool between them, the compiled backward emits heavy
+        same-shape Inductor exact-reuse aliasing; a buffer read by one extern
+        dispatch (conv-bwd / GN-bwd) is then written by a later one through the
+        alias. The C++ smart-barrier used to track only writes (RAW/WAW), so the
+        write-after-read hazard was unguarded and gradients exploded (rel ~1e3+
+        worst at the earliest layer). The WAR-barrier fix in
+        ``csrc/ops/dispatch.cpp`` (track reads, barrier when an output overlaps
+        a prior read) restores parity. Distinct from the residual case
+        (``test_resnet_block_conv_gn_residual_fc``).
+        """
+        import torch.nn as nn
+
+        class StackedConvGN(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.stem = nn.Sequential(
+                    nn.Conv2d(3, 16, 3, padding=1, bias=False),
+                    nn.GroupNorm(4, 16), nn.ReLU())
+                # two more conv+GN+ReLU stages at the SAME resolution (no pool)
+                self.s1 = nn.Sequential(
+                    nn.Conv2d(16, 16, 3, padding=1, bias=False),
+                    nn.GroupNorm(4, 16), nn.ReLU())
+                self.s2 = nn.Sequential(
+                    nn.Conv2d(16, 16, 3, padding=1, bias=False),
+                    nn.GroupNorm(4, 16), nn.ReLU())
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.classifier = nn.Conv2d(16, num_classes, 1)
+
+            def forward(self, x):
+                x = self.s2(self.s1(self.stem(x)))
+                return self.classifier(self.pool(x)).flatten(1)
+
+        self._run_sweep(StackedConvGN, x_shape=(4, 3, 16, 16))
+
     def test_resnet_block_conv_gn_residual_fc(self):
         """(C) ResNet-mini: Conv + GroupNorm + ReLU + residual add + 1x1 Conv.
 
