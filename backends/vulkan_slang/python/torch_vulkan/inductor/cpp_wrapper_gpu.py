@@ -736,3 +736,74 @@ def emit_aoti_spv_header(bundle: dict[str, bytes]) -> str:
     lines.append("")
 
     return "\n".join(lines)
+
+
+# ── Kernels.bin binary format (v2, A2.7) ─────────────────────────────
+
+
+def write_kernels_bin(
+    path: str,
+    kernels: "list[dict]",
+    version: int = 2,
+) -> None:
+    """Write a ``kernels.bin`` file in the v2 binary format.
+
+    Compatible with ``torch_vulkan_aoti_model_load`` in
+    ``csrc/backend/AotiRuntime.cpp``.
+
+    Parameters
+    ----------
+    path : str
+        Output file path (e.g., ``/tmp/model/kernels.bin``).
+    kernels : list[dict]
+        Each dict describes one kernel:
+        - ``spv`` : bytes — SPIR-V binary (required).
+        - ``key`` : str — cache key (required).
+        - ``n_input_buffers`` : int — number of input buffers.
+        - ``n_output_buffers`` : int — number of output buffers.
+        - ``wg_x``, ``wg_y``, ``wg_z`` : int — workgroup dimensions.
+          If all zero, the runtime computes wg_x from the first buffer.
+    version : int
+        Binary format version (default 2).
+    """
+    import struct
+    import os
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    with open(path, "wb") as f:
+        # Header: magic (8B) + version (4B) + kernel_count (4B)
+        f.write(b"vk_aoti\n")
+        f.write(struct.pack("<I", version))
+        f.write(struct.pack("<I", len(kernels)))
+
+        for k in kernels:
+            spv = k["spv"]
+            spirv_words = len(spv) // 4
+
+            n_input = k.get("n_input_buffers", 0)
+            n_output = k.get("n_output_buffers", 1)
+            n_bufs = n_input + n_output
+            pc_bytes = k.get("pc_size_bytes", 0)
+            wg_x = k.get("wg_x", 0)
+            wg_y = k.get("wg_y", 0)
+            wg_z = k.get("wg_z", 0)
+            key = k["key"].encode("utf-8")
+
+            # Entry header (9 × uint32 = 36 bytes)
+            f.write(struct.pack(
+                "<9I",
+                spirv_words,
+                n_input,
+                n_output,
+                n_bufs,
+                pc_bytes,
+                wg_x,
+                wg_y,
+                wg_z,
+                len(key),
+            ))
+            # Cache key
+            f.write(key)
+            # SPIR-V data (4 bytes per word, little-endian)
+            f.write(spv)

@@ -268,24 +268,50 @@ const char* torch_vulkan_aoti_last_error(void) {
 namespace {
 
 // Serialized per-kernel metadata in the kernels.bin file.
-// Header: 8-byte magic + uint32_t kernel_count, then kernel entries.
+//
+// v1 format (backward compat):
+//   Header: 8-byte magic "vk_aoti\n" + uint32_t kernel_count
+//   Entry:  spirv_size + n_buffers + pc_size_bytes + key_len
+//           + key + SPIR-V
+//
+// v2 format (per-kernel dispatch metadata, A2.7):
+//   Header: 8-byte magic "vk_aoti\n" + uint32_t version + uint32_t kernel_count
+//   Entry:  spirv_size + n_input_buffers + n_output_buffers
+//           + n_buffers + pc_size_bytes
+//           + wg_x + wg_y + wg_z + key_len
+//           + key + SPIR-V
 struct AotiKernelEntry {
     uint32_t spirv_size;       // in uint32_t words
-    uint32_t n_buffers;
+    uint32_t n_input_buffers;  // v2: input buffer count
+    uint32_t n_output_buffers;  // v2: output buffer count
+    uint32_t n_buffers;        // total descriptor count
     uint32_t pc_size_bytes;
+    uint32_t wg_x;             // v2: workgroup X
+    uint32_t wg_y;             // v2: workgroup Y
+    uint32_t wg_z;             // v2: workgroup Z
     uint32_t key_len;          // length of cache key string
     // followed by: key_len bytes (cache key), then spirv_size*4 bytes (SPIR-V)
+};
+
+// Per-kernel dispatch metadata (populated from v2 entries).
+struct AotiKernelMeta {
+    uint32_t n_input_buffers = 0;
+    uint32_t n_output_buffers = 0;
+    uint32_t wg_x = 0;
+    uint32_t wg_y = 0;
+    uint32_t wg_z = 0;
 };
 
 // Minimal header for kernels.bin
 struct AotiBinHeader {
     char magic[8];             // "vk_aoti\n"
-    uint32_t kernel_count;
+    uint32_t version = 1;      // 1 = v1 (legacy), 2 = v2 (per-kernel metadata)
+    uint32_t kernel_count = 0;
 };
 
 struct AotiModelHandleImpl {
     std::vector<AotiKernelHandleImpl*> kernels;
-    // For future: dispatch order / buffer-layout metadata
+    std::vector<AotiKernelMeta> kernel_metas;
     std::string path;
 };
 
@@ -341,9 +367,35 @@ int torch_vulkan_aoti_model_load(
             set_last_error("torch_vulkan_aoti_model_load: bad magic in " + bin_path);
             return 5;
         }
-        if (!read_u32_le(in, hdr.kernel_count) || hdr.kernel_count == 0) {
-            set_last_error("torch_vulkan_aoti_model_load: zero kernel count");
+
+        // ── Version detection (backward compat) ─────────────────────
+        // v1: magic (8B) + kernel_count (4B) = 12B header, then entries.
+        // v2: magic (8B) + version (4B) + kernel_count (4B) = 16B header.
+        // Distinguish by reading the next 4 bytes and checking if they
+        // could plausibly be a version (1 or 2) vs a kernel count (> 0).
+        // If the value is 1 or 2, treat it as version; otherwise treat
+        // the file as v1 and rewind to re-read as kernel_count.
+        uint32_t next_word = 0;
+        if (!read_u32_le(in, next_word)) {
+            set_last_error("torch_vulkan_aoti_model_load: truncated header");
             return 6;
+        }
+        uint32_t format_version = 1;
+        if (next_word == 1 || next_word == 2) {
+            format_version = next_word;
+            if (!read_u32_le(in, hdr.kernel_count)) {
+                set_last_error("torch_vulkan_aoti_model_load: truncated kernel count");
+                return 6;
+            }
+        } else {
+            // v1: the word we just read is the kernel count
+            hdr.kernel_count = next_word;
+        }
+        hdr.version = format_version;
+
+        if (hdr.kernel_count == 0) {
+            set_last_error("torch_vulkan_aoti_model_load: zero kernel count");
+            return 7;
         }
 
         auto* model = new AotiModelHandleImpl();
@@ -351,14 +403,47 @@ int torch_vulkan_aoti_model_load(
 
         for (uint32_t k = 0; k < hdr.kernel_count; ++k) {
             AotiKernelEntry entry{};
-            if (!read_u32_le(in, entry.spirv_size) ||
-                !read_u32_le(in, entry.n_buffers) ||
-                !read_u32_le(in, entry.pc_size_bytes) ||
-                !read_u32_le(in, entry.key_len)) {
-                set_last_error("torch_vulkan_aoti_model_load: truncated entry " +
-                               std::to_string(k));
-                delete model;
-                return 7;
+            AotiKernelMeta meta{};
+
+            if (format_version >= 2) {
+                // v2: spirv_size + n_input + n_output + n_buffers
+                //      + pc_size_bytes + wg_x + wg_y + wg_z + key_len
+                if (!read_u32_le(in, entry.spirv_size) ||
+                    !read_u32_le(in, entry.n_input_buffers) ||
+                    !read_u32_le(in, entry.n_output_buffers) ||
+                    !read_u32_le(in, entry.n_buffers) ||
+                    !read_u32_le(in, entry.pc_size_bytes) ||
+                    !read_u32_le(in, entry.wg_x) ||
+                    !read_u32_le(in, entry.wg_y) ||
+                    !read_u32_le(in, entry.wg_z) ||
+                    !read_u32_le(in, entry.key_len)) {
+                    set_last_error("torch_vulkan_aoti_model_load: truncated v2 entry " +
+                                   std::to_string(k));
+                    delete model;
+                    return 8;
+                }
+                meta.n_input_buffers = entry.n_input_buffers;
+                meta.n_output_buffers = entry.n_output_buffers;
+                meta.wg_x = entry.wg_x;
+                meta.wg_y = entry.wg_y;
+                meta.wg_z = entry.wg_z;
+            } else {
+                // v1: spirv_size + n_buffers + pc_size_bytes + key_len
+                if (!read_u32_le(in, entry.spirv_size) ||
+                    !read_u32_le(in, entry.n_buffers) ||
+                    !read_u32_le(in, entry.pc_size_bytes) ||
+                    !read_u32_le(in, entry.key_len)) {
+                    set_last_error("torch_vulkan_aoti_model_load: truncated v1 entry " +
+                                   std::to_string(k));
+                    delete model;
+                    return 8;
+                }
+                // v1: all buffers are inputs, 1 output, default workgroup
+                meta.n_input_buffers = entry.n_buffers > 0 ? entry.n_buffers - 1 : 0;
+                meta.n_output_buffers = 1;
+                meta.wg_x = 0;  // will be computed at runtime
+                meta.wg_y = 0;
+                meta.wg_z = 0;
             }
 
             // Read cache key
@@ -367,7 +452,7 @@ int torch_vulkan_aoti_model_load(
                 set_last_error("torch_vulkan_aoti_model_load: truncated key " +
                                std::to_string(k));
                 delete model;
-                return 8;
+                return 9;
             }
 
             // Read SPIR-V
@@ -378,7 +463,7 @@ int torch_vulkan_aoti_model_load(
                     set_last_error("torch_vulkan_aoti_model_load: truncated SPIR-V " +
                                    std::to_string(k));
                     delete model;
-                    return 9;
+                    return 10;
                 }
             }
 
@@ -393,20 +478,21 @@ int torch_vulkan_aoti_model_load(
                                std::to_string(k) + ": " +
                                std::string(torch_vulkan_aoti_last_error()));
                 delete model;
-                return 10;
+                return 11;
             }
             model->kernels.push_back(
                 reinterpret_cast<AotiKernelHandleImpl*>(kh));
+            model->kernel_metas.push_back(meta);
         }
 
         *out_handle = reinterpret_cast<AotiVulkanModelHandle*>(model);
         return 0;
     } catch (const std::exception& e) {
         set_last_error(std::string("torch_vulkan_aoti_model_load: ") + e.what());
-        return 11;
+        return 12;
     } catch (...) {
         set_last_error("torch_vulkan_aoti_model_load: unknown exception");
-        return 12;
+        return 13;
     }
 }
 
@@ -423,16 +509,6 @@ int torch_vulkan_aoti_model_run(
     }
     auto* model = reinterpret_cast<AotiModelHandleImpl*>(handle);
 
-    // ── Simplified single-kernel dispatch ─────────────────────
-    // Extended in later milestones for multi-kernel dispatch with
-    // proper buffer alias tracking and workgroup derivation from
-    // tensor shapes. For now: dispatch all kernels in order with
-    // the provided tensors treated as buffers.
-    //
-    // Each kernel is dispatched with all tensors (inputs interleaved
-    // with outputs). Full multi-kernel scheduling with per-kernel
-    // buffer layouts and intermediate tensor management is the next
-    // increment (P4.x).
     if (model->kernels.empty()) {
         set_last_error("torch_vulkan_aoti_model_run: no kernels in model");
         return 2;
@@ -461,28 +537,86 @@ int torch_vulkan_aoti_model_run(
             all_tensors.push_back(*t);
         }
 
-        // Dispatch all kernels in order with the same tensor set.
-        // Each kernel reads from the inputs and writes to the outputs
-        // (simplified: full buffer set per kernel).
+        // ── Per-kernel dispatch (A2.7) ─────────────────────────────
+        // Each kernel dispatches with its own buffer subset and
+        // workgroup dimensions, derived from per-kernel metadata
+        // stored in the v2 kernels.bin format.
         for (size_t ki = 0; ki < model->kernels.size(); ++ki) {
             auto* kh = model->kernels[ki];
-            // Default workgroup: 1D dispatch sized from first tensor
-            uint32_t wg_x = 1, wg_y = 1, wg_z = 1;
-            if (n_inputs > 0) {
-                auto* t = reinterpret_cast<at::Tensor*>(inputs[0]);
-                uint32_t numel = static_cast<uint32_t>(t->numel());
-                wg_x = (numel + 255) / 256;
-            } else if (n_outputs > 0) {
-                auto* t = reinterpret_cast<at::Tensor*>(outputs[0]);
-                uint32_t numel = static_cast<uint32_t>(t->numel());
-                wg_x = (numel + 255) / 256;
+            auto& meta = model->kernel_metas[ki];
+
+            // Determine which buffers this kernel uses.
+            // Convention: inputs first (n_input_buffers), then outputs
+            // (n_output_buffers). When metadata is available (v2),
+            // use the exact counts. When not (v1 fallback), use all
+            // tensors with the last n_outputs treated as written.
+            uint32_t n_in = meta.n_input_buffers;
+            uint32_t n_out = meta.n_output_buffers;
+            if (n_in == 0 && n_out == 0) {
+                // v1 fallback: all except last are inputs, last is output
+                n_in = static_cast<uint32_t>(all_tensors.size());
+                n_out = static_cast<uint32_t>(n_outputs);
+                if (n_in > n_out) n_in -= n_out;
+            }
+
+            // Build per-kernel buffer list: first n_in input buffers,
+            // then n_out output buffers.
+            std::vector<at::Tensor> kbuffers;
+            kbuffers.reserve(n_in + n_out);
+            for (uint32_t i = 0; i < n_in && i < all_tensors.size(); ++i) {
+                kbuffers.push_back(all_tensors[i]);
+            }
+            // Outputs are the last n_out entries
+            size_t out_start = all_tensors.size() > n_out
+                ? all_tensors.size() - n_out : 0;
+            for (size_t i = out_start; i < all_tensors.size(); ++i) {
+                kbuffers.push_back(all_tensors[i]);
+            }
+
+            // Workgroup dimensions: use metadata if available, else
+            // compute from the first input tensor's numel.
+            uint32_t wg_x = meta.wg_x;
+            uint32_t wg_y = meta.wg_y;
+            uint32_t wg_z = meta.wg_z;
+            if (wg_x == 0 && wg_y == 0 && wg_z == 0) {
+                // Fallback: ceil(numel / 256)
+                if (!kbuffers.empty()) {
+                    uint32_t numel = static_cast<uint32_t>(kbuffers[0].numel());
+                    wg_x = (numel + 255u) / 256u;
+                } else if (n_inputs > 0) {
+                    auto* t = reinterpret_cast<at::Tensor*>(inputs[0]);
+                    uint32_t numel = static_cast<uint32_t>(t->numel());
+                    wg_x = (numel + 255u) / 256u;
+                } else {
+                    wg_x = 1;
+                }
+                wg_y = 1;
+                wg_z = 1;
+            }
+
+            // ── Push constants: compute from buffer shapes when needed ──
+            std::vector<uint8_t> pc_data;
+            const void* pc_ptr = nullptr;
+            uint32_t pc_size_to_pass = 0;
+            if (kh->pc_size_bytes > 0 && !kbuffers.empty()) {
+                // For pointwise/reduction shaders, the first push constant
+                // is typically the element count.  Pack it as a single
+                // uint32_t.  The full layout would require per-model
+                // metadata; this handles the common case.
+                uint32_t numel = static_cast<uint32_t>(kbuffers[0].numel());
+                pc_data.resize(kh->pc_size_bytes, 0);
+                if (kh->pc_size_bytes >= 4) {
+                    std::memcpy(pc_data.data(), &numel, sizeof(numel));
+                }
+                pc_ptr = pc_data.data();
+                pc_size_to_pass = kh->pc_size_bytes;
             }
 
             torch_vulkan::ops::dispatch_shader(
                 kh->key, /*spirv_code=*/nullptr, /*spirv_size=*/0,
-                all_tensors, wg_x, wg_y, wg_z,
-                /*push_constants=*/nullptr, /*pc_size=*/0,
-                static_cast<uint32_t>(n_outputs));
+                kbuffers, wg_x, wg_y, wg_z,
+                pc_ptr, pc_size_to_pass,
+                n_out);
         }
 
         // Flush all pending dispatches

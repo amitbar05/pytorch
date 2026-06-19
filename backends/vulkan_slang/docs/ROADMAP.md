@@ -299,14 +299,13 @@ at a different readiness state:
    `TestAotiSoLoadsWithoutTorchVulkanPythonpath` — prerequisites (PF.60,
    PF.30.e, AOTI compile) are now resolved. Test needs re-evaluation.
 
-7. **Model-level AOTI API is a stub** 🟡
-   `AotiRuntime.h` declares `torch_vulkan_aoti_model_load/run/free`.
-   Implementation does simplified single-kernel dispatch — no per-kernel
-   buffer layouts, no intermediate tensor management.
-   The old `"rc=" in str(exc.value)` assertion failed because the pybind wrapper
-   now surfaces the C-side human-readable error (`"empty SPIR-V"`). Fixed to
-   `"empty SPIR-V" in str(exc.value)`. The underlying C ABI error contract is
-   working correctly — the test just needed the assertion updated.
+7. **Model-level AOTI API** ✅
+   **FIXED 2026-06-19 (A2.7).** Extended `model_load` binary format to v2 with
+   per-kernel dispatch metadata: buffer counts (n_input/n_output), workgroup
+   dimensions (wg_x/wg_y/wg_z).  `model_run` now dispatches each kernel with
+   its specific buffer subset and workgroup, computing push constants from
+   actual buffer shapes at runtime.  Added `write_kernels_bin()` Python helper
+   and round-trip test (`TestAOTIModelAPI`).  Backward-compatible with v1 format.
 
 8. **Full training step .so (fwd + bwd + optimizer)** ⛔
    Gated on item 5 (extern-kernel codegen). Once conv/matmul/GN extern kernels

@@ -63157,6 +63157,102 @@ class TestOptimizerAOTICodegen:
             assert alg_type in key, f"A2.5: cache key doesn't include algorithm type for {alg}"
 
 
+class TestAOTIModelAPI:
+    """A2.7 — Model-level AOTI API (model_load/run/free).
+
+    Tests the ``torch_vulkan_aoti_model_load/run/free`` C ABI
+    entries with a round-trip through the v2 ``kernels.bin``
+    binary format.  Verifies that:
+    1. ``write_kernels_bin`` produces a valid v2 binary.
+    2. ``model_load`` parses it and creates kernel handles.
+    3. ``model_run`` dispatches kernels with correct results.
+    4. ``model_free`` cleans up without leaks/crashes.
+    """
+
+    _BUG_ROOT_COMPONENT = "aoti-runtime"
+
+    _SCALE_SHADER = (
+        "[[vk::binding(0)]] StructuredBuffer<float> in_ptr0;\n"
+        "[[vk::binding(1)]] RWStructuredBuffer<float> out_ptr0;\n"
+        "[[vk::push_constant]] cbuffer Push {{ uint numel; }};\n"
+        '[shader("compute")] [numthreads(64,1,1)]\n'
+        "void computeMain(uint3 gtid : SV_DispatchThreadID) {{\n"
+        "  if (gtid.x < numel) {{\n"
+        "    out_ptr0[gtid.x] = in_ptr0[gtid.x] * {scale}.0;\n"
+        "  }}\n"
+        "}}\n"
+    )
+
+    def _build_spv(self, cache_key, scale=2):
+        from torch_vulkan.inductor.runtime import compile_slang_to_spirv
+        src = self._SCALE_SHADER.format(scale=scale)
+        return compile_slang_to_spirv(src, "computeMain", cache_key=cache_key)
+
+    def test_aoti_model_round_trip_v2(self, tmp_path):
+        """A2.7: write kernels.bin (v2) → model_load → model_run → CPU match."""
+        import os
+        import struct
+
+        from torch_vulkan import _C as _c
+        from torch_vulkan.inductor.cpp_wrapper_gpu import write_kernels_bin
+
+        pid = os.getpid()
+        key = f"_test_aoti_model_v2_{pid}"
+        spv = self._build_spv(key, scale=3)
+
+        # Write v2 kernels.bin with per-kernel metadata
+        bin_path = str(tmp_path / "kernels.bin")
+        write_kernels_bin(
+            bin_path,
+            [{
+                "spv": spv,
+                "key": key,
+                "n_input_buffers": 1,
+                "n_output_buffers": 1,
+                "wg_x": 2,   # ceil(64/64) * 2 for testing
+                "wg_y": 1,
+                "wg_z": 1,
+                "pc_size_bytes": 4,
+            }],
+            version=2,
+        )
+        assert os.path.exists(bin_path)
+
+        # Load via model_load (returns int64 handle)
+        model_handle = _c._aoti_model_load(str(tmp_path))
+        assert model_handle != 0, (
+            f"model_load failed: {_c._aoti_last_error().decode()}"
+        )
+
+        try:
+            # Build inputs and outputs
+            x = torch.arange(64, dtype=torch.float32, device="vulkan:0")
+            y = torch.empty_like(x)
+
+            # model_run takes vector<Tensor> for inputs and outputs
+            _c._aoti_model_run(model_handle, [x], [y])
+
+            torch.testing.assert_close(
+                y.cpu(), torch.arange(64, dtype=torch.float32) * 3
+            )
+        finally:
+            _c._aoti_model_free(model_handle)
+
+    def test_aoti_model_load_bad_magic(self, tmp_path):
+        """A2.7: model_load with bad magic returns error code."""
+        from torch_vulkan import _C as _c
+        bin_path = str(tmp_path / "kernels.bin")
+        with open(bin_path, "wb") as f:
+            f.write(b"BAD_MAGI")  # wrong magic
+        with pytest.raises(RuntimeError, match="bad magic"):
+            _c._aoti_model_load(str(tmp_path))
+
+    def test_aoti_model_free_null_is_noop(self):
+        """A2.7: model_free(nullptr) must not crash."""
+        from torch_vulkan import _C as _c
+        _c._aoti_model_free(0)
+
+
 class TestAOTITrainingE2E:
     """M4 — end-to-end training correctness on Vulkan via torch.compile(backend="inductor").
 
