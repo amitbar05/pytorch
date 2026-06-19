@@ -110,7 +110,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔬 needs re-verification
 | Subgroup (`WaveActive*`) reduction ops behind `IWaveReduction` | ✅ | `shaders/lib/reduction.slang:59-170` |
 | `flash_attention*` wg_size/BQ/BK as spec-constants | ✅ | committed `03c00dd6176`; `is_causal`/`head_layout` remain Jinja (defensible: code-structural) |
 | **`foreach_optimizer` algorithm → Slang interface** | ✅ | `templates/foreach_optimizer.slang` uses `IOptimizer` + generics `<Algo : IOptimizer>`; entry point via `computeMain<AdamWImpl>` |
-| **`rnn_cell*` direction → interface; cell_type (lstm/gru) Jinja** | ⛔ | `rnn_cell.slang:35-47` Jinja `cell_type` + `direction` branches (cell_type was a gap in v16) |
+| **`rnn_cell*` direction → interface; cell_type (lstm/gru) Jinja** | ✅ | **FIXED 2026-06-19 (B2).** `rnn_cell_bwd.slang` migrated from Jinja `cell_type` branches to Slang `IRnnCell` interface with `bwd_update()`. All 4 cell structs always present; entry via `computeMain<LstmCellImpl>`. `direction` already runtime gate (M10). |
 | **AST validator: spec-constant pass** | ✅ | `slang_validate/spec_constants.py` (189 L) |
 | **AST validator: bwd_diff signature matching** | ✅ | `bwd_diff_scan.py` validates param count/types: DifferentialPair mapping, no_diff preservation, output grad check (B3) |
 
@@ -581,7 +581,7 @@ A1 (conv-bwd grad fix) ✅ ──→ A2 (full-step .so) ⛔
    └─ A5 (pooling fwd) 🟡 — FallbackKernel done, pure Slang TBD
 
 B1 (foreach interface) ✅
-B2 (rnn interface)     ⛔
+B2 (rnn interface)     ✅
 B3 (validator)         ✅
 
 C1 (overlap) ──→ flip BATCH_DISPATCH default ──→ C2 (shape bucketing) ⛔

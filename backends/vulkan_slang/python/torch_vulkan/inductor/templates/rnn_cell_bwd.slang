@@ -1,50 +1,223 @@
-// M20.1 — RNN cell backward template (LSTM / GRU / RNN-tanh / RNN-relu).
+// M20.1 / B2 — RNN cell backward template (LSTM / GRU / RNN-tanh / RNN-relu).
 //
-// Pre-M20.1, this template hand-rolled the chain rule including the
-// inverse derivatives of sigmoid and tanh as inline helpers (d-sigmoid
-// and d-tanh of saved primal). Three known chain-rule-class bugs
-// (M17.8.d.3, M18.2, M18.3) traced to copy-paste errors in this region.
+// B2: cell_type Jinja branches replaced with Slang `interface IRnnCellBwd`.
+// Each cell struct provides its own `bwd_update()` implementing the
+// gate-gradient chain rule.  `GATE_SIZE` / `HAS_CELL_STATE` are
+// compile-time interface constants (the same `IRnnCell` interface used
+// by the forward template).  The cell type is selected by the slangc
+// entry-point name, e.g. ``entry="computeMain<LstmCellImpl>"``.
 //
-// Post-M20.1, the activation backwards delegate to lib/pointwise.slang
-// primitives via bwd_diff(sigmoid_fwd) / bwd_diff(tanh_fwd) /
-// bwd_diff(relu_fwd). Those primitives carry validator-clean
-// [BackwardDerivative] partners (sigmoid_fast_bwd, tanh_fast_bwd,
-// relu_fast_bwd) that are unit-tested in the lib. The cell-state chain
-// rule (LSTM's c' = f*c + i*g; h' = o*tanh(c')) is still composed
-// manually here, but it's small (~10 LoC for LSTM, fewer for others)
-// and the activation-derivative bug class is eliminated.
+// All four cell structs are always emitted; the entry point picks one
+// via `<Cell : IRnnCell>` generics — matching the forward
+// `rnn_cell.slang` pattern and the `foreach_optimizer.slang` pattern.
 //
-// Why not full bwd_diff() over a single Slang-Differentiable
-// cell-update? The slang_validator at slang_validate/bwd_diff_scan.py
-// requires every Slang-Differentiable-tagged function to have a
-// paired BackwardDerivative-or-ForwardDerivative annotation;
-// bwd_diff(name)(...) invocations don't satisfy that contract from
-// the validator's regex point of view. Patching the validator is
-// Group F (out of templates/ lane), so M20.1 ratchets to the
-// per-primitive bwd_diff() form and leaves the
-// autodiff-over-the-whole-cell variant for a later milestone after
-// the validator is tightened to recognise bwd_diff() use sites.
+// Activation backward routes through lib/pointwise.slang primitives
+// via bwd_diff(sigmoid_fwd) / bwd_diff(tanh_fwd) / bwd_diff(relu_fwd).
 
 import pointwise;
-// M20.1.c: weight + bias grad accumulators use vk_atomic_add to dedupe
-// cross-batch / cross-time-step accumulation. Mirrors slang_conv_bwd.slang's
-// dX/dW/dB accumulators which have used vk_atomic_add since OP.25.
 import atomics;
 
-//# ── Cell-type specific constants ── #//
-/*{%*/ if cell_type == "lstm" /*%}*/
-/*{%*/ set gate_size = 4 /*%}*/
-/*{%*/ set has_cell_state = true /*%}*/
-/*{%*/ elif cell_type == "gru" /*%}*/
-/*{%*/ set gate_size = 3 /*%}*/
-/*{%*/ set has_cell_state = false /*%}*/
-/*{%*/ elif cell_type in ("rnn_tanh", "rnn_relu") /*%}*/
-/*{%*/ set gate_size = 1 /*%}*/
-/*{%*/ set has_cell_state = false /*%}*/
-/*{%*/ else /*%}*/
-/*{%*/ set gate_size = 1 /*%}*/
-/*{%*/ set has_cell_state = false /*%}*/
-/*{%*/ endif /*%}*/
+// ── Cell-type specific constants (via interface, B2) ──────────────────
+// Re-use the same IRnnCell interface + concrete cell structs as the
+// forward template.  No Jinja `[% if cell_type %]` branches anywhere.
+
+interface IRnnCell {
+    static const int GATE_SIZE;
+    static const bool HAS_CELL_STATE;
+
+    // Forward update — see rnn_cell.slang for the contract.
+    static void update(
+        float ih_gate[4],
+        float hh_gate[4],
+        float c_prev,
+        out float h_new,
+        out float c_new
+    );
+
+    // B2: Backward gate-gradient computation.
+    //   ih_gate/hh_gate: saved raw pre-activation gate sums (recomputed).
+    //   c_prev: saved cell state (LSTM) or h_prev[h] (GRU/RNN).
+    //   grad_h: incoming gradient w.r.t. hidden output.
+    //   grad_c: incoming gradient w.r.t. cell state (0.0 for non-LSTM).
+    //   gate_grad_ih[g]: gradient w.r.t. ih_gate[g]
+    //   gate_grad_hh[g]: gradient w.r.t. hh_gate[g]
+    //     (may differ from gate_grad_ih[g] for GRU's r-scaled n-gate)
+    //   grad_c_prev: gradient w.r.t. c_prev.
+    //   grad_h_prev_direct: direct gradient w.r.t. h_prev (outside the
+    //     W_hh dot-product).  For GRU this is gh * z; for others 0.0.
+    static void bwd_update(
+        float ih_gate[4],
+        float hh_gate[4],
+        float c_prev,
+        float grad_h,
+        float grad_c,
+        out float gate_grad_ih[4],
+        out float gate_grad_hh[4],
+        out float grad_c_prev,
+        out float grad_h_prev_direct
+    );
+}
+
+// ── Concrete cell implementations ─────────────────────────────────────
+// All four are always present; entry point selects one via
+// ``computeMain<LstmCellImpl>`` etc.  Each struct provides both forward
+// update() and backward bwd_update().
+
+struct LstmCellImpl : IRnnCell {
+    static const int GATE_SIZE = 4;
+    static const bool HAS_CELL_STATE = true;
+
+    static void update(
+        float ih_gate[4], float hh_gate[4], float c_prev,
+        out float h_new, out float c_new
+    ) {
+        float i = sigmoid_fwd(ih_gate[0] + hh_gate[0]);
+        float f = sigmoid_fwd(ih_gate[1] + hh_gate[1]);
+        float g = tanh_fwd(ih_gate[2] + hh_gate[2]);
+        float o = sigmoid_fwd(ih_gate[3] + hh_gate[3]);
+        c_new = f * c_prev + i * g;
+        h_new = o * tanh_fwd(c_new);
+    }
+
+    static void bwd_update(
+        float ih_gate[4], float hh_gate[4],
+        float c_prev, float grad_h, float grad_c,
+        out float gate_grad_ih[4], out float gate_grad_hh[4],
+        out float grad_c_prev, out float grad_h_prev_direct
+    ) {
+        float i_raw = ih_gate[0] + hh_gate[0];
+        float f_raw = ih_gate[1] + hh_gate[1];
+        float g_raw = ih_gate[2] + hh_gate[2];
+        float o_raw = ih_gate[3] + hh_gate[3];
+        float i_val = sigmoid_fwd(i_raw);
+        float f_val = sigmoid_fwd(f_raw);
+        float g_val = tanh_fwd(g_raw);
+        float o_val = sigmoid_fwd(o_raw);
+        float c_val = f_val * c_prev + i_val * g_val;
+        float tanh_c = tanh_fwd(c_val);
+
+        float gh = grad_h;
+        float gc = grad_c;
+        // dc' = (gh * o) routed through bwd_diff(tanh_fwd) + gc
+        float dc = _tanh_grad(c_val, gh * o_val) + gc;
+        float di = _sigmoid_grad(i_raw, dc * g_val);
+        float df = _sigmoid_grad(f_raw, dc * c_prev);
+        float dg = _tanh_grad(g_raw, dc * i_val);
+        float dout_do = _sigmoid_grad(o_raw, gh * tanh_c);
+
+        gate_grad_ih[0] = di;  gate_grad_ih[1] = df;
+        gate_grad_ih[2] = dg;  gate_grad_ih[3] = dout_do;
+        gate_grad_hh = gate_grad_ih;  // LSTM: same gradient for ih and hh
+        grad_c_prev = dc * f_val;
+        grad_h_prev_direct = 0.0f;
+    }
+};
+
+struct GruCellImpl : IRnnCell {
+    static const int GATE_SIZE = 3;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[4], float hh_gate[4], float c_prev,
+        out float h_new, out float c_new
+    ) {
+        float r = sigmoid_fwd(ih_gate[0] + hh_gate[0]);
+        float z = sigmoid_fwd(ih_gate[1] + hh_gate[1]);
+        float n = tanh_fwd(ih_gate[2] + r * hh_gate[2]);
+        h_new = (1.0f - z) * n + z * c_prev;
+        c_new = 0.0f;
+    }
+
+    static void bwd_update(
+        float ih_gate[4], float hh_gate[4],
+        float c_prev, float grad_h, float grad_c,
+        out float gate_grad_ih[4], out float gate_grad_hh[4],
+        out float grad_c_prev, out float grad_h_prev_direct
+    ) {
+        float r_raw = ih_gate[0] + hh_gate[0];
+        float z_raw = ih_gate[1] + hh_gate[1];
+        float r_val = sigmoid_fwd(r_raw);
+        float z_val = sigmoid_fwd(z_raw);
+        float n_raw_input = ih_gate[2] + r_val * hh_gate[2];
+        float n_val = tanh_fwd(n_raw_input);
+        // c_prev carries h_prev[h] for non-cell-state cells
+        float h_prev_val = c_prev;
+
+        float gh = grad_h;
+        float dn = gh * (1.0f - z_val);
+        float dz = gh * (h_prev_val - n_val);
+        grad_h_prev_direct = gh * z_val;
+
+        float dn_raw = _tanh_grad(n_raw_input, dn);
+        float dr = _sigmoid_grad(r_raw, dn_raw * hh_gate[2]);
+        dz = _sigmoid_grad(z_raw, dz);
+
+        gate_grad_ih[0] = dr;  gate_grad_ih[1] = dz;  gate_grad_ih[2] = dn_raw;
+        gate_grad_hh[0] = dr;  gate_grad_hh[1] = dz;
+        // n-gate hh path: dn_raw * r_val (r-scaled)
+        gate_grad_hh[2] = dn_raw * r_val;
+        grad_c_prev = 0.0f;
+    }
+};
+
+struct RnnTanhCellImpl : IRnnCell {
+    static const int GATE_SIZE = 1;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[4], float hh_gate[4], float c_prev,
+        out float h_new, out float c_new
+    ) {
+        h_new = tanh_fwd(ih_gate[0] + hh_gate[0]);
+        c_new = 0.0f;
+    }
+
+    static void bwd_update(
+        float ih_gate[4], float hh_gate[4],
+        float c_prev, float grad_h, float grad_c,
+        out float gate_grad_ih[4], out float gate_grad_hh[4],
+        out float grad_c_prev, out float grad_h_prev_direct
+    ) {
+        float raw = ih_gate[0] + hh_gate[0];
+        float d_raw = _tanh_grad(raw, grad_h);
+        gate_grad_ih[0] = d_raw;
+        gate_grad_hh[0] = d_raw;
+        grad_c_prev = 0.0f;
+        grad_h_prev_direct = 0.0f;
+    }
+};
+
+struct RnnReluCellImpl : IRnnCell {
+    static const int GATE_SIZE = 1;
+    static const bool HAS_CELL_STATE = false;
+
+    static void update(
+        float ih_gate[4], float hh_gate[4], float c_prev,
+        out float h_new, out float c_new
+    ) {
+        h_new = relu_fwd(ih_gate[0] + hh_gate[0]);
+        c_new = 0.0f;
+    }
+
+    static void bwd_update(
+        float ih_gate[4], float hh_gate[4],
+        float c_prev, float grad_h, float grad_c,
+        out float gate_grad_ih[4], out float gate_grad_hh[4],
+        out float grad_c_prev, out float grad_h_prev_direct
+    ) {
+        float raw = ih_gate[0] + hh_gate[0];
+        float d_raw = _relu_grad(raw, grad_h);
+        gate_grad_ih[0] = d_raw;
+        gate_grad_hh[0] = d_raw;
+        grad_c_prev = 0.0f;
+        grad_h_prev_direct = 0.0f;
+    }
+};
+
+// ── Push constants / KernelArgs ────────────────────────────────────────
+// B2: Always the full LSTM-shaped layout — no Jinja struct-field
+// conditionals.  c_prev / grad_c / grad_c_prev / stride_c are always
+// present; non-LSTM cells simply don't read/write those slots.
 
 struct BwdPC {
     uint hidden_size;
@@ -53,9 +226,7 @@ struct BwdPC {
     uint stride_w_hh;
     uint stride_x;
     uint stride_h;
-/*{%*/ if has_cell_state /*%}*/
-    uint stride_c;
-/*{%*/ endif /*%}*/
+    uint stride_c;       // always present (unused if !HAS_CELL_STATE)
     uint has_bias;
 };
 
@@ -64,28 +235,16 @@ struct BwdPC {
 struct KernelArgs {
     StructuredBuffer</*{{*/ dtype /*}}float*/> x_t;
     StructuredBuffer</*{{*/ dtype /*}}float*/> h_prev;
-/*{%*/ if has_cell_state /*%}*/
-    StructuredBuffer</*{{*/ dtype /*}}float*/> c_prev;
-/*{%*/ endif /*%}*/
+    StructuredBuffer</*{{*/ dtype /*}}float*/> c_prev;       // always present
     StructuredBuffer</*{{*/ dtype /*}}float*/> w_ih;
     StructuredBuffer</*{{*/ dtype /*}}float*/> w_hh;
     StructuredBuffer</*{{*/ dtype /*}}float*/> b_ih;
     StructuredBuffer</*{{*/ dtype /*}}float*/> b_hh;
     StructuredBuffer</*{{*/ dtype /*}}float*/> grad_h;
-/*{%*/ if has_cell_state /*%}*/
-    StructuredBuffer</*{{*/ dtype /*}}float*/> grad_c;
-/*{%*/ endif /*%}*/
+    StructuredBuffer</*{{*/ dtype /*}}float*/> grad_c;        // always present
     RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_x;
     RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_h_prev;
-/*{%*/ if has_cell_state /*%}*/
-    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_c_prev;
-/*{%*/ endif /*%}*/
-    // M20.1.c: bind weight + bias grad accumulators as RWStructuredBuffer<uint>
-    // so the CAS-based vk_atomic_add (in lib/atomics.slang) can reinterpret
-    // the float values via asuint/asfloat. The host-side caller zeros each
-    // buffer before the BPTT loop (lowerings/rnn/bwd_vulkan.py uses
-    // torch.zeros_like(w_ih) etc.) — atomic-add into a zero-init buffer is
-    // the correct semantics for cross-batch + cross-time-step accumulation.
+    RWStructuredBuffer</*{{*/ dtype /*}}float*/> grad_c_prev;  // always present
     RWStructuredBuffer<uint> grad_w_ih;
     RWStructuredBuffer<uint> grad_w_hh;
     RWStructuredBuffer<uint> grad_b_ih;
@@ -97,12 +256,6 @@ struct KernelArgs {
 groupshared float scratch_in[/*{{*/ hidden_size /*}}256*/];
 
 // ── M20.1: thin wrappers around lib primitive bwd_diffs ────────────────
-//
-// Each helper returns the gradient w.r.t. the input given the gradient
-// w.r.t. the output and the saved forward primal. They route through
-// bwd_diff(<lib primitive>) so the activation-derivative formulae live
-// in one place (lib/pointwise.slang) and bug fixes there propagate to
-// every consumer.
 
 [ForceInline]
 float _sigmoid_grad(float x_primal, float grad_out) {
@@ -125,9 +278,14 @@ float _relu_grad(float x_primal, float grad_out) {
     return dp.d;
 }
 
+// ── Entry point ───────────────────────────────────────────────────────
+// B2: Generic over <Cell : IRnnCell>.  The cell type is selected by the
+// slangc entry-point name, e.g. ``entry="computeMain<LstmCellImpl>"``.
+// Cell.GATE_SIZE and Cell.HAS_CELL_STATE are compile-time constants.
+
 [shader("compute")]
 [numthreads(/*{{*/ hidden_size /*}}256*/, 1, 1)]
-void computeMain(uint3 gtid : SV_DispatchThreadID,
+void computeMain<Cell : IRnnCell>(uint3 gtid : SV_DispatchThreadID,
                  uint3 lid : SV_GroupThreadID,
                  uint3 gid : SV_GroupID) {
     uint batch = gid.x;
@@ -139,14 +297,12 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
 
     uint x_off = batch * pc.stride_x;
     uint h_off = batch * pc.stride_h;
-/*{%*/ if has_cell_state /*%}*/
     uint c_off = batch * pc.stride_c;
-/*{%*/ endif /*%}*/
 
-    // ── Recompute pre-activation raw gate sums (forward mirror). ─
-    float ih_gate[/*{{*/ gate_size /*}}4*/];
-    float hh_gate[/*{{*/ gate_size /*}}4*/];
-    for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
+    // ── Recompute pre-activation raw gate sums (forward mirror) ───
+    float ih_gate[4];
+    float hh_gate[4];
+    for (uint g = 0u; g < (uint)Cell.GATE_SIZE; g++) {
         uint gate_row = g * pc.hidden_size + hid;
         float acc_ih = 0.0f;
         for (uint k = 0u; k < pc.input_size; k++) {
@@ -166,107 +322,37 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
         hh_gate[g] = acc_hh;
     }
 
-    // ── Cell-type-specific gate-gradient computation ─────────────
-    // The activation derivatives use bwd_diff(<lib primitive>) — the
-    // cell-state chain rule (where present) is composed manually.
-/*{%*/ if cell_type == "lstm" /*%}*/
-    // LSTM: c' = f*c + i*g; h' = o * tanh(c')
-    //   ∂L/∂o_raw = ∂σ(o_raw) * (gh * tanh(c'))
-    //   ∂L/∂c'    = gh * o * ∂tanh(c') + gc
-    //   ∂L/∂i_raw = ∂σ(i_raw) * (dc' * g)
-    //   ∂L/∂f_raw = ∂σ(f_raw) * (dc' * c_prev)
-    //   ∂L/∂g_raw = ∂tanh(g_raw) * (dc' * i)
-    //   ∂L/∂c_prev = dc' * f
-    float i_raw = ih_gate[0] + hh_gate[0];
-    float f_raw = ih_gate[1] + hh_gate[1];
-    float g_raw = ih_gate[2] + hh_gate[2];
-    float o_raw = ih_gate[3] + hh_gate[3];
-    float i_val = sigmoid_fwd(i_raw);
-    float f_val = sigmoid_fwd(f_raw);
-    float g_val = tanh_fwd(g_raw);
-    float o_val = sigmoid_fwd(o_raw);
-    float c_prev_val = (float)args.c_prev[c_off + hid];
-    float c_val = f_val * c_prev_val + i_val * g_val;
-    float tanh_c = tanh_fwd(c_val);
+    // ── Per-cell-type backward via interface bwd_update() ────────
+    float c_prev_val;
+    if (Cell.HAS_CELL_STATE) {
+        c_prev_val = (float)args.c_prev[c_off + hid];
+    } else {
+        c_prev_val = (float)args.h_prev[h_off + hid];
+    }
 
     float gh = (float)args.grad_h[h_off + hid];
-    float gc = (float)args.grad_c[h_off + hid];
-    // dc' propagation: gh contributes through h' = o * tanh(c'), so
-    // dc' includes (gh * o) routed through bwd_diff(tanh_fwd).
-    float dc = _tanh_grad(c_val, gh * o_val) + gc;
-    // di / df / dg / do via per-primitive bwd_diff:
-    float di = _sigmoid_grad(i_raw, dc * g_val);
-    float df = _sigmoid_grad(f_raw, dc * c_prev_val);
-    float dg = _tanh_grad(g_raw, dc * i_val);
-    float dout_do = _sigmoid_grad(o_raw, gh * tanh_c);
+    float gc = Cell.HAS_CELL_STATE ? (float)args.grad_c[h_off + hid] : 0.0f;
 
-    float gate_grad[4] = { di, df, dg, dout_do };
-    float grad_c_prev_val = dc * f_val;
-    args.grad_c_prev[h_off + hid] = (/*{{*/ dtype /*}}float*/)grad_c_prev_val;
-    float dh_prev_direct = 0.0f;
-/*{%*/ elif cell_type == "gru" /*%}*/
-    // GRU: r = σ(...), z = σ(...), n = tanh(ih_n + r * hh_n);
-    //      h' = (1-z)*n + z*h_prev
-    //   dn         = gh * (1 - z)
-    //   dz         = gh * (h_prev - n)
-    //   dh_prev (z-route) = gh * z
-    //   dn_raw = bwd_diff(tanh_fwd)(ih_n + r*hh_n, dn) gives gradient
-    //           w.r.t. the tanh input. Split between ih_n and r*hh_n.
-    //   dr = dn_raw * hh_n; then ∂σ(r_raw); dr_sig = dz; etc.
-    float r_raw = ih_gate[0] + hh_gate[0];
-    float z_raw = ih_gate[1] + hh_gate[1];
-    float r_val = sigmoid_fwd(r_raw);
-    float z_val = sigmoid_fwd(z_raw);
-    float n_raw_input = ih_gate[2] + r_val * hh_gate[2];
-    float n_val = tanh_fwd(n_raw_input);
-    float h_prev_val = (float)args.h_prev[h_off + hid];
+    float gate_grad_ih[4];
+    float gate_grad_hh[4];
+    float grad_c_prev_val;
+    float dh_prev_direct;
 
-    float gh = (float)args.grad_h[h_off + hid];
-    float dn = gh * (1.0f - z_val);
-    float dz = gh * (h_prev_val - n_val);
-    float dh_prev_direct = gh * z_val;
+    Cell.bwd_update(
+        ih_gate, hh_gate, c_prev_val, gh, gc,
+        gate_grad_ih, gate_grad_hh,
+        grad_c_prev_val, dh_prev_direct
+    );
 
-    // bwd through tanh on the n-gate input.
-    float dn_raw = _tanh_grad(n_raw_input, dn);
-    float dr = dn_raw * hh_gate[2];
-    dr = _sigmoid_grad(r_raw, dr);
-    dz = _sigmoid_grad(z_raw, dz);
-
-    // Gate gradients applied to ih vs hh differ for the n-gate:
-    //   ih path of n: dn_raw (direct contribution)
-    //   hh path of n: dn_raw * r_val (through the r-scaling)
-    float gate_grad[3] = { dr, dz, dn_raw };
-    float gate_grad_hh[3] = { dr, dz, dn_raw * r_val };
-/*{%*/ elif cell_type == "rnn_tanh" /*%}*/
-    float raw = ih_gate[0] + hh_gate[0];
-    float gh = (float)args.grad_h[h_off + hid];
-    float d_raw = _tanh_grad(raw, gh);
-    float gate_grad[1] = { d_raw };
-    float gate_grad_hh[1] = { d_raw };
-    float dh_prev_direct = 0.0f;
-/*{%*/ elif cell_type == "rnn_relu" /*%}*/
-    float raw = ih_gate[0] + hh_gate[0];
-    float gh = (float)args.grad_h[h_off + hid];
-    float d_raw = _relu_grad(raw, gh);
-    float gate_grad[1] = { d_raw };
-    float gate_grad_hh[1] = { d_raw };
-    float dh_prev_direct = 0.0f;
-/*{%*/ endif /*%}*/
+    if (Cell.HAS_CELL_STATE) {
+        args.grad_c_prev[h_off + hid] = (/*{{*/ dtype /*}}float*/)grad_c_prev_val;
+    }
 
     // ── Accumulate W_ih, W_hh, b_ih, b_hh gradients ─────────────
-    // M20.1.c: vk_atomic_add (CAS-based, RDNA1-portable — see
-    // lib/atomics.slang) replaces the prior non-atomic read-modify-write.
-    // The race surfaces under batch_size > 1: each batch element's
-    // workgroup writes to the same (gate_row, k) cell, dropping updates.
-    // Mirrors the canonical pattern from templates/slang_conv_bwd.slang.
-    for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
+    for (uint g = 0u; g < (uint)Cell.GATE_SIZE; g++) {
         uint gate_row = g * pc.hidden_size + hid;
-        float gg_ih = gate_grad[g];
-/*{%*/ if cell_type in ("gru", "rnn_tanh", "rnn_relu") /*%}*/
+        float gg_ih = gate_grad_ih[g];
         float gg_hh = gate_grad_hh[g];
-/*{%*/ else /*%}*/
-        float gg_hh = gg_ih;
-/*{%*/ endif /*%}*/
         for (uint k = 0u; k < pc.input_size; k++) {
             uint idx = gate_row * pc.stride_w_ih + k;
             vk_atomic_add(args.grad_w_ih, idx, gg_ih * (float)args.x_t[x_off + k]);
@@ -284,9 +370,9 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
     // ── Reduce to grad_x[k] ────────────────────────────────────
     for (uint k = 0u; k < pc.input_size; k++) {
         float contrib = 0.0f;
-        for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
+        for (uint g = 0u; g < (uint)Cell.GATE_SIZE; g++) {
             uint gate_row = g * pc.hidden_size + hid;
-            contrib += gate_grad[g] * (float)args.w_ih[gate_row * pc.stride_w_ih + k];
+            contrib += gate_grad_ih[g] * (float)args.w_ih[gate_row * pc.stride_w_ih + k];
         }
         scratch_in[hid] = contrib;
         GroupMemoryBarrierWithGroupSync();
@@ -308,13 +394,9 @@ void computeMain(uint3 gtid : SV_DispatchThreadID,
     // ── Reduce to grad_h_prev[k] ───────────────────────────────
     for (uint k = 0u; k < pc.hidden_size; k++) {
         float contrib = 0.0f;
-        for (uint g = 0u; g < /*{{*/ gate_size /*}}4*/u; g++) {
+        for (uint g = 0u; g < (uint)Cell.GATE_SIZE; g++) {
             uint gate_row = g * pc.hidden_size + hid;
-/*{%*/ if cell_type in ("gru", "rnn_tanh", "rnn_relu") /*%}*/
             contrib += gate_grad_hh[g] * (float)args.w_hh[gate_row * pc.stride_w_hh + k];
-/*{%*/ else /*%}*/
-            contrib += gate_grad[g] * (float)args.w_hh[gate_row * pc.stride_w_hh + k];
-/*{%*/ endif /*%}*/
         }
         if (hid == k) {
             contrib += dh_prev_direct;

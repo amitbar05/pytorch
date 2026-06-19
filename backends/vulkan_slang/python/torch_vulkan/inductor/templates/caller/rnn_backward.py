@@ -18,15 +18,18 @@ _rnn_cell_bwd_cache: dict[tuple, str] = {}
 
 
 def _render_rnn_cell_bwd(
-    cell_type: str,
     hidden_size: int,
     input_size: int,
     dtype: str = "float",
 ) -> str:
     """Render the rnn_cell_bwd Jinja2 template.
 
+    B2: `cell_type` is no longer a Jinja variable — the rendered source
+    is identical for all cell types (all four IRnnCell impl structs are
+    always emitted).  The cell type is selected at dispatch time via the
+    slangc entry-point name (``entry="computeMain<LstmCellImpl>"``).
+
     Args:
-        cell_type: One of ``"lstm"``, ``"gru"``, ``"rnn_tanh"``, ``"rnn_relu"``.
         hidden_size: Number of hidden units.
         input_size: Input feature dimension.
         dtype: Slang type string — ``"float"`` (f32) or ``"half"`` (f16).
@@ -36,12 +39,7 @@ def _render_rnn_cell_bwd(
     """
     from jinja2 import Environment
 
-    if cell_type not in _RNN_CELL_TYPES:
-        raise ValueError(
-            f"Unknown RNN cell_type '{cell_type}'. Must be one of: {_RNN_CELL_TYPES}"
-        )
-
-    key = (cell_type, hidden_size, input_size, dtype)
+    key = (hidden_size, input_size, dtype)
     if key in _rnn_cell_bwd_cache:
         return _rnn_cell_bwd_cache[key]
 
@@ -52,7 +50,6 @@ def _render_rnn_cell_bwd(
     env = Environment()
     tmpl = env.from_string(src)
     rendered = tmpl.render(
-        cell_type=cell_type,
         hidden_size=hidden_size,
         input_size=input_size,
         dtype=dtype,
@@ -123,17 +120,17 @@ def _dispatch_rnn_cell_bwd(
         cache_key: SPIR-V cache key (computed if None).
     """
     from ...runtime import compile_and_dispatch
+    from .rnn import _rnn_cell_entry
 
-    is_lstm = cell_type == "lstm"
+    entry = _rnn_cell_entry(cell_type)
 
     if src is None or cache_key is None:
         src = _render_rnn_cell_bwd(
-            cell_type=cell_type,
             hidden_size=hidden_size,
             input_size=input_size,
             dtype=dtype,
         )
-        cache_key = f"slang_rnn_bwd_{cell_type}_h{hidden_size}_i{input_size}_{dtype}"
+        cache_key = f"slang_rnn_bwd_h{hidden_size}_i{input_size}_{dtype}"
 
     stride_w_ih = input_size
     stride_w_hh = hidden_size
@@ -141,29 +138,18 @@ def _dispatch_rnn_cell_bwd(
     stride_h = hidden_size
     stride_c = hidden_size
 
-    if is_lstm:
-        pc = struct.pack(
-            "8I",
-            hidden_size,
-            input_size,
-            stride_w_ih,
-            stride_w_hh,
-            stride_x,
-            stride_h,
-            stride_c,
-            1 if has_bias else 0,
-        )
-    else:
-        pc = struct.pack(
-            "7I",
-            hidden_size,
-            input_size,
-            stride_w_ih,
-            stride_w_hh,
-            stride_x,
-            stride_h,
-            1 if has_bias else 0,
-        )
+    # B2: Always 8-field PC (with stride_c).  Non-LSTM cells ignore it.
+    pc = struct.pack(
+        "8I",
+        hidden_size,
+        input_size,
+        stride_w_ih,
+        stride_w_hh,
+        stride_x,
+        stride_h,
+        stride_c,
+        1 if has_bias else 0,
+    )
 
     # Ensure all inputs are contiguous.
     for t_name in (
@@ -186,14 +172,14 @@ def _dispatch_rnn_cell_bwd(
             locals()[t_name] = t.contiguous()
 
     # Build buffer list matching KernelArgs field order.
-    # [x_t, h_prev, [c_prev], w_ih, w_hh, b_ih, b_hh, grad_h, [grad_c],
-    #  grad_x, grad_h_prev, [grad_c_prev], grad_w_ih, grad_w_hh,
+    # [x_t, h_prev, c_prev, w_ih, w_hh, b_ih, b_hh, grad_h, grad_c,
+    #  grad_x, grad_h_prev, grad_c_prev, grad_w_ih, grad_w_hh,
     #  grad_b_ih, grad_b_hh]
+    # B2: All buffer slots always present (non-LSTM cells pass dummy).
     buffers: list[torch.Tensor] = [x_t, h_prev]
-    if is_lstm:
-        buffers.append(
-            c_prev if c_prev is not None else torch.empty(0, device=x_t.device)
-        )
+    buffers.append(
+        c_prev if c_prev is not None else torch.empty(0, device=x_t.device)
+    )
     buffers.extend([w_ih, w_hh])
     if has_bias and b_ih is not None:
         buffers.append(b_ih.contiguous() if not b_ih.is_contiguous() else b_ih)
@@ -204,18 +190,16 @@ def _dispatch_rnn_cell_bwd(
     else:
         buffers.append(torch.empty(0, device=x_t.device))
     buffers.append(grad_h)
-    if is_lstm:
-        buffers.append(
-            grad_c if grad_c is not None else torch.empty(0, device=x_t.device)
-        )
+    buffers.append(
+        grad_c if grad_c is not None else torch.empty(0, device=x_t.device)
+    )
     buffers.append(grad_x)
     buffers.append(grad_h_prev)
-    if is_lstm:
-        buffers.append(
-            grad_c_prev
-            if grad_c_prev is not None
-            else torch.empty(0, device=x_t.device)
-        )
+    buffers.append(
+        grad_c_prev
+        if grad_c_prev is not None
+        else torch.empty(0, device=x_t.device)
+    )
     buffers.append(grad_w_ih)
     buffers.append(grad_w_hh)
     if has_bias and grad_b_ih is not None:
@@ -231,15 +215,13 @@ def _dispatch_rnn_cell_bwd(
     else:
         buffers.append(torch.empty(0, device=x_t.device))
 
-    # All outputs are RW (accumulated in-place), but we still need to tell
-    # compile_and_dispatch how many are outputs.
-    # Outputs: grad_x, grad_h_prev, [grad_c_prev], grad_w_ih, grad_w_hh,
+    # All outputs are RW (accumulated in-place).
+    # Outputs: grad_x, grad_h_prev, grad_c_prev, grad_w_ih, grad_w_hh,
     #          grad_b_ih, grad_b_hh
-    num_outputs = 5 if has_bias else 3
-    if is_lstm:
-        num_outputs += 1  # grad_c_prev
+    # B2: grad_c_prev always present (non-LSTM cells just don't write it).
+    num_outputs = 5  # grad_x, grad_h_prev, grad_c_prev, grad_w_ih, grad_w_hh
     if has_bias:
-        num_outputs += 0  # already counted
+        num_outputs += 2  # grad_b_ih, grad_b_hh
 
     grid_x = batch_size
     grid_y = 1
@@ -254,6 +236,7 @@ def _dispatch_rnn_cell_bwd(
         push_constants=pc,
         num_outputs=num_outputs,
         cache_key=cache_key,
+        entry=entry,
     )
 
 
@@ -288,13 +271,12 @@ class _SlangTileRNNBackward:
             return cached
 
         src = _render_rnn_cell_bwd(
-            cell_type=self.cell_type,
             hidden_size=hidden_size,
             input_size=input_size,
             dtype=dtype,
         )
         cache_key = (
-            f"slang_rnn_bwd_{self.cell_type}_h{hidden_size}_i{input_size}_{dtype}"
+            f"slang_rnn_bwd_h{hidden_size}_i{input_size}_{dtype}"
         )
         cached = (src, cache_key)
         self._per_spec[spec_key] = cached
