@@ -594,6 +594,15 @@ def _slang_tile_conv2d_bwd(
         (44, threads_h),
     ]
 
+    # S2.0c: conv backward indexes grad_out as 4D NCHW (stride(2)/stride(3)
+    # below). A 1x1-conv classifier after a global pool + flatten(1) can
+    # deliver grad_out already collapsed to (N, C_out) (oH==oW==1), so restore
+    # the canonical 4D shape from the known dims before reading spatial
+    # strides. reshape raises if the element count disagrees, so a genuinely
+    # wrong shape still fails loudly rather than silently mis-indexing.
+    if grad_out_f32.dim() != 4:
+        grad_out_f32 = grad_out_f32.reshape(int(N), int(C_out), int(oH), int(oW))
+
     # Ensure contiguous for direct buffer access
     if not input_f32.is_contiguous():
         input_f32 = input_f32.contiguous()

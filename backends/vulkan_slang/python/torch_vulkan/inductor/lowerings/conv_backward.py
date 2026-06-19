@@ -77,13 +77,17 @@ def _vk_realize_then_unwrap(x):
     """
     if isinstance(x, _ir_module.TensorBox):
         x = x.data
-    while isinstance(x, _ir_module.StorageBox):
-        x = x.data  # Unwrap — ComputedBuffer fallback handles Pointwise below
-    if isinstance(x, _ir_module.StorageBox):
-        x = x.data
-    # Unwrap View layers (View → inner data)
-    while isinstance(x, _ir_module.BaseView) and hasattr(x, 'data'):
-        x = x.data
+    # S2.0b: unwrap StorageBox/View layers to a fixpoint (interleaved nesting
+    # like StorageBox → View → StorageBox → Buffer would otherwise leave a
+    # trailing StorageBox that crashes decide_layout).
+    while True:
+        if isinstance(x, _ir_module.StorageBox):
+            x = x.data
+            continue
+        if isinstance(x, _ir_module.BaseView) and hasattr(x, 'data'):
+            x = x.data
+            continue
+        break
     # If result is not a real Buffer (Pointwise/Reduction/etc.),
     # wrap in a ComputedBuffer so it gets codegen_reference() and allocation.
     if not isinstance(x, (_ir_module.Buffer, _ir_module.ReinterpretView)):

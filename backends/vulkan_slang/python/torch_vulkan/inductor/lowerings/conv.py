@@ -166,16 +166,19 @@ def _register_conv_and_pool_lowerings() -> None:
         if isinstance(x, _ir.TensorBox):
             x = x.data
 
-        # If StorageBox contains Pointwise/Reduction, realize it first
-        while isinstance(x, _ir.StorageBox):
-            x = x.data  # Unwrap — ComputedBuffer fallback handles Pointwise below
-
-        # Unwrap to raw data (Buffer/ReinterpretView)
-        if isinstance(x, _ir.StorageBox):
-            x = x.data
-        # Unwrap View layers (View → inner data)
-        while isinstance(x, _ir.BaseView) and hasattr(x, 'data'):
-            x = x.data
+        # S2.0b: unwrap StorageBox/View layers to a fixpoint — the nesting can
+        # interleave (StorageBox → View → StorageBox → Buffer), so a single
+        # StorageBox pass followed by a single View pass leaves a trailing
+        # StorageBox that crashes decide_layout ('StorageBox' has no
+        # get_pointwise_size). Loop until x is neither.
+        while True:
+            if isinstance(x, _ir.StorageBox):
+                x = x.data
+                continue
+            if isinstance(x, _ir.BaseView) and hasattr(x, 'data'):
+                x = x.data
+                continue
+            break
         # If result is not a real Buffer (Pointwise/Reduction/etc.),
         # wrap in a ComputedBuffer so it gets codegen_reference() and allocation.
         if not isinstance(x, (_ir.Buffer, _ir.ReinterpretView)):
