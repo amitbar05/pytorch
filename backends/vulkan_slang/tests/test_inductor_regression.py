@@ -42851,6 +42851,48 @@ class TestM211DeviceProfile:
         c = dp.compute_device_id(props2)
         assert c != a
 
+    def test_profile_limit_drives_codegen(self, tmp_path):
+        """S0.1 — ``profile_limit`` makes the warm-up profile drive WG sizing.
+
+        Codegen used to read device limits from the device-interface query,
+        which under-reports ``max_workgroup_size`` (256 vs the real 1024) and
+        returns no CU count. ``threadgroup_sizing`` now prefers the measured
+        profile via ``profile_limit``; an injected synthetic profile must
+        change the limit the heuristic sees, and the absence of any profile
+        must fall back to the caller's value.
+        """
+        from torch_vulkan.inductor import device_profile as dp
+
+        prior = self._isolated_cache(tmp_path)
+        try:
+            # Injected profile (few CUs / small ceiling) overrides the fallback.
+            dp.reset_for_test()
+            dp.CURRENT = {
+                "device_id": "synthetic",
+                "limits": {"max_workgroup_size": 512, "compute_units": 7},
+            }
+            assert dp.profile_limit("max_workgroup_size", 256) == 512
+            assert dp.profile_limit("compute_units", 20) == 7
+            # Unknown / non-positive keys fall through to the caller's value.
+            assert dp.profile_limit("compute_units", 20) != 20
+            assert dp.profile_limit("bogus_key", 999) == 999
+
+            # No profile in memory and an empty cache dir -> fallback returned.
+            dp.reset_for_test()
+            assert dp.profile_limit("max_workgroup_size", 256) == 256
+            assert dp.profile_limit("compute_units", 20) == 20
+        finally:
+            dp.reset_for_test()
+            self._restore_cache(prior)
+
+        # Structural: the WG-sizing mixin must consult profile_limit (so the
+        # mechanism above is actually on the codegen path, not dead).
+        import inspect
+        from torch_vulkan.inductor.kernel import threadgroup_sizing as tgs
+        src = inspect.getsource(tgs)
+        assert "profile_limit" in src
+        assert src.count("profile_limit(") >= 2  # max_workgroup_size + compute_units
+
     @pytest.mark.timeout(300)
     def test_profile_budget_under_500ms(self, tmp_path):
         """``profile_device`` measurement phase fits in < 500 ms.

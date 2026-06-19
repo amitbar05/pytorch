@@ -463,6 +463,13 @@ class ThreadgroupSizingMixin:
             max_wg = props.max_workgroup_size
         except Exception:
             max_wg = 256
+        # S0.1: prefer the warm-up profile's measured workgroup ceiling. The
+        # device-interface query under-reports it (256 vs the real 1024 on
+        # RDNA1), capping WG sizes 4x below the hardware limit; the profile
+        # captured the authoritative VkPhysicalDeviceLimits value at warm-up.
+        from ..device_profile import profile_limit
+
+        max_wg = profile_limit("max_workgroup_size", max_wg)
 
         # M20.5: use reflection-derived subgroup_size as a fallback when
         # the device query returns 0 / None.  Falls back to 64 (RDNA1 default).
@@ -588,6 +595,13 @@ class ThreadgroupSizingMixin:
             max_wg = props.max_workgroup_size
         except Exception:
             max_wg = 256
+        # S0.1: prefer the warm-up profile's measured workgroup ceiling. The
+        # device-interface query under-reports it (256 vs the real 1024 on
+        # RDNA1), capping WG sizes 4x below the hardware limit; the profile
+        # captured the authoritative VkPhysicalDeviceLimits value at warm-up.
+        from ..device_profile import profile_limit
+
+        max_wg = profile_limit("max_workgroup_size", max_wg)
 
         # M20.5: use reflection-derived subgroup_size as a fallback when
         # the device query returns 0 / None.  Falls back to 64 (RDNA1 default).
@@ -647,6 +661,12 @@ class ThreadgroupSizingMixin:
                 num_cus = getattr(props, "num_compute_units", 20)
             except Exception:
                 num_cus = 20
+            # S0.1: prefer the warm-up profile's measured CU count (the
+            # device-interface query returns None here -> hardcoded 20, but the
+            # RX 5600 XT has 16); this drives the occupancy target below.
+            from ..device_profile import profile_limit
+
+            num_cus = profile_limit("compute_units", num_cus)
             # Dispatch grid = product of non-reduction dimensions
             non_red_numel = sympy.S.One
             for prefix, numel in self.numels.items():

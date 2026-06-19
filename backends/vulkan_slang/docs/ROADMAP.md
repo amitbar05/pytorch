@@ -272,23 +272,25 @@ on a validation-layer + parity floor.
 - **Exit**: `TestConvGnReluFusedWriteCoverage` — fused fwd+bwd parity vs CPU
   under `VUID_AS_ERROR=1`, asserted over ≥3 reruns (catch non-determinism).
 
-### S0.1 — 🔥 Make the device profile *drive* codegen (the missing half of "probe")
+### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
 
-The probe measures the GPU but **codegen ignores it.** Wire the captured
-profile into the decisions that currently use hardcoded NAVI10 constants:
-- **WG sizing / numthreads cap** ← `limits.max_workgroup_size`, `compute_units`
-  (`kernel/main.py` hardcodes 1024).
-- **LDS budget** ← `limits.shared_memory_per_workgroup_bytes` (hardcoded 65536).
-- **Occupancy gate / register-aware WG** ← CU count + LDS BW.
-- **Persistent-vs-grid-stride and batch-vs-direct dispatch thresholds** ←
-  `empty_kernel_launch_us`, `memcpy_d2d_GBps`.
-- **Reduction `rnumel` cap** ← already via `_wave64_persistent_ok` (extend it).
-This is what makes warm-up portable beyond the one dev GPU (an 80-CU card gets
-different tiling than a 16-CU card).
-- **Files**: `scheduling_helpers.py`, `kernel/main.py`,
-  `kernel/threadgroup_sizing.py`, `device_profile.py`.
-- **Exit**: `TestProfileDrivesCodegen` — injecting a synthetic profile (small
-  LDS / few CUs) changes the chosen WG/tile vs the NAVI10 profile.
+**WG sizing wired 2026-06-20.** `threadgroup_sizing.py` read device limits from
+the device-interface query, which on this stack under-reports
+`max_workgroup_size` as **256** (real: **1024**) and returns **no CU count**
+(→ hardcoded 20; real: 16) — so WG sizes were capped 4× below the hardware
+ceiling. Added `device_profile.profile_limit(key, fallback)` (reads the
+warm-up profile, loading the on-disk cache without ever profiling at codegen
+time) and routed all four `max_workgroup_size`/`compute_units` sites through it.
+Result: `conv_gn_relu` warm step **8.2 ms → 6.9 ms (~16%)**, others neutral,
+**zero correctness regressions** vs a clean-main baseline.
+- **Files**: `device_profile.py:profile_limit`, `kernel/threadgroup_sizing.py`.
+- **Exit**: `TestM211DeviceProfile::test_profile_limit_drives_codegen` ✅.
+
+**Still open (S0.1 remainder):** the rich *microbench* data is still unused —
+LDS budget ← `shared_memory_per_workgroup_bytes`; persistent-vs-grid-stride and
+batch-vs-direct dispatch thresholds ← `empty_kernel_launch_us` / `memcpy_d2d_GBps`;
+matmul/conv tile selection ← measured mem BW. Wire these next so warm-up is
+fully portable (an 80-CU card tiles differently from a 16-CU card).
 
 ### S0.2 — Complete the device-limits pybind query
 

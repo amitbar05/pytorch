@@ -721,6 +721,52 @@ def current() -> Optional[dict[str, Any]]:
     return CURRENT
 
 
+def _current_or_cached() -> Optional[dict[str, Any]]:
+    """Return the in-memory profile, or load it from the on-disk cache.
+
+    Never profiles (that would block codegen for seconds). Reads the cached
+    JSON written by a prior ``prepare_device`` / auto-probe if present, sets
+    ``CURRENT``, and returns it; returns ``None`` if no cache exists.
+    """
+    global CURRENT
+    if CURRENT is not None:
+        return CURRENT
+    try:
+        name = _device_name_safe()
+        device_id = compute_device_id({
+            "device_name": name,
+            "vendor_id": _guess_vendor_id(name),
+            "device_type": _classify_device_type(name),
+        })
+        cached = _read_cache(cache_path(device_id))
+        if cached is not None and cached.get("device_id") == device_id:
+            CURRENT = cached
+            return cached
+    except Exception:
+        pass
+    return None
+
+
+def profile_limit(key: str, fallback: int) -> int:
+    """S0.1 — device limit from the warm-up profile, else ``fallback``.
+
+    The warm-up microbench captures accurate device limits
+    (``max_workgroup_size``, ``compute_units``, ``subgroup_size_max``,
+    ``shared_memory_per_workgroup_bytes``). Codegen historically read these
+    from the ``device_interface`` query, which on this stack under-reports
+    (``max_workgroup_size`` 256 vs the real 1024; ``compute_units`` missing) —
+    so WG sizing was capped 4× below the hardware ceiling. Prefer the measured
+    profile value when it is present and a positive int; otherwise the caller's
+    ``fallback`` (its existing device-interface / hardcoded path).
+    """
+    prof = _current_or_cached()
+    if prof is not None:
+        val = prof.get("limits", {}).get(key)
+        if isinstance(val, int) and val > 0:
+            return val
+    return fallback
+
+
 def reset_for_test() -> None:
     """Reset module-level state — only used by the regression tests."""
     global CURRENT, _PROFILE_RUN_COUNT
