@@ -232,20 +232,25 @@ increases** (6.63 → 8.62). Bisected 2026-06-19 (repro
   recompute / relu-mask / GN-bwd / conv-bwd chain; a still-needed buffer is
   aliased/overwritten. (`allow_buffer_reuse=False` can't be used to confirm —
   that path hits a separate `_jit_dispatch` TypeError, itself a bug.)
-- **Two layers confirmed 2026-06-20** (forcing `make_buffer_reuse` to never
-  alias — allocate-fresh for every reuse):
-  1. **Buffer aliasing causes the explosion** — with aliasing off, the worst
-     grad rel drops from `5.6e+03` → **`1.0`** (explosion gone). So a same-shape
-     Inductor exact/reinterpret alias on the recompute/GN-bwd chain is being
-     written while still live (WAR hazard the runtime misses). Needs a *narrow*
-     WAR-safe guard (the global no-alias is too broad + perf-costly).
-  2. **A second, bounded bug remains** — even with no aliasing, `block.conv2.weight`
-     grad is rel `1.0` wrong (~zero or sign-flipped). Specific to stacked
-     same-resolution conv+GN; absent in `small_cnn` (pool-separated). Likely the
-     conv-bwd recompute or the relu+GN-bwd mask fusion mid-stack.
-- **Next**: (a) identify the specific hazardous alias in
-  `agent_space/noresid_bwd.txt` and guard just it; (b) root-cause the residual
-  conv2-grad error separately.
+- **Single root cause confirmed 2026-06-20: a WAR-barrier miss on aliased
+  buffers across *extern* dispatches.** Forcing `make_buffer_reuse` to never
+  alias drops the worst grad rel `5.6e+03` → `1.0`, i.e. removes the explosion —
+  but that crude hack then zeroes *all* upstream grads (`|vk|/|cpu|=0.000`,
+  classifier still perfect) because allocating `new` fresh loses `old`'s data on
+  exact-reuse in-place chains. So there is **one** bug, not two: a same-VkBuffer
+  exact/reinterpret alias is written by an extern dispatch (`_slang_tile_conv2d_bwd`
+  / `_dispatch_group_norm_backward_slang`) after the donor was read by a prior
+  extern, with no barrier between — the C++ barrier tracker doesn't register
+  extern-kernel buffer accesses, so the hazard is missed only when 2+ stages
+  chain at the same resolution (heavy same-shape reuse). `small_cnn` (pool-
+  separated, different shapes → little same-shape reuse) is unaffected.
+- **Fix (deep, C++)**: register extern-dispatch buffer reads/writes with the
+  barrier tracker in `csrc/ops/dispatch.cpp` (or insert a pipeline barrier
+  before an extern writes an aliased buffer), so a WAR barrier is emitted. The
+  existing `_flush_batcher_before_direct_call` is the closest hook. A Python-
+  side narrow guard is hard (no scheduling/extern info in `make_buffer_reuse`).
+- **Repro/evidence**: `agent_space/check_resnet_bisect.py` (+`VERBOSE=1`),
+  `agent_space/noresid_bwd.txt`.
 - **Exit**: `test_resnet_block_conv_gn_residual_fc` — Vulkan loss decreases and
   tracks CPU within 50%.
 
