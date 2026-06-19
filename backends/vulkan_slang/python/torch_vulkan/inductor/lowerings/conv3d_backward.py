@@ -48,7 +48,17 @@ def _get_conv3d_backward_extern_kernel_class():
             self.has_bias = has_bias
 
         def codegen(self, wrapper):
-            """Emit ``_slang_tile_conv3d_bwd`` in the generated wrapper."""
+            """Emit ``_slang_tile_conv3d_bwd`` in the generated wrapper.
+
+            In AOTI mode, compiles the Slang template to SPIR-V at codegen
+            time and emits C++ dispatch via ``emit_aoti_extern_dispatch``.
+            """
+            from torch._inductor import graph as _inductor_graph
+
+            if getattr(_inductor_graph.V.graph, 'aot_mode', False):
+                self._codegen_aoti(wrapper)
+                return
+
             # M-NEW.12: flush batcher before direct Vulkan dispatch
             wrapper._flush_batcher_before_direct_call()
 
@@ -90,6 +100,94 @@ def _get_conv3d_backward_extern_kernel_class():
                 f"grad_bias={grad_bias_arg})"
             )
             self.codegen_size_asserts(wrapper)
+
+        def _codegen_aoti(self, wrapper):
+            """Emit C++ AOTI dispatch for conv3d backward via pre-compiled SPIR-V."""
+            from ..templates.caller.conv3d import _render_conv3d_bwd_slang
+
+            input_names = [inp.codegen_reference() for inp in self.inputs]
+            out_name = self.codegen_reference()  # grad_input
+
+            # inputs: [input, weight, grad_output, grad_weight, grad_bias?]
+            input_t = input_names[0]
+            weight_t = input_names[1]
+            grad_out = input_names[2]
+            grad_weight = input_names[3]
+            grad_bias = input_names[4] if self.has_bias and len(input_names) > 4 else None
+
+            in_layout = self.inputs[0].get_layout()
+            w_layout = self.inputs[1].get_layout()
+            go_layout = self.inputs[2].get_layout()
+            out_layout = self.get_layout()
+
+            N, C_in, iD, iH, iW = in_layout.size
+            C_out, _, kD, kH, kW = w_layout.size
+            oD, oH, oW = go_layout.size[2], go_layout.size[3], go_layout.size[4]
+
+            sD, sH, sW = self.stride_arg
+            pD, pH, pW = self.padding_arg
+            dD, dH, dW = self.dilation_arg
+
+            tile_w = tile_h = tile_c = 4
+            threads_w = threads_h = 8
+
+            slang_src = _render_conv3d_bwd_slang(
+                tile_w=tile_w, tile_h=tile_h, tile_c=tile_c,
+                threads_w=threads_w, threads_h=threads_h,
+                has_bias=self.has_bias,
+            )
+
+            dtype_s = "f32"
+            cache_key = f"slang_conv3d_bwd_{dtype_s}{'_bias' if self.has_bias else ''}_aoti"
+
+            pc_values = [
+                int(N), int(C_in), int(C_out),
+                int(iD), int(iH), int(iW),
+                int(oD), int(oH), int(oW),
+                int(kD), int(kH), int(kW),
+                int(sD), int(sH), int(sW),
+                int(pD), int(pH), int(pW),
+                int(dD), int(dH), int(dW),
+                int(tile_w), int(tile_h), int(tile_c),
+                1 if self.has_bias else 0,  # has_bias
+                0, 0, 0,  # padding
+            ]
+
+            grid_x = (int(oW) + tile_w - 1) // tile_w
+            grid_y = (int(oH) + tile_h - 1) // tile_h
+            tile_c_count = (int(C_out) + tile_c - 1) // tile_c
+            grid_z = int(N) * tile_c_count * int(oD)
+
+            # buffers: input, weight, grad_out, grad_input, grad_weight, grad_bias?
+            buffer_names = [input_t, weight_t, grad_out, out_name, grad_weight]
+            if self.has_bias and grad_bias is not None:
+                buffer_names.append(grad_bias)
+            else:
+                buffer_names.append("_conv3d_bwd_dummy_gb")
+
+            output_allocations = [
+                {"name": out_name, "shape": [int(s) for s in out_layout.size],
+                 "stride": [int(s) for s in out_layout.stride], "dtype": "float32"},
+            ]
+            if not self.has_bias:
+                output_allocations.append({
+                    "name": "_conv3d_bwd_dummy_gb",
+                    "shape": [1], "stride": [1], "dtype": "float32",
+                })
+
+            num_outputs = 3 if self.has_bias else 2
+
+            wrapper.emit_aoti_extern_dispatch(
+                slang_src=slang_src,
+                cache_key=cache_key,
+                buffer_names=buffer_names,
+                pc_values=pc_values,
+                grid_x=grid_x,
+                grid_y=grid_y,
+                grid_z=grid_z,
+                num_outputs=num_outputs,
+                output_allocations=output_allocations,
+            )
 
     return _VulkanConv3dBwdExternKernel
 

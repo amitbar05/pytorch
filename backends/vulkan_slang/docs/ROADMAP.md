@@ -289,8 +289,9 @@ at a different readiness state:
    with pre-computed push constants from the IR layout info.
 
    **Wired**: conv2d fwd+bwd, matmul, GN fwd+bwd (input + weight),
-   optimizer (SGD/SGD+momentum/AdamW/Lion — A2.5, 2026-06-19).
-   **Not yet wired**: conv3d fwd+bwd.
+   optimizer (SGD/SGD+momentum/AdamW/Lion — A2.5, 2026-06-19),
+   conv3d fwd+bwd (A2.5.1, 2026-06-19).
+   **All extern-kernel families now wired.**
 
    Remaining work: GPU test verification of the AOTI `.so` compile path
    (pointwise-only AOTI compile works; extern-kernel AOTI needs GPU testing).
@@ -307,12 +308,13 @@ at a different readiness state:
    actual buffer shapes at runtime.  Added `write_kernels_bin()` Python helper
    and round-trip test (`TestAOTIModelAPI`).  Backward-compatible with v1 format.
 
-8. **Full training step .so (fwd + bwd + optimizer)** ⛔
-   Gated on item 5 (extern-kernel codegen). Once conv/matmul/GN extern kernels
-   emit proper C++ AOTI dispatch, the forward-only `.so` compiles and dispatches.
+8. **Full training step .so (fwd + bwd + optimizer)** 🟡
+   **GATE SATISFIED 2026-06-19.** All extern-kernel families (conv2d/conv3d
+   fwd+bwd, matmul, GN fwd+bwd, optimizer) now emit proper C++ AOTI dispatch.
    The next step is multi-graph: fwd+bwd+optimizer compiled into a single `.so`
    with correct buffer lifetime management across subgraphs. The `torch.compile`
    path already handles this correctly (verified: `TestAOTITrainingE2E` ✅).
+   Blocked by `torch.export` eager `empty.memory_format` dispatch gap (A2.6).
 
 #### A3 — Conv backward paired FX rewrite → `bwd_diff(conv_inner_madd)` ✅ (ratified 2026-06-16)
 The `aten.convolution_backward` lowering intercepts at Inductor lowering time
