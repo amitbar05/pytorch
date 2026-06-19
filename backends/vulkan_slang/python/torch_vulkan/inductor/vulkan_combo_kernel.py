@@ -206,6 +206,31 @@ class VulkanComboKernel:
         if len(orphans) < 2:
             return nodes
 
+        # --- Correctness guard (S2.0): readiness positions ---
+        # Map each output buffer to the position of its producing node, and
+        # each node to its own position.  An orphan's "ready index" is the
+        # latest producer position among its inputs (-1 if every input is a
+        # graph input) — the earliest point at which it can run.  The combo
+        # node is emitted at the EARLIEST member's position, so a member whose
+        # ready index is later than that emission point would be pulled before
+        # its inputs exist — a use-before-def (e.g.
+        # ``vulkan_kernel_0(tangents_1, buf7, ...)`` emitted before ``buf7``
+        # is allocated, crashing the wrapper with ``UnboundLocalError: buf7``).
+        # Repro: agent_space/probe_variants.py.  These maps drive the
+        # readiness drop applied inside the safety filter below.
+        producer_pos: dict[str, int] = {}
+        node_pos: dict[int, int] = {}
+        for i, n in enumerate(nodes):
+            node_pos[id(n)] = i
+            for bn in n.get_buffer_names():
+                producer_pos[bn] = i
+
+        def _ready_index(n: "BaseSchedulerNode") -> int:
+            ri = -1
+            for dep in n.unmet_dependencies:
+                ri = max(ri, producer_pos.get(dep.name, -1))
+            return ri
+
         # --- Phase 2: group orphans by compatible grid size ---
         # C6.4 (2026-06-18): previously bucketed by exact numel, which
         # prevented fill/copy ops (often 1-4 elements) from fusing with
@@ -296,6 +321,21 @@ class VulkanComboKernel:
                         dep_ids.add(id(a))
                         dep_ids.add(id(b))
             independent = [n for n in bucket if id(n) not in dep_ids]
+            # Readiness drop (S2.0): the combo is emitted at the earliest
+            # member's position (smallest node_pos).  Any member whose inputs
+            # only become available after that point would be pulled before
+            # its producer runs (use-before-def).  Keep only members whose
+            # ready index is <= the earliest member's position.  The earliest
+            # member always survives (its own inputs precede it), so the
+            # emission point is stable.  This only ever shrinks a bucket — it
+            # never forms a grouping that magnitude bucketing didn't already
+            # permit — so it cannot create a combo that breaks downstream
+            # partitioning.
+            if len(independent) >= 2:
+                emit_pos = min(node_pos[id(n)] for n in independent)
+                independent = [
+                    n for n in independent if _ready_index(n) <= emit_pos
+                ]
             filtered_buckets[key] = independent if len(independent) >= 2 else []
         buckets = defaultdict(list, filtered_buckets)
 

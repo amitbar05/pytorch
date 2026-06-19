@@ -581,6 +581,36 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             del_line = f"; del {old_name}"
         if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
+        # S2.0/S2.1: a *graph output* must not be a different-shape
+        # ``reinterpret_tensor`` alias of an internal donor.  On Vulkan this
+        # aliasing is unsafe when the output is then written by an extern
+        # dispatch: the runtime's per-buffer barrier/binding tracking keys on
+        # the donor's storage, so the write-after-read hazard against the
+        # donor's last reader is missed — observed as an ~80%-wrong conv
+        # ``grad_bias`` returned gradient when a GroupNorm-stats buffer (stride
+        # ``(4,1,16)``) was reinterpret-reused as the bias output (repro:
+        # agent_space/probe_variants.py).  For an output buffer, allocate it
+        # fresh and release the donor to the pool — allocate *before* freeing
+        # so the pool can't re-hand the donor's buffer back (which would
+        # re-introduce the alias).  Internal (non-output) reshape-reuse stays
+        # on the cheap zero-copy path: its consumers are codegen kernels that
+        # honour the view's stride, and the buffer-pool hit-rate depends on it.
+        if new_name in V.graph.get_output_names():
+            self.wrapper_call.writeline(
+                self.make_allocation(
+                    new_name,
+                    new.get_device(),
+                    new.get_dtype(),
+                    new.get_size(),
+                    new.get_stride(),
+                )
+            )
+            if old_name not in V.graph.get_output_names() and delete_old:
+                return self.make_buffer_free(old)
+            return (
+                f"{self.comment} S2.0: fresh alloc for output {new_name} "
+                f"(donor {old_name} kept)"
+            )
         reinterpret_view = self.codegen_reinterpret_view(
             old, new.get_size(), new.get_stride(), 0, self.wrapper_call.writeline
         )

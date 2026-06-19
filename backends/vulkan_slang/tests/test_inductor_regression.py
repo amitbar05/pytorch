@@ -60817,6 +60817,40 @@ class TestTrain8ConvTrainingSweep:
 
         self._run_sweep(SmallCNN)
 
+    def test_small_cnn_conv_gn_relu_linear_head(self):
+        """(S2.0) Conv + GroupNorm + ReLU + AdaptiveAvgPool + Flatten + Linear.
+
+        The ``nn.Linear`` classifier head is the path the other sweep models
+        deliberately avoid (they use a 1x1 Conv "to avoid the addmm autotune
+        blocker").  It exercises three bugs fixed together:
+          * S2.0 — combo orphan-coalescing readiness inversion produced
+            ``vulkan_kernel_0(... buf7 ...)`` before ``buf7`` was allocated
+            (``UnboundLocalError: buf7`` in the generated backward wrapper).
+          * S2.0-reuse — Inductor reinterpret-reused a non-contiguous
+            GroupNorm-stats buffer as the conv ``grad_bias`` output; the
+            aliasing missed a write-after-read hazard and produced an
+            ~80%-wrong conv bias gradient.
+          * S2.0b — the realize/unwrap helper left a ``ComputedBuffer`` wrapping
+            a ``StorageBox`` (``get_pointwise_size`` crash in ``decide_layout``).
+        Repro lineage: agent_space/probe_variants.py.
+        """
+        import torch.nn as nn
+
+        class CnnLinearHead(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.pool = nn.AdaptiveAvgPool2d((1, 1))
+                self.fc = nn.Linear(16, num_classes)
+
+            def forward(self, x):
+                x = torch.relu(self.gn1(self.conv1(x)))
+                x = self.pool(x).flatten(1)
+                return self.fc(x)
+
+        self._run_sweep(CnnLinearHead, x_shape=(4, 3, 16, 16))
+
     def test_resnet_block_conv_gn_residual_fc(self):
         """(C) ResNet-mini: Conv + GroupNorm + ReLU + residual add + 1x1 Conv.
 
