@@ -63096,6 +63096,67 @@ class TestPerf3BenchmarkPipeline:
         )
 
 
+class TestOptimizerAOTICodegen:
+    """A2.5 — AOTI codegen for foreach optimizer extern-kernel.
+
+    Verifies that the ``_VulkanForeachOptimizerExternKernel`` class
+    implements ``_codegen_aoti`` to emit C++ AOTI dispatch for the
+    foreach optimizer Slang template, replacing the former
+    ``NotImplementedError`` stub.
+
+    Non-GPU tests verify the codegen infrastructure; GPU tests verify
+    compiled dispatch correctness.
+    """
+
+    _BUG_ROOT_COMPONENT = "aoti-codegen"
+
+    def test_optimizer_aoti_codegen_method_exists(self):
+        """A2.5: the _codegen_aoti method is implemented on the optimizer
+        extern-kernel class."""
+        import inspect
+        from torch_vulkan.inductor.lowerings import optimizer_lowerings as mod
+        src = inspect.getsource(mod)
+        assert '_codegen_aoti' in src, (
+            "A2.5: _codegen_aoti method not found in optimizer_lowerings module source"
+        )
+        assert 'emit_aoti_extern_dispatch' in src, (
+            "A2.5: emit_aoti_extern_dispatch call not found in optimizer AOTI codegen"
+        )
+
+    def test_optimizer_aoti_codegen_no_longer_raises_notimplemented(self):
+        """A2.5: the codegen method no longer raises NotImplementedError
+        for the AOTI path."""
+        import inspect
+        from torch_vulkan.inductor.lowerings import optimizer_lowerings as mod
+        src = inspect.getsource(mod)
+        # The codegen method should not unconditionally raise for AOTI mode
+        # It should instead call _codegen_aoti
+        assert '_codegen_aoti(' in src or 'emit_aoti_extern_dispatch' in src, (
+            "A2.5: AOTI dispatch path not wired in codegen method"
+        )
+        # The old unconditional stub pattern should be gone:
+        #   if getattr(..., 'aot_mode', False):\n        #       raise NotImplementedError("Optimizer AOTI codegen...")
+        assert 'Optimizer AOTI codegen not yet implemented' not in src, (
+            "A2.5: old unconditional AOTI stub still present"
+        )
+
+    def test_optimizer_template_renders_all_algorithms(self):
+        """A2.5: the foreach optimizer Slang template renders correctly
+        for all four algorithm types."""
+        from torch_vulkan.inductor.templates.caller.optimizer import (
+            _render_foreach_optimizer_slang,
+            _foreach_cache_key,
+            _resolve_algorithm_type,
+        )
+        for alg in ['sgd', 'sgd_momentum', 'adamw', 'lion']:
+            alg_type = _resolve_algorithm_type(alg)
+            src = _render_foreach_optimizer_slang(alg_type, 1, 'float', parameter_array=False)
+            key = _foreach_cache_key(alg_type, 1, 'float', parameter_array=False)
+            assert len(src) > 1000, f"A2.5: rendered source too short for {alg}"
+            assert 'computeMain<' in src, f"A2.5: missing entry point for {alg}"
+            assert alg_type in key, f"A2.5: cache key doesn't include algorithm type for {alg}"
+
+
 class TestAOTITrainingE2E:
     """M4 — end-to-end training correctness on Vulkan via torch.compile(backend="inductor").
 

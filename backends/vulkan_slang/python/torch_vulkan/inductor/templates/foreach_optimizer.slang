@@ -21,7 +21,7 @@
 //                     dynamically.
 //
 // B1: Algorithm is a COMPILE-TIME generic parameter <Algo : IOptimizer>
-// selected by the slangc entry-point name.  No per-line {% if algorithm %}
+// selected by the slangc entry-point name.  No per-line [% if algorithm %]
 // branches in the template; no pc.algorithm push-constant field.
 //
 // Dispatch: 2D grid.  X = element index (256 threads/wg).

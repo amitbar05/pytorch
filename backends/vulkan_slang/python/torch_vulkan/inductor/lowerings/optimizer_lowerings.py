@@ -86,17 +86,20 @@ def _register_optimizer_lowerings() -> None:
         def codegen(self, wrapper):
             """Emit a call to ``_pick_foreach_optimizer_caller`` in the wrapper.
 
-            NOTE: AOTI mode not yet supported for optimizer — raises an
-            error when V.graph.aot_mode is True.  The optimizer is a
-            post-training step that can be deferred to the Python runtime.
+            In AOTI mode, compiles the foreach optimizer Slang template to
+            SPIR-V at codegen time and emits C++ dispatch calls through
+            the ``emit_aoti_extern_dispatch`` helper.
             """
             from torch._inductor import graph as _inductor_graph
 
-            if getattr(_inductor_graph.V.graph, 'aot_mode', False):
-                raise NotImplementedError(
-                    "Optimizer AOTI codegen not yet implemented. "
-                    "Run optimizer step in Python after AOTI forward+backward."
-                )
+            input_names = [inp.codegen_reference() for inp in self.inputs]
+            n = self.n_params
+
+            was_aoti = getattr(_inductor_graph.V.graph, 'aot_mode', False)
+
+            if was_aoti:
+                self._codegen_aoti(wrapper, input_names, n)
+                return
 
             # M-NEW.12: flush batcher before direct Vulkan dispatch
             wrapper._flush_batcher_before_direct_call()
@@ -105,9 +108,6 @@ def _register_optimizer_lowerings() -> None:
                 "from torch_vulkan.inductor.templates.caller.optimizer "
                 "import _pick_foreach_optimizer_caller"
             )
-
-            input_names = [inp.codegen_reference() for inp in self.inputs]
-            n = self.n_params
 
             # ── Split inputs into param/grad/momentum/v buffers ────────
             params_refs = [input_names[i * 2] for i in range(n)]
@@ -139,6 +139,174 @@ def _register_optimizer_lowerings() -> None:
                 f"{mom_bufs_str}{v_bufs_str})"
             )
             self.codegen_size_asserts(wrapper)
+
+        def _codegen_aoti(self, wrapper, input_names, n_params):
+            """Emit AOTI C++ dispatch for the foreach optimizer template."""
+            import struct
+
+            from ..templates.caller.optimizer import (
+                _foreach_cache_key,
+                _OPTIMIZER_BATCH_SIZES,
+                _render_foreach_optimizer_slang,
+                _resolve_algorithm_type,
+            )
+
+            algorithm_type = _resolve_algorithm_type(self.algorithm)
+
+            # 1. Pick batch_size: smallest pre-defined size >= n_params
+            batch_size = n_params
+            for bs in _OPTIMIZER_BATCH_SIZES:
+                if bs >= n_params:
+                    batch_size = bs
+                    break
+            if n_params > _OPTIMIZER_BATCH_SIZES[-1]:
+                batch_size = _OPTIMIZER_BATCH_SIZES[-1]
+
+            # 2. Render Slang template and compute cache key
+            slang_src = _render_foreach_optimizer_slang(
+                algorithm_type, batch_size, "float", parameter_array=False
+            )
+            cache_key = _foreach_cache_key(
+                algorithm_type, batch_size, "float", parameter_array=False
+            )
+
+            # 3. Extract concrete scalar values from scalar_kwargs
+            def _extract_scalar_list(key, default_val):
+                vals = self.scalar_kwargs.get(key)
+                if vals is None:
+                    return [default_val] * n_params
+                # Try to extract concrete values from IR nodes
+                result = []
+                for v in vals:
+                    try:
+                        # ir.Constant wrapping a Python scalar
+                        if hasattr(v, 'value'):
+                            result.append(float(v.value))
+                        # plain Python number
+                        elif isinstance(v, (int, float)):
+                            result.append(float(v))
+                        # sympy expression
+                        else:
+                            from sympy import Integer as SymInt, Float as SymFloat
+                            if isinstance(v, (SymInt, SymFloat)):
+                                result.append(float(v))
+                            else:
+                                raise ValueError(f"Cannot extract concrete value from {type(v)}: {v}")
+                    except Exception as e:
+                        raise NotImplementedError(
+                            f"Optimizer AOTI: cannot extract scalar {key} value from "
+                            f"{type(v).__name__}={v!r}. Use concrete (non-symbolic) "
+                            f"optimizer scalars for AOTI compilation."
+                        ) from e
+                return result
+
+            lr_vals = _extract_scalar_list("lr", 0.01)
+            wd_vals = _extract_scalar_list("weight_decay", 0.0)
+            momentum_vals = _extract_scalar_list("momentum", 0.0)
+            beta2_vals = _extract_scalar_list("beta2", 0.0)
+            eps_vals = _extract_scalar_list("eps", 0.0)
+
+            # 4. Determine numels from the first param's layout
+            params_ir = self.inputs[: n_params * 2 : 2]  # every other from index 0
+            numel = None
+            for pi in params_ir:
+                try:
+                    sz = pi.get_size()
+                    if sz:
+                        from sympy import prod
+                        numel = int(prod(sz))
+                        break
+                except Exception:
+                    pass
+            if numel is None:
+                raise NotImplementedError(
+                    "Optimizer AOTI: cannot determine parameter numel. "
+                    "Ensure parameter shapes are statically known."
+                )
+            numels = [numel] * n_params
+
+            # 5. Build push constants in the B1 format
+            # Header: (n_params, pad, pad, pad) as 4 uint32
+            pc_values = [n_params, 0, 0, 0]
+
+            for i in range(n_params):
+                # Pack ParamConfig: numel (uint32) + 6 floats (as uint32 via struct)
+                pc_values.append(numels[i])
+                floats_to_pack = [
+                    lr_vals[i],
+                    wd_vals[i],
+                    momentum_vals[i],
+                    beta2_vals[i],
+                    eps_vals[i],
+                    0.0,  # _pad
+                ]
+                for f in floats_to_pack:
+                    packed = struct.unpack("<I", struct.pack("<f", f))[0]
+                    pc_values.append(packed)
+
+            # 6. Pad remaining ParamConfig slots for batch_size - n_params
+            for _ in range(n_params, batch_size):
+                pc_values.append(0)  # numel = 0
+                for _f in range(6):
+                    pc_values.append(0)
+
+            # 7. Build buffer names in the order the shader expects
+            # Layout: [p0, g0, m0, v0, p1, g1, m1, v1, ...]
+            buffer_names: list[str] = []
+            offset = 2 * n_params  # past param/grad pairs
+            remaining = input_names[offset:]
+
+            for i in range(n_params):
+                buffer_names.append(input_names[i * 2])      # param_i
+                buffer_names.append(input_names[i * 2 + 1])  # grad_i
+                # momentum buffer
+                if self.algorithm in ("sgd_momentum", "adamw", "lion"):
+                    buffer_names.append(remaining[i])
+                else:
+                    buffer_names.append("_opt_dummy")  # placeholder
+                # v buffer
+                if self.algorithm == "adamw":
+                    # v bufs come after momentum bufs
+                    v_idx = n_params + i
+                    if v_idx < len(remaining):
+                        buffer_names.append(remaining[v_idx])
+                    else:
+                        buffer_names.append("_opt_dummy")
+                else:
+                    buffer_names.append("_opt_dummy")
+
+            # Pad remaining slots for batch_size
+            for _ in range(n_params, batch_size):
+                buffer_names.extend(["_opt_dummy", "_opt_dummy", "_opt_dummy", "_opt_dummy"])
+
+            # 8. Compute grid
+            threadgroup_size = 256
+            grid_x = (numel + threadgroup_size - 1) // threadgroup_size
+            grid_y = n_params
+            grid_z = 1
+
+            # 9. Allocate dummy buffer for algorithms that don't need momentum/v buffers
+            output_allocations = []
+            if "_opt_dummy" in buffer_names:
+                output_allocations.append({
+                    "name": "_opt_dummy",
+                    "shape": [1],
+                    "stride": [1],
+                    "dtype": "float32",
+                })
+
+            # 10. Emit AOTI dispatch
+            wrapper.emit_aoti_extern_dispatch(
+                slang_src=slang_src,
+                cache_key=cache_key,
+                buffer_names=buffer_names,
+                pc_values=pc_values,
+                grid_x=grid_x,
+                grid_y=grid_y,
+                grid_z=grid_z,
+                num_outputs=n_params * 3,
+                output_allocations=output_allocations if output_allocations else None,
+            )
 
     # ═════════════════════════════════════════════════════════════════════
     # Lowering helpers

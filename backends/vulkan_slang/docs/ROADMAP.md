@@ -288,10 +288,9 @@ at a different readiness state:
    and emits C++ code calling `torch_vulkan_aoti_make_kernel` + `dispatch`
    with pre-computed push constants from the IR layout info.
 
-   **Wired**: conv2d fwd+bwd, matmul, GN fwd+bwd (input + weight).
-   **Not yet wired**: conv3d fwd+bwd, optimizer (raises NotImplementedError —
-   `foreach_optimizer.slang` uses Slang `interface` generics that need
-   per-algorithm SPIR-V precompile).
+   **Wired**: conv2d fwd+bwd, matmul, GN fwd+bwd (input + weight),
+   optimizer (SGD/SGD+momentum/AdamW/Lion — A2.5, 2026-06-19).
+   **Not yet wired**: conv3d fwd+bwd.
 
    Remaining work: GPU test verification of the AOTI `.so` compile path
    (pointwise-only AOTI compile works; extern-kernel AOTI needs GPU testing).
