@@ -63252,6 +63252,73 @@ class TestAOTIModelAPI:
         from torch_vulkan import _C as _c
         _c._aoti_model_free(0)
 
+    def test_aoti_model_multi_kernel_v2(self, tmp_path):
+        """A2.7: v2 binary with 2 kernels → each dispatched with proper
+        workgroup dimensions from per-kernel metadata."""
+        import os
+        from torch_vulkan import _C as _c
+        from torch_vulkan.inductor.cpp_wrapper_gpu import write_kernels_bin
+
+        pid = os.getpid()
+
+        # Build a scale shader
+        scale_shader = (
+            "[[vk::binding(0)]] StructuredBuffer<float> in_ptr0;\n"
+            "[[vk::binding(1)]] RWStructuredBuffer<float> out_ptr0;\n"
+            "[[vk::push_constant]] cbuffer Push {{ uint numel; }};\n"
+            '[shader("compute")] [numthreads(64,1,1)]\n'
+            "void computeMain(uint3 gtid : SV_DispatchThreadID) {{\n"
+            "  if (gtid.x < numel) {{\n"
+            "    out_ptr0[gtid.x] = in_ptr0[gtid.x] * {scale}.0;\n"
+            "  }}\n"
+            "}}\n"
+        )
+        from torch_vulkan.inductor.runtime import compile_slang_to_spirv
+
+        spv_a = compile_slang_to_spirv(
+            scale_shader.format(scale=3), "computeMain",
+            cache_key=f"_test_aoti_mk_a_{pid}"
+        )
+        spv_b = compile_slang_to_spirv(
+            scale_shader.format(scale=7), "computeMain",
+            cache_key=f"_test_aoti_mk_b_{pid}"
+        )
+
+        # Write v2 kernels.bin with two kernels (different wg sizes)
+        bin_path = str(tmp_path / "kernels.bin")
+        write_kernels_bin(
+            bin_path,
+            [
+                {
+                    "spv": spv_a, "key": f"_test_aoti_mk_a_{pid}",
+                    "n_input_buffers": 1, "n_output_buffers": 1,
+                    "wg_x": 4, "wg_y": 1, "wg_z": 1,
+                    "pc_size_bytes": 4,
+                },
+                {
+                    "spv": spv_b, "key": f"_test_aoti_mk_b_{pid}",
+                    "n_input_buffers": 1, "n_output_buffers": 1,
+                    "wg_x": 1, "wg_y": 1, "wg_z": 1,
+                    "pc_size_bytes": 4,
+                },
+            ],
+            version=2,
+        )
+
+        model_handle = _c._aoti_model_load(str(tmp_path))
+        assert model_handle != 0
+
+        try:
+            x = torch.arange(64, dtype=torch.float32, device="vulkan:0")
+            y = torch.empty_like(x)
+            # Both kernels read x → write y. Last kernel wins: x*7
+            _c._aoti_model_run(model_handle, [x], [y])
+            torch.testing.assert_close(
+                y.cpu(), torch.arange(64, dtype=torch.float32) * 7
+            )
+        finally:
+            _c._aoti_model_free(model_handle)
+
 
 class TestAOTITrainingE2E:
     """M4 — end-to-end training correctness on Vulkan via torch.compile(backend="inductor").
