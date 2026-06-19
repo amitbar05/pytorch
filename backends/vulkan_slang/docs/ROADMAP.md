@@ -211,11 +211,31 @@ element count disagrees, so genuine shape errors still fail loudly).
 - **Exit (all S2.0)**: `test_small_cnn_conv_gn_relu_linear_head` +
   `test_small_cnn_conv_gn_relu_fc` + `test_simple_cnn_conv_maxpool_fc`.
 
-#### S2.0d — ⛔ ResNet residual block training diverges
-`test_resnet_block_conv_gn_residual_fc` now compiles and runs (past S2.0a–c) but
-**loss increases** (6.63 → 8.62 over 10 steps) — a correctness bug in the
-residual `relu(out + identity)` backward (gradient mis-distribution through the
-`add`, or GN-bwd interaction with the skip connection). Distinct from S2.0a–c.
+#### S2.0d — ⛔ Stacked conv+GN+ReLU backward explodes (NOT the residual)
+`test_resnet_block_conv_gn_residual_fc` compiles+runs (past S2.0a–c) but **loss
+increases** (6.63 → 8.62). Bisected 2026-06-19 (repro
+`agent_space/check_resnet_bisect.py`):
+- **Forward is exact** (loss matches CPU to 5 dp); **one-step backward gradients
+  explode** — rel up to `5e+18`, worst at the *earliest* layer, compounding
+  ~1000×/stage. The Vulkan loss trajectory spikes (step-1 loss 34 → ∞) then
+  flatlines (dead grads).
+- **NOT the residual**: the `noresid` variant (plain stacked conv+GN+ReLU, no
+  skip) fails identically; the residual block *in isolation* (fixed upstream
+  grad) has perfect parity (`6e-7`).
+- **NOT the fusion**: `TORCH_VULKAN_DISABLE_CONV_GN_FUSION=1` makes it *worse*
+  (`6e+18`).
+- **NOT the buffer pool**: `TORCH_VULKAN_BUFFER_POOL=0` is byte-identical failure.
+- **Trigger**: ≥2 conv+GN+ReLU backward stages chained at the **same spatial
+  resolution** (no pool between). `noblock` (one stage) passes; `small_cnn`
+  (stages separated by pool, different shapes) passes. The multi-stage backward
+  emits heavy same-shape Inductor exact-buffer-reuse aliasing across the
+  recompute / relu-mask / GN-bwd / conv-bwd chain; a still-needed buffer is
+  aliased/overwritten. (`allow_buffer_reuse=False` can't be used to confirm —
+  that path hits a separate `_jit_dispatch` TypeError, itself a bug.)
+- **Next**: dump the stacked backward (`agent_space/dump_noresid.py`), find which
+  exact-reuse alias clobbers a live recompute/GN-stats buffer; likely needs the
+  same WAR-safety guard as S2.0-reuse but for same-size internal aliases on the
+  conv-bwd recompute path.
 - **Exit**: `test_resnet_block_conv_gn_residual_fc` — Vulkan loss decreases and
   tracks CPU within 50%.
 
