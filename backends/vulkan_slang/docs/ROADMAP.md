@@ -67,8 +67,10 @@ The backend **trains real Conv+GN models end-to-end on the GPU today** via
 `torch.compile(backend="inductor")`. A Conv→GroupNorm→ReLU→Pool one-step
 fwd+bwd+SGD loop compiles and runs with per-param gradient parity vs CPU
 (L∞ < 1e-4) and **zero VUIDs** under `TORCH_VULKAN_VUID_AS_ERROR=1`. Backward is
-fully Slang. **However, adding a `Linear` classifier head breaks backward
-codegen (S2.0) — so a complete CNN does not yet train end-to-end.**
+fully Slang. **As of 2026-06-20, `Linear`-head CNNs (S2.0), stacked same-
+resolution conv+GN stages (S2.0d), and ResNet-style residual blocks
+(S2.0d-resid) all train end-to-end with per-param grad parity vs CPU** — the
+correctness blockers for a full CNN are closed.
 
 Live numbers (RX 5600 XT, RDNA1): Conv(3→16)+GN(4,16)+ReLU+AdaptiveAvgPool,
 B=4 — **21 dispatches/step, ~6.7 ms warm**, of which **~10 are tiny plumbing
@@ -123,7 +125,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | ID | Defect | Severity |
 |---|---|---|
 | **S2.0** | Conv+GN CNN training (Linear & 1×1-conv heads): `buf7` combo inversion + wrong conv `grad_bias` (output reuse) + `StorageBox` unwrap crash + 4D grad_out assumption. | ✅ **FIXED 2026-06-19** (S2.0a/reuse/b/c) |
-| **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **Residual** `relu(out+identity)` fan-out still explodes → S2.0d-resid. | 🟡 partial |
+| **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **S2.0d-resid also FIXED 2026-06-20** (two more root causes, see below): residual `relu(out+identity)` backward now has full per-param grad parity (`test_resnet_block_residual_grad_parity` ✅). | ✅ **FIXED** |
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper still leaks `extern_kernels.mm` + `aten._adaptive_avg_pool2d_backward` — codegen-only pillar breach (orthogonal to S2.0 correctness). | 🟡 P1 |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | 🟡 perf |
 
@@ -211,66 +213,62 @@ element count disagrees, so genuine shape errors still fail loudly).
 - **Exit (all S2.0)**: `test_small_cnn_conv_gn_relu_linear_head` +
   `test_small_cnn_conv_gn_relu_fc` + `test_simple_cnn_conv_maxpool_fc`.
 
-#### S2.0d — 🟡 Stacked conv+GN+ReLU backward — WAR-barrier miss (FIXED); residual still open
-**FIXED 2026-06-20 for the non-residual case.** Root cause: the C++ smart
-barrier (`dispatch.cpp`) tracked only *writes* (`dirty_buffers`) and emitted a
-barrier when a dispatch touched a previously-written buffer (RAW/WAW). A buffer
+#### S2.0d — ✅ Stacked + residual conv+GN+ReLU backward (FIXED 2026-06-20)
+**Non-residual (stacked) case — FIXED via C++ WAR barrier.** The C++ smart
+barrier (`dispatch.cpp`) tracked only *writes* (`dirty_buffers`). A buffer
 *read* by one extern dispatch (conv-bwd / GN-bwd) and then *written* by a later
-one — via Inductor same-shape exact-reuse aliasing — was a **write-after-read
-hazard with no barrier**, so the write raced the read and gradients exploded.
-Fix: track read buffers (`read_buffers`), emit a barrier (combined
-`SHADER_READ|WRITE` mask) when an output overlaps a prior read, at both dispatch
-sites. `test_stacked_conv_gn_backward_war` ✅; `noresid` grad parity `5e-6`;
-perf-neutral (barriers only fire on real hazards); 0 regressions.
-**Still open — S2.0d-resid**: the residual `relu(out+identity)` model still
-explodes (`5.4e5`, unchanged by the WAR fix) — a *separate* hazard in the
-fan-out gradient accumulation (identity = stem output, consumed by conv1 *and*
-the add). Next: dump the residual backward, find the unguarded accumulation
-hazard (likely an in-place add where the WAR/RAW classification of in-place
-buffers needs care).
+one — via Inductor same-shape exact-reuse aliasing — was a write-after-read
+hazard with no barrier. Fix: track read buffers (`read_buffers`), emit a
+combined-mask barrier when an output overlaps a prior read. `test_stacked_conv_gn_backward_war` ✅.
 
-Original diagnosis (retained for reference):
-`test_resnet_block_conv_gn_residual_fc` compiles+runs (past S2.0a–c) but **loss
-increases** (6.63 → 8.62). Bisected 2026-06-19 (repro
-`agent_space/check_resnet_bisect.py`):
-- **Forward is exact** (loss matches CPU to 5 dp); **one-step backward gradients
-  explode** — rel up to `5e+18`, worst at the *earliest* layer, compounding
-  ~1000×/stage. The Vulkan loss trajectory spikes (step-1 loss 34 → ∞) then
-  flatlines (dead grads).
-- **NOT the residual**: the `noresid` variant (plain stacked conv+GN+ReLU, no
-  skip) fails identically; the residual block *in isolation* (fixed upstream
-  grad) has perfect parity (`6e-7`).
-- **NOT the fusion**: `TORCH_VULKAN_DISABLE_CONV_GN_FUSION=1` makes it *worse*
-  (`6e+18`).
-- **NOT the buffer pool**: `TORCH_VULKAN_BUFFER_POOL=0` is byte-identical failure.
-- **Trigger**: ≥2 conv+GN+ReLU backward stages chained at the **same spatial
-  resolution** (no pool between). `noblock` (one stage) passes; `small_cnn`
-  (stages separated by pool, different shapes) passes. The multi-stage backward
-  emits heavy same-shape Inductor exact-buffer-reuse aliasing across the
-  recompute / relu-mask / GN-bwd / conv-bwd chain; a still-needed buffer is
-  aliased/overwritten. (`allow_buffer_reuse=False` can't be used to confirm —
-  that path hits a separate `_jit_dispatch` TypeError, itself a bug.)
-- **Single root cause confirmed 2026-06-20: a WAR-barrier miss on aliased
-  buffers across *extern* dispatches.** Forcing `make_buffer_reuse` to never
-  alias drops the worst grad rel `5.6e+03` → `1.0`, i.e. removes the explosion —
-  but that crude hack then zeroes *all* upstream grads (`|vk|/|cpu|=0.000`,
-  classifier still perfect) because allocating `new` fresh loses `old`'s data on
-  exact-reuse in-place chains. So there is **one** bug, not two: a same-VkBuffer
-  exact/reinterpret alias is written by an extern dispatch (`_slang_tile_conv2d_bwd`
-  / `_dispatch_group_norm_backward_slang`) after the donor was read by a prior
-  extern, with no barrier between — the C++ barrier tracker doesn't register
-  extern-kernel buffer accesses, so the hazard is missed only when 2+ stages
-  chain at the same resolution (heavy same-shape reuse). `small_cnn` (pool-
-  separated, different shapes → little same-shape reuse) is unaffected.
-- **Fix (deep, C++)**: register extern-dispatch buffer reads/writes with the
-  barrier tracker in `csrc/ops/dispatch.cpp` (or insert a pipeline barrier
-  before an extern writes an aliased buffer), so a WAR barrier is emitted. The
-  existing `_flush_batcher_before_direct_call` is the closest hook. A Python-
-  side narrow guard is hard (no scheduling/extern info in `make_buffer_reuse`).
-- **Repro/evidence**: `agent_space/check_resnet_bisect.py` (+`VERBOSE=1`),
-  `agent_space/noresid_bwd.txt`.
-- **Exit**: `test_resnet_block_conv_gn_residual_fc` — Vulkan loss decreases and
-  tracks CPU within 50%.
+**S2.0d-resid (residual `relu(out+identity)`) — FIXED 2026-06-20** via two more
+root causes, both found by dumping the residual backward wrapper and bisecting
+the per-param grad with `agent_space/check_resnet_bisect.py residual` (forward
+was always exact; backward exploded `5.4e5` at the stem, with `gn2.bias` and
+`classifier` correct). After both fixes every parameter has grad parity vs CPU
+at ~1e-6 (`test_resnet_block_residual_grad_parity` ✅); the stacked/noresid/
+noblock/small-CNN variants stay green.
+
+1. **Standalone-GroupNorm saved-`rstd` corruption** (`wrapper.py:make_buffer_reuse`).
+   A GroupNorm *not* immediately followed by ReLU (here `gn2`, separated from
+   the final ReLU by the residual `+`) does not fuse into `conv2d_gn_relu_fused`;
+   it lowers as a standalone norm whose forward saves `mean` + `rstd`. The `rstd`
+   save is codegen'd as an *in-place* kernel (`rstd = rsqrt(var+eps)` over the
+   welford `var` buffer, emitted as `in_out_ptr0`). The S2.0/S2.1 graph-output
+   fresh-alloc fired for the (graph-output) `rstd` buffer — allocating it fresh
+   instead of aliasing `var` — so the in-place kernel read **uninitialized
+   memory** → garbage `rstd` → exploded `gn.weight`/grad_input (`gn.bias`, which
+   doesn't use `rstd`, stayed correct: the diagnostic signature). Fix: the
+   fresh-alloc is only correct for a *reinterpret-view* reuse (producer fully
+   overwrites the output); skip it for an *in-place mutation* reuse (detected via
+   `new` reading `old`). The WAR hazard the fresh-alloc once guarded against is
+   now covered by the S2.0d C++ WAR barrier above.
+
+2. **Persistent grid-stride loop re-runs in-place accumulations** (`kernel/header.py`).
+   The residual fan-in `grad_x += grad_conv1` (an `in_out_ptr` add) ran under the
+   persistent-pointwise grid-stride loop. That loop wraps only `self.body`; the
+   per-element index vars are derived from `gtid.x` in the preamble *outside* the
+   loop, so each `_pi` iteration re-executes the **same** element. For separate-
+   buffer pointwise (`out[i]=f(in[i])`) re-execution is idempotent (harmless);
+   for an in-place op it re-applies the mutation N times → ~2× stem gradients
+   (only the stem, since the block grads route correctly). Fix: skip the
+   persistent wrap whenever the kernel binds any in-place buffer.
+
+- **Files**: `python/torch_vulkan/inductor/wrapper.py` (`_reuse_reads_donor` +
+  gate in `make_buffer_reuse`), `python/torch_vulkan/inductor/kernel/header.py`
+  (`_has_inplace` gate on the persistent wrap).
+- **Repro/evidence**: `agent_space/check_resnet_bisect.py {residual,noresid,noblock}`.
+- **Exit**: `test_resnet_block_residual_grad_parity` (per-param grad parity) +
+  `test_resnet_block_conv_gn_residual_fc` (loss-based sweep). ✅
+
+**Follow-up filed — S2.0d-deadgrad**: a standalone GroupNorm `(y*y).sum()` (GN
+not followed by ReLU, non-constant grad) yields a **dead** `gn.weight` gradient
+(`rel=1.0`, vk≈0) *only inside the full pytest harness* — the same model passes
+as a standalone script (`agent_space/gn_assert.py`, rel 4e-7) and is unaffected
+by the S2.0d-resid fixes (the weight-grad is a reduction, not in-place). Likely a
+DCE / autotune interaction triggered by module-level import side effects. Tracked
+as a separate item (does not block residual training; the residual path’s gn2
+weight-grad is correct).
 
 #### S2.0e — ⛔ Pre-existing GPU-suite failures (slangc/env)
 A clean-main GPU sweep shows ~24 pre-existing failures unrelated to S2.0

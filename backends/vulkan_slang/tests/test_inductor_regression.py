@@ -60974,6 +60974,74 @@ class TestTrain8ConvTrainingSweep:
 
         self._run_sweep(ResNetMini, x_shape=(4, 3, 16, 16))
 
+    def test_resnet_block_residual_grad_parity(self):
+        """S2.0d-resid: per-parameter gradient parity for a residual block.
+
+        Stronger than the loss-based ``test_resnet_block_conv_gn_residual_fc``
+        (``_run_sweep`` only checks loss decrease + 50% tolerance).  This asserts
+        every parameter's one-step gradient matches CPU, locking *both*
+        S2.0d-resid bugs together:
+          1. standalone-GN saved-``rstd`` corruption → backward grads exploded
+             (rel ~1e5, worst at the earliest layer);
+          2. the residual fan-in ``grad_x += grad_conv1`` ran under a persistent
+             grid-stride loop whose index vars are fixed (derived from
+             ``gtid.x`` in the preamble, outside the wrapped body), so the
+             in-place add re-applied N times → ~2× stem gradients.  Fixed by
+             skipping the persistent wrap for in-place (``in_out_ptr``) kernels.
+        Repro: agent_space/check_resnet_bisect.py residual.
+        """
+        import copy
+        import torch.nn as nn
+        import torch_vulkan
+
+        class ResBlock(nn.Module):
+            def __init__(self, ch):
+                super().__init__()
+                self.conv1 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+                self.gn1 = nn.GroupNorm(4, ch)
+                self.conv2 = nn.Conv2d(ch, ch, 3, padding=1, bias=False)
+                self.gn2 = nn.GroupNorm(4, ch)
+
+            def forward(self, x):
+                identity = x
+                out = torch.relu(self.gn1(self.conv1(x)))
+                out = self.gn2(self.conv2(out))
+                return torch.relu(out + identity)
+
+        class Net(nn.Module):
+            def __init__(self, num_classes=10):
+                super().__init__()
+                self.stem = nn.Sequential(
+                    nn.Conv2d(3, 16, 3, padding=1, bias=False),
+                    nn.GroupNorm(4, 16), nn.ReLU())
+                self.block = ResBlock(16)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+                self.classifier = nn.Conv2d(16, num_classes, 1)
+
+            def forward(self, x):
+                return self.classifier(self.pool(self.block(self.stem(x)))).flatten(1)
+
+        torch.manual_seed(42)
+        base = Net()
+        x = torch.randn(4, 3, 16, 16)
+        y = torch.randint(0, 10, (4,))
+        loss_fn = nn.CrossEntropyLoss()
+
+        cpu = copy.deepcopy(base)
+        loss_fn(cpu(x), y).backward()
+
+        vk = copy.deepcopy(base).to("vulkan:0")
+        cm = torch.compile(vk, backend="inductor")
+        loss_fn(cm(x.to("vulkan:0")), y.to("vulkan:0")).backward()
+        torch_vulkan.synchronize()
+
+        cpu_grads = dict(cpu.named_parameters())
+        for n, p in vk.named_parameters():
+            g, c = p.grad.cpu(), cpu_grads[n].grad
+            rel = (g - c).abs().max().item() / (c.abs().max().item() + 1e-8)
+            # Pre-fix: rel ~1e5 (exploded) at the stem; post-fix: rel < 1e-5.
+            assert rel < 5e-3, f"grad mismatch for {n}: rel={rel:.2e}"
+
     def test_adamw_optimizer(self):
         """Training with AdamW through torch.compile (forward-only pattern).
 

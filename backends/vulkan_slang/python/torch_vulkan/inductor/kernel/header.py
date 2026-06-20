@@ -149,7 +149,25 @@ class HeaderMixin(CallKernelMixin):
             self.body.splice(self.stores)
 
         # GPU.5: Persistent pointwise micro-batching.
-        if getattr(self, "_persistent_mode", False) and not self.inside_reduction:
+        #
+        # S2.0d-resid: the grid-stride loop re-runs the body for each ``_pi``
+        # but the per-element index variables are derived from ``gtid.x`` in the
+        # preamble (codegen_kernel), *outside* the wrapped body — so every
+        # iteration re-executes the *same* element.  For separate-buffer
+        # pointwise (``out[i] = f(in[i])``) that re-execution is idempotent and
+        # harmless, but for an *in-place* kernel (``in_out_ptr``, e.g. the
+        # residual fan-in ``grad_x += grad_conv1``) it re-applies the mutation
+        # N times → an N-fold-too-large accumulation (observed as ~2× stem
+        # gradients in a ResNet block; repro agent_space/check_resnet_bisect.py).
+        # Re-execution of an in-place op is non-idempotent, so skip the
+        # persistent wrap whenever the kernel binds any in-place buffer; it then
+        # codegens as a plain one-element-per-thread dispatch (correct).
+        _has_inplace = bool(getattr(self.args, "inplace_buffers", None))
+        if (
+            getattr(self, "_persistent_mode", False)
+            and not self.inside_reduction
+            and not _has_inplace
+        ):
             persistent_body = self._emit_persistent_grid_stride_loop()
             if persistent_body is not None:
                 self.body = IndentedBuffer()

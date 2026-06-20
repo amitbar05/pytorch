@@ -561,6 +561,32 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         finally:
             self._vulkan_in_generate_return = False
 
+    def _reuse_reads_donor(self, old_name, new):
+        """True if the op producing ``new`` reads ``old_name`` — i.e. this is
+        an in-place mutation reuse (the kernel reads the donor's data through
+        the aliased output binding, ``in_out_ptr0``), not a reinterpret-view
+        reuse.  For the in-place case the alias must be preserved or the kernel
+        reads uninitialized memory (S2.0d-resid).  Best-effort: any failure
+        falls back to ``False`` (treat as a view reuse, the prior behaviour)."""
+        new_name = new.get_name()
+        try:
+            sched = getattr(V.graph, "scheduler", None)
+            if sched is not None:
+                sbuf = getattr(sched, "name_to_buf", {}).get(new_name)
+                if sbuf is not None and getattr(sbuf, "defining_op", None):
+                    for dep in sbuf.defining_op.read_writes.reads:
+                        if dep.name == old_name:
+                            return True
+        except Exception:
+            pass
+        try:
+            get = getattr(new, "get_read_names", None)
+            if get is not None and old_name in get():
+                return True
+        except Exception:
+            pass
+        return False
+
     def make_buffer_reuse(self, old, new, delete_old):
         # On the reuse path the storage is *aliased* to the new name, so
         # the old name's `del` must not pool-release (that would re-vend a
@@ -595,7 +621,23 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
         # re-introduce the alias).  Internal (non-output) reshape-reuse stays
         # on the cheap zero-copy path: its consumers are codegen kernels that
         # honour the view's stride, and the buffer-pool hit-rate depends on it.
-        if new_name in V.graph.get_output_names():
+        #
+        # S2.0d-resid: the fresh-alloc is only correct for a *reinterpret-view*
+        # reuse, where the producer of ``new`` fully overwrites it and never
+        # reads the donor's old contents.  An *in-place mutation* reuse — where
+        # the kernel reads ``old`` through the (aliased) output binding and
+        # rewrites it in place (emitted as ``in_out_ptr0``) — REQUIRES the
+        # alias: fresh-allocating ``new`` makes the kernel read uninitialized
+        # memory.  This is exactly what corrupts a standalone GroupNorm's saved
+        # ``rstd`` (``rstd = rsqrt(var+eps)`` computed in place over the welford
+        # ``var`` buffer, then returned as a graph output) → garbage rstd →
+        # ~100%-wrong ``gn.weight`` gradient (bias is correct: it doesn't use
+        # rstd).  Detect the in-place case (``new`` reads ``old``) and keep it
+        # on the alias path; the WAR hazard the fresh-alloc once guarded against
+        # is now covered by the C++ read-tracking WAR barrier (S2.0d).
+        if new_name in V.graph.get_output_names() and not self._reuse_reads_donor(
+            old_name, new
+        ):
             self.wrapper_call.writeline(
                 self.make_allocation(
                     new_name,
