@@ -261,14 +261,24 @@ noblock/small-CNN variants stay green.
 - **Exit**: `test_resnet_block_residual_grad_parity` (per-param grad parity) +
   `test_resnet_block_conv_gn_residual_fc` (loss-based sweep). ✅
 
-**Follow-up filed — S2.0d-deadgrad**: a standalone GroupNorm `(y*y).sum()` (GN
-not followed by ReLU, non-constant grad) yields a **dead** `gn.weight` gradient
-(`rel=1.0`, vk≈0) *only inside the full pytest harness* — the same model passes
-as a standalone script (`agent_space/gn_assert.py`, rel 4e-7) and is unaffected
-by the S2.0d-resid fixes (the weight-grad is a reduction, not in-place). Likely a
-DCE / autotune interaction triggered by module-level import side effects. Tracked
-as a separate item (does not block residual training; the residual path’s gn2
-weight-grad is correct).
+**Follow-up filed — S2.0d-deadgrad** (latent, order-dependent; does NOT block
+conv training): a standalone GroupNorm `(y*y).sum()` (GN not followed by ReLU,
+non-constant grad) yields a **dead** `gn.weight` gradient (`rel=1.0`, vk≈0)
+*depending on process state*. `agent_space/gn_assert.py` (plain script) gives the
+correct grad (rel 4e-7); `agent_space/gn_after_import.py` — the identical model,
+but after `import tests.test_inductor_regression` — reproduces the dead grad with
+a **fresh cache**. The test module has **no** module-scope `torch_vulkan`/inductor
+import or `config` patch (only string constants + class/def defs), so this is not
+a config leak: importing a large inert module perturbs Python memory layout / set
+iteration order, which flips a **scheduler-fusion / DCE iteration-order
+dependence** — for some orderings the `gn.weight` reduction (the
+`sum(grad·x̂)` over N,H,W) is silently dropped/zeroed. The weight-grad is a
+reduction (not in-place) so it is untouched by the S2.0d-resid fixes. Not a
+blocker: real conv training works (full `TestTrain8ConvTrainingSweep` green; the
+residual model's standalone `gn2` weight-grad matches CPU at ~1e-6). Next: find
+the order-dependent set/dict iteration in the scheduler/DCE path that drops the
+standalone-GN weight-grad reduction (likely in `scheduling.py` fusion or
+`kernel/header.py:_eliminate_dead_code`).
 
 #### S2.0e — ⛔ Pre-existing GPU-suite failures (slangc/env)
 A clean-main GPU sweep shows ~24 pre-existing failures unrelated to S2.0
