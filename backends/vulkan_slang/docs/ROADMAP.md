@@ -118,7 +118,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | Pooling | bwd | `scatter_atomic.slang` / codegen | ✅ |
 | Linear | fwd | `aten.addmm` → `slang_mm.slang` | ✅ |
 | Linear | bwd | `slang_mm_bwd.slang` — ✅ **FIXED 2026-06-21 (S2.1)**: `aten.mm.default` now routes through `_vulkan_mm` (forced override after `get_overloads()` skip), and `_adaptive_avg_pool2d_backward.default` routes through `Pointwise.create` (same override + `ops.*-on-TensorBox` bug fix). | ✅ |
-| SGD/AdamW/Lion | step | eager: `foreach_optimizer.slang` (`IOptimizer`). **Compiled step fans out to per-param `binary_add_inplace`** (no foreach bridge) | 🔴 |
+| SGD/AdamW/Lion | step | ✅ **S3.1 FIXED 2026-06-21**: compiled step routes to `foreach_sgd_step` ExternKernel → `foreach_optimizer.slang` (`IOptimizer`) — same path as eager. Both `_foreach_add_.List` (inplace) and `_foreach_add.List` (functional, post-AOTAutograd) are handled. | ✅ |
 | CrossEntropyLoss | fwd/bwd | decomposed → Slang codegen | ✅ |
 
 **Defects (2026-06-19 ground-truth run)**
