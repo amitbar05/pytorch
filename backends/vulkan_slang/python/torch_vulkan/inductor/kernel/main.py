@@ -288,7 +288,12 @@ class VulkanKernel(
         self._p16_load_records: list[tuple[str, str, str]] = []
         self._p16_store_records: list[tuple[str, str, str]] = []
         self._groupshared_bytes_used: int = 0
-        self._groupshared_budget_bytes: int = 64 * 1024
+        # S0.1: read LDS budget from device profile (via S0.2 _device_caps);
+        # falls back to 64 KB (Vulkan mandatory minimum).
+        from ..device_profile import profile_limit
+        self._groupshared_budget_bytes: int = profile_limit(
+            "shared_memory_per_workgroup_bytes", 64 * 1024
+        )
         self._reduction_type: Optional[str] = None
         # Per-entry brace counter so mixed partitioned (2 braces)
         # and standard (1 brace) entries accumulate correctly.

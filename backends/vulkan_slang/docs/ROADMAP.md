@@ -84,8 +84,8 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | Item | State | Evidence |
 |---|---|---|
 | Microbench (launch latency, mem/LDS BW, atomics) | ✅ | `device_profile.py`; cached `~/.cache/torch_vulkan/device_profile_<id>.json` |
-| Device limits (CU count, LDS, max WG, subgroup) | 🟡 | `_get_device_capabilities()` not in pybind → **NAVI10 defaults** (`device_profile.py:156`) |
-| **Profile is *consumed* by codegen** | 🔴 | **Only `_wave64_persistent_ok()` reads one field** (`subgroup_size_max`, `scheduling_helpers.py:44`). Mem-BW/LDS-BW/latency/CU-count all dead. Codegen uses hardcoded NAVI10 constants. |
+| Device limits (CU count, LDS, max WG, subgroup) | ✅ **S0.2 FIXED 2026-06-21** | `_device_caps()` wired into `_query_limits()` (`device_profile.py:_query_limits`). Returns real `max_workgroup_size=1024`, `subgroup=64`, `shared_memory=65536` from device. `TestM211DeviceProfile::test_device_limits_come_from_hardware` ✅ |
+| **Profile is *consumed* by codegen** | 🟡 **S0.1 partial** | `profile_limit` wired to `max_workgroup_size`/`compute_units` (`threadgroup_sizing.py`), LDS budget (`kernel/main.py:291` via `profile_limit("shared_memory_per_workgroup_bytes")` 2026-06-21). Mem-BW/latency-threshold routing still unused. |
 
 **S1 — TUNE (autotune sweep)**
 | Item | State | Evidence |
