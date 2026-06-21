@@ -355,6 +355,23 @@ def _register_loss_lowerings() -> None:
         )
         return result
 
+    # ── TRAIN.4.b: nll_loss_forward IR lowering ───────────────────────
+    # The C++ vulkan_nll_loss_forward ignores weight for mean reduction
+    # (returns total_weight = N instead of sum(weight[target])). This
+    # Inductor lowering replaces the FallbackKernel path with correct IR.
+    # Returned as [result, total_weight] — Inductor's multi-output convention.
+    @register_lowering(aten.nll_loss_forward, type_promotion_kind=None)
+    def _vulkan_nll_loss_forward(self, target, weight, reduction, ignore_index):
+        if not _is_vulkan(self):
+            return NotImplemented
+        result, total_weight = _nll_loss_decomp(
+            self, target,
+            weight=weight,
+            reduction=int(reduction),
+            ignore_index=int(ignore_index),
+        )
+        return [result, total_weight]
+
     # ── TRAIN.4: nll_loss_backward ─────────────────────────────────────
     # NOTE (anti-goal #3): Implementation moved to _get_nll_loss_backward_impl()
     # below. Registration is done in bwd_lowerings.py.

@@ -128,6 +128,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **S2.0d-resid also FIXED 2026-06-20** (two more root causes, see below): residual `relu(out+identity)` backward now has full per-param grad parity (`test_resnet_block_residual_grad_parity` ✅). | ✅ **FIXED** |
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper leaks — **FIXED 2026-06-21**: two root-cause fixes in `matmul.py` + `bwd_lowerings.py` + `pool.py` (`TestNoExternInFullCNNBwd` ✅). | ✅ **FIXED** |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | ✅ **FIXED 2026-06-21** — routes `aten._foreach_add.List` (functional form, post AOTAutograd) + `aten._foreach_add_.List` (inplace form) both to `foreach_sgd_step` ExternKernel. Batch sizes capped at 8 (push-const limit). Tests: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅, `test_s3_1_compiled_sgd_variable_numel_correctness` ✅ |
+| **TRAIN.4.b** | `vulkan_nll_loss_forward` (C++ FallbackKernel) ignores weight for mean reduction — returns `total_weight = N` instead of `sum(weight[target_n])`, causing 75% wrong gradients in weighted cross-entropy. | ✅ **FIXED 2026-06-21** — added `aten.nll_loss_forward` Inductor lowering in `lowerings/loss.py` that calls `_nll_loss_decomp()` with correct weighted total_weight IR. `TestTrain4CrossEntropyBackward::test_cross_entropy_with_weight` ✅ |
 
 **S3 — TRAIN (steady-state perf)**
 | Item | State | Evidence |
@@ -155,6 +156,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
 | 6 | **No CPU/eager fallbacks on the compile path** | ✅ S2.5 ✅ FIXED 2026-06-21 (avg_pool2d → `torch_vulkan` custom op); S2.1 ✅ fixed; S2.2 ✅ confirmed |
 | 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
+| 8 | **Binary loss backward via inline bwd_diff (not external custom-op shim)** | ✅ **CG.M8 FIXED 2026-06-21** — `aten.{mse,l1,bce,bce_with_logits,smooth_l1,huber}_loss_backward` route through `ops.vulkan_bwd_diff_binary` inline path with correct 1/N mean-scale. `TestTrain1LossBackwardReachability` 10/10 ✅. |
 
 ---
 
