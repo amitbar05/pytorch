@@ -111,15 +111,16 @@ def _ensure_extern_choices(tile_fns, extern_kernel_choice_cls) -> None:
 
 
 def install_external_mm() -> None:
-    """Register Slang template mm callables as external matmul choices.
+    """Override aten.mm lowering for Vulkan to use Slang tiled matmul.
 
-    Appends to ``torch._inductor.config.external_matmul`` so that Inductor's
-    ``tuned_mm`` lowering benchmarks our Slang tiled-matmul templates
-    alongside ``torch.mm`` (C++ Vulkan backend) and picks the fastest.
+    Registers a Vulkan-specific ``aten.mm`` lowering that offers ONLY Slang
+    tile choices to the autotuner (no ``aten_mm`` / C++ Vulkan eager fallback).
+    This satisfies the codegen-only pillar (anti-goal #6): the generated
+    backward wrapper must not contain ``extern_kernels.mm``.
 
-    For each tile config, registers both a single-stage (NUM_STAGES=1) and
-    a double-buffered (NUM_STAGES=2) variant.  The pipelined variant overlaps
-    shared-memory loads with compute, which helps on memory-bound problems.
+    For non-Vulkan tensors the original ``tuned_mm`` lowering is delegated to.
+    ``aten_mm`` is still included as last resort if no Slang tiles exist (e.g.
+    ``TORCH_VULKAN_DISABLE_SLANG_TILES=1``).
 
     Safe to call multiple times — only installs once.
     """
@@ -133,11 +134,22 @@ def install_external_mm() -> None:
     if not tiles and not reg_tiles:
         return
 
-    from torch._inductor import config as inductor_config
-    from torch._inductor.select_algorithm import ExternKernelChoice
+    # Force registration of tuned_mm before we capture + replace it.
+    import torch._inductor.kernel.mm as _mm_mod  # noqa: F401
+    from torch._inductor import lowering as _L
+    from torch._inductor.kernel.mm_common import _is_static_problem, mm_args
+    from torch._inductor.select_algorithm import (
+        ExternKernelChoice,
+        autotune_select_algorithm,
+    )
+    from torch._inductor.utils import use_aten_gemm_kernels
 
+    aten = torch.ops.aten
+
+    _orig_mm = _L.lowerings.get(aten.mm.default) or _L.lowerings.get(aten.mm)
+
+    mm_tile_fns: list = []
     if _slang_tiles_enabled():
-        mm_tile_fns: list = []
         for tm, tn, tk in tiles:
             mm_tile_fns.append(_make_tile_mm_fn(tm, tn, tk, num_stages=1))
             mm_tile_fns.append(_make_tile_mm_fn(tm, tn, tk, num_stages=2))
@@ -152,15 +164,53 @@ def install_external_mm() -> None:
                     tm, tn, tk, num_stages=2, m_per_thread=mpt, n_per_thread=npt
                 )
             )
-        # M-NEW.1: pre-construct ExternKernelChoices at install time so
-        # the deterministic ``__name__``s are registered on
-        # ``extern_kernels`` exactly once per process.  The upstream
-        # ``lazy_register_extern_choice`` has ``@functools.cache`` which
-        # catches repeat calls within one process, but pre-constructing
-        # here provides defense-in-depth against codecache serialization
-        # creating new callable objects.
+        # M-NEW.1: pre-construct ExternKernelChoices at install time so the
+        # deterministic ``__name__``s are registered on ``extern_kernels``
+        # exactly once per process.  Cached wrappers reference
+        # ``extern_kernels.slang_mm_*`` directly; pre-registration ensures they
+        # resolve even when the wrapper is loaded without re-entering this fn.
         _ensure_extern_choices(mm_tile_fns, ExternKernelChoice)
-        inductor_config.external_matmul.extend(mm_tile_fns)
+
+    @_L.register_lowering(aten.mm, type_promotion_kind=None)
+    def _vulkan_tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
+        if mat1.get_device().type != "vulkan" or out_dtype is not None:
+            if _orig_mm is not None:
+                return _orig_mm(mat1, mat2, out_dtype=out_dtype, layout=layout)
+            return torch.mm(mat1, mat2)
+
+        from torch._inductor.kernel.mm import aten_mm
+        from torch._inductor.kernel_inputs import MMKernelInputs
+
+        m, n, k, layout_, mat1_, mat2_ = mm_args(mat1, mat2, layout=layout)[:6]
+        kernel_inputs = MMKernelInputs([mat1_, mat2_])
+        choices = []
+
+        if use_aten_gemm_kernels():
+            # S2.1: exclude aten_mm when Slang tiles are available for Vulkan.
+            # aten_mm routes to C++ Vulkan eager mm (anti-goal #6 violation).
+            # For non-Vulkan or when tiles are absent, aten_mm is the fallback.
+            if not mm_tile_fns:
+                choices.append(aten_mm.bind(kernel_inputs.nodes(), layout_))
+
+        candidate_fns = _filter_tiles_by_k(mm_tile_fns, k)
+        for fn in candidate_fns:
+            choice = _EXTERN_CHOICE_CACHE.get(fn.__name__)
+            if choice is None:
+                choice = ExternKernelChoice(fn)
+                _EXTERN_CHOICE_CACHE[fn.__name__] = choice
+            choices.append(choice.bind(kernel_inputs.nodes(), layout_))
+
+        if not choices:
+            choices.append(aten_mm.bind(kernel_inputs.nodes(), layout_))
+
+        result = autotune_select_algorithm(
+            "mm", choices, kernel_inputs.nodes(), layout_
+        )
+        if isinstance(result, tuple):
+            node, _ = result
+        else:
+            node = result
+        return node
 
 
 def install_external_bmm() -> None:

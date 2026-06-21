@@ -323,21 +323,31 @@ on a validation-layer + parity floor.
 - **Exit**: `TestConvGnReluFusedWriteCoverage` — fused fwd+bwd parity vs CPU
   under `VUID_AS_ERROR=1`, asserted over ≥3 reruns (catch non-determinism).
 
-### S2.5 — Pool forward: replace FallbackKernel with codegen (anti-goal #6 close-out)
+### S2.5 — Pool forward: replace FallbackKernel with custom-op dispatch (anti-goal #6 close-out)
 
 `aten.avg_pool2d.default` and `aten._adaptive_avg_pool2d.default` are intentionally
-routed to `FallbackKernel` (`bwd_lowerings.py:769`) because the upstream Inductor
+routed to `FallbackKernel` (`bwd_lowerings.py`) because the upstream Inductor
 lowering uses `make_loader+indirect_indexing`, which produces wrong SPIR-V on Vulkan.
-The fix is to write a `Reduction.create`-based lowering for the non-overlapping,
-no-padding case (stride == kernel_size, h_in % kH == 0), using affine index arithmetic
-`oh*kH + kh_offset` (not indirect_indexing).  General (overlapping/padding) cases
-continue to use FallbackKernel.
 
-- **Files**: `lowerings/pool.py` (new `avg_pool2d_forward_codegen`),
-  `bwd_lowerings.py:_vulkan_avg_pool2d` (try codegen path first, fallback on None).
-- **Exit**: `TestPoolFwdCodegen` — `avg_pool2d(4,3,16,16, kernel=(4,4))` produces
-  `Reduction` IR (not `FallbackKernel`); parity vs CPU.  Anti-goal #6 row
-  updates to ✅ once this and S2.2 are both green.
+**Attempted (2026-06-21, reverted):** `Reduction.create` with affine index arithmetic.
+This works for global-pool (1×1 output, `reduction_numel≥128` → Inductor multilayer
+path), but fails for spatial-pool (4×4 output, `reduction_numel=16` → single-layer
+path) with `NotImplementedError: Reduction` in our Slang codegen — our backend
+only handles 1D reduce; 2D window reductions need a dedicated codegen path.
+
+**Correct approach:** Register `torch_vulkan::avg_pool2d_forward` as a C++ custom op
+backed by the existing Vulkan pool kernel in `csrc/ops/legacy_eager.cpp`.  Wire a
+`FallbackKernel`-style lowering to emit `torch.ops.torch_vulkan.avg_pool2d_forward(...)`
+(private Vulkan compute) instead of `torch.ops.aten.avg_pool2d(...)` (public aten
+eager).  This closes anti-goal #6 without needing 2D-reduction codegen support.
+
+- **Files**: `csrc/ops/legacy_eager.cpp` (new `torch_vulkan::avg_pool2d_forward` op),
+  `bwd_lowerings.py:_vulkan_avg_pool2d` (emit custom-op extern instead of aten).
+- **Prerequisite**: C++ rebuild.
+- **Exit**: `TestPoolAdaptiveRouting::test_adaptive_avg_pool2d_routes_to_avg_pool2d`
+  flips from "wrapper contains aten.avg_pool2d" to "wrapper contains
+  torch_vulkan.avg_pool2d_forward".  Anti-goal #6 row updates to ✅ once this
+  and S2.2 are both green.
 
 ### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
 
@@ -489,8 +499,8 @@ prepare_device(level, timeout_s, validate)
 │   └─ S1.1 (conv/flash → V.choices) ⛔
 │
 ├─ S2 COMPILE + VALIDATE
-│   ├─ S2.0 (buf7 full-CNN bwd crash) 🔴 P0 ─┐ both block
-│   ├─ S2.1 (extern/aten leak)        🔴 P0 ─┘ a real CNN
+│   ├─ S2.0 (buf7 full-CNN bwd crash) ✅ FIXED
+│   ├─ S2.1 (extern/aten leak)        ✅ FIXED 2026-06-21
 │   ├─ S2.2 (conv_gn_relu RDNA1 bug)  🔴 latent
 │   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
 │   ├─ S2.4 (warm→train coherence)    🟡
@@ -528,7 +538,7 @@ drives codegen) ∥ S2.3 (validation actually runs). Perf (S3.*) and breadth
    spec-constant numeric tunables and genuinely code-structural branches.
 6. **No CPU/eager fallbacks on the compile path** — `TORCH_CHECK(false)` for
    unimplemented ops; no `extern_kernels.X` / `torch.ops.aten.*` in a compiled
-   wrapper (S2.1, S2.5 are the current breaches).
+   wrapper (S2.5 pooling-fwd is the remaining breach; S2.1 ✅ fixed 2026-06-21).
 7. No file in `python/torch_vulkan/inductor/` exceeds 800 lines.
 
 ## § 5 — Discipline (durable)

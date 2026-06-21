@@ -765,7 +765,9 @@ def _register_pool_backward() -> None:
 
     # aten.avg_pool2d: upstream Inductor lowering (_avg_poolnd) uses
     # make_loader+indirect_indexing for the complex case, producing wrong
-    # SPIR-V.  Override with FallbackKernel.
+    # SPIR-V on Vulkan.  Override with FallbackKernel (eager C++ dispatch).
+    # S2.5 (open): replace with a torch_vulkan custom op to avoid the aten
+    # extern while keeping eager C++ dispatch.
     _vk_avg_pool2d_fallback = fallback_handler(
         aten.avg_pool2d.default,
         add_to_fallback_set=False,

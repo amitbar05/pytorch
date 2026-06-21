@@ -1,8 +1,11 @@
 """M17.3 — Adaptive average pooling lowering for Vulkan Inductor.
 
-Forward: For the integer-divisible case, delegates to ``aten.avg_pool2d``
-which creates a Reduction IR node that the scheduler fuses with adjacent
-pointwise ops. Non-divisible / non-Vulkan cases fall back to the eager handler.
+Forward: For the integer-divisible case, ``_adaptive_avg_pool2d_vulkan``
+delegates to ``aten.avg_pool2d`` (FallbackKernel → eager Vulkan C++).
+S2.5 (open) tracks replacing the FallbackKernel with a custom
+``torch_vulkan::avg_pool2d`` op so the wrapper emits
+``torch.ops.torch_vulkan.avg_pool2d(...)`` instead of the public aten extern.
+Non-divisible / non-Vulkan cases fall back to the eager handler.
 
 Backward: Replaces the upstream ``make_fallback`` for
 ``aten._adaptive_avg_pool2d_backward`` with a decomposition into broadcast
@@ -268,3 +271,5 @@ def avg_pool2d_backward_codegen(
         inner_fn=inner_fn,
         ranges=[*prefix_ints, h_in, w_in],
     )
+
+

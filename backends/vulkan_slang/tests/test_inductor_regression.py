@@ -63835,3 +63835,69 @@ class TestNoExternInFullCNNBwd:
             "S2.1: wrapper contains extern_kernels.mm (anti-goal #6):\n"
             + "\n".join(f"  {l}" for l in mm_externs[:5])
         )
+
+
+class TestPoolAdaptiveRouting:
+    """S2.5-pre — pool lowering dispatch audit.
+
+    During FX tracing, adaptive_avg_pool2d on a Vulkan tensor dispatches to
+    the C++ custom op ``torch_vulkan::adaptive_avg_pool2d`` (not to the
+    aten op), so the FX graph already contains
+    ``torch_vulkan.adaptive_avg_pool2d.default``.  Inductor generates a
+    FallbackKernel for it → wrapper emits
+    ``torch.ops.torch_vulkan.adaptive_avg_pool2d.default(...)``.
+
+    This is the pre-S2.5 state:
+    * No public ``aten::_adaptive_avg_pool2d`` extern (anti-goal #6 aten half ✅).
+    * Still calls back to eager custom-op dispatch (anti-goal #6 spirit 🔴).
+
+    S2.5 (open) adds a lowering for ``torch_vulkan.adaptive_avg_pool2d.default``
+    that generates a Slang reduction kernel, eliminating the FallbackKernel call.
+    """
+
+    @pytest.mark.timeout(60)
+    def test_adaptive_avg_pool2d_uses_custom_op_not_aten_extern(self):
+        """Adaptive pool wrapper must use torch_vulkan custom op, not aten extern.
+
+        Expected wrapper shape (pre-S2.5):
+        * ``torch.ops.aten._adaptive_avg_pool2d`` NOT present.
+        * ``torch.ops.torch_vulkan.adaptive_avg_pool2d`` IS present
+          (FallbackKernel for our custom op — known S2.5 open item).
+        """
+        import torch_vulkan  # noqa: F401
+        from torch._inductor.utils import get_code
+        import torch._inductor.config as _ind_cfg
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 3, 16, 16, device="vulkan:0")
+
+        def fwd(x):
+            return torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
+
+        with _ind_cfg.patch({"triton.unique_kernel_names": True}):
+            compiled = torch.compile(fwd, backend="inductor")
+            codes = get_code(compiled, x)
+
+        full_source = "\n".join(codes)
+        assert full_source.strip(), "get_code returned no source"
+
+        # Must NOT have a public aten extern (anti-goal #6 aten half).
+        aten_adaptive = [
+            line.strip() for line in full_source.split("\n")
+            if "torch.ops.aten._adaptive_avg_pool2d" in line
+        ]
+        assert not aten_adaptive, (
+            "Unexpected aten._adaptive_avg_pool2d extern in wrapper "
+            "(anti-goal #6 aten breach):\n"
+            + "\n".join(f"  {l}" for l in aten_adaptive[:5])
+        )
+
+        # Must use our custom-op path (FallbackKernel for torch_vulkan op).
+        custom_op = any(
+            "torch.ops.torch_vulkan.adaptive_avg_pool2d" in line
+            for line in full_source.split("\n")
+        )
+        assert custom_op, (
+            "Expected torch_vulkan.adaptive_avg_pool2d FallbackKernel in wrapper "
+            "(dispatch routing may have regressed; S2.5 Slang codegen not yet landed)"
+        )
