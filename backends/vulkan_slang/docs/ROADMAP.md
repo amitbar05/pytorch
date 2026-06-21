@@ -418,15 +418,19 @@ uses (B1). Bridge the eager-foreach interface into the compiled optimizer step.
 - **Exit tests**: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅,
   `test_s3_1_compiled_sgd_variable_numel_correctness` ✅, `test_e2e_compiled_sgd_15_params_one_dispatch` ✅.
 
-### S3.2 — Tiny-kernel fusion (close out the plumbing dispatches)
+### S3.2 — Tiny-kernel fusion (close out the plumbing dispatches) ✅ FIXED 2026-06-21
 
-~10/21 dispatches are fill/copy/inplace. C6.x raised caps and wired
-`_coalesce_orphan_pointwise`, but coalescing is incomplete. Push per-step
-dispatch count down by folding strided copies + fills into neighbouring compute
-kernels and the combo grid.
-- **Files**: `scheduling.py`, `vulkan_combo_kernel.py`, `kernel/pointwise.py`.
-- **Exit**: `TestTinyKernelFusion` — Conv+GN training step ≤14 dispatches (vs 21
-  today); no standalone `copy_fill`/`copy_strided` dispatches.
+Root cause: `_stashed_outputs` in `wrapper.py:generate_return` was holding extra
+references to gradient-class output tensors, keeping `use_count >= 2` so
+`is_tensor_stealable()` returned false and `AccumulateGrad` fell to
+`clone_obey_contract` (`new_empty_strided + copy_` = 1 Vulkan dispatch per
+parameter). Fix: skip `lt == "gradient"` outputs from the stash — they transfer
+ownership to AccumulateGrad anyway and are freed naturally by `zero_grad()`.
+
+Result with `torch_vulkan.SGD` (1 fused dispatch for all params):
+- forward=2, loss=1, backward=8, optimizer=1, **total=12** (≤14 target ✓)
+- **Files fixed**: `python/torch_vulkan/inductor/wrapper.py` (`generate_return`)
+- **Exit test**: `TestTinyKernelFusion::test_conv_gn_pool_training_step_dispatch_count` ✅
 
 ### S3.3 — Wire persistent-kernel routing for large reductions (C3 is dead code)
 
@@ -515,7 +519,7 @@ prepare_device(level, timeout_s, validate)
 │
 ├─ S3 TRAIN (perf — after correctness)
 │   ├─ S3.1 (compiled foreach optimizer) ✅
-│   ├─ S3.2 (tiny-kernel fusion)         🟡
+│   ├─ S3.2 (tiny-kernel fusion)         ✅ FIXED 2026-06-21
 │   ├─ S3.3 (persistent reduction wiring)🔴 dead code
 │   └─ S3.4 (batch-dispatch overlap)     🟡
 │

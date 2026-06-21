@@ -137,15 +137,22 @@ class VulkanPythonWrapperCodegen(PythonWrapperCodegen):
             self.wrapper_call.writeline("_batcher.__exit__(None, None, None)")
         # M9.7: stash outputs for next-call recycling (lookback depth 1).
         # Emit (tensor, lt) tuples so release reuses the correct pool key.
+        # Skip gradient-class outputs: they transfer ownership to AccumulateGrad
+        # (param.grad assignment). Stashing them keeps use_count >= 2, which
+        # makes is_tensor_stealable() return false and forces clone_obey_contract
+        # (new_empty_strided + copy_ = 1 Vulkan dispatch per parameter).
+        # Gradient tensors are freed naturally when zero_grad() releases param.grad.
         if output_refs:
             stash_entries = []
             for ref in output_refs:
                 base_name = ref.split(".")[0].split("(")[0].strip()
                 lt = self._output_lifetime_map.get(base_name, "transient")
-                stash_entries.append(f"({ref}, {lt!r})")
-            self.wrapper_call.writeline(
-                f"_stashed_outputs[:] = [{', '.join(stash_entries)}]"
-            )
+                if lt != "gradient":
+                    stash_entries.append(f"({ref}, {lt!r})")
+            if stash_entries:
+                self.wrapper_call.writeline(
+                    f"_stashed_outputs[:] = [{', '.join(stash_entries)}]"
+                )
         super().generate_return(output_refs)
 
     # M22.2: The regex post-processor (M17.7) is superseded by the IR-level

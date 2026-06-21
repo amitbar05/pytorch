@@ -41149,24 +41149,26 @@ class TestMPipeline1ConvLoweringReachable:
             "``extern_kernels.conv2d_gn_relu_fused`` (implicit fallback)."
         )
 
-    def test_conv_gn_relu_no_pregrad_fusion(self):
-        """Pre-grad fusion is disabled for correctness.
+    def test_conv_gn_relu_pregrad_fusion_present(self):
+        """S2.2: pre-grad conv+GN+ReLU fusion is enabled (RDNA1-gated).
 
-        The M18.8.b pre-grad fusion inserted ``conv2d_gn_relu_fused.default``
-        before AOTAutograd, causing AOTAutograd's setup_context rematerialisation
-        to recompute conv without bias, which produced wrong xhat in the GN
-        backward (~22× gradient error).  Fusion is now disabled; Inductor
-        uses native aten lowerings for conv, native_group_norm, and relu.
-        Verify the fused op does NOT appear in the compiled wrapper.
+        M18.8.b disabled the fusion due to setup_context rematerialisation
+        producing wrong xhat in GN backward. S2.2 fixed this by moving the
+        fusion to post-grad (after AOTAutograd), so the fused op now appears
+        correctly in the compiled wrapper.  Verify ``conv2d_gn_relu_fused``
+        IS present — its absence means the S2.2 fusion regressed.
+
+        Note: the fusion is RDNA1-gated (``_RDNA1_FUSION_ENABLED``); this test
+        runs on the test GPU which IS RDNA1.
         """
         _, codes = self._compile_smallcnn()
         if not codes:
             pytest.skip("Inductor emitted no wrapper code (downstream blocker).")
         joined = "\n".join(codes)
-        assert "conv2d_gn_relu_fused" not in joined, (
-            "Pre-grad fusion is disabled — conv2d_gn_relu_fused must NOT appear "
-            "in the compiled wrapper.  If it does, install_conv_patched_gn_relu_fusion "
-            "is being called again somewhere."
+        assert "conv2d_gn_relu_fused" in joined, (
+            "S2.2 regression: conv2d_gn_relu_fused MUST appear in the compiled "
+            "wrapper on RDNA1.  The S2.2 post-grad fusion (install_conv_gn_relu_fusion) "
+            "is no longer firing — check fx_passes/post_grad.py and the RDNA1 gate."
         )
 
     def test_eager_patch_register_is_idempotent(self):
@@ -64157,4 +64159,85 @@ class TestConvGnReluFusedWriteCoverage:
             "S2.2: Conv+GN+ReLU fused backward write-coverage failure "
             f"({len(failures)} regressions across 5 seeds):\n"
             + "\n".join(f"  {f}" for f in failures)
+        )
+
+
+class TestTinyKernelFusion:
+    """S3.2 regression — Conv+GN training step dispatch count ≤14.
+
+    Tracks the total Vulkan dispatch count across a full training step
+    (forward + loss + backward + optimizer) for a Conv+GN+Pool model.
+    The gradient stash fix (wrapper.py generate_return) eliminated the 4
+    AccumulateGrad clone dispatches by not holding an extra ref to returned
+    gradient tensors. Combined with torch_vulkan.SGD's single-dispatch
+    batch step, the total drops from 19 → 12.
+
+    Ratchet: ≤14 (empirical steady-state is 12 as of 2026-06-21).
+    """
+
+    def test_conv_gn_pool_training_step_dispatch_count(self):
+        """S3.2: Conv+GN+Pool training step ≤14 dispatches.
+
+        Counts Vulkan GPU dispatches across forward + loss + backward + step.
+        Uses torch_vulkan.SGD for the fused 1-dispatch optimizer.
+        """
+        import torch
+        import torch.nn as nn
+        import torch._dynamo
+        import torch_vulkan
+        from torch_vulkan._C import _reset_perf_counters, _get_dispatch_count
+
+        torch._dynamo.reset()
+
+        class ConvGNPool(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn = nn.GroupNorm(4, 16)
+                self.pool = nn.AdaptiveAvgPool2d(1)
+
+            def forward(self, x):
+                x = self.conv(x)
+                x = self.gn(x)
+                x = torch.relu(x)
+                x = self.pool(x)
+                return x.flatten(1)
+
+        dev = "vulkan:0"
+        model = ConvGNPool().to(dev)
+        opt = torch_vulkan.SGD(model.parameters(), lr=0.01)
+        compiled = torch.compile(model, backend="inductor")
+        x = torch.randn(4, 3, 8, 8, device=dev)
+
+        # Warmup (compile + cache fill)
+        for _ in range(2):
+            out = compiled(x)
+            loss = out.sum()
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+
+        # Measure clean step
+        _reset_perf_counters()
+        out = compiled(x)
+        fwd = _get_dispatch_count()
+        _reset_perf_counters()
+
+        loss = out.sum()
+        loss_d = _get_dispatch_count()
+        _reset_perf_counters()
+
+        loss.backward()
+        bwd = _get_dispatch_count()
+        _reset_perf_counters()
+
+        opt.step()
+        opt_d = _get_dispatch_count()
+
+        total = fwd + loss_d + bwd + opt_d
+        assert total <= 14, (
+            f"S3.2: Conv+GN+Pool training step ≤14 dispatches expected, got {total} "
+            f"(fwd={fwd} loss={loss_d} bwd={bwd} opt={opt_d}). "
+            "Check AccumulateGrad stash (wrapper.py generate_return) and "
+            "torch_vulkan.SGD optimizer dispatch count."
         )
