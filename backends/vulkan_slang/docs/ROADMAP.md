@@ -351,11 +351,16 @@ Result: `conv_gn_relu` warm step **8.2 ms → 6.9 ms (~16%)**, others neutral,
 - **Files**: `device_profile.py:profile_limit`, `kernel/threadgroup_sizing.py`.
 - **Exit**: `TestM211DeviceProfile::test_profile_limit_drives_codegen` ✅.
 
-**Still open (S0.1 remainder):** the rich *microbench* data is still unused —
-LDS budget ← `shared_memory_per_workgroup_bytes`; persistent-vs-grid-stride and
-batch-vs-direct dispatch thresholds ← `empty_kernel_launch_us` / `memcpy_d2d_GBps`;
-matmul/conv tile selection ← measured mem BW. Wire these next so warm-up is
-fully portable (an 80-CU card tiles differently from a 16-CU card).
+**S0.1 partial FIXED 2026-06-21:** persistent-vs-grid-stride numel cap now
+scales from device profile. `_persistent_pointwise_numel_cap()` in
+`scheduling.py` reads `compute_units` + `empty_kernel_launch_us` from
+`profile_limit` and computes `16384 × (cu/16) × (launch_us/12.3)`, clamped to
+[4096, 65536]. For RDNA1 (16 CU, 12.3µs) cap stays at 16384; for an 80-CU/50µs
+GPU the cap scales to 65536. `TestProfileDrivenPersistentCap` ✅.
+
+**Still open (S0.1 remainder):** `memcpy_d2d_GBps` → matmul/conv tile selection;
+batch-vs-direct dispatch threshold → `batcher.py` (blocked on S3.4). Portable
+auto-tuning for tile size on different memory-BW cards is the next step.
 
 ### S0.2 — ✅ FIXED 2026-06-21: Complete the device-limits pybind query
 

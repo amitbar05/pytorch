@@ -27,6 +27,31 @@ if TYPE_CHECKING:
     from torch._inductor.scheduler import Scheduler, SchedulerNode
 
 
+_PERSISTENT_CAP_CACHE: Optional[int] = None
+
+
+def _persistent_pointwise_numel_cap() -> int:
+    """S0.1: Compute the persistent-mode numel cap from device profile.
+
+    Scales the base cap (16384, empirically set for RDNA1) by the device's
+    CU count and empty-kernel launch latency relative to the RDNA1 baseline
+    (16 CU, 12.3 µs). Clamped to [4096, 65536].
+    """
+    global _PERSISTENT_CAP_CACHE
+    if _PERSISTENT_CAP_CACHE is not None:
+        return _PERSISTENT_CAP_CACHE
+    try:
+        from .device_profile import profile_limit
+
+        cu_count = int(profile_limit("compute_units", 16))
+        launch_us = float(profile_limit("empty_kernel_launch_us", 12.3))
+        cap = int(16384 * (cu_count / 16.0) * (launch_us / 12.3))
+        _PERSISTENT_CAP_CACHE = max(4096, min(65536, cap))
+    except Exception:
+        _PERSISTENT_CAP_CACHE = 16384
+    return _PERSISTENT_CAP_CACHE
+
+
 class VulkanScheduling(SIMDScheduling):
     kernel_type = VulkanKernel  # type: ignore[assignment]
 
@@ -847,15 +872,16 @@ class VulkanScheduling(SIMDScheduling):
         numel = kernel_features.numel
         if not isinstance(numel, sympy.Integer):
             return kernels
-        # C6.4 (2026-06-18): raise persistent-mode cap from 4096→16384.
-        # The grid-stride loop in _emit_persistent_grid_stride_loop
-        # already handles larger numel by scaling WG count with CU count
-        # (M11.4), so the only cost is a modulo operation per element.
-        # Raising the cap lets more pointwise chains benefit from the
-        # persistent dispatch amortization — fill/copy/inplace ops with
-        # intermediate tensor sizes (e.g. 64×64=4096 to 128×128=16384)
-        # now get grid-stride wrapping instead of standalone dispatches.
-        if int(numel) > 16384:
+        # S0.1: scale persistent-mode cap from device profile.
+        # Base cap (16384) was empirically calibrated for RDNA1 (16 CU,
+        # 12.3 µs launch latency, 230 GB/s BW).  On GPUs with more CUs or
+        # higher launch latency, a larger cap is beneficial — the grid-stride
+        # loop amortises more launches before the per-element modulo cost
+        # exceeds the savings.  Formula: scale linearly with CU count and
+        # launch latency relative to the RDNA1 baseline.
+        #   threshold = 16384 × (cu_count / 16) × (launch_us / 12.3)
+        # clamped to [4096, 65536].
+        if int(numel) > _persistent_pointwise_numel_cap():
             return kernels
 
         for kernel in kernels:

@@ -64319,3 +64319,64 @@ class TestWarmCacheCoherence:
                 os.environ["TORCH_VULKAN_MM_TILES"] = prev
             else:
                 os.environ.pop("TORCH_VULKAN_MM_TILES", None)
+
+
+class TestProfileDrivenPersistentCap:
+    """S0.1 regression — persistent-mode numel cap scales with device profile.
+
+    Verifies that _persistent_pointwise_numel_cap() reads compute_units and
+    empty_kernel_launch_us from the device profile and produces a scaled cap.
+    """
+
+    def test_persistent_cap_scales_with_device_profile(self, monkeypatch):
+        """S0.1: persistent cap scales linearly with CU count and launch latency."""
+        import torch_vulkan.inductor.scheduling as sched_mod
+        from torch_vulkan.inductor import device_profile as dp_mod
+
+        # Reset cache so the function re-reads the profile
+        monkeypatch.setattr(sched_mod, "_PERSISTENT_CAP_CACHE", None)
+
+        # Patch profile_limit to return known values
+        def mock_profile_limit(key, fallback=None):
+            return {
+                "compute_units": 32,
+                "empty_kernel_launch_us": 24.6,
+            }.get(key, fallback)
+
+        monkeypatch.setattr(dp_mod, "profile_limit", mock_profile_limit)
+
+        cap = sched_mod._persistent_pointwise_numel_cap()
+        # Expected: 16384 × (32/16) × (24.6/12.3) = 16384 × 2 × 2 = 65536
+        assert cap == 65536, (
+            f"S0.1: expected cap=65536 for 32 CU / 24.6µs launch, got {cap}"
+        )
+
+    def test_persistent_cap_clamped_minimum(self, monkeypatch):
+        """S0.1: cap is clamped to min 4096 even for very fast GPUs."""
+        import torch_vulkan.inductor.scheduling as sched_mod
+        from torch_vulkan.inductor import device_profile as dp_mod
+
+        monkeypatch.setattr(sched_mod, "_PERSISTENT_CAP_CACHE", None)
+
+        def mock_profile_limit(key, fallback=None):
+            return {"compute_units": 1, "empty_kernel_launch_us": 1.0}.get(key, fallback)
+
+        monkeypatch.setattr(dp_mod, "profile_limit", mock_profile_limit)
+
+        cap = sched_mod._persistent_pointwise_numel_cap()
+        assert cap >= 4096, f"S0.1: cap must be >= 4096 (min), got {cap}"
+
+    def test_persistent_cap_clamped_maximum(self, monkeypatch):
+        """S0.1: cap is clamped to max 65536 even for very slow/large GPUs."""
+        import torch_vulkan.inductor.scheduling as sched_mod
+        from torch_vulkan.inductor import device_profile as dp_mod
+
+        monkeypatch.setattr(sched_mod, "_PERSISTENT_CAP_CACHE", None)
+
+        def mock_profile_limit(key, fallback=None):
+            return {"compute_units": 256, "empty_kernel_launch_us": 100.0}.get(key, fallback)
+
+        monkeypatch.setattr(dp_mod, "profile_limit", mock_profile_limit)
+
+        cap = sched_mod._persistent_pointwise_numel_cap()
+        assert cap <= 65536, f"S0.1: cap must be <= 65536 (max), got {cap}"
