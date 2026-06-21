@@ -63901,3 +63901,66 @@ class TestPoolAdaptiveRouting:
             "Expected torch_vulkan.adaptive_avg_pool2d FallbackKernel in wrapper "
             "(dispatch routing may have regressed; S2.5 Slang codegen not yet landed)"
         )
+
+
+class TestConvGnReluFusedWriteCoverage:
+    """S2.2 — Conv+GN+ReLU fused shader: RDNA1 write-coverage regression gate.
+
+    The fused `conv_gn_relu.slang` forward shader had a multi-wave write-coverage
+    miscompile on RDNA1 (slangc 2026.7.1) that caused some output elements to be
+    unwritten, producing silent garbage in the GroupNorm output and zero-or-wrong
+    gradients during backward.  The M-CG.3 workaround (256→64 WG, forcing single-
+    wave64) resolved the forward coverage issue.
+
+    This test pins the fix by running the fused Conv+GN+ReLU fwd+bwd FIVE TIMES
+    with different random seeds and asserting gradient parity vs CPU on every run.
+    If the write-coverage bug were to re-emerge (e.g. slangc regression or WG size
+    change), gradients would become near-zero or inconsistent and the L∞ check
+    would fail on at least one run.
+
+    VUID checking is ON by default (M-VAL.1 autouse fixture in conftest.py):
+    any Vulkan synchronization VUID emitted during the run fails the test
+    immediately.  This catches buffer-hazard root causes that the gradient check
+    alone might miss.
+
+    Exit criterion for ROADMAP.md S2.2.
+    """
+
+    @pytest.mark.timeout(300)
+    def test_fused_bwd_parity_multi_run(self):
+        """S2.2 — gradient parity under fused path, 5 independent seeds.
+
+        Regression gate: if the write-coverage bug returns, at least one of
+        the 5 runs will produce L∞ ≥ 1e-4 and the assertion will catch it.
+        """
+        import torch.nn as nn
+
+        failures = []
+        for seed in range(5):
+            torch.manual_seed(seed)
+            cpu_mod = nn.Sequential(
+                nn.Conv2d(3, 16, 3, padding=1),
+                nn.GroupNorm(4, 16),
+                nn.ReLU(),
+            )
+            torch.manual_seed(seed)
+            vk_mod = nn.Sequential(
+                nn.Conv2d(3, 16, 3, padding=1),
+                nn.GroupNorm(4, 16),
+                nn.ReLU(),
+            ).to("vulkan:0")
+
+            results = _train_one_step_compare(cpu_mod, vk_mod, (2, 3, 8, 8))
+            for name, (cpu_g, vk_g, l_inf) in results.items():
+                if l_inf >= 1e-4:
+                    failures.append(
+                        f"seed={seed} {name}: L∞={l_inf:.6f} "
+                        f"(cpu_norm={cpu_g.norm().item():.5f}, "
+                        f"vk_norm={vk_g.norm().item():.5f})"
+                    )
+
+        assert not failures, (
+            "S2.2: Conv+GN+ReLU fused backward write-coverage failure "
+            f"({len(failures)} regressions across 5 seeds):\n"
+            + "\n".join(f"  {f}" for f in failures)
+        )

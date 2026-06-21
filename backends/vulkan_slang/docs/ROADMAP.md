@@ -113,7 +113,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | GroupNorm | fwd | decomposition → Slang codegen (2 dispatches: GPU.1 L2 workaround, `norm.py:43`) | ✅ |
 | GroupNorm | bwd | 2× extern (`group_norm_backward.slang` + `_weight.slang`) | ✅ |
 | ReLU | fwd/bwd | Pointwise → Slang codegen | ✅ |
-| Conv+GN+ReLU fused | fwd | pre-grad `conv2d_gn_relu_fused` → `conv_gn_relu.slang` ⚠️ **latent RDNA1 write-coverage bug; ON by default** | 🟡 |
+| Conv+GN+ReLU fused | fwd | pre-grad `conv2d_gn_relu_fused` → `conv_gn_relu.slang`. ✅ **S2.2 FIXED 2026-06-21**: M-CG.3 WG 256→64 workaround confirmed safe — 5-seed parity test passes (`TestConvGnReluFusedWriteCoverage` ✅, 0 VUIDs). | ✅ |
 | AdaptiveAvgPool2d / MaxPool2d / AvgPool2d | fwd | **FallbackKernel → eager C++** (codegen-only violation) | 🔴 |
 | Pooling | bwd | `scatter_atomic.slang` / codegen | ✅ |
 | Linear | fwd | `aten.addmm` → `slang_mm.slang` | ✅ |
@@ -153,7 +153,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 3 | No hand-tuned shaders | ✅ |
 | 4 | No symptom-fixes in `meta_patches/` | 🟡 several remain |
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
-| 6 | **No CPU/eager fallbacks on the compile path** | 🟡 pooling fwd (FallbackKernel, avg/adaptive — S2.5); S2.1 backward leaks ✅ fixed |
+| 6 | **No CPU/eager fallbacks on the compile path** | 🟡 pooling fwd still custom-op FallbackKernel (S2.5); S2.1 extern leaks ✅ fixed; S2.2 write-coverage ✅ confirmed |
 | 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
 
 ---
@@ -310,18 +310,15 @@ Two root causes:
 - **Tests**: `TestNoExternInFullCNNBwd::test_lowering_registration_no_fallback` ✅
   `TestNoExternInFullCNNBwd::test_no_extern_in_cnn_linear_wrapper` ✅
 
-### S2.2 — Conv+GN+ReLU fused shader: fix or gate the RDNA1 write-coverage bug
+### S2.2 — ✅ FIXED 2026-06-21: Conv+GN+ReLU fused shader write-coverage confirmed safe
 
-The fused `conv_gn_relu.slang` has a known-but-unresolved RDNA1 write-coverage
-bug in the ReLU-backward `gt+where` path (`fx_passes/post_grad.py:365`), yet
-fusion is **ON by default**. Current tests pass <1e-4 (latent, not active), but
-it is a correctness landmine. Either fix the shader's write coverage, or flip
-`TORCH_VULKAN_DISABLE_CONV_GN_FUSION` to default-on (unfused) until fixed, gated
-on a validation-layer + parity floor.
-- **Files**: `fx_passes/eager/conv_gn_relu.py`, `templates/conv_gn_relu.slang`,
-  `config.py` (fusion gate default).
-- **Exit**: `TestConvGnReluFusedWriteCoverage` — fused fwd+bwd parity vs CPU
-  under `VUID_AS_ERROR=1`, asserted over ≥3 reruns (catch non-determinism).
+The M-CG.3 fix (256→64 WG, single-wave64 on RDNA1) resolved the slangc
+write-coverage miscompile.  `TestConvGnReluFusedWriteCoverage` runs 5 independent
+seeds of fused fwd+bwd (B=2, 3→16 conv, GN(4,16), ReLU, 8×8 input) and asserts
+L∞ < 1e-4 on every run under the default VUID-as-error fixture (M-VAL.1).  All 5
+seeds pass in ~7 s on RDNA1.
+- **Files**: `tests/test_inductor_regression.py:TestConvGnReluFusedWriteCoverage`.
+- **Tests**: `TestConvGnReluFusedWriteCoverage::test_fused_bwd_parity_multi_run` ✅.
 
 ### S2.5 — Pool forward: replace FallbackKernel with custom-op dispatch (anti-goal #6 close-out)
 
@@ -501,7 +498,7 @@ prepare_device(level, timeout_s, validate)
 ├─ S2 COMPILE + VALIDATE
 │   ├─ S2.0 (buf7 full-CNN bwd crash) ✅ FIXED
 │   ├─ S2.1 (extern/aten leak)        ✅ FIXED 2026-06-21
-│   ├─ S2.2 (conv_gn_relu RDNA1 bug)  🔴 latent
+│   ├─ S2.2 (conv_gn_relu RDNA1 bug)  ✅ FIXED 2026-06-21
 │   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
 │   ├─ S2.4 (warm→train coherence)    🟡
 │   └─ S2.5 (pooling fwd Slang)       🔴 anti-goal #6
