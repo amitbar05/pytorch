@@ -64241,3 +64241,81 @@ class TestTinyKernelFusion:
             "Check AccumulateGrad stash (wrapper.py generate_return) and "
             "torch_vulkan.SGD optimizer dispatch count."
         )
+
+
+class TestWarmCacheCoherence:
+    """S2.4 regression — warm-up tuning knobs propagate to training compiles.
+
+    After a level-2 warm-up (which sets MM_TILES=expanded), subsequent imports
+    must restore MM_TILES=expanded as a soft default so torch.compile generates
+    the same Slang tile source → same SPIR-V cache key → cache hit.
+    """
+
+    def test_probe_status_restores_mm_tiles_env(self, tmp_path):
+        """S2.4: _restore_probe_defaults() applies mm_tiles_mode from probe_status.
+
+        Writes a synthetic probe_status.json with mm_tiles_mode=expanded, calls
+        the restore function, asserts MM_TILES env is set to 'expanded'.
+        """
+        import os
+        import json
+        from torch_vulkan.inductor import hardware_probe as hp
+
+        # Write a synthetic probe_status.json with warm-up knobs
+        status_path = tmp_path / "probe_status_test.json"
+        status_path.write_text(json.dumps({
+            "completed_level": 2,
+            "mm_tiles_mode": "expanded",
+        }))
+
+        # Patch _probe_status_path to return our synthetic file
+        original_fn = hp._probe_status_path
+        hp._probe_status_path = lambda: status_path
+
+        prev_mm_tiles = os.environ.pop("TORCH_VULKAN_MM_TILES", None)
+        try:
+            hp._restore_probe_defaults()
+            assert os.environ.get("TORCH_VULKAN_MM_TILES") == "expanded", (
+                "S2.4: _restore_probe_defaults() should set MM_TILES=expanded "
+                "from probe_status.json when the user hasn't explicitly set it."
+            )
+        finally:
+            hp._probe_status_path = original_fn
+            if prev_mm_tiles is not None:
+                os.environ["TORCH_VULKAN_MM_TILES"] = prev_mm_tiles
+            else:
+                os.environ.pop("TORCH_VULKAN_MM_TILES", None)
+
+    def test_user_mm_tiles_not_overridden(self, tmp_path):
+        """S2.4: explicit TORCH_VULKAN_MM_TILES is NOT overridden by the manifest.
+
+        If the user has explicitly set MM_TILES=default, warm-up defaults must
+        not override it — user intent wins.
+        """
+        import os
+        import json
+        from torch_vulkan.inductor import hardware_probe as hp
+
+        status_path = tmp_path / "probe_status_test.json"
+        status_path.write_text(json.dumps({
+            "completed_level": 2,
+            "mm_tiles_mode": "expanded",
+        }))
+
+        original_fn = hp._probe_status_path
+        hp._probe_status_path = lambda: status_path
+
+        prev = os.environ.get("TORCH_VULKAN_MM_TILES")
+        os.environ["TORCH_VULKAN_MM_TILES"] = "default"
+        try:
+            hp._restore_probe_defaults()
+            assert os.environ.get("TORCH_VULKAN_MM_TILES") == "default", (
+                "S2.4: user-set TORCH_VULKAN_MM_TILES must not be overridden by "
+                "the probe manifest."
+            )
+        finally:
+            hp._probe_status_path = original_fn
+            if prev is not None:
+                os.environ["TORCH_VULKAN_MM_TILES"] = prev
+            else:
+                os.environ.pop("TORCH_VULKAN_MM_TILES", None)

@@ -103,7 +103,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | `prepare_model()` → 100% warm SPIR-V cache | ✅ | `hardware_probe.py:791`; proven 13 s→0.59 s |
 | Subprocess validation of autotune winners | ✅ | `autotune.py:validate_winner` spawns fresh-instance subprocess |
 | **In-process validation during warm-up** | 🔴 | aspirational — needs `VK_INSTANCE_LAYERS` set *before* `import torch_vulkan` (instance built at import). `validate=True` is a no-op for S0/S1 in-process. |
-| **Warm→train cache coherence** | 🟡 | depends on tuning env-knobs (`MM_TILES`/`CONV_TILE`) staying frozen; not hashed into cache key |
+| **Warm→train cache coherence** | ✅ **S2.4 FIXED 2026-06-21** | `_restore_probe_defaults()` reads `mm_tiles_mode` from probe_status.json and applies as soft default on every import. `TestWarmCacheCoherence` ✅ |
 
 **S2 — Conv+GN+ReLU+Pool+Linear compile-path dispatch audit**
 | Op | Dir | Mechanism | Slang? |
@@ -133,7 +133,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 **S3 — TRAIN (steady-state perf)**
 | Item | State | Evidence |
 |---|---|---|
-| Tiny-kernel fusion (fill/copy/inplace) | 🟡 | ~10/21 dispatches still plumbing; C6.x cap-raises + `_coalesce_orphan_pointwise` wired (`__init__.py:907`) but not fully coalescing |
+| Tiny-kernel fusion (AccumulateGrad stash) | ✅ **S3.2 FIXED 2026-06-21** | gradient stash fix → 12 dispatches/step (≤14); `TestTinyKernelFusion` ✅ |
 | Persistent-kernel routing for large reductions | 🔴 | **dead code** — `dispatch_persistent_pointwise()` defined, never called; no numel>65536 routing |
 | Batch-dispatch overlap (exec N ∥ compile N+2) | 🟡 | async precompile real (`slangc.py:573`); full overlap TODO; `BATCH_DISPATCH=1` still 1.8× slower → default OFF |
 | GN backward fusion | ✅ | already 2 fused extern dispatches (`gn_backward_extern.py`); the 11-kernel figure was loss-bwd, not GN-bwd |
@@ -263,24 +263,15 @@ noblock/small-CNN variants stay green.
 - **Exit**: `test_resnet_block_residual_grad_parity` (per-param grad parity) +
   `test_resnet_block_conv_gn_residual_fc` (loss-based sweep). ✅
 
-**Follow-up filed — S2.0d-deadgrad** (latent, order-dependent; does NOT block
-conv training): a standalone GroupNorm `(y*y).sum()` (GN not followed by ReLU,
-non-constant grad) yields a **dead** `gn.weight` gradient (`rel=1.0`, vk≈0)
-*depending on process state*. `agent_space/gn_assert.py` (plain script) gives the
-correct grad (rel 4e-7); `agent_space/gn_after_import.py` — the identical model,
-but after `import tests.test_inductor_regression` — reproduces the dead grad with
-a **fresh cache**. The test module has **no** module-scope `torch_vulkan`/inductor
-import or `config` patch (only string constants + class/def defs), so this is not
-a config leak: importing a large inert module perturbs Python memory layout / set
-iteration order, which flips a **scheduler-fusion / DCE iteration-order
-dependence** — for some orderings the `gn.weight` reduction (the
-`sum(grad·x̂)` over N,H,W) is silently dropped/zeroed. The weight-grad is a
-reduction (not in-place) so it is untouched by the S2.0d-resid fixes. Not a
-blocker: real conv training works (full `TestTrain8ConvTrainingSweep` green; the
-residual model's standalone `gn2` weight-grad matches CPU at ~1e-6). Next: find
-the order-dependent set/dict iteration in the scheduler/DCE path that drops the
-standalone-GN weight-grad reduction (likely in `scheduling.py` fusion or
-`kernel/header.py:_eliminate_dead_code`).
+**Follow-up filed — S2.0d-deadgrad** ✅ **FIXED 2026-06-21 (side effect of S2.0d-resid)**:
+The order-dependent dead `gn.weight` gradient no longer reproduces. Both
+`agent_space/gn_assert.py` and `agent_space/gn_after_import.py` (with
+`import test_inductor_regression`) now show rel≈4e-7 on fresh cache
+(`TORCHINDUCTOR_FORCE_DISABLE_CACHES=1`). The S2.0d-resid fix 1
+(`make_buffer_reuse`: skip fresh-alloc for in-place mutation reuse) fixed the
+rstd initialization corruption that was the actual root cause; the apparent
+set-ordering non-determinism was a red herring caused by the corruption
+producing different wrong results in different orderings.
 
 #### S2.0e — ⛔ Pre-existing GPU-suite failures (slangc/env)
 A clean-main GPU sweep shows ~24 pre-existing failures unrelated to S2.0
@@ -390,16 +381,28 @@ warm-up runs under validation — catching shader bugs at warm-up, not mid-train
 - **Exit**: `TestWarmupValidationInProcess` — `prepare_device(validate=True)`
   from a clean env validates S0/S1 kernels in-process; an injected VUID fails.
 
-### S2.4 — Warm→train cache coherence (hash the tuning knobs)
+### S2.4 — Warm→train cache coherence (hash the tuning knobs) ✅ FIXED 2026-06-21
 
-Warm-up sets `MM_TILES=expanded` / `WG_AUTOTUNE=1`; if training doesn't preserve
-them the kernel source hash differs → silent cold recompile + autotune miss.
-Hash the active tuning knobs into the SPIR-V/autotune cache key, or emit a
-warm-up manifest the training path asserts against.
-- **Files**: `runtime/slangc.py` (cache key), `autotune.py`, `hardware_probe.py`
-  (manifest).
-- **Exit**: `TestWarmCacheCoherence` — after `prepare_device(deep)`, a training
-  compile of a swept shape reports 100% SPIR-V + autotune cache hits.
+Warm-up set `MM_TILES=expanded` temporarily (during `_run_level_2_autotune`)
+then cleared it. Training used the default 4 tile configs instead of the 16
+expanded ones → generated different Slang source → different SPIR-V cache key
+→ cold slangc on first training compile.
+
+Fix (manifest approach):
+1. After level-2 autotune, `_write_probe_status` now saves `"mm_tiles_mode":
+   "expanded"` to `probe_status_<id>.json`.
+2. `_restore_probe_defaults()` reads this manifest on every import and sets
+   `TORCH_VULKAN_MM_TILES=expanded` as a soft default (only if the user hasn't
+   explicitly set it). Called from `auto_probe_on_import()` unconditionally —
+   fast disk read, no GPU work.
+
+Note: WG autotune was already coherent — `make_vulkan_kernel` reads the disk
+cache even when `WG_AUTOTUNE` env is unset.
+
+- **Files**: `hardware_probe.py` (`_restore_probe_defaults`, `_write_probe_status`,
+  `auto_probe_on_import`).
+- **Exit**: `TestWarmCacheCoherence::test_probe_status_restores_mm_tiles_env` ✅
+  `TestWarmCacheCoherence::test_user_mm_tiles_not_overridden` ✅
 
 ### S3.1 — Compiled optimizer: route SGD/AdamW to the foreach extern ✅ FIXED 2026-06-21
 
@@ -514,7 +517,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S2.1 (extern/aten leak)        ✅ FIXED 2026-06-21
 │   ├─ S2.2 (conv_gn_relu RDNA1 bug)  ✅ FIXED 2026-06-21
 │   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
-│   ├─ S2.4 (warm→train coherence)    🟡
+│   ├─ S2.4 (warm→train coherence)    ✅ FIXED 2026-06-21
 │   └─ S2.5 (pooling fwd custom-op)   ✅ FIXED 2026-06-21
 │
 ├─ S3 TRAIN (perf — after correctness)

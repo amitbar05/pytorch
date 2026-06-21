@@ -693,15 +693,18 @@ def _profile_device_impl(
             )
 
     result["total_ms"] = (time.perf_counter() - t_total) * 1e3
-    _write_probe_status(
-        level,
-        extra={
-            "total_ms": result["total_ms"],
-            "device_name": (result.get("device_profile") or {}).get(
-                "device_name", "unknown"
-            ),
-        },
-    )
+    extra: dict[str, Any] = {
+        "total_ms": result["total_ms"],
+        "device_name": (result.get("device_profile") or {}).get(
+            "device_name", "unknown"
+        ),
+    }
+    # S2.4: record the tuning knobs that were active during warm-up so that
+    # subsequent training imports can apply the same defaults → same Slang
+    # source hash → SPIR-V cache hit instead of cold slangc.
+    if level >= LEVEL_DEEP:
+        extra["mm_tiles_mode"] = os.environ.get("TORCH_VULKAN_MM_TILES", "expanded")
+    _write_probe_status(level, extra=extra)
 
     if verbose:
         print(
@@ -731,6 +734,25 @@ def _resolve_auto_level(mode: str) -> Optional[int]:
     return None
 
 
+def _restore_probe_defaults() -> None:
+    """S2.4: Apply tuning defaults from a previous warm-up (soft env defaults).
+
+    Reads probe_status.json and sets env vars that were active during the
+    level-2 autotune sweep, only when the user has NOT explicitly set them.
+    This ensures torch.compile kernels generate the same Slang source as
+    warm-up → same SPIR-V cache key → hit instead of cold slangc.
+
+    Called on every import (before any compile) so that training inherits
+    the warm-up tile config without the user needing to remember to set env vars.
+    """
+    status = _read_probe_status()
+    if not status:
+        return
+    mm_mode = status.get("mm_tiles_mode")
+    if mm_mode and "TORCH_VULKAN_MM_TILES" not in os.environ:
+        os.environ["TORCH_VULKAN_MM_TILES"] = mm_mode
+
+
 def auto_probe_on_import() -> Optional[dict[str, Any]]:
     """Entry point for ``inductor/__init__.py`` on first import.
 
@@ -738,6 +760,14 @@ def auto_probe_on_import() -> Optional[dict[str, Any]]:
     Returns the result dict, or ``None`` when disabled. Errors are swallowed
     and logged — never let the probe block backend registration.
     """
+    # S2.4: always restore tuning defaults from the last warm-up, even when
+    # auto-probe is disabled. This is a fast disk read (no GPU work) and
+    # ensures cache coherence between warm-up and training processes.
+    try:
+        _restore_probe_defaults()
+    except Exception:
+        pass
+
     mode = os.environ.get("TORCH_VULKAN_PROFILE_DEVICE", "auto")
     level = _resolve_auto_level(mode)
     if level is None:
