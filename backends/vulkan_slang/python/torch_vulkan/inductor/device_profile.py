@@ -156,18 +156,18 @@ def compute_device_id(props: dict[str, Any]) -> str:
 def _query_limits() -> dict[str, int]:
     """Best-effort device-limit query.
 
-    Today the only path exposed to Python is ``_get_device_capabilities``,
-    which doesn't exist in the C++ binding (the call in
-    ``device_interface.py`` falls back to an empty dict — see M21.1.b).
-    We try it anyway so a future C++ patch lights up automatically; the
-    fallback values are conservative NAVI10-ish defaults that match what
-    ``device_interface.py`` already uses.
+    S0.2: reads live device limits via ``_device_caps()`` (always present in
+    the C++ binding since M18.4-followup-C).  The old ``_get_device_capabilities``
+    path is kept as a dead branch for compat.  Fallback values are conservative
+    NAVI10-ish defaults used when the backend is not loaded.
     """
     caps: dict[str, Any] = {}
     try:
         import torch_vulkan._C as _c  # type: ignore[import-not-found]
 
-        if hasattr(_c, "_get_device_capabilities"):
+        if hasattr(_c, "_device_caps"):
+            caps = _c._device_caps()
+        elif hasattr(_c, "_get_device_capabilities"):
             caps = _c._get_device_capabilities(0)
     except Exception:
         caps = {}

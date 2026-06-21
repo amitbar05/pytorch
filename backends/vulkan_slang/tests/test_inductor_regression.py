@@ -43061,6 +43061,44 @@ class TestM211DeviceProfile:
             else:
                 os.environ.pop("TORCH_VULKAN_PROFILE_DEVICE", None)
 
+    def test_device_limits_come_from_hardware(self):
+        """S0.2 — _query_limits() reads live values via _device_caps(), not NAVI10 guesses.
+
+        Verifies that `_query_limits()` now calls `_C._device_caps()` and returns
+        plausible non-zero values for max_workgroup_size and shared memory, rather
+        than always returning the NAVI10 name-based defaults.  This ensures the
+        profile system is portable across GPUs without hard-coded constants.
+        """
+        from torch_vulkan.inductor import device_profile as dp
+
+        limits = dp._query_limits()
+        # Must be populated (not empty)
+        assert limits, "device limits must be non-empty"
+        # max_workgroup_size must be a positive integer from the real device
+        mwgs = limits["max_workgroup_size"]
+        assert isinstance(mwgs, int) and mwgs > 0, f"max_workgroup_size={mwgs}"
+        # On our RDNA1 device this should be 1024 (not 256 from old interface)
+        assert mwgs >= 256, f"max_workgroup_size {mwgs} < 256 (implausibly small)"
+        # shared memory must be a valid value (48 KB minimum for any Vulkan device)
+        smem = limits["shared_memory_per_workgroup_bytes"]
+        assert isinstance(smem, int) and smem >= 16384, f"shared_memory={smem}"
+        # subgroup sizes must be positive and consistent (min ≤ max)
+        sgs_min = limits["subgroup_size_min"]
+        sgs_max = limits["subgroup_size_max"]
+        assert sgs_min > 0 and sgs_max >= sgs_min, (
+            f"subgroup_size min={sgs_min} max={sgs_max}"
+        )
+        # Verify the live device caps path is actually wired up (not empty caps dict)
+        import torch_vulkan._C as _c
+        if hasattr(_c, "_device_caps"):
+            live_caps = _c._device_caps()
+            assert limits["max_workgroup_size"] == live_caps["max_workgroup_size"], (
+                "_query_limits must pull max_workgroup_size from _device_caps()"
+            )
+            assert limits["shared_memory_per_workgroup_bytes"] == (
+                live_caps["max_compute_shared_memory"]
+            ), "_query_limits must pull shared_memory from _device_caps()"
+
 
 # Capability atoms recognised by the static-parse gate. The mapping
 # encodes which Slang `[require(spirv, <atom>)]` annotations are accepted

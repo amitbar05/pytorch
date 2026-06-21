@@ -366,13 +366,16 @@ batch-vs-direct dispatch thresholds ← `empty_kernel_launch_us` / `memcpy_d2d_G
 matmul/conv tile selection ← measured mem BW. Wire these next so warm-up is
 fully portable (an 80-CU card tiles differently from a 16-CU card).
 
-### S0.2 — Complete the device-limits pybind query
+### S0.2 — ✅ FIXED 2026-06-21: Complete the device-limits pybind query
 
-`_get_device_capabilities()` is not exposed, so S0 falls back to NAVI10
-defaults — a portability hole and a precondition for S0.1.
-- **Files**: `csrc/init.cpp` (expose caps), `device_profile.py:156`.
-- **Exit**: `TestDeviceLimitsReal` — probed limits come from the live device,
-  not the NAVI10 fallback constants.
+`_device_caps()` (already in `_C` since M18.4-followup-C) was not wired into
+`_query_limits()` — which was checking for the nonexistent `_get_device_capabilities`.
+Fix: update `device_profile.py:_query_limits()` to call `_C._device_caps()` first,
+giving correct `max_workgroup_size=1024` and `max_compute_shared_memory=65536` from
+the live device instead of the NAVI10 name-based defaults.  No C++ change needed.
+- **Files**: `python/torch_vulkan/inductor/device_profile.py:_query_limits`.
+- **Exit**: `TestM211DeviceProfile::test_device_limits_come_from_hardware` ✅ — limits
+  come from the real device, not NAVI10 fallback constants.
 
 ### S2.3 — In-process validation during warm-up (make `validate=True` real)
 
