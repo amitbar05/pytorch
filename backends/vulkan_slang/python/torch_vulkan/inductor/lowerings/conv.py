@@ -154,33 +154,35 @@ def _register_conv_and_pool_lowerings() -> None:
     # ═════════════════════════════════════════════════════════════════════
 
     def _vk_realize_then_unwrap(x):
-        """Realize Pointwise/Reduction, then unwrap StorageBox → data.
-        Returns Buffer/ReinterpretView (what ExternKernel expects).
+        """Realize Pointwise/Reduction, then unwrap to Buffer or ReinterpretView.
 
-        Handles nested StorageBox (TensorBox → StorageBox → StorageBox → Pointwise)
-        by looping until the innermost data is reached.
+        Mirrors ExternKernel.unwrap_storage_for_input but also handles
+        Pointwise/Reduction nodes (the base class asserts Buffer|ReinterpretView).
+
+        IMPORTANT: Do NOT unwrap ReinterpretView — it carries shape/stride
+        information (e.g. the 4D view from aten.unsqueeze) and generates a
+        proper reinterpret_tensor call in the emitted wrapper code. Stripping
+        it would pass the underlying raw storage (wrong shape) to the shader.
         """
         import torch._inductor.ir as _ir
 
-        # Unwrap TensorBox → StorageBox
+        # Unwrap TensorBox → data
         if isinstance(x, _ir.TensorBox):
             x = x.data
+        # Unwrap StorageBox → data
+        if isinstance(x, _ir.StorageBox):
+            x = x.data
 
-        # S2.0b: unwrap StorageBox/View layers to a fixpoint — the nesting can
-        # interleave (StorageBox → View → StorageBox → Buffer), so a single
-        # StorageBox pass followed by a single View pass leaves a trailing
-        # StorageBox that crashes decide_layout ('StorageBox' has no
-        # get_pointwise_size). Loop until x is neither.
-        while True:
-            if isinstance(x, _ir.StorageBox):
-                x = x.data
-                continue
-            if isinstance(x, _ir.BaseView) and hasattr(x, 'data'):
-                x = x.data
-                continue
-            break
-        # If result is not a real Buffer (Pointwise/Reduction/etc.),
-        # wrap in a ComputedBuffer so it gets codegen_reference() and allocation.
+        # For non-ReinterpretView views (e.g. View, Slice, ExpandView),
+        # materialize via realize_input (which converts to ReinterpretView or
+        # copy_input). Then recurse to handle the resulting TensorBox.
+        if isinstance(x, _ir.BaseView) and not isinstance(x, _ir.ReinterpretView):
+            x = _ir.ExternKernel.realize_input(x)
+            if isinstance(x, _ir.TensorBox):
+                return _vk_realize_then_unwrap(x)
+
+        # For Pointwise/Reduction (not Buffer/ReinterpretView), register a
+        # ComputedBuffer so the scheduler materializes it before this kernel runs.
         if not isinstance(x, (_ir.Buffer, _ir.ReinterpretView)):
             from torch._inductor.graph import V
             layout = _ir.FlexibleLayout(
@@ -676,13 +678,15 @@ def _register_conv_and_pool_lowerings() -> None:
             weight_4d = _lowerings[aten.unsqueeze.default](weight, -1)
 
             # Step 3 — adjust stride / padding / dilation to 2-D.
-            # The dummy dim (H) is stride=1, pad=0, dilation=1 — a passthrough.
+            # unsqueeze(-1) adds W as the dummy dim (size=1); H maps to L.
+            # sH/pH/dH drive the real spatial computation; sW/pW/dW are
+            # passthrough (1, 0, 1) so output_W stays 1.
             s = int(stride[0])
             p = int(padding[0])
             d = int(dilation[0])
-            stride_4d = [1, s]
-            padding_4d = [0, p]
-            dilation_4d = [1, d]
+            stride_4d = [s, 1]
+            padding_4d = [p, 0]
+            dilation_4d = [d, 1]
 
             # Step 4 — dispatch to Conv2d custom-op lowering.
             # M19.5-followup-1: avoid OpOverload-identity drift by looking
