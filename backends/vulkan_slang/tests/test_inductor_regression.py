@@ -621,6 +621,119 @@ class TestOptimizerStepE2E:
         # T4.8 ratchet (2026-05-09): empirical steady-state is 1 dispatch.
         assert dispatches <= 10, "M16/T4.8: dispatches=" + str(dispatches)
 
+    def test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu(self):
+        """S3.1 regression: torch.optim.SGD optimizer step compiled via Inductor
+        routes through the foreach_optimizer template (functional-form routing)
+        and produces the same weight updates as CPU eager.
+
+        Regression: S3.1 closed 2026-06-21 — functional-form aten._foreach_add.List
+        routing via _VulkanForeachOptimizerExternKernel (NoneLayout mutation pattern).
+        Uses a 2-layer linear model (no activation) to isolate the optimizer step.
+        """
+        import torch.nn as nn
+
+        torch.manual_seed(42)
+
+        class _Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(8, 8)
+
+            def forward(self, x):
+                return self.fc(x).sum()
+
+        # CPU baseline
+        model_cpu = _Net()
+
+        # Vulkan compiled: copy identical initial weights
+        model_vk = _Net().to("vulkan:0")
+        with torch.no_grad():
+            model_vk.fc.weight.copy_(model_cpu.fc.weight)
+            model_vk.fc.bias.copy_(model_cpu.fc.bias)
+
+        opt_cpu = torch.optim.SGD(model_cpu.parameters(), lr=0.01)
+        opt_vk = torch.optim.SGD(model_vk.parameters(), lr=0.01)
+
+        x = torch.randn(4, 8)
+        x_vk = x.to("vulkan:0")
+
+        def train_step(xi):
+            opt_vk.zero_grad()
+            loss = model_vk(xi)
+            loss.backward()
+            opt_vk.step()
+            return loss
+
+        compiled_step = torch.compile(train_step, backend="inductor")
+
+        # Run 6 steps on both
+        for _ in range(6):
+            opt_cpu.zero_grad()
+            model_cpu(x).backward()
+            opt_cpu.step()
+            compiled_step(x_vk)
+
+        # Verify weights match within float32 tolerance
+        for (n_cpu, p_cpu), (n_vk, p_vk) in zip(
+            model_cpu.named_parameters(), model_vk.named_parameters()
+        ):
+            torch.testing.assert_close(
+                p_vk.cpu(), p_cpu,
+                rtol=1e-4, atol=1e-4,
+                msg=f"S3.1: {n_cpu} diverged after 6 compiled SGD steps"
+            )
+
+    def test_s3_1_compiled_sgd_variable_numel_correctness(self):
+        """S3.1 regression: foreach optimizer handles mixed-numel params correctly.
+        Linear(4,4) has weight [4×4=16 elems] and bias [4 elems] — different numels.
+        """
+        import torch.nn as nn
+
+        torch.manual_seed(7)
+
+        class _Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.fc(x).sum()
+
+        model_cpu = _Net()
+        model_vk = _Net().to("vulkan:0")
+        with torch.no_grad():
+            model_vk.fc.weight.copy_(model_cpu.fc.weight)
+            model_vk.fc.bias.copy_(model_cpu.fc.bias)
+
+        opt_cpu = torch.optim.SGD(model_cpu.parameters(), lr=0.05)
+        opt_vk = torch.optim.SGD(model_vk.parameters(), lr=0.05)
+
+        x = torch.randn(2, 4)
+        x_vk = x.to("vulkan:0")
+
+        def train_step(xi):
+            opt_vk.zero_grad()
+            model_vk(xi).backward()
+            opt_vk.step()
+
+        compiled_step = torch.compile(train_step, backend="inductor")
+
+        for _ in range(5):
+            opt_cpu.zero_grad()
+            model_cpu(x).backward()
+            opt_cpu.step()
+            compiled_step(x_vk)
+
+        # Weight (16 elems) and bias (4 elems) must both match CPU
+        torch.testing.assert_close(
+            model_vk.fc.weight.cpu(), model_cpu.fc.weight, rtol=1e-4, atol=1e-4,
+            msg="S3.1: weight mismatch (variable-numel case)"
+        )
+        torch.testing.assert_close(
+            model_vk.fc.bias.cpu(), model_cpu.fc.bias, rtol=1e-4, atol=1e-4,
+            msg="S3.1: bias mismatch (variable-numel case)"
+        )
+
 
 _BWD_FAKE_DEVICE_BLOCKER = (
     "P0.0 backward graph compilation is still blocked by FakeTensor device "

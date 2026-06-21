@@ -551,6 +551,69 @@ def _route_foreach_add_to_template(
         total_routed += 1
         changed = True
 
+    # ── Pass 3: aten._foreach_add.List (functional/non-inplace form) ──────
+    # AOTAutograd functionalizes in-place ops: _foreach_add_ → _foreach_add
+    # (returns new tensors) followed by getitem nodes.  Detect negative-alpha
+    # (SGD step), insert foreach_sgd_step, replace getitem users with original
+    # params (since our kernel mutates in place), and delete the old nodes.
+    import operator as _operator
+
+    foreach_add_out = aten._foreach_add.List
+
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not foreach_add_out:
+            continue
+        total_foreach += 1
+        if len(node.args) < 2:
+            continue
+
+        params_arg = node.args[0]
+        grads_arg = node.args[1]
+
+        if not isinstance(params_arg, (list, tuple)) or not params_arg:
+            _debug(f"skip {node.name}: params_arg not a list")
+            continue
+        if not _is_vulkan_device(params_arg):
+            _debug(f"skip {node.name}: not Vulkan (functional form)")
+            continue
+
+        alpha = node.kwargs.get("alpha", 1)
+        if not isinstance(alpha, (int, float)) or alpha >= 0:
+            _debug(f"skip {node.name}: alpha={alpha!r} not negative")
+            continue
+
+        lr = -float(alpha)
+        n = len(params_arg)
+
+        from ..eager_patches import _ensure_foreach_sgd_step_op_registered
+
+        foreach_sgd = _ensure_foreach_sgd_step_op_registered()
+
+        with gm.graph.inserting_before(node):
+            fused = gm.graph.call_function(
+                foreach_sgd,
+                args=(list(params_arg), list(grads_arg), [lr], [0.0]),
+            )
+            fused.meta = {}
+
+        # Replace getitem_i users with original param_i (mutated in-place).
+        for user in list(node.users):
+            if user.op == "call_function" and user.target is _operator.getitem:
+                idx = user.args[1]
+                if isinstance(idx, int) and 0 <= idx < n:
+                    user.replace_all_uses_with(params_arg[idx])
+                user.graph.erase_node(user)
+
+        if not list(node.users):
+            gm.graph.erase_node(node)
+
+        _debug(
+            f"ROUTED (functional): {node.name} (aten._foreach_add.List alpha={alpha})"
+            f" -> foreach_sgd_step (lr={lr}, n={n})"
+        )
+        total_routed += 1
+        changed = True
+
     if changed:
         _debug(
             f"T4.8 routing complete: {total_routed}/{total_foreach} "

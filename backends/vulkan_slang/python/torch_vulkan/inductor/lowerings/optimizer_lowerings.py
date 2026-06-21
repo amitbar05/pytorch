@@ -44,17 +44,17 @@ def _register_optimizer_lowerings() -> None:
     # CODEGEN.1: _VulkanForeachOptimizerExternKernel
     # ═════════════════════════════════════════════════════════════════════
 
-    class _VulkanForeachOptimizerExternKernel(ir.ExternKernelOut):
-        """ExternKernelOut that dispatches an optimizer step via the Slang
-        foreach_optimizer template.
+    class _VulkanForeachOptimizerExternKernel(ir.ExternKernel):
+        """Void mutation ExternKernel that dispatches an optimizer step via the
+        Slang foreach_optimizer template.
 
         Inputs layout (flattened):
             [param0, grad0, param1, grad1, ..., param_{n-1}, grad_{n-1},
              mom_buf0, ..., mom_buf_{n-1},        # if algorithm in {sgd_momentum, adamw, lion}
              v_buf0, ..., v_buf_{n-1}]             # if algorithm == "adamw"
 
-        The ``layout`` is derived from the first param (used only for
-        scheduler metadata — the kernel mutates params in-place).
+        Uses NoneLayout (no output tensor).  All param tensors at even indices
+        are registered as mutated so the scheduler preserves ordering.
 
         The codegen override emits a call to
         ``_pick_foreach_optimizer_caller(algorithm, n, 'float')``  —
@@ -64,24 +64,39 @@ def _register_optimizer_lowerings() -> None:
 
         def __init__(
             self,
-            layout,
             inputs,
             algorithm: str,
             n_params: int,
             scalar_kwargs: dict[str, list],
         ):
+            dev = inputs[0].get_device()
+            # Collect param IR nodes before unwrap_storage (needed for MutationOutput).
+            param_inputs = [inputs[i * 2] for i in range(n_params)]
             super().__init__(
-                layout=layout,
-                inputs=inputs,
-                python_kernel_name=(
-                    "torch_vulkan.inductor.templates.caller.optimizer"
-                    "._slang_foreach_optimizer"
-                ),
-                op_overload=None,
+                None,
+                ir.NoneLayout(device=dev),
+                self.unwrap_storage(inputs),
+                (),
             )
             self.algorithm = algorithm
             self.n_params = n_params
             self.scalar_kwargs = scalar_kwargs
+            # Inductor constraint: each output buffer can declare at most 1 mutation.
+            # Use one MutationOutput per param (each with mutation_names=[param_name]),
+            # stored in self.mutation_outputs (returned by ExternKernel.get_outputs()).
+            # MutationOutput.__init__ calls mark_buffer_mutated internally.
+            for p in param_inputs:
+                self.mutation_outputs.append(
+                    ir.MutationOutput(ir.NoneLayout(device=dev), p, self)
+                )
+            self.name = ir.V.graph.register_buffer(self)
+            ir.V.graph.register_operation(self)
+
+        def has_side_effects(self) -> bool:
+            return True
+
+        def should_allocate(self) -> bool:
+            return False
 
         def codegen(self, wrapper):
             """Emit a call to ``_pick_foreach_optimizer_caller`` in the wrapper.
@@ -138,7 +153,7 @@ def _register_optimizer_lowerings() -> None:
                 f"{', ' + ', '.join(scalar_parts) if scalar_parts else ''}"
                 f"{mom_bufs_str}{v_bufs_str})"
             )
-            self.codegen_size_asserts(wrapper)
+            # NoneLayout — no output tensor to assert sizes on.
 
         def _codegen_aoti(self, wrapper, input_names, n_params):
             """Emit AOTI C++ dispatch for the foreach optimizer template."""
@@ -312,23 +327,6 @@ def _register_optimizer_lowerings() -> None:
     # Lowering helpers
     # ═════════════════════════════════════════════════════════════════════
 
-    def _make_optimizer_layout(param_ir):
-        """Create a FixedLayout matching *param_ir* for the ExternKernelOut."""
-        try:
-            dev = param_ir.get_device()
-            dtype = param_ir.get_dtype()
-            size = list(param_ir.get_size())
-            stride = list(param_ir.get_stride())
-        except Exception:
-            # Fallback: minimal layout for scheduling.
-            import sympy
-
-            dev = torch.device("vulkan")
-            dtype = torch.float32
-            size = [sympy.Integer(1)]  # type: ignore[assignment]
-            stride = [sympy.Integer(1)]  # type: ignore[assignment]
-        return ir.FixedLayout(device=dev, dtype=dtype, size=size, stride=stride)
-
     def _create_extern_kernel(
         algorithm: str,
         params: list,
@@ -336,9 +334,12 @@ def _register_optimizer_lowerings() -> None:
         scalar_kwargs: dict,
         extra_buffers: list | None = None,
     ):
-        """Build inputs list + ExternKernelOut for an optimizer step."""
+        """Build inputs list and create a void mutation optimizer kernel.
+
+        The kernel self-registers via __init__ (mark_buffer_mutated +
+        register_buffer + register_operation), so no return value is needed.
+        """
         n = len(params)
-        # Flatten: [p0, g0, p1, g1, ...]
         flat_inputs: list = []
         for i in range(n):
             flat_inputs.append(params[i])
@@ -346,16 +347,12 @@ def _register_optimizer_lowerings() -> None:
         if extra_buffers:
             flat_inputs.extend(extra_buffers)
 
-        layout = _make_optimizer_layout(params[0])
-        kernel = _VulkanForeachOptimizerExternKernel(
-            layout=layout,
+        _VulkanForeachOptimizerExternKernel(
             inputs=flat_inputs,
             algorithm=algorithm,
             n_params=n,
             scalar_kwargs=scalar_kwargs,
         )
-        # Ensure all input tensors are realized before dispatch.
-        return ir.TensorBox.create(kernel)
 
     # ═════════════════════════════════════════════════════════════════════
     # Per-op lowerings
@@ -381,7 +378,7 @@ def _register_optimizer_lowerings() -> None:
             _create_extern_kernel(
                 "sgd", params, grads, {"lr": list(lr), "weight_decay": list(weight_decay)}
             )
-            return None  # void op
+            return None  # void op — params mutated in-place
 
     def _register_sgd_momentum_step():
         op = getattr(torch.ops.torch_vulkan, "foreach_sgd_momentum_step", None)
@@ -414,7 +411,7 @@ def _register_optimizer_lowerings() -> None:
                 },
                 extra_buffers=list(momentum_bufs),
             )
-            return None
+            return None  # void op — params and momentum_bufs mutated in-place
 
     def _register_adamw_step():
         op = getattr(torch.ops.torch_vulkan, "foreach_adamw_step", None)
@@ -453,7 +450,7 @@ def _register_optimizer_lowerings() -> None:
                 },
                 extra_buffers=list(m_bufs) + list(v_bufs),
             )
-            return None
+            return None  # void op — params, m_bufs, v_bufs mutated in-place
 
     def _register_lion_step():
         op = getattr(torch.ops.torch_vulkan, "foreach_lion_step", None)
@@ -489,7 +486,7 @@ def _register_optimizer_lowerings() -> None:
                 },
                 extra_buffers=list(momentum_bufs),
             )
-            return None
+            return None  # void op — params and momentum_bufs mutated in-place
 
     # ── Install all 4 lowerings ────────────────────────────────────────
     _register_sgd_step()

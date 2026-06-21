@@ -127,7 +127,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S2.0** | Conv+GN CNN training (Linear & 1×1-conv heads): `buf7` combo inversion + wrong conv `grad_bias` (output reuse) + `StorageBox` unwrap crash + 4D grad_out assumption. | ✅ **FIXED 2026-06-19** (S2.0a/reuse/b/c) |
 | **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **S2.0d-resid also FIXED 2026-06-20** (two more root causes, see below): residual `relu(out+identity)` backward now has full per-param grad parity (`test_resnet_block_residual_grad_parity` ✅). | ✅ **FIXED** |
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper leaks — **FIXED 2026-06-21**: two root-cause fixes in `matmul.py` + `bwd_lowerings.py` + `pool.py` (`TestNoExternInFullCNNBwd` ✅). | ✅ **FIXED** |
-| **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | 🟡 perf |
+| **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | ✅ **FIXED 2026-06-21** — routes `aten._foreach_add.List` (functional form, post AOTAutograd) + `aten._foreach_add_.List` (inplace form) both to `foreach_sgd_step` ExternKernel. Batch sizes capped at 8 (push-const limit). Tests: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅, `test_s3_1_compiled_sgd_variable_numel_correctness` ✅ |
 
 **S3 — TRAIN (steady-state perf)**
 | Item | State | Evidence |
@@ -396,15 +396,22 @@ warm-up manifest the training path asserts against.
 - **Exit**: `TestWarmCacheCoherence` — after `prepare_device(deep)`, a training
   compile of a swept shape reports 100% SPIR-V + autotune cache hits.
 
-### S3.1 — Compiled optimizer: route SGD/AdamW to the foreach extern
+### S3.1 — Compiled optimizer: route SGD/AdamW to the foreach extern ✅ FIXED 2026-06-21
 
 The compiled step fans out to one `binary_add_inplace` per parameter (4 tiny
 dispatches here) instead of the foreach `IOptimizer` extern that eager already
 uses (B1). Bridge the eager-foreach interface into the compiled optimizer step.
-- **Files**: `lowerings/optimizer_lowerings.py`, `fx_passes/post_grad.py`
-  (recognize the per-param add cluster), `templates/foreach_optimizer.slang`.
-- **Exit**: `TestCompiledOptimizerForeach` — N-param SGD/AdamW step compiles to
-  ≤2 dispatches (vs N today); parity vs eager.
+- **Files**: `lowerings/optimizer_lowerings.py`, `fx_passes/functional/optimizer.py`
+  (route `aten._foreach_add.List` + `aten._foreach_add_.List`), `templates/foreach_optimizer.slang`,
+  `templates/caller/optimizer.py` (batch_size cap at 8 for 256-byte push-const limit).
+- **Root causes fixed**: (1) `ExternKernelOut` base class DCE'd void kernels → switched to
+  `ExternKernel` + `NoneLayout` + `MutationOutput` per param; (2) post-grad graphs use
+  functional `_foreach_add.List` not inplace `_foreach_add_.List` → added Pass 3 in
+  `fx_passes/functional/optimizer.py`; (3) variable-numel params → use `max_numel` for grid;
+  (4) generic entry point `computeMain<SGDImpl>` not `computeMain`; (5) push-const overflow
+  for batch_size > 8 → cap at 8 (240 bytes ≤ 256 limit).
+- **Exit tests**: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅,
+  `test_s3_1_compiled_sgd_variable_numel_correctness` ✅, `test_e2e_compiled_sgd_15_params_one_dispatch` ✅.
 
 ### S3.2 — Tiny-kernel fusion (close out the plumbing dispatches)
 
@@ -502,7 +509,7 @@ prepare_device(level, timeout_s, validate)
 │   └─ S2.5 (pooling fwd custom-op)   ✅ FIXED 2026-06-21
 │
 ├─ S3 TRAIN (perf — after correctness)
-│   ├─ S3.1 (compiled foreach optimizer) 🟡
+│   ├─ S3.1 (compiled foreach optimizer) ✅
 │   ├─ S3.2 (tiny-kernel fusion)         🟡
 │   ├─ S3.3 (persistent reduction wiring)🔴 dead code
 │   └─ S3.4 (batch-dispatch overlap)     🟡

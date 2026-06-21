@@ -28,14 +28,19 @@ from ...vulkan_template import _load_slang_template
 # over `batch_size` params per dispatch (each param gets its own binding
 # slot).  We pre-select a few common sizes; callers pick the smallest
 # size that fits their parameter count.
-_OPTIMIZER_BATCH_SIZES = (1, 7, 15, 21, 32)
+#
+# Push-constant layout: 16-byte header + batch_size × 28-byte ParamConfig.
+# AMD RDNA1 maxPushConstantsSize = 256 bytes → max batch_size = (256-16)/28 = 8.
+# Sizes 15/21/32 are removed to stay within the 256-byte device limit.
+# For N > 8 params, _SlangForeachOptimizer.__call__ splits into multiple batches.
+_OPTIMIZER_BATCH_SIZES = (1, 7, 8)
 
 # ── B1: Algorithm name → Slang concrete type mapping ──────────────────────
 # External callers use the legacy string names; internally we map to the
 # Slang interface concrete type names used by the generic entry point.
 _ALGORITHM_TO_TYPE: dict[str, str] = {
     "sgd": "SGDImpl",
-    "sgd_momentum": "SGD MomentumImpl",
+    "sgd_momentum": "SGDMomentumImpl",
     "adamw": "AdamWImpl",
     "lion": "LionImpl",
 }
@@ -238,15 +243,9 @@ def _slang_foreach_optimizer(
         )
         cache_key = _foreach_cache_key(algorithm_type, batch_size, output_dtype, use_pa)
 
-    # Validate all params have the same shape and dtype.
-    numel = params[0].numel()
+    # Validate all params have the same dtype (but numels may differ).
     dtype = params[0].dtype
     for p in params:
-        if p.numel() != numel:
-            raise ValueError(
-                f"foreach optimizer: all params must have same numel, "
-                f"got {numel} vs {p.numel()}"
-            )
         if p.dtype != dtype:
             raise ValueError(
                 f"foreach optimizer: all params must have same dtype, "
@@ -258,6 +257,8 @@ def _slang_foreach_optimizer(
     default_wd = [0.0] * n_params
 
     numels = [p.numel() for p in params]
+    # Grid X covers max numel; per-param early-return handles shorter params.
+    max_numel = max(numels) if numels else 1
     lr_list = list(lr) if lr is not None else default_lr
     wd_list = list(weight_decay) if weight_decay is not None else default_wd
     mom_list = list(momentum) if momentum is not None else [0.0] * n_params
@@ -298,9 +299,9 @@ def _slang_foreach_optimizer(
         buffers.append(dummy)  # momentum
         buffers.append(dummy)  # v
 
-    # Grid: X = elements per param, Y = n_params.
+    # Grid: X = max numel across params (per-param early-return handles shorter ones).
     threadgroup_size = 256
-    grid_x = (numel + threadgroup_size - 1) // threadgroup_size
+    grid_x = (max_numel + threadgroup_size - 1) // threadgroup_size
     grid_y = n_params
     grid_z = 1
 
@@ -317,6 +318,7 @@ def _slang_foreach_optimizer(
         grid_z,
         push_constants=pc_bytes,
         num_outputs=num_outputs,
+        entry=f"computeMain<{algorithm_type}>",
         cache_key=cache_key,
     )
     # T6.7: dispatch is done; the padding ``dummy`` is dead.
@@ -525,7 +527,7 @@ def _collect_optimizer_prewarm_specs() -> list[tuple[str, str]]:
     """
     specs: list[tuple[str, str]] = []
     dtypes = ("float", "half")
-    algorithms = ("SGDImpl", "SGD MomentumImpl", "AdamWImpl", "LionImpl")
+    algorithms = ("SGDImpl", "SGDMomentumImpl", "AdamWImpl", "LionImpl")
     use_pa = _foreach_use_parameter_array()
     for alg in algorithms:
         for bs in _OPTIMIZER_BATCH_SIZES:

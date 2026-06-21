@@ -62,7 +62,7 @@ struct SGDImpl : IOptimizer {
     }
 };
 
-struct SGD MomentumImpl : IOptimizer {
+struct SGDMomentumImpl : IOptimizer {
     static float step(
         float grad, float param,
         inout float state1, inout float state2,
