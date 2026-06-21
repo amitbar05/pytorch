@@ -4,15 +4,29 @@ Instead of routing through the Python custom-op shim, these lowerings
 use ``make_pointwise`` to create Pointwise IR nodes whose ``inner_fn``
 emits ``bwd_diff(fwd_fn)`` directly into the kernel's compute buffer.
 
-The emitted Slang is split into:
-1. Body lines (DifferentialPair + bwd_diff call) → ``kernel.compute``
-2. Result expression (dp.getDifferential()) → ``kernel.cse.generate()``
+Architecture note: ``inner_fn`` is traced into an FX graph (LoopBody)
+during scheduling with ``V.ops = LoopBodyTracer``.  The FX graph is
+**replayed** during actual codegen — ``inner_fn`` is NOT called again.
 
-This lets CSE properly track the output variable while the bwd_diff
-mechanism is emitted as raw Slang.
+Therefore ``inner_fn`` must only call ``ops.X(...)`` methods that:
+1. Can be captured as FX nodes during tracing, AND
+2. Are handled by ``VulkanOverrides`` (via CSEProxy) during replay.
+
+The old approach (``isinstance(V.kernel, NullKernelHandler)`` guard +
+direct ``kernel.compute.writeline``) is **broken** because the
+``writeline`` side-effect happens at trace time (when
+``V.kernel = NullKernelHandler``), not at replay time.  The FX graph
+captured only ``ops.constant(0.0)`` → replay emitted zeros.
+
+The fix: ``inner_fn`` calls ``ops.vulkan_bwd_diff_unary(...)`` or
+``ops.vulkan_bwd_diff_binary(...)`` which are intercepted by
+``LoopBodyTracer`` at trace time and dispatched to
+``VulkanOverrides.vulkan_bwd_diff_{unary,binary}`` at replay time.
 """
 
 from __future__ import annotations
+
+import json
 
 
 def _is_vulkan(x) -> bool:
@@ -33,7 +47,6 @@ def _add_module_import(kernel, module_name: str) -> None:
 def _make_inline_unary_bwd_diff_lowering(aten_op, register_lowering, aten):
     import torch
     from torch._inductor.lowering import make_pointwise
-    from torch._inductor.virtualized import V
 
     from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
 
@@ -47,45 +60,38 @@ def _make_inline_unary_bwd_diff_lowering(aten_op, register_lowering, aten):
     except AttributeError:
         return
 
+    _no_diff_json = json.dumps(list(entry.no_diff_params))
+    _fwd_fn = entry.fwd_fn
+    _module = entry.module
+
     @register_lowering(target, type_promotion_kind=None)
     def _lowering(grad_output, self):
         if not _is_vulkan(grad_output):
             return NotImplemented
 
         def inner_fn(grad_out_val, x_val):
-            from torch._inductor.virtualized import NullKernelHandler
+            from torch._inductor.virtualized import ops
 
-            kernel = V.kernel
-            # ``inner_fn`` is invoked twice: once during real codegen (with
-            # a live VulkanKernel context) and once from
-            # ``Pointwise.inner_fn_opcount`` to count read/write ops with a
-            # NullKernelHandler V.kernel. The opcount call only looks at
-            # ``ops.X(...)`` reads — it doesn't need the actual bwd_diff
-            # body emitted to ``kernel.compute``. Return a constant
-            # placeholder so opcount sees a valid op tree.
-            if isinstance(kernel, NullKernelHandler):
-                return ops.constant(0.0, torch.float32)
-
-            _add_module_import(kernel, entry.module)
-
-            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
-                emit_inline_unary_bwd,
+            return ops.vulkan_bwd_diff_unary(
+                _fwd_fn,
+                _module,
+                _no_diff_json,
+                x_val,
+                grad_out_val,
             )
 
-            body_lines, result_expr = emit_inline_unary_bwd(
-                entry,
-                x_var=str(x_val),
-                grad_out_var=str(grad_out_val),
-                dtype="float",
-            )
-            kernel.compute.writeline(body_lines)
-            return kernel.cse.generate(
-                kernel.compute,
-                result_expr,
-                dtype=torch.float32,
-            )
-
-        from torch._inductor.virtualized import ops
+        # Broadcast scalar (0-D) grad_output to match self's shape so
+        # make_pointwise can unify ranges. Happens when
+        # loss = reduction_op(...).backward() passes grad_output = tensor(1.0).
+        if len(grad_output.get_size()) == 0 and len(self.get_size()) > 0:
+            from torch._inductor import ir as _ir
+            _scalar_loader = grad_output.make_loader()
+            grad_output = _ir.TensorBox.create(_ir.Pointwise.create(
+                device=self.get_device(),
+                dtype=grad_output.get_dtype(),
+                inner_fn=lambda _index: _scalar_loader([]),
+                ranges=list(self.get_size()),
+            ))
 
         return make_pointwise(inner_fn)(grad_output, self)
 
@@ -95,7 +101,6 @@ def _make_inline_unary_bwd_diff_lowering(aten_op, register_lowering, aten):
 def _make_inline_binary_bwd_diff_lowering(aten_op, register_lowering, aten):
     import torch
     from torch._inductor.lowering import make_pointwise
-    from torch._inductor.virtualized import V
 
     from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
 
@@ -109,46 +114,94 @@ def _make_inline_binary_bwd_diff_lowering(aten_op, register_lowering, aten):
     except AttributeError:
         return
 
+    _no_diff_json = json.dumps(list(entry.no_diff_params))
+    _fwd_fn = entry.fwd_fn
+    _module = entry.module
+
+    # Runtime scalar param names for ops like smooth_l1 (beta) / huber (delta).
+    _extra_param_names = {
+        "aten.smooth_l1_loss_backward": ["beta"],
+        "aten.huber_loss_backward": ["delta"],
+    }.get(aten_op, [])
+
     @register_lowering(target, type_promotion_kind=None)
-    def _lowering(grad_output, self, target_tensor, reduction, *args, **kwargs):
+    def _lowering(*raw_args, **kwargs):
+        # Positional args differ per op:
+        #  mse/l1/smooth_l1/huber: (grad_output, self, target, reduction, [scalars...])
+        #  binary_cross_entropy:   (grad_output, self, target[, weight=None]) + kwargs['reduction']
+        # We unpack only the first 3 guaranteed positional args then handle the rest.
+        if len(raw_args) < 3:
+            return NotImplemented
+        grad_output, self, target_tensor = raw_args[0], raw_args[1], raw_args[2]
+        extra_raw = list(raw_args[3:])
+
         if not _is_vulkan(self):
             return NotImplemented
 
-        extra_params = {
-            "aten.smooth_l1_loss_backward": ["beta"],
-            "aten.huber_loss_backward": ["delta"],
-        }.get(aten_op, [])
-        scalar_args = list(args) + [kwargs.get(p) for p in extra_params if p in kwargs]
+        # Extract reduction: might be positional or in kwargs.
+        # For bce_backward with weight=None the weight arg is omitted → reduction in kwargs.
+        # For other ops (mse, smooth_l1, huber) reduction is the first extra positional arg.
+        reduction = None
+        remaining = []
+        for val in extra_raw:
+            if reduction is None and isinstance(val, int):
+                reduction = val
+            elif val is not None and not isinstance(val, int):
+                remaining.append(val)  # tensor args only — None (weight=None) discarded
+        if reduction is None:
+            # Ops whose aten backward has default reduction=MEAN (=1) omit the
+            # reduction arg when the caller uses the default.  E.g.
+            # binary_cross_entropy_backward(grad, self, target) with weight=None
+            # and reduction=1 (default) arrives as only 3 positional args.
+            # All binary loss functions default to MEAN, so 1 is the safe fallback.
+            reduction = kwargs.get('reduction', 1)
+
+        scalar_args = remaining + [kwargs.get(p) for p in _extra_param_names if p in kwargs]
+
+        # Loss backward ops encode 1/N scaling for mean-reduction inside the aten op
+        # semantics. Our bwd_diff(loss_elem) only computes the element-wise derivative
+        # without the 1/N factor, so we scale grad_output here.
+        # reduction=0: none, 1: mean, 2: sum.
+        _mean_scale: float | None = None
+        if reduction == 1:  # Mean
+            try:
+                numel = 1
+                for s in self.get_size():
+                    numel = numel * int(s)
+                _mean_scale = 1.0 / numel
+            except (TypeError, ValueError):
+                pass  # dynamic shape — no scaling (accept inaccuracy)
 
         def inner_fn(grad_out_val, pred_val, target_val, *scalars):
-            from torch._inductor.virtualized import NullKernelHandler, ops
+            from torch._inductor.virtualized import ops
+            import torch as _torch
 
-            kernel = V.kernel
-            # See unary case above: ``inner_fn_opcount`` calls this without
-            # a real kernel context. Return a constant placeholder for the
-            # opcount pass; only emit real bwd_diff body during codegen.
-            if isinstance(kernel, NullKernelHandler):
-                return ops.constant(0.0, torch.float32)
-
-            _add_module_import(kernel, entry.module)
-
-            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
-                emit_inline_binary_bwd,
+            _go = grad_out_val
+            if _mean_scale is not None:
+                # Emit: float _scaled_go = _mean_scale * grad_out_val;
+                _scale_expr = ops.constant(_mean_scale, _torch.float32)
+                _go = ops.mul(_scale_expr, _go)
+            return ops.vulkan_bwd_diff_binary(
+                _fwd_fn,
+                _module,
+                _no_diff_json,
+                pred_val,
+                target_val,
+                _go,
+                *scalars,
             )
 
-            body_lines, result_a_expr, _result_b_expr = emit_inline_binary_bwd(
-                entry,
-                a_var=str(pred_val),
-                b_var=str(target_val),
-                grad_out_var=str(grad_out_val),
-                dtype="float",
-            )
-            kernel.compute.writeline(body_lines)
-            return kernel.cse.generate(
-                kernel.compute,
-                result_a_expr,
-                dtype=torch.float32,
-            )
+        # Broadcast scalar (0-D) grad_output to match self's shape so
+        # make_pointwise can unify ranges.
+        if len(grad_output.get_size()) == 0 and len(self.get_size()) > 0:
+            from torch._inductor import ir as _ir
+            _scalar_loader = grad_output.make_loader()
+            grad_output = _ir.TensorBox.create(_ir.Pointwise.create(
+                device=self.get_device(),
+                dtype=grad_output.get_dtype(),
+                inner_fn=lambda _index: _scalar_loader([]),
+                ranges=list(self.get_size()),
+            ))
 
         inputs = [grad_output, self, target_tensor] + scalar_args
         return make_pointwise(inner_fn)(*inputs)
@@ -176,18 +229,20 @@ def _register_leaky_relu_backward_inline(register_lowering, aten):
     """
     import torch
     from torch._inductor.lowering import make_pointwise
-    from torch._inductor.virtualized import V
 
     from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
     from torch_vulkan.inductor.kernel.bwd_diff_inline import (
         can_inline_bwd_diff,
-        emit_inline_unary_bwd,
     )
 
     aten_op = "aten.leaky_relu_backward"
     if not can_inline_bwd_diff(aten_op):
         return
     entry = BWD_DIFF_TABLE[aten_op]
+
+    _no_diff_json = json.dumps(list(entry.no_diff_params))
+    _fwd_fn = entry.fwd_fn
+    _module = entry.module
 
     # NOTE (anti-goal #3): Use variable target to avoid text grep on @register_lowering(aten...
     _lrbwd_target = aten.leaky_relu_backward
@@ -205,35 +260,16 @@ def _register_leaky_relu_backward_inline(register_lowering, aten):
             return NotImplemented
 
         def inner_fn(grad_out_val, x_val, ns_val):
-            from torch._inductor.virtualized import NullKernelHandler
+            from torch._inductor.virtualized import ops
 
-            kernel = V.kernel
-            if isinstance(kernel, NullKernelHandler):
-                from torch._inductor.virtualized import ops
-
-                return ops.constant(0.0, torch.float32)
-
-            _add_module_import(kernel, entry.module)
-
-            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
-                emit_inline_unary_bwd,
+            return ops.vulkan_bwd_diff_unary(
+                _fwd_fn,
+                _module,
+                _no_diff_json,
+                x_val,
+                grad_out_val,
+                ns_val,
             )
-
-            body_lines, result_expr = emit_inline_unary_bwd(
-                entry,
-                x_var=str(x_val),
-                grad_out_var=str(grad_out_val),
-                dtype="float",
-                no_diff_scalar_values={"negative_slope": str(ns_val)},
-            )
-            kernel.compute.writeline(body_lines)
-            return kernel.cse.generate(
-                kernel.compute,
-                result_expr,
-                dtype=torch.float32,
-            )
-
-        from torch._inductor.virtualized import ops
 
         return make_pointwise(inner_fn)(grad_output, self_or_result, negative_slope)
 
@@ -254,18 +290,20 @@ def _register_softplus_backward_inline(register_lowering, aten):
     """
     import torch
     from torch._inductor.lowering import make_pointwise
-    from torch._inductor.virtualized import V
 
     from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
     from torch_vulkan.inductor.kernel.bwd_diff_inline import (
         can_inline_bwd_diff,
-        emit_inline_unary_bwd,
     )
 
     aten_op = "aten.softplus_backward"
     if not can_inline_bwd_diff(aten_op):
         return
     entry = BWD_DIFF_TABLE[aten_op]
+
+    _no_diff_json = json.dumps(list(entry.no_diff_params))
+    _fwd_fn = entry.fwd_fn
+    _module = entry.module
 
     # NOTE (anti-goal #3): Use variable target to avoid text grep on @register_lowering(aten...
     _spbwd_target = aten.softplus_backward
@@ -276,38 +314,17 @@ def _register_softplus_backward_inline(register_lowering, aten):
             return NotImplemented
 
         def inner_fn(grad_out_val, x_val, beta_val, thr_val):
-            from torch._inductor.virtualized import NullKernelHandler
+            from torch._inductor.virtualized import ops
 
-            kernel = V.kernel
-            if isinstance(kernel, NullKernelHandler):
-                from torch._inductor.virtualized import ops
-
-                return ops.constant(0.0, torch.float32)
-
-            _add_module_import(kernel, entry.module)
-
-            from torch_vulkan.inductor.kernel.bwd_diff_inline import (
-                emit_inline_unary_bwd,
+            return ops.vulkan_bwd_diff_unary(
+                _fwd_fn,
+                _module,
+                _no_diff_json,
+                x_val,
+                grad_out_val,
+                beta_val,
+                thr_val,
             )
-
-            body_lines, result_expr = emit_inline_unary_bwd(
-                entry,
-                x_var=str(x_val),
-                grad_out_var=str(grad_out_val),
-                dtype="float",
-                no_diff_scalar_values={
-                    "beta": str(beta_val),
-                    "threshold": str(thr_val),
-                },
-            )
-            kernel.compute.writeline(body_lines)
-            return kernel.cse.generate(
-                kernel.compute,
-                result_expr,
-                dtype=torch.float32,
-            )
-
-        from torch._inductor.virtualized import ops
 
         return make_pointwise(inner_fn)(grad_output, self, beta, threshold)
 
@@ -340,9 +357,18 @@ def _register_inline_bwd_diff_lowerings(register_lowering, L, aten):
         # [BackwardDerivative(mish_fast_bwd)] across module import
         # boundaries — inline bwd_diff(mish_fwd) returns all-zero
         # gradients. Algebraic lowering in bwd_lowerings.py.
-        "aten.sigmoid_backward",
-        "aten.tanh_backward",
-        "aten.gelu_backward",
+        #
+        # NOTE: aten.sigmoid_backward and aten.tanh_backward are NOT
+        # in this set. Their aten signature receives the forward *output*
+        # (y = sigmoid(x) / y = tanh(x)), not the forward *input* x.
+        # bwd_diff(sigmoid_fwd)(y, grad_out) would compute
+        # sigmoid(y)*(1-sigmoid(y))*grad_out, which is wrong; the correct
+        # value is y*(1-y)*grad_out.  Algebraic lowering in bwd_lowerings.py.
+        #
+        # NOTE: aten.gelu_backward is NOT in this set because gelu_fwd uses
+        # the tanh approximation while PyTorch default is approximate="none"
+        # (erf formula).  Algebraic lowering in bwd_lowerings.py handles
+        # both variants correctly via the approximate kwarg.
         "aten.sin_backward",
         "aten.cos_backward",
         "aten.tan_backward",

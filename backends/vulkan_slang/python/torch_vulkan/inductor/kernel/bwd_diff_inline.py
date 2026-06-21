@@ -87,10 +87,15 @@ def emit_inline_binary_bwd(
     b_var: str,
     grad_out_var: str,
     dtype: str = "float",
+    no_diff_scalar_values: dict[str, str] | None = None,
 ) -> tuple[str, str, str]:
     """Emit inline Slang code for a binary bwd_diff.
 
     Returns (body_lines, result_a_expr, result_b_expr).
+
+    ``no_diff_scalar_values`` maps each ``no_diff`` param name to its
+    Slang expression string (the runtime CSE variable). Mirrors the
+    unary emitter's interface.
     """
     import itertools
 
@@ -100,9 +105,17 @@ def emit_inline_binary_bwd(
     dpa_name = f"_dpa_bwd_{cnt}"
     dpb_name = f"_dpb_bwd_{cnt}"
 
-    no_diff_args = ", ".join(entry.no_diff_params) if entry.no_diff_params else ""
-    if no_diff_args:
-        no_diff_args += ", "
+    if entry.no_diff_params:
+        scalar_values = no_diff_scalar_values or {}
+        parts = []
+        for param_name in entry.no_diff_params:
+            if param_name in scalar_values:
+                parts.append(scalar_values[param_name])
+            else:
+                parts.append(param_name)
+        no_diff_args = ", ".join(parts) + ", "
+    else:
+        no_diff_args = ""
 
     body_lines = (
         f"DifferentialPair<{dtype}> {dpa_name} = diffPair({a_var}, ({dtype})0);\n"

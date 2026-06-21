@@ -470,4 +470,3 @@ public [ForceInline] float hprod() { return this.x * this.y * this.z * this.w; }
 
 // Free-function alias for hypot used by pointwise.slang.
 [ForceInline] public float hypot(float a, float b) { return a.hypot(b); }
-

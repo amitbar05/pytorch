@@ -669,8 +669,9 @@ def register() -> None:
     _register_pointwise_math_lowerings()
     _register_complex_lowerings()
     # CG.M8: Register inline bwd_diff lowerings FIRST so they take priority
-    # over the Python custom-op shim lowerings in bwd_lowerings.py.
-    # Inductor's register_lowering is first-come-first-served.
+    # over the external-dispatch shims in bwd_lowerings.py.
+    # register_lowering is first-come-first-served (get_overloads() filters
+    # already-registered OpOverloadPacket overloads), so inline MUST go first.
     import torch
     from torch._inductor.lowering import register_lowering as _reg_low2
 
@@ -685,6 +686,9 @@ def register() -> None:
 
     # TR.19: All backward lowerings are now consolidated in bwd_lowerings.py.
     # The _register_*_backward stubs below are no-ops retained for compat.
+    # bwd_lowerings is registered AFTER inline so it only claims ops that
+    # the inline set does not cover (algebraic fallbacks: sigmoid, tanh, gelu,
+    # mish, etc.).
     from ..bwd_lowerings import register as _register_bwd_lowerings
 
     _register_bwd_lowerings()

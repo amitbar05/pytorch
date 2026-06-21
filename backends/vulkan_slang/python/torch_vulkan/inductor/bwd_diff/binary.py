@@ -56,6 +56,10 @@ def dispatch_binary_bwd(
     orig_dtype = a.dtype
     _check_float(a, b, grad_out)
     _check_vulkan(a, b, grad_out)
+    # Scalar (0-D) grad_out arises when loss.backward() is called on a
+    # mean/sum-reduced loss.  Expand to match a's shape before dispatch.
+    if grad_out.dim() == 0 and a.dim() > 0:
+        grad_out = grad_out.expand(a.shape)
     if a.shape != b.shape or a.shape != grad_out.shape:
         raise ValueError(
             f"PF.6.b: binary backward expects matching shapes for "

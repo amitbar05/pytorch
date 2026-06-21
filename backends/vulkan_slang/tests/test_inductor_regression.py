@@ -60280,10 +60280,13 @@ class TestTrain1LossBackwardReachability:
             lambda x, t: torch.nn.functional.huber_loss(x, t, delta=1.0)
         )
 
-    def test_kl_div_backward_removed_from_table(self):
-        """Phantom aten.kl_div_backward removed from BWD_DIFF_TABLE."""
+    def test_kl_div_in_table_not_inductor_lowering(self):
+        """kl_div_backward is in BWD_DIFF_TABLE for eager dispatch but NOT
+        in _BINARY_BWD_DIFF_LOWERING_OPS — it never appears in compiled graphs."""
         from torch_vulkan.inductor.bwd_diff_table import BWD_DIFF_TABLE
-        assert "aten.kl_div_backward" not in BWD_DIFF_TABLE
+        from torch_vulkan.inductor.bwd_lowerings import _BINARY_BWD_DIFF_LOWERING_OPS
+        assert "aten.kl_div_backward" in BWD_DIFF_TABLE
+        assert "aten.kl_div_backward" not in _BINARY_BWD_DIFF_LOWERING_OPS
 
     def test_binary_loss_lowering_ops_complete(self):
         """All 6 loss bwd ops have lowering registrations."""

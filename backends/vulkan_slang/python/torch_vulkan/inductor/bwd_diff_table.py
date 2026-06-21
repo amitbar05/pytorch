@@ -149,11 +149,14 @@ BWD_DIFF_TABLE: dict[str, BwdDiffEntry] = {
         2,
         no_diff_params=("delta",),
     ),
-    # TRAIN.1 (2026-05-27): aten.kl_div_backward removed — phantom entry.
-    # PyTorch does not expose kl_div_backward as an aten op. KL divergence
-    # backward is computed through autograd C++ that decomposes into primitives
-    # (exp, sub, mul, etc.) before any aten op is emitted. The entry was dead
-    # code — no graph would ever produce aten.kl_div_backward.
+    # CG.M8: kl_div_backward is kept for eager dispatch / shader-numerics
+    # verification even though aten.kl_div_backward never appears in
+    # Inductor-compiled graphs (PyTorch decomposes it into log/sub/mul
+    # primitives before any aten op is emitted).  The entry satisfies the
+    # coverage gate for kl_div_elem and allows dispatch_binary_bwd to
+    # test the kl_div_elem shader numerically.  It is NOT in
+    # _BINARY_BWD_DIFF_LOWERING_OPS, so no Inductor lowering fires.
+    "aten.kl_div_backward": BwdDiffEntry("kl_div_elem", "losses", 2),
 }
 
 

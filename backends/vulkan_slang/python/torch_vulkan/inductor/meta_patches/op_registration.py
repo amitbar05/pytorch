@@ -180,6 +180,26 @@ def _patch_proxy_call_matmul_decomp() -> None:
         _matmul_lib.impl("matmul", _vulkan_matmul)
 
         def _vulkan_matmul_backward(grad, self, other, mask):
+            # Handle 1-D `other` (matrix-vector: self @ other, other.ndim == 1).
+            # grad has shape self.shape[:-1] (one fewer dim than self).
+            # grad_self[..., n, k] = grad[..., n] * other[k]
+            # grad_other[k]        = sum_{..., n} self[..., n, k] * grad[..., n]
+            if other.ndim == 1:
+                results = []
+                if mask[0]:
+                    results.append((grad.unsqueeze(-1) * other).reshape(self.shape))
+                else:
+                    results.append(torch.zeros_like(self))
+                if mask[1]:
+                    # Flatten batch dims: (..., N, K).T @ (..., N) → (K,)
+                    s_flat = self.reshape(-1, self.shape[-1])  # (B*N, K)
+                    g_flat = grad.reshape(-1)                  # (B*N,)
+                    results.append(torch.ops.aten.mm(s_flat.T, g_flat.unsqueeze(-1)).squeeze(-1).reshape(other.shape))
+                else:
+                    results.append(torch.zeros_like(other))
+                return tuple(results)
+
+            # Standard case: both self and other are ≥ 2-D (or batched).
             results = []
             if mask[0]:
                 g = torch.ops.aten.bmm(
