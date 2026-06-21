@@ -593,6 +593,35 @@ def _register_optional_tensor_workarounds():
             return torch.ops.torch_vulkan.adaptive_avg_pool2d.default(input, osize)
         return _orig_adaptive_avg_pool2d(input, output_size)
 
+    _orig_avg_pool2d = F.avg_pool2d
+
+    def _patched_avg_pool2d(
+        input, kernel_size, stride=None, padding=0, ceil_mode=False,
+        count_include_pad=True, divisor_override=None,
+    ):
+        # S2.5: route Vulkan inputs through torch_vulkan::avg_pool2d custom_op
+        # during compile/trace to avoid FakeTensor data_ptr() access in the C++
+        # PrivateUse1 kernel.  The wrapper emits
+        # torch.ops.torch_vulkan.avg_pool2d.default(...) instead of the public
+        # aten.avg_pool2d extern (anti-goal #6 close-out).
+        if _is_vulkan(input) and _route_via_custom_op(input):
+            _ensure_patch_custom_ops()
+            def _to_list2(x, default=None):
+                if x is None:
+                    return list(default) if default is not None else []
+                return [x, x] if isinstance(x, int) else list(x)
+            ks = _to_list2(kernel_size)
+            st = _to_list2(stride, ks)
+            pd = _to_list2(padding, [0, 0])
+            return torch.ops.torch_vulkan.avg_pool2d.default(
+                input, ks, st, pd, bool(ceil_mode), bool(count_include_pad),
+                int(divisor_override) if divisor_override is not None else 0,
+            )
+        return _orig_avg_pool2d(
+            input, kernel_size, stride, padding, ceil_mode,
+            count_include_pad, divisor_override,
+        )
+
     F.conv1d = _patched_conv1d
     F.conv2d = _patched_conv2d
     F.layer_norm = _patched_layer_norm
@@ -602,6 +631,7 @@ def _register_optional_tensor_workarounds():
     F.instance_norm = _patched_instance_norm
     F.max_pool2d = _patched_max_pool2d
     F.adaptive_avg_pool2d = _patched_adaptive_avg_pool2d
+    F.avg_pool2d = _patched_avg_pool2d
 
 
 def _register_device_module():

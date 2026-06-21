@@ -63838,22 +63838,62 @@ class TestNoExternInFullCNNBwd:
 
 
 class TestPoolAdaptiveRouting:
-    """S2.5-pre — pool lowering dispatch audit.
+    """S2.5 — pool lowering dispatch audit (both avg_pool2d and adaptive_avg_pool2d).
 
-    During FX tracing, adaptive_avg_pool2d on a Vulkan tensor dispatches to
-    the C++ custom op ``torch_vulkan::adaptive_avg_pool2d`` (not to the
-    aten op), so the FX graph already contains
-    ``torch_vulkan.adaptive_avg_pool2d.default``.  Inductor generates a
-    FallbackKernel for it → wrapper emits
-    ``torch.ops.torch_vulkan.adaptive_avg_pool2d.default(...)``.
-
-    This is the pre-S2.5 state:
-    * No public ``aten::_adaptive_avg_pool2d`` extern (anti-goal #6 aten half ✅).
-    * Still calls back to eager custom-op dispatch (anti-goal #6 spirit 🔴).
-
-    S2.5 (open) adds a lowering for ``torch_vulkan.adaptive_avg_pool2d.default``
-    that generates a Slang reduction kernel, eliminating the FallbackKernel call.
+    During FX tracing on Vulkan tensors, both pool ops dispatch to private
+    ``torch_vulkan::*`` custom ops (not aten externs) — satisfying anti-goal #6.
+    Inductor generates FallbackKernel nodes for them → wrapper emits
+    ``torch.ops.torch_vulkan.*.default(...)`` which calls back to the Vulkan
+    compute kernel.  This is the S2.5 state:
+    * No public aten pool externs in the wrapper ✅ (anti-goal #6 aten half).
+    * Custom-op path dispatches to Vulkan private kernel ✅ (private, not public aten).
     """
+
+    @pytest.mark.timeout(60)
+    def test_avg_pool2d_uses_custom_op_not_aten_extern(self):
+        """S2.5 — avg_pool2d wrapper must use torch_vulkan custom op, not aten extern.
+
+        Expected wrapper (S2.5):
+        * ``torch.ops.aten.avg_pool2d`` NOT present in executable lines.
+        * ``torch.ops.torch_vulkan.avg_pool2d`` IS present (FallbackKernel).
+        """
+        import torch_vulkan  # noqa: F401
+        from torch._inductor.utils import get_code
+        import torch._inductor.config as _ind_cfg
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 3, 8, 8, device="vulkan:0")
+
+        def fwd(x):
+            return torch.nn.functional.avg_pool2d(x, kernel_size=2)
+
+        with _ind_cfg.patch({"triton.unique_kernel_names": True}):
+            compiled = torch.compile(fwd, backend="inductor")
+            codes = get_code(compiled, x)
+
+        full_source = "\n".join(codes)
+        assert full_source.strip(), "get_code returned no source"
+
+        # Must NOT have a public aten extern.
+        aten_pool = [
+            line.strip() for line in full_source.split("\n")
+            if "torch.ops.aten.avg_pool2d" in line
+            and not line.strip().startswith("#")
+        ]
+        assert not aten_pool, (
+            "S2.5: wrapper contains aten.avg_pool2d extern (anti-goal #6):\n"
+            + "\n".join(f"  {l}" for l in aten_pool[:3])
+        )
+
+        # Must use the private torch_vulkan custom-op path.
+        custom_op = any(
+            "torch.ops.torch_vulkan.avg_pool2d" in line
+            for line in full_source.split("\n")
+        )
+        assert custom_op, (
+            "S2.5: expected torch_vulkan.avg_pool2d in wrapper "
+            "(FallbackKernel dispatch routing regressed)"
+        )
 
     @pytest.mark.timeout(60)
     def test_adaptive_avg_pool2d_uses_custom_op_not_aten_extern(self):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .eager import (
     _ensure_adaptive_avg_pool2d_op_registered,
+    _ensure_avg_pool2d_op_registered,
     _ensure_addmm_gelu_op_registered,
     _ensure_conv1d_with_optional_bias_op_registered,
     _ensure_conv2d_with_optional_bias_op_registered,
@@ -29,6 +30,7 @@ from .eager import (
 __all__ = [
     "_ensure_addmm_gelu_op_registered",
     "_ensure_adaptive_avg_pool2d_op_registered",
+    "_ensure_avg_pool2d_op_registered",
     "_ensure_conv1d_with_optional_bias_op_registered",
     "_ensure_conv2d_with_optional_bias_op_registered",
     "_ensure_flash_attention_op_registered",

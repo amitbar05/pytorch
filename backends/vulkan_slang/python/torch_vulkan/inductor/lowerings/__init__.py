@@ -492,6 +492,11 @@ def register() -> None:
     if hasattr(torch.ops.torch_vulkan, "avg_pool2d_scatter_bwd"):
         make_fallback(torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default)
 
+    # S2.5: avg_pool2d forward custom op — emits torch_vulkan private op
+    # instead of public aten.avg_pool2d (anti-goal #6 close-out).
+    if hasattr(torch.ops.torch_vulkan, "avg_pool2d"):
+        make_fallback(torch.ops.torch_vulkan.avg_pool2d.default)
+
     # TRAIN.7: autocast boundary ops — identity dtype casts that must not
     # break fusion.  aten._autocast_to_reduced_precision (fp32→fp16/bf16)
     # and aten._autocast_to_full_precision (fp16/bf16→fp32) are generated

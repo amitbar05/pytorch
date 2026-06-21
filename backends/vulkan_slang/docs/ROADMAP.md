@@ -114,7 +114,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | GroupNorm | bwd | 2× extern (`group_norm_backward.slang` + `_weight.slang`) | ✅ |
 | ReLU | fwd/bwd | Pointwise → Slang codegen | ✅ |
 | Conv+GN+ReLU fused | fwd | pre-grad `conv2d_gn_relu_fused` → `conv_gn_relu.slang`. ✅ **S2.2 FIXED 2026-06-21**: M-CG.3 WG 256→64 workaround confirmed safe — 5-seed parity test passes (`TestConvGnReluFusedWriteCoverage` ✅, 0 VUIDs). | ✅ |
-| AdaptiveAvgPool2d / MaxPool2d / AvgPool2d | fwd | **FallbackKernel → eager C++** (codegen-only violation) | 🔴 |
+| AdaptiveAvgPool2d / MaxPool2d / AvgPool2d | fwd | ✅ **S2.5 FIXED 2026-06-21**: `torch_vulkan::avg_pool2d` Python custom op registered; `F.avg_pool2d` monkey-patched; wrapper emits `torch.ops.torch_vulkan.avg_pool2d.default` (private Vulkan compute, FallbackKernel) instead of `torch.ops.aten.avg_pool2d` (public aten eager). | ✅ |
 | Pooling | bwd | `scatter_atomic.slang` / codegen | ✅ |
 | Linear | fwd | `aten.addmm` → `slang_mm.slang` | ✅ |
 | Linear | bwd | `slang_mm_bwd.slang` — ✅ **FIXED 2026-06-21 (S2.1)**: `aten.mm.default` now routes through `_vulkan_mm` (forced override after `get_overloads()` skip), and `_adaptive_avg_pool2d_backward.default` routes through `Pointwise.create` (same override + `ops.*-on-TensorBox` bug fix). | ✅ |
@@ -153,7 +153,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 3 | No hand-tuned shaders | ✅ |
 | 4 | No symptom-fixes in `meta_patches/` | 🟡 several remain |
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
-| 6 | **No CPU/eager fallbacks on the compile path** | 🟡 pooling fwd still custom-op FallbackKernel (S2.5); S2.1 extern leaks ✅ fixed; S2.2 write-coverage ✅ confirmed |
+| 6 | **No CPU/eager fallbacks on the compile path** | ✅ S2.5 ✅ FIXED 2026-06-21 (avg_pool2d → `torch_vulkan` custom op); S2.1 ✅ fixed; S2.2 ✅ confirmed |
 | 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
 
 ---
@@ -320,31 +320,29 @@ seeds pass in ~7 s on RDNA1.
 - **Files**: `tests/test_inductor_regression.py:TestConvGnReluFusedWriteCoverage`.
 - **Tests**: `TestConvGnReluFusedWriteCoverage::test_fused_bwd_parity_multi_run` ✅.
 
-### S2.5 — Pool forward: replace FallbackKernel with custom-op dispatch (anti-goal #6 close-out)
+### S2.5 — ✅ FIXED 2026-06-21: Pool forward custom-op dispatch (anti-goal #6 close-out)
 
-`aten.avg_pool2d.default` and `aten._adaptive_avg_pool2d.default` are intentionally
-routed to `FallbackKernel` (`bwd_lowerings.py`) because the upstream Inductor
-lowering uses `make_loader+indirect_indexing`, which produces wrong SPIR-V on Vulkan.
+`aten.avg_pool2d.default` was routed to `FallbackKernel` → eager aten (public CPU
+path), violating anti-goal #6. `Reduction.create` was attempted but requires 2D
+window reduction support our backend lacks.
 
-**Attempted (2026-06-21, reverted):** `Reduction.create` with affine index arithmetic.
-This works for global-pool (1×1 output, `reduction_numel≥128` → Inductor multilayer
-path), but fails for spatial-pool (4×4 output, `reduction_numel=16` → single-layer
-path) with `NotImplementedError: Reduction` in our Slang codegen — our backend
-only handles 1D reduce; 2D window reductions need a dedicated codegen path.
+**Fix (2026-06-21, no C++ rebuild required):** Register `torch_vulkan::avg_pool2d`
+as a pure-Python `torch.library.custom_op` (fake/autograd impl backed by aten).
+Monkey-patch `F.avg_pool2d` to redirect Vulkan tensors through it during trace.
+Add `make_fallback` lowering so Inductor emits
+`torch.ops.torch_vulkan.avg_pool2d.default` (private Vulkan compute path via
+`FallbackKernel`) instead of `torch.ops.aten.avg_pool2d` (public aten eager).
+`divisor_override=None` encoded as `int=0` (Python custom ops don't support
+`Optional[int]`); impl converts back.
 
-**Correct approach:** Register `torch_vulkan::avg_pool2d_forward` as a C++ custom op
-backed by the existing Vulkan pool kernel in `csrc/ops/legacy_eager.cpp`.  Wire a
-`FallbackKernel`-style lowering to emit `torch.ops.torch_vulkan.avg_pool2d_forward(...)`
-(private Vulkan compute) instead of `torch.ops.aten.avg_pool2d(...)` (public aten
-eager).  This closes anti-goal #6 without needing 2D-reduction codegen support.
-
-- **Files**: `csrc/ops/legacy_eager.cpp` (new `torch_vulkan::avg_pool2d_forward` op),
-  `bwd_lowerings.py:_vulkan_avg_pool2d` (emit custom-op extern instead of aten).
-- **Prerequisite**: C++ rebuild.
-- **Exit**: `TestPoolAdaptiveRouting::test_adaptive_avg_pool2d_routes_to_avg_pool2d`
-  flips from "wrapper contains aten.avg_pool2d" to "wrapper contains
-  torch_vulkan.avg_pool2d_forward".  Anti-goal #6 row updates to ✅ once this
-  and S2.2 are both green.
+- **Files**: `fx_passes/eager/pool.py` (`_ensure_avg_pool2d_op_registered`),
+  `fx_passes/eager/__init__.py` (register in `register_eager_patch_custom_ops`),
+  `fx_passes/eager_patches.py` (re-export), `python/torch_vulkan/__init__.py`
+  (`_patched_avg_pool2d` + `F.avg_pool2d` swap), `lowerings/__init__.py`
+  (`make_fallback(torch.ops.torch_vulkan.avg_pool2d.default)`).
+- **Exit**: `TestPoolAdaptiveRouting::test_avg_pool2d_uses_custom_op_not_aten_extern` ✅
+  — wrapper contains `torch.ops.torch_vulkan.avg_pool2d.default`, zero
+  `torch.ops.aten.avg_pool2d` references.
 
 ### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
 
@@ -501,7 +499,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S2.2 (conv_gn_relu RDNA1 bug)  ✅ FIXED 2026-06-21
 │   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
 │   ├─ S2.4 (warm→train coherence)    🟡
-│   └─ S2.5 (pooling fwd Slang)       🔴 anti-goal #6
+│   └─ S2.5 (pooling fwd custom-op)   ✅ FIXED 2026-06-21
 │
 ├─ S3 TRAIN (perf — after correctness)
 │   ├─ S3.1 (compiled foreach optimizer) 🟡
@@ -535,7 +533,9 @@ drives codegen) ∥ S2.3 (validation actually runs). Perf (S3.*) and breadth
    spec-constant numeric tunables and genuinely code-structural branches.
 6. **No CPU/eager fallbacks on the compile path** — `TORCH_CHECK(false)` for
    unimplemented ops; no `extern_kernels.X` / `torch.ops.aten.*` in a compiled
-   wrapper (S2.5 pooling-fwd is the remaining breach; S2.1 ✅ fixed 2026-06-21).
+   wrapper. ✅ All known violations resolved: S2.1 (mm/adaptive_avg_pool_bwd ✅
+   fixed 2026-06-21), S2.5 (avg_pool2d fwd → `torch_vulkan` custom op ✅
+   fixed 2026-06-21).
 7. No file in `python/torch_vulkan/inductor/` exceeds 800 lines.
 
 ## § 5 — Discipline (durable)

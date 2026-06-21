@@ -26,6 +26,7 @@ from .optimizer import (
 )
 from .pool import (
     _ensure_adaptive_avg_pool2d_op_registered,
+    _ensure_avg_pool2d_op_registered,
     _ensure_max_pool2d_op_registered,
     _ensure_max_pool2d_scatter_bwd_op_registered,
 )
@@ -71,6 +72,7 @@ def register_eager_patch_custom_ops() -> None:
     _ensure_max_pool2d_op_registered()
     # TRAIN.2: GPU-only max_pool2d backward via scatter_add template
     _ensure_max_pool2d_scatter_bwd_op_registered()
+    _ensure_avg_pool2d_op_registered()
     _ensure_adaptive_avg_pool2d_op_registered()
     # M17.2 Phase 1: conv+ReLU fused custom op
     _ensure_conv2d_relu_fused_op_registered()

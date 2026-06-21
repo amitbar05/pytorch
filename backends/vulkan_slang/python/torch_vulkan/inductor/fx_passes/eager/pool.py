@@ -451,6 +451,107 @@ def _ensure_avg_pool2d_scatter_bwd_op_registered() -> "object":
     return torch.ops.torch_vulkan.avg_pool2d_scatter_bwd.default
 
 
+def _ensure_avg_pool2d_op_registered() -> "object":
+    """Register ``torch_vulkan::avg_pool2d`` as a custom_op (S2.5).
+
+    ``aten.avg_pool2d.default`` carries a ``PrivateUse1`` dispatch key that
+    runs the C++ Vulkan kernel before FakeTensorMode interception, causing
+    Dynamo's fake-trace to hit ``data_ptr()`` on a FakeTensor and fail.
+    Routing through this custom_op lets Dynamo treat it as opaque and use
+    the ``register_fake`` shape-inference instead.
+
+    The wrapper emits ``torch.ops.torch_vulkan.avg_pool2d.default(...)``
+    (private Vulkan compute) instead of ``torch.ops.aten.avg_pool2d(...)``
+    (public aten eager), satisfying anti-goal #6.
+    """
+    import math
+
+    import torch
+
+    op_name = "torch_vulkan::avg_pool2d"
+    existing = getattr(torch.ops.torch_vulkan, "avg_pool2d", None)
+    if existing is not None and hasattr(existing, "default"):
+        return existing.default
+
+    Tensor = torch.Tensor
+
+    def _avg_pool2d_impl(
+        input: Tensor,
+        kernel_size: list[int],
+        stride: list[int],
+        padding: list[int],
+        ceil_mode: bool,
+        count_include_pad: bool,
+        divisor_override: int,
+    ) -> Tensor:
+        return torch.ops.aten.avg_pool2d.default(
+            input, kernel_size, stride, padding, ceil_mode,
+            count_include_pad,
+            divisor_override if divisor_override != 0 else None,
+        )
+
+    _avg_pool2d_impl.__annotations__ = {
+        "input": Tensor,
+        "kernel_size": list[int],
+        "stride": list[int],
+        "padding": list[int],
+        "ceil_mode": bool,
+        "count_include_pad": bool,
+        "divisor_override": int,
+        "return": Tensor,
+    }
+    pool_op = torch.library.custom_op(op_name, mutates_args=())(
+        _avg_pool2d_impl
+    )
+
+    def _avg_pool2d_fake(
+        input, kernel_size, stride, padding, ceil_mode, count_include_pad,
+        divisor_override,
+    ):
+        N, C, H, W = input.shape
+        kH = kernel_size[0]
+        kW = kernel_size[1] if len(kernel_size) > 1 else kH
+        sH = stride[0] if stride else kH
+        sW = (stride[1] if len(stride) > 1 else sH) if stride else kW
+        pH = padding[0] if padding else 0
+        pW = (padding[1] if len(padding) > 1 else pH) if padding else 0
+        if ceil_mode:
+            oH = math.ceil((H + 2 * pH - kH) / sH) + 1
+            oW = math.ceil((W + 2 * pW - kW) / sW) + 1
+        else:
+            oH = math.floor((H + 2 * pH - kH) / sH) + 1
+            oW = math.floor((W + 2 * pW - kW) / sW) + 1
+        return input.new_empty((N, C, oH, oW))
+
+    pool_op.register_fake(_avg_pool2d_fake)
+
+    def _avg_pool2d_setup_context(ctx, inputs, output):
+        inp, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override = inputs
+        ctx.save_for_backward(inp)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.ceil_mode = ceil_mode
+        ctx.count_include_pad = count_include_pad
+        ctx.divisor_override = divisor_override
+
+    def _avg_pool2d_backward(ctx, grad_output):
+        inp = ctx.saved_tensors[0]
+        g_inp = torch.ops.aten.avg_pool2d_backward.default(
+            grad_output, inp,
+            ctx.kernel_size, ctx.stride, ctx.padding,
+            ctx.ceil_mode, ctx.count_include_pad,
+            ctx.divisor_override if ctx.divisor_override != 0 else None,
+        )
+        return g_inp, None, None, None, None, None, None
+
+    pool_op.register_autograd(
+        _avg_pool2d_backward,
+        setup_context=_avg_pool2d_setup_context,
+    )
+    return torch.ops.torch_vulkan.avg_pool2d.default
+
+
 def _ensure_adaptive_avg_pool2d_op_registered() -> "object":
     """Register ``torch_vulkan::adaptive_avg_pool2d`` as a custom_op.
 
