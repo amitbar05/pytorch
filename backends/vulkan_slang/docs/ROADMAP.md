@@ -117,7 +117,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | AdaptiveAvgPool2d / MaxPool2d / AvgPool2d | fwd | **FallbackKernel → eager C++** (codegen-only violation) | 🔴 |
 | Pooling | bwd | `scatter_atomic.slang` / codegen | ✅ |
 | Linear | fwd | `aten.addmm` → `slang_mm.slang` | ✅ |
-| Linear | bwd | `slang_mm_bwd.slang` — **but in a Conv+GN+Pool+Linear bwd graph it leaks `extern_kernels.mm` + `aten._adaptive_avg_pool2d_backward` into the wrapper** | 🔴 |
+| Linear | bwd | `slang_mm_bwd.slang` — ✅ **FIXED 2026-06-21 (S2.1)**: `aten.mm.default` now routes through `_vulkan_mm` (forced override after `get_overloads()` skip), and `_adaptive_avg_pool2d_backward.default` routes through `Pointwise.create` (same override + `ops.*-on-TensorBox` bug fix). | ✅ |
 | SGD/AdamW/Lion | step | eager: `foreach_optimizer.slang` (`IOptimizer`). **Compiled step fans out to per-param `binary_add_inplace`** (no foreach bridge) | 🔴 |
 | CrossEntropyLoss | fwd/bwd | decomposed → Slang codegen | ✅ |
 
@@ -126,7 +126,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 |---|---|---|
 | **S2.0** | Conv+GN CNN training (Linear & 1×1-conv heads): `buf7` combo inversion + wrong conv `grad_bias` (output reuse) + `StorageBox` unwrap crash + 4D grad_out assumption. | ✅ **FIXED 2026-06-19** (S2.0a/reuse/b/c) |
 | **S2.0d** | Stacked conv+GN+ReLU backward exploded (WAR-barrier miss). **FIXED 2026-06-20** — `csrc/ops/dispatch.cpp` now tracks reads + emits a WAR barrier (`test_stacked_conv_gn_backward_war` ✅). **S2.0d-resid also FIXED 2026-06-20** (two more root causes, see below): residual `relu(out+identity)` backward now has full per-param grad parity (`test_resnet_block_residual_grad_parity` ✅). | ✅ **FIXED** |
-| **S2.1** | Conv+GN+Pool+Linear backward wrapper still leaks `extern_kernels.mm` + `aten._adaptive_avg_pool2d_backward` — codegen-only pillar breach (orthogonal to S2.0 correctness). | 🟡 P1 |
+| **S2.1** | Conv+GN+Pool+Linear backward wrapper leaks — **FIXED 2026-06-21**: two root-cause fixes in `matmul.py` + `bwd_lowerings.py` + `pool.py` (`TestNoExternInFullCNNBwd` ✅). | ✅ **FIXED** |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | 🟡 perf |
 
 **S3 — TRAIN (steady-state perf)**
@@ -153,7 +153,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 3 | No hand-tuned shaders | ✅ |
 | 4 | No symptom-fixes in `meta_patches/` | 🟡 several remain |
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
-| 6 | **No CPU/eager fallbacks on the compile path** | 🔴 pooling fwd (FallbackKernel) + S2.1 leak |
+| 6 | **No CPU/eager fallbacks on the compile path** | 🟡 pooling fwd (FallbackKernel, avg/adaptive — S2.5); S2.1 backward leaks ✅ fixed |
 | 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
 
 ---
@@ -288,17 +288,27 @@ A clean-main GPU sweep shows ~24 pre-existing failures unrelated to S2.0
 regression in the current tree.
 - **Exit**: `TestConv1dCompile` + `TestConvGeneralityGaps` green on GPU.
 
-### S2.1 — 🔴 P0: Eliminate the extern/aten leak in the combined backward wrapper
+### S2.1 — ✅ FIXED 2026-06-21: Eliminate the extern/aten leak in the combined backward wrapper
 
-The same full-CNN backward wrapper emits `extern_kernels.mm(...)` and
-`torch.ops.aten._adaptive_avg_pool2d_backward.default(...)` inside the compiled
-wrapper. Linear-bwd is supposed to route to `slang_mm_bwd`; it falls to extern
-`mm` when co-scheduled. `_adaptive_avg_pool2d_backward` is not codegen'd on this
-path. Both breach the codegen-only pillar (anti-goal #6).
-- **Files**: `lowerings/matmul.py` (mm-bwd interception robustness),
-  `lowerings/pool.py` / `bwd_lowerings.py` (adaptive-avg-pool bwd codegen).
-- **Exit**: `TestNoExternInFullCNNBwd` — assert the full-CNN backward wrapper
-  source contains no `extern_kernels.` and no `torch.ops.aten.` call.
+Two root causes:
+
+1. **mm backward went through `tuned_mm` (autotuner → `extern_kernels.mm`).**
+   `get_overloads()` in Inductor's `_register_lowering` skips overloads already
+   in `lowerings`. `aten.mm.default` was pre-registered by `tuned_mm` before our
+   `_vulkan_mm` ran; `@register_lowering(aten.mm)` only overrode the packet key,
+   NOT `.default`. Fix: explicit `lowerings[aten.mm.default] = lowerings[aten.mm]`
+   after registration in `_register_mm_lowering()`.
+
+2. **`aten._adaptive_avg_pool2d_backward.default` went through `fallback_handler`
+   (same `get_overloads()` skip bug + `ops.*-on-TensorBox` bug in the lowering).**
+   Original `_adaptive_avg_pool2d_backward_vulkan` called `ops.mul(TensorBox, ...)`
+   at lowering time, producing invalid OpsValue → lowering fell through to FallbackKernel.
+   Fix: (a) rewrite using `Pointwise.create(inner_fn=...)` with affine index mapping
+   `h // kH, w // kW`; (b) force-override `.default` after registration (same pattern).
+
+- **Files**: `lowerings/matmul.py`, `lowerings/pool.py`, `bwd_lowerings.py`.
+- **Tests**: `TestNoExternInFullCNNBwd::test_lowering_registration_no_fallback` ✅
+  `TestNoExternInFullCNNBwd::test_no_extern_in_cnn_linear_wrapper` ✅
 
 ### S2.2 — Conv+GN+ReLU fused shader: fix or gate the RDNA1 write-coverage bug
 
@@ -312,6 +322,22 @@ on a validation-layer + parity floor.
   `config.py` (fusion gate default).
 - **Exit**: `TestConvGnReluFusedWriteCoverage` — fused fwd+bwd parity vs CPU
   under `VUID_AS_ERROR=1`, asserted over ≥3 reruns (catch non-determinism).
+
+### S2.5 — Pool forward: replace FallbackKernel with codegen (anti-goal #6 close-out)
+
+`aten.avg_pool2d.default` and `aten._adaptive_avg_pool2d.default` are intentionally
+routed to `FallbackKernel` (`bwd_lowerings.py:769`) because the upstream Inductor
+lowering uses `make_loader+indirect_indexing`, which produces wrong SPIR-V on Vulkan.
+The fix is to write a `Reduction.create`-based lowering for the non-overlapping,
+no-padding case (stride == kernel_size, h_in % kH == 0), using affine index arithmetic
+`oh*kH + kh_offset` (not indirect_indexing).  General (overlapping/padding) cases
+continue to use FallbackKernel.
+
+- **Files**: `lowerings/pool.py` (new `avg_pool2d_forward_codegen`),
+  `bwd_lowerings.py:_vulkan_avg_pool2d` (try codegen path first, fallback on None).
+- **Exit**: `TestPoolFwdCodegen` — `avg_pool2d(4,3,16,16, kernel=(4,4))` produces
+  `Reduction` IR (not `FallbackKernel`); parity vs CPU.  Anti-goal #6 row
+  updates to ✅ once this and S2.2 are both green.
 
 ### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
 

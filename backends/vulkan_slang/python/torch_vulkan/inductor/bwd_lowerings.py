@@ -846,6 +846,14 @@ def _register_consolidated_backward_impls() -> None:
     register_lowering(aten._adaptive_avg_pool2d_backward, type_promotion_kind=None)(
         _adaptive_avg_pool2d_backward_vulkan
     )
+    # get_overloads() skips overloads already in lowerings, so .default stays
+    # pointing at the upstream make_fallback handler.  Force-override so
+    # backward pool dispatch actually hits our Pointwise.create implementation.
+    from torch._inductor import lowering as _L
+    if aten._adaptive_avg_pool2d_backward.default in _L.lowerings:
+        _L.lowerings[aten._adaptive_avg_pool2d_backward.default] = (
+            _L.lowerings[aten._adaptive_avg_pool2d_backward]
+        )
 
     # ── aten.embedding_dense_backward (embedding.py) ─────────────────────
     _emb_dense_impl = _get_embedding_dense_backward_impl()

@@ -62,55 +62,83 @@ def _adaptive_avg_pool2d_vulkan(x, output_size):
 
 # NOTE (anti-goal #3): @register_lowering moved to bwd_lowerings.py.
 # This function is imported there and registered via _register_pool_adaptive_bwd().
-def _adaptive_avg_pool2d_backward_vulkan(grad_out, x, output_size):
+def _adaptive_avg_pool2d_backward_vulkan(grad_out, x):
     """Lower the backward pass for adaptive_avg_pool2d.
 
-    For the integer-divisible case, the backward is simply broadcasting
-    ``grad_out / (kH * kW)`` to the input shape.  Inductor's scheduler
-    fuses the broadcast with upstream pointwise/reduction ops.
-    Non-divisible / non-Vulkan cases fall back to the upstream handler.
+    aten::_adaptive_avg_pool2d_backward(Tensor grad_output, Tensor self) → Tensor
+    (no output_size arg — derived from grad_out spatial dims).
+
+    For the integer-divisible case each input pixel (h, w) receives the
+    gradient of output pixel (h//kH, w//kW) scaled by 1/(kH*kW).  Uses
+    Pointwise.create so ops.* runs inside the kernel body where it belongs
+    — calling ops.* on TensorBox at lowering time produces invalid OpsValue.
+    Non-divisible / non-Vulkan cases fall back to the C++ Vulkan handler.
     """
-    from torch._inductor.ir import TensorBox
+    from torch._inductor.ir import Pointwise, TensorBox
     from torch._inductor.virtualized import V, ops
 
-    assert isinstance(grad_out, TensorBox)
+    if not isinstance(grad_out, TensorBox):
+        return _fallback(grad_out, x)
+
     grad_out.realize_hint()
 
-    # Only intercept Vulkan tensors.
     try:
         if grad_out.get_device().type != "vulkan":
-            return _fallback(grad_out, x, output_size)
+            return _fallback(grad_out, x)
     except Exception:
-        return _fallback(grad_out, x, output_size)
+        return _fallback(grad_out, x)
 
-    h_out, w_out = output_size
+    *b, ho, wo = grad_out.get_size()
+    try:
+        h_out = V.graph.sizevars.guard_int(ho)
+        w_out = V.graph.sizevars.guard_int(wo)
+    except Exception:
+        return _fallback(grad_out, x)
 
-    # Determine input spatial size from `x`.
-    if isinstance(x, TensorBox):
-        x.realize_hint()
-        *_, h_in, w_in = x.get_size()
+    if not isinstance(x, TensorBox):
+        return _fallback(grad_out, x)
+
+    x.realize_hint()
+    *_, h_in, w_in = x.get_size()
+    try:
         h_in_int = V.graph.sizevars.guard_int(h_in)
         w_in_int = V.graph.sizevars.guard_int(w_in)
-    else:
-        return _fallback(grad_out, x, output_size)
+    except Exception:
+        return _fallback(grad_out, x)
 
-    if h_in_int % h_out == 0 and w_in_int % w_out == 0:
-        kH = h_in_int // h_out
-        kW = w_in_int // w_out
-        scale = 1.0 / float(kH * kW)
+    if h_in_int % h_out != 0 or w_in_int % w_out != 0:
+        return _fallback(grad_out, x)
 
-        # grad_scaled = grad_out * scale
-        grad_scaled = ops.mul(grad_out, ops.constant(grad_out.get_dtype(), scale))
+    kH = h_in_int // h_out
+    kW = w_in_int // w_out
+    scale = 1.0 / float(kH * kW)
+    dtype = grad_out.get_dtype()
+    device = grad_out.get_device()
 
-        # Broadcast each output pixel to a (kH, kW) block in the input.
-        # reshape -> expand -> reshape
-        *b, ho, wo = grad_out.get_size()
-        reshaped = ops.reshape(grad_scaled, [*b, ho, 1, wo, 1])
-        expanded = ops.expand(reshaped, [*b, ho, kH, wo, kW])
-        result = ops.reshape(expanded, [*b, h_in_int, w_in_int])
-        return result
+    try:
+        b_ints = [V.graph.sizevars.guard_int(d) for d in b]
+    except Exception:
+        return _fallback(grad_out, x)
 
-    return _fallback(grad_out, x, output_size)
+    try:
+        grad_out_loader = grad_out.make_loader()
+        _kH, _kW, _scale, _dtype = kH, kW, scale, dtype
+
+        def inner_fn(idx):
+            *b_idx, h, w = idx
+            # Affine index: input (h,w) → output (h//kH, w//kW).
+            # kH/kW are compile-time ints → simple sympy floor-div, not indirect_indexing.
+            val = grad_out_loader([*b_idx, h // _kH, w // _kW])
+            return ops.mul(val, ops.constant(_scale, _dtype))
+
+        return Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[*b_ints, h_in_int, w_in_int],
+        )
+    except Exception:
+        return _fallback(grad_out, x)
 
 
 def _fallback_fwd(x, output_size):
@@ -120,13 +148,11 @@ def _fallback_fwd(x, output_size):
     return fallback_handler(aten._adaptive_avg_pool2d.default)(x, output_size)
 
 
-def _fallback(grad_out, x, output_size):
+def _fallback(grad_out, x):
     """Route to the upstream fallback handler (eager Vulkan dispatch)."""
     from torch._inductor.lowering import fallback_handler
 
-    return fallback_handler(aten._adaptive_avg_pool2d_backward)(
-        grad_out, x, output_size
-    )
+    return fallback_handler(aten._adaptive_avg_pool2d_backward)(grad_out, x)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -142,24 +168,17 @@ def avg_pool2d_backward_codegen(
 
     Returns a TensorBox when the parameters allow a decomposition that
     avoids ``ops.indirect_indexing`` (which generates incorrect SPIR-V on
-    Vulkan).  Otherwise returns ``None`` so the caller falls back to the
-    eager Vulkan handler.
+    Vulkan).  Otherwise returns ``None`` so the caller falls back.
 
-    Supported parameter combinations (all sizes are compile-time static):
+    Supported parameter combinations (all sizes must be compile-time static):
       * stride == kernel_size, no padding, no ceil_mode
       * stride == kernel_size, padding > 0, count_include_pad=True
-        (or divisor_override set) — broadcast to padded shape then slice
+        (or divisor_override set)
 
-    The decomposition is:
-      1. scale grad_output by 1/N  (N = divisor or kH*kW)
-      2. reshape → expand → reshape to broadcast from output spatial to
-         input spatial dimensions
-      3. (padding case) slice out the valid input region
-    All IR nodes (mul / reshape / expand / slice) produce fusable Slang
-    kernels — no indirect_indexing, no eager dispatch.
+    Uses Pointwise.create with an inner_fn for the index mapping — calling
+    ops.* on TensorBox at lowering time produces invalid OpsValue nodes.
     """
-    import torch
-    from torch._inductor.ir import TensorBox
+    from torch._inductor.ir import Pointwise, TensorBox
     from torch._inductor.virtualized import V, ops
 
     if not stride:
@@ -167,7 +186,6 @@ def avg_pool2d_backward_codegen(
     if not padding:
         padding = [0, 0]
 
-    # Only handle 2-D pooling with list args.
     if not (isinstance(kernel_size, (list, tuple)) and len(kernel_size) == 2):
         return None
     if not (isinstance(stride, (list, tuple)) and len(stride) == 2):
@@ -175,22 +193,18 @@ def avg_pool2d_backward_codegen(
     if not (isinstance(padding, (list, tuple)) and len(padding) == 2):
         return None
 
-    kh, kw = kernel_size
-    sh, sw = stride
-    ph, pw = padding
+    kh, kw = int(kernel_size[0]), int(kernel_size[1])
+    sh, sw = int(stride[0]), int(stride[1])
+    ph, pw = int(padding[0]), int(padding[1])
 
-    # ── Gate: only non-overlapping cases ──────────────────────────────
     if sh != kh or sw != kw:
         return None  # overlapping windows need indirect_indexing
     if ceil_mode:
-        return None  # irregular output sizes
+        return None
 
-    # When count_include_pad=False AND there is padding, the per-pixel
-    # divisor varies across spatial positions → needs indirect_indexing.
     if (ph > 0 or pw > 0) and not count_include_pad and divisor_override is None:
         return None
 
-    # ── Resolve spatial sizes to Python ints ──────────────────────────
     assert isinstance(grad_output, TensorBox)
     assert isinstance(x, TensorBox)
 
@@ -203,49 +217,54 @@ def avg_pool2d_backward_codegen(
     w_in = V.graph.sizevars.guard_int(x_size[-1])
     h_out = V.graph.sizevars.guard_int(go_size[-2])
     w_out = V.graph.sizevars.guard_int(go_size[-1])
-    prefix = go_size[:-2]  # batch dims: [] for 3-D or [N] for 4-D
+    prefix_sym = list(go_size[:-2])
+    try:
+        prefix_ints = [V.graph.sizevars.guard_int(d) for d in prefix_sym]
+    except Exception:
+        return None
 
-    # ── Compute uniform scale factor ──────────────────────────────────
     if divisor_override is not None:
         scale = 1.0 / float(divisor_override)
     else:
-        # count_include_pad or no padding → uniform kH*kW divisor.
         scale = 1.0 / float(kh * kw)
 
-    # ── Decompose: scale → broadcast → (optional slice) ───────────────
-    grad_scaled = ops.mul(
-        grad_output, ops.constant(grad_output.get_dtype(), scale)
-    )
+    dtype = grad_output.get_dtype()
+    device = grad_output.get_device()
+    grad_loader = grad_output.make_loader()
+    _kh, _kw, _ph, _pw, _scale, _dtype = kh, kw, ph, pw, scale, dtype
 
-    # Broadcast from (prefix, h_out, w_out) to (prefix, h_out, 1, w_out, 1)
-    # then expand with (kh, kw) in the inserted dims, then flatten back.
-    reshaped = ops.reshape(grad_scaled, [*prefix, h_out, 1, w_out, 1])
-    expanded = ops.expand(reshaped, [*prefix, h_out, kh, w_out, kw])
-
-    padded_h = h_out * kh
-    padded_w = w_out * kw
-
-    # Padding case: broadcast to padded shape then slice.
-    # Skip if the padded shape doesn't match the expected relationship.
     if ph > 0 or pw > 0:
-        # Verify padded dimensions are consistent: h_out*kh == h_in + 2*ph
+        padded_h = h_out * kh
+        padded_w = w_out * kw
         if padded_h != h_in + 2 * ph or padded_w != w_in + 2 * pw:
-            return None  # Inconsistent sizes — fall back
-        grad_padded = ops.reshape(expanded, [*prefix, padded_h, padded_w])
+            return None
 
-        # Try to use aten.slice lowering (creates SliceView — pure codegen).
-        from torch._inductor.lowering import lowerings as _L
+        def inner_fn_pad(idx):
+            *pre, h, w = idx
+            # Padded input coord → output coord via floor-div by compile-time stride.
+            oh = (h + _ph) // _kh
+            ow = (w + _pw) // _kw
+            val = grad_loader([*pre, oh, ow])
+            return ops.mul(val, ops.constant(_scale, _dtype))
 
-        _aten = torch.ops.aten
-        # aten.slice may be keyed as .Tensor or .default depending on
-        # PyTorch version; try both.
-        slice_fn = _L.get(getattr(_aten.slice, "Tensor", None)) or _L.get(_aten.slice.default)
-        if slice_fn is None:
-            return None  # slice lowering not available — fall back
-        ndim = len(prefix) + 2
-        result = slice_fn(grad_padded, dim=ndim - 2, start=ph, end=ph + h_in, step=1)
-        result = slice_fn(result, dim=ndim - 1, start=pw, end=pw + w_in, step=1)
-        return result
+        return Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn_pad,
+            ranges=[*prefix_ints, h_in, w_in],
+        )
 
-    # No padding → reshape directly to input spatial shape.
-    return ops.reshape(expanded, [*prefix, h_in, w_in])
+    def inner_fn(idx):
+        *pre, h, w = idx
+        # Input coord → output coord via floor-div by compile-time kernel size.
+        oh = h // _kh
+        ow = w // _kw
+        val = grad_loader([*pre, oh, ow])
+        return ops.mul(val, ops.constant(_scale, _dtype))
+
+    return Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=[*prefix_ints, h_in, w_in],
+    )

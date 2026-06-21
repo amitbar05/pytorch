@@ -63681,3 +63681,157 @@ class TestMaskingBackward:
         a = torch.randn(16, requires_grad=True)
         b = torch.randn(16, requires_grad=True)
         self._grad_parity(lambda c, x, y: torch.where(c, x, y), cond, a, b)
+
+
+class TestNoExternInFullCNNBwd:
+    """S2.1 — Codegen-only pillar: backward wrapper must be free of aten externs.
+
+    The full Conv+GN+ReLU+Pool+Linear backward previously leaked two externs:
+      - ``extern_kernels.mm(...)`` — autotuner chose C++ eager mm (tuned_mm
+        bypassed our ``_vulkan_mm`` for ``aten.mm.default``).
+      - ``torch.ops.aten._adaptive_avg_pool2d_backward.default(...)`` — pool
+        backward lowering returned OpsValue instead of a valid TensorBox.
+
+    Both are anti-goal #6 violations.  This test asserts the generated backward
+    wrapper source contains neither string.
+
+    Exit criterion for ROADMAP.md S2.1.
+
+    Two test tiers:
+      1. ``test_lowering_registration_no_fallback`` — fast (< 5 s), no GPU
+         needed.  Checks that the Inductor lowering dict routes the two
+         previously-broken overloads to our implementations, not the upstream
+         fallback handler.  This is the primary S2.1 regression gate.
+      2. ``test_no_extern_in_cnn_linear_wrapper`` — slow (cold ~10 min,
+         warm ~30 s on cached SPIR-V).  Captures the full generated wrapper
+         source via ``get_code`` (no GPU execution) and asserts neither extern
+         string appears.
+    """
+
+    @pytest.mark.timeout(60)
+    def test_lowering_registration_no_fallback(self):
+        """S2.1 fast gate — aten.mm.default and pool_bwd.default must not route
+        to the upstream fallback handler.
+
+        Root causes fixed:
+          * ``get_overloads()`` in Inductor's ``_register_lowering`` skips
+            overloads already in ``lowerings``.  Both ops had their ``.default``
+            overload pre-registered by ``make_fallback`` / ``tuned_mm``.
+            Explicit ``lowerings[op.default] = lowerings[op]`` after each
+            registration overwrites those stale entries.
+
+        This test verifies both overrides hold after ``torch_vulkan._register()``.
+        """
+        import torch_vulkan  # noqa: F401 — side effect: registers our lowerings
+        import torch._inductor.lowering as _L
+
+        aten = torch.ops.aten
+
+        # ── aten.mm.default ──────────────────────────────────────────────────
+        mm_overload = _L.lowerings.get(aten.mm)
+        mm_default = _L.lowerings.get(aten.mm.default)
+        assert mm_overload is not None, "aten.mm is not in lowerings"
+        assert mm_default is not None, "aten.mm.default is not in lowerings"
+        assert mm_overload is mm_default, (
+            f"S2.1: aten.mm.default routes to a DIFFERENT lowering than aten.mm.\n"
+            f"  aten.mm       → {getattr(mm_overload, '__qualname__', mm_overload)}\n"
+            f"  aten.mm.default → {getattr(mm_default, '__qualname__', mm_default)}\n"
+            "This means backward mm ops hit upstream tuned_mm → extern_kernels.mm."
+        )
+        assert "_vulkan_mm" in getattr(mm_default, "__qualname__", ""), (
+            f"S2.1: aten.mm.default routes to {getattr(mm_default, '__qualname__', mm_default)}, "
+            "expected _vulkan_mm"
+        )
+
+        # ── aten._adaptive_avg_pool2d_backward.default ───────────────────────
+        pool_bwd = _L.lowerings.get(aten._adaptive_avg_pool2d_backward)
+        pool_bwd_default = _L.lowerings.get(aten._adaptive_avg_pool2d_backward.default)
+        assert pool_bwd is not None, "aten._adaptive_avg_pool2d_backward not in lowerings"
+        assert pool_bwd_default is not None, (
+            "aten._adaptive_avg_pool2d_backward.default not in lowerings"
+        )
+        assert pool_bwd is pool_bwd_default, (
+            f"S2.1: aten._adaptive_avg_pool2d_backward.default routes to a DIFFERENT "
+            f"lowering.\n"
+            f"  op       → {getattr(pool_bwd, '__qualname__', pool_bwd)}\n"
+            f"  op.default → {getattr(pool_bwd_default, '__qualname__', pool_bwd_default)}\n"
+            "This means pool backward hits the upstream fallback handler "
+            "→ torch.ops.aten._adaptive_avg_pool2d_backward extern."
+        )
+        assert "fallback" not in getattr(pool_bwd_default, "__qualname__", "fallback"), (
+            f"S2.1: aten._adaptive_avg_pool2d_backward.default still routes to "
+            f"{getattr(pool_bwd_default, '__qualname__', pool_bwd_default)} (fallback path)"
+        )
+
+    @pytest.mark.timeout(120)
+    def test_no_extern_in_cnn_linear_wrapper(self):
+        """S2.1 — Conv+GN+Pool+Linear wrapper must not contain aten externs.
+
+        Uses ``get_code`` (no GPU execution, no slangc) to capture the Inductor-
+        generated Python wrapper source for the CNN model.  Asserts:
+          (a) No ``torch.ops.aten.`` in the wrapper (no FallbackKernel).
+          (b) No ``extern_kernels.mm(`` call (mm routes through _slang_tile_mm).
+
+        NOTE: ``get_code`` patches ``compile_to_module`` to return a DummyModule,
+        so the model is traced and lowered but NOT executed on GPU.  This is
+        a pure codegen-level check, fast even on cold caches.
+
+        Both failures indicate anti-goal #6 violations (extern_kernels to eager
+        Vulkan instead of Slang codegen).
+        """
+        import torch.nn as nn
+        import torch_vulkan  # noqa: F401
+        from torch._inductor.utils import get_code
+        import torch._inductor.config as _ind_cfg
+
+        class CnnLinearHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+                self.gn1 = nn.GroupNorm(4, 16)
+                self.pool = nn.AdaptiveAvgPool2d((1, 1))
+                self.fc = nn.Linear(16, 10)
+
+            def forward(self, x):
+                x = torch.relu(self.gn1(self.conv1(x)))
+                x = self.pool(x).flatten(1)
+                return self.fc(x)
+
+        torch.manual_seed(42)
+        model = CnnLinearHead().to("vulkan:0")
+        x = torch.randn(4, 3, 16, 16, device="vulkan:0", requires_grad=True)
+
+        # get_code: compiles the graph (lowering + codegen) but skips GPU execution.
+        # AOT autograd traces the joint forward+backward graph on the first call,
+        # so we capture both wrapper sections in one shot.
+        with _ind_cfg.patch({"triton.unique_kernel_names": True}):
+            compiled = torch.compile(model, backend="inductor")
+            codes = get_code(compiled, x)
+
+        full_source = "\n".join(codes)
+        assert full_source.strip(), "S2.1: get_code returned no wrapper source"
+
+        # (a) Pool backward must NOT be a FallbackKernel.
+        #     Pre-existing known issue allowed by exception: avg_pool2d forward
+        #     is intentionally a FallbackKernel (see ROADMAP § pool-fwd; tracked
+        #     separately from S2.1).  We check only the specific S2.1 regression.
+        pool_bwd_externs = [
+            line.strip() for line in full_source.split("\n")
+            if "aten._adaptive_avg_pool2d_backward" in line
+            and "torch.ops.aten." in line
+        ]
+        assert not pool_bwd_externs, (
+            "S2.1: wrapper contains aten._adaptive_avg_pool2d_backward extern "
+            "(pool bwd FallbackKernel — anti-goal #6):\n"
+            + "\n".join(f"  {l}" for l in pool_bwd_externs[:5])
+        )
+
+        # (b) No extern_kernels.mm( — backward mm must go through _slang_tile_mm.
+        mm_externs = [
+            line.strip() for line in full_source.split("\n")
+            if "extern_kernels.mm(" in line
+        ]
+        assert not mm_externs, (
+            "S2.1: wrapper contains extern_kernels.mm (anti-goal #6):\n"
+            + "\n".join(f"  {l}" for l in mm_externs[:5])
+        )

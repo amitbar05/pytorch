@@ -365,6 +365,14 @@ def _register_mm_lowering() -> None:
         )
         return ir.TensorBox.create(kernel)
 
+    # get_overloads() only appends overloads NOT already in lowerings, so
+    # @register_lowering(aten.mm) above only updates the OpOverloadPacket key.
+    # aten.mm.default was registered by upstream tuned_mm first → it keeps
+    # pointing to tuned_mm (the autotuner path).  Force-override it here so
+    # backward mm ops (from _linear_backward_decomp) also route through us.
+    if aten.mm.default in L.lowerings:
+        L.lowerings[aten.mm.default] = L.lowerings[aten.mm]
+
 
 def _register_linear_backward_decomposition() -> None:
     """M19.1 — decompose ``aten.linear_backward.default`` into mm + sum.
