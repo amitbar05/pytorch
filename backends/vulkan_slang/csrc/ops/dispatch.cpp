@@ -186,10 +186,38 @@ void cleanup_runtimes() {
 
 // ── Buffer extraction ───────────────────────────────────────────
 BufferInfo get_buffer_info(const at::Tensor& tensor) {
+    if (tensor.storage_offset() > 0) {
+        // Offset view: data_ptr() = opaque_base + storage_offset * itemsize.
+        // A naive get_buffer(data_ptr()) collides when another tensor's opaque
+        // ID happens to equal that offset-shifted value. Recover the base by
+        // arithmetic subtraction so the lookup is always to the parent buffer.
+        VkDeviceSize off_bytes =
+            static_cast<VkDeviceSize>(tensor.storage_offset()) *
+            static_cast<VkDeviceSize>(tensor.element_size());
+        static bool _dbg = (getenv("TORCH_VULKAN_DEBUG_OFFSET") != nullptr);
+        if (_dbg) {
+            fprintf(stderr, "DBG get_buffer_info: storage_offset=%ld off_bytes=%lu\n",
+                    (long)tensor.storage_offset(), (unsigned long)off_bytes);
+            fflush(stderr);
+        }
+        void* base = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(tensor.data_ptr()) -
+            static_cast<uintptr_t>(off_bytes));
+        auto* buf = VulkanAllocator::instance().get_buffer(base);
+        if (buf != nullptr && buf->is_valid()) {
+            return {buf->buffer(), buf->size(), off_bytes};
+        }
+        // Arithmetic path failed; fall back to C10 storage pointer.
+        buf = VulkanAllocator::instance().get_buffer(
+            tensor.storage().data_ptr().get());
+        TORCH_CHECK(buf && buf->is_valid(),
+                    "Tensor has no backing Vulkan buffer");
+        return {buf->buffer(), buf->size(), off_bytes};
+    }
     auto* buf = VulkanAllocator::instance().get_buffer(tensor.data_ptr());
     TORCH_CHECK(buf && buf->is_valid(),
                 "Tensor has no backing Vulkan buffer");
-    return {buf->buffer(), buf->size()};
+    return {buf->buffer(), buf->size(), 0};
 }
 
 // ── Shader dispatch (deferred) ──────────────────────────────────
@@ -290,6 +318,7 @@ void dispatch_shader(
     const uint32_t max_bindings = kUseDescCache ? 256u : 32u;
     VkBuffer vk_buffers_arr[MAX_BINDINGS_CAP];
     VkDeviceSize vk_sizes_arr[MAX_BINDINGS_CAP];
+    VkDeviceSize vk_offsets_arr[MAX_BINDINGS_CAP];
     uint32_t n = static_cast<uint32_t>(tensors.size());
     TORCH_CHECK(n <= max_bindings,
         "dispatch_shader: total buffer count ", n,
@@ -300,14 +329,16 @@ void dispatch_shader(
         auto info = get_buffer_info(tensors[i]);
         vk_buffers_arr[i] = info.buffer;
         vk_sizes_arr[i] = info.size;
+        vk_offsets_arr[i] = info.offset;
     }
 
     if (g_profile_enabled) { t4 = _now_ns(); g_profile_buffer_info_ns += (t4 - t3); }
 
-    // FNV-1a 64-bit hash of the bound VkBuffer handles, in order. We
-    // hash only the handles (not the sizes) because the sizes are a
-    // function of the handles plus the binding's layout (which is
-    // already in the cache key). VkBuffer is opaque-pointer-sized.
+    // FNV-1a 64-bit hash of the bound VkBuffer handles + byte offsets, in
+    // order. Offsets must be included so that two reinterpret_tensor views
+    // into the same VkBuffer at different storage_offsets get distinct
+    // descriptor sets (otherwise the cache would return a stale set with the
+    // wrong VkDescriptorBufferInfo.offset, corrupting the binding).
     uint64_t buffers_hash = 0xcbf29ce484222325ull;
     for (uint32_t i = 0; i < n; ++i) {
         uint64_t v = reinterpret_cast<uint64_t>(vk_buffers_arr[i]);
@@ -315,9 +346,14 @@ void dispatch_shader(
             buffers_hash ^= (v >> (b * 8)) & 0xff;
             buffers_hash *= 0x100000001b3ull;
         }
+        uint64_t o = static_cast<uint64_t>(vk_offsets_arr[i]);
+        for (int b = 0; b < 8; ++b) {
+            buffers_hash ^= (o >> (b * 8)) & 0xff;
+            buffers_hash *= 0x100000001b3ull;
+        }
     }
 
-    // M17.5 + M-cpp-new-6: cache lookup keyed on (layout, buffer-list).
+    // M17.5 + M-cpp-new-6: cache lookup keyed on (layout, buffer-list+offsets).
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     if (kUseDescCache) {
         DeviceRuntime::DescSetCacheKey key{
@@ -346,7 +382,7 @@ void dispatch_shader(
 
     if (g_profile_enabled) { t3 = _now_ns(); g_profile_desc_alloc_ns += (t3 - t2); }
 
-    vulkan::bind_buffers(device, desc_set, vk_buffers_arr, vk_sizes_arr, n);
+    vulkan::bind_buffers(device, desc_set, vk_buffers_arr, vk_sizes_arr, vk_offsets_arr, n);
 
     if (g_profile_enabled) { t5 = _now_ns(); g_profile_desc_write_ns += (t5 - t4); }
 
@@ -522,6 +558,7 @@ void dispatch_shader_indexed(
         ctx.descriptor_indexing_enabled() ? 256u : 32u;
     VkBuffer vk_buffers_arr[MAX_BINDINGS_CAP];
     VkDeviceSize vk_sizes_arr[MAX_BINDINGS_CAP];
+    VkDeviceSize vk_offsets_arr[MAX_BINDINGS_CAP];
     const uint32_t n = static_cast<uint32_t>(tensors.size());
     TORCH_CHECK(n <= max_bindings,
         "dispatch_shader_indexed: total buffer count ", n,
@@ -531,6 +568,7 @@ void dispatch_shader_indexed(
         auto info = get_buffer_info(tensors[i]);
         vk_buffers_arr[i] = info.buffer;
         vk_sizes_arr[i] = info.size;
+        vk_offsets_arr[i] = info.offset;
     }
 
     uint64_t buffers_hash = 0xcbf29ce484222325ull;
@@ -540,9 +578,14 @@ void dispatch_shader_indexed(
             buffers_hash ^= (v >> (b * 8)) & 0xff;
             buffers_hash *= 0x100000001b3ull;
         }
+        uint64_t o = static_cast<uint64_t>(vk_offsets_arr[i]);
+        for (int b = 0; b < 8; ++b) {
+            buffers_hash ^= (o >> (b * 8)) & 0xff;
+            buffers_hash *= 0x100000001b3ull;
+        }
     }
 
-    // M17.5: Reuse cached descriptor set keyed on (layout, buffer-list).
+    // M17.5: Reuse cached descriptor set keyed on (layout, buffer-list+offsets).
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     {
         DeviceRuntime::DescSetCacheKey key{
@@ -558,7 +601,7 @@ void dispatch_shader_indexed(
 
     vulkan::bind_buffers_indexed(
         device, desc_set,
-        vk_buffers_arr, vk_sizes_arr,
+        vk_buffers_arr, vk_sizes_arr, vk_offsets_arr,
         descriptor_counts.data(),
         static_cast<uint32_t>(descriptor_counts.size()));
 
@@ -875,17 +918,25 @@ void dispatch_strided_copy(const at::Tensor& src, const at::Tensor& dst) {
     auto ndim = static_cast<uint32_t>(src.dim());
     TORCH_CHECK(ndim <= 5, "strided_copy: max 5 dimensions");
 
-    // Build push constants with sizes and strides
-    // Strides are in elements (float-sized), not bytes
+    // Build push constants with sizes, strides, and storage offset.
+    // storage_offset_src handles Inductor _reinterpret_tensor views whose
+    // data_ptr() is offset from the registered VkBuffer base.
+    // Strides are in elements (float-sized), not bytes.
     struct {
         uint32_t numel;
         uint32_t ndim;
         uint32_t sizes0, sizes1, sizes2, sizes3, sizes4;
         uint32_t strides0, strides1, strides2, strides3, strides4;
+        uint32_t storage_offset_src;
     } params{};
 
     params.numel = numel;
     params.ndim = ndim;
+    // storage_offset_src was the manual fallback when VkDescriptorBufferInfo.offset
+    // was always 0. Now get_buffer_info() propagates storage_offset into the
+    // descriptor binding, so src[0] already maps to physical[storage_offset].
+    // Setting this to 0 prevents double-counting the offset.
+    params.storage_offset_src = 0;
 
     auto sizes = src.sizes();
     auto strides = src.strides();

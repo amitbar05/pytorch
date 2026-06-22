@@ -353,7 +353,7 @@ Add `make_fallback` lowering so Inductor emits
   — wrapper contains `torch.ops.torch_vulkan.avg_pool2d.default`, zero
   `torch.ops.aten.avg_pool2d` references.
 
-### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
+### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe") [Slices A+B FIXED 2026-06-22]
 
 **WG sizing wired 2026-06-20.** `threadgroup_sizing.py` read device limits from
 the device-interface query, which on this stack under-reports
@@ -384,30 +384,17 @@ persistent-pointwise numel cap, subgroup size (for tile filtering), MM tiles mod
 
 | Priority | File:line | Hard-coded | Should use |
 |---|---|---|---|
-| **HIGH** | `autotune.py:64` | WG candidates `[128,256,512]` | Cap at `profile_limit("max_workgroup_size")` |
-| **HIGH** | `autotune.py:90` | Fallback `return 256` | `profile_limit("max_workgroup_size", 256)` |
-| **HIGH** | `dispatch.py:125` | `max_wg: int = 1024` in `_check_workgroup_fits` | `profile_limit("max_workgroup_size", 1024)` |
+| ✅ **DONE** | `autotune.py` | WG candidates `[128,256,512]` | `profile_limit("max_workgroup_size")` — FIXED 2026-06-22 (Slice A) |
+| ✅ **DONE** | `templates/caller/gemm/dispatch.py` | `max_wg: int = 1024` in `_check_workgroup_fits` | `profile_limit("max_workgroup_size", 1024)` — FIXED 2026-06-22 (Slice B) |
 | **HIGH** | `vulkan_template.py:185-196` | Static 4 MM tile configs | Filter/expand by `memcpy_d2d_GBps` |
 | **HIGH** | `lowerings/conv.py:208` | Default tile `(8,8,8)` | Scale with `memcpy_d2d_GBps` |
 | **MEDIUM** | `vulkan_template.py:253,278,294` | `threadgroup_size=256` for RNG/optimizer/flash | `profile_limit("max_workgroup_size", 256)` |
 | **MEDIUM** | `kernel/main.py:260-275` | Cooperative-reduction thresholds (65536, 8192, …) | Scale with `compute_units` + `empty_kernel_launch_us` |
 | **MEDIUM** | `scheduling.py:340-349` | `rnumel_fuse_cap` 64/256/8192 | Scale with `compute_units` |
 
-**Minimal first slice (Slice A — ~15 min, very low risk):**
-
-```python
-# autotune.py — cap candidates at real device max_workgroup_size
-def get_wg_size_variants(is_reduction=False):
-    from ..device_profile import profile_limit
-    max_wg = profile_limit("max_workgroup_size", 1024)
-    base = [64, 128, 256, 512] if is_reduction else [128, 256, 512, 1024]
-    return [w for w in base if w <= max_wg] or [min(256, max_wg)]
-```
-
-**Slice B** (5 min): Replace `max_wg: int = 1024` default in
-`dispatch.py:125` `_check_workgroup_fits()` with
-`profile_limit("max_workgroup_size", 1024)` — enables 2048-WG GPUs (RDNA3),
-tightens the ceiling on mobile.
+**Slices A+B FIXED 2026-06-22** (commit `5ecbb66c34e`):
+- `autotune.py:get_wg_size_variants` now reads `profile_limit("max_workgroup_size", 1024)` and filters all candidate lists through it, respecting `_autotune_level()` tier. Enables >1024-WG GPUs; caps 512 ceiling on restricted devices.
+- `templates/caller/gemm/dispatch.py:_check_workgroup_fits` `max_wg` default changed from hardcoded `1024` to lazy `profile_limit("max_workgroup_size", 1024)`.
 
 **Profile availability**: `profile_limit()` reads the on-disk cache and never
 crashes when absent (returns the `fallback`). No race possible — cache written
@@ -426,77 +413,6 @@ the live device instead of the NAVI10 name-based defaults.  No C++ change needed
 - **Exit**: `TestM211DeviceProfile::test_device_limits_come_from_hardware` ✅ — limits
   come from the real device, not NAVI10 fallback constants.
 
-**2026-06-22 exact fix specs for remaining S0.1 open items (confirmed by audit):**
-
-**Slice A — `autotune.py:43-57` (WG candidate list capping)**
-
-Exact current text:
-```python
-def get_wg_size_variants(
-    is_reduction: bool = False,
-) -> list[int]:
-    if _autotune_level() < 2:
-        if is_reduction:
-            return [128, 256]
-        return [256]
-    if is_reduction:
-        return [64, 128, 256]
-    return [128, 256, 512]
-```
-
-Exact replacement:
-```python
-def get_wg_size_variants(
-    is_reduction: bool = False,
-) -> list[int]:
-    from .device_profile import profile_limit
-    max_wg = profile_limit("max_workgroup_size", 1024)
-    base = [64, 128, 256, 512] if is_reduction else [128, 256, 512, 1024]
-    return [w for w in base if w <= max_wg] or [min(256, max_wg)]
-```
-
-Note: `autotune.py` currently has no imports from `device_profile`. The lazy
-import `from .device_profile import profile_limit` inside the function avoids
-import cycles.
-
-**Slice B — `templates/caller/gemm/dispatch.py:121-137` (GEMM tile WG cap)**
-
-Two edits:
-
-*Edit 1*: Add this import near the top (after the existing `from ....vulkan_template_caller import` block):
-```python
-from ....device_profile import profile_limit
-```
-
-*Edit 2*: Replace the `max_wg: int = 1024` default in `_check_workgroup_fits`:
-```python
-# OLD:
-def _check_workgroup_fits(
-    tile_m: int,
-    tile_n: int,
-    m_per_thread: int = 1,
-    n_per_thread: int = 1,
-    max_wg: int = 1024,
-) -> bool:
-
-# NEW:
-def _check_workgroup_fits(
-    tile_m: int,
-    tile_n: int,
-    m_per_thread: int = 1,
-    n_per_thread: int = 1,
-    max_wg: int = profile_limit("max_workgroup_size", 1024),
-) -> bool:
-```
-
-Note: `templates/caller/gemm/dispatch.py` uses 4-dot relative import (`from ....device_profile`)
-since `gemm/` is 4 levels below `inductor/`.
-
-**New tests required** (neither Slice has existing unit test coverage):
-- `TestAutotuneWorkgroupVariants` — monkeypatch `profile_limit` to return 512,
-  assert `get_wg_size_variants()` returns `[128, 256, 512]` not `[128, 256, 512, 1024]`
-- `TestGemmTileWGCap` — monkeypatch `profile_limit` to return 2048, confirm
-  a 1024-invocation tile now passes `_check_workgroup_fits`
 
 ### S2.3 — In-process validation during warm-up (make `validate=True` real)
 

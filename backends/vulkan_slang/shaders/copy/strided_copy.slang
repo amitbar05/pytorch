@@ -4,8 +4,11 @@
 //
 // For each linear index i in [0, numel):
 //   Decompose i into multi-dimensional indices (d0, d1, d2, d3, d4)
-//   Read src at offset = d0*src_stride[0] + d1*src_stride[1] + ...
+//   Read src at offset = storage_offset_src + d0*src_stride[0] + ...
 //   Write dst at offset = i
+//
+// storage_offset_src handles Vulkan tensor views created by _reinterpret_tensor
+// (Inductor wrapper) which share base storage but have a non-zero element offset.
 
 struct Params {
     uint numel;
@@ -13,6 +16,7 @@ struct Params {
     // sizes[0..4] and src_strides[0..4], packed
     uint sizes0, sizes1, sizes2, sizes3, sizes4;
     uint strides0, strides1, strides2, strides3, strides4;
+    uint storage_offset_src;
 };
 
 [[vk::binding(0)]] StructuredBuffer<float> src;
@@ -46,5 +50,5 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
         src_offset += dim_idx * strides[d];
     }
 
-    dst[idx] = src[src_offset];
+    dst[idx] = src[params.storage_offset_src + src_offset];
 }

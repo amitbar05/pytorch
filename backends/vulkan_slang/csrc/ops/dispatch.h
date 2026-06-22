@@ -98,10 +98,14 @@ DeviceRuntime& get_runtime(uint32_t device_index = UINT32_MAX);
 // Must be called before VkDevice destruction.
 void cleanup_runtimes();
 
-// Get VkBuffer + size from a Vulkan tensor
+// Get VkBuffer + size + byte-offset from a Vulkan tensor.
+// offset = storage_offset * element_size; consumed by bind_buffers to set
+// VkDescriptorBufferInfo.offset so reinterpret_tensor views land at the
+// correct sub-range of the underlying VkBuffer.
 struct BufferInfo {
     VkBuffer buffer;
     VkDeviceSize size;
+    VkDeviceSize offset;  // byte offset into the VkBuffer (from storage_offset)
 };
 
 BufferInfo get_buffer_info(const at::Tensor& tensor);

@@ -383,14 +383,13 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         # Now check: for each I/O buffer, does its index variable depend
         # on a lane-ID?  We look at patterns like `buf_name[<var>]`.
         buf_access_re = re.compile(
-            r"\b(" + "|".join(re.escape(n) for n in all_inners) + r")\s*\[\s*(\w+)\s*\]"
+            r"\b(" + "|".join(re.escape(n) for n in all_inners) + r")\s*\[\s*(.+?)\s*\]"
         )
         for m in buf_access_re.finditer(body_str):
-            idx_var = m.group(2)
-            # Check if idx_var or any of its transitive deps reference lane IDs
-            closure = self._transitive_dep_closure(deps, {idx_var})
-            if "__lane_id__" in closure:
-                return True
+            for idx_var in re.findall(r"\b([a-zA-Z_]\w*)\b", m.group(2)):
+                closure = self._transitive_dep_closure(deps, {idx_var})
+                if "__lane_id__" in closure:
+                    return True
         return False
 
     def _can_register_tile(self, tile_size: int) -> bool:
@@ -723,6 +722,9 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
             # This is identical to the packed16 store path above but entered
             # unconditionally when out_dtype is bfloat16.
             self._pw_uses_subbyte_packing = True
+            # CG.2: only set wave-op flag when the scalar path is active
+            if not getattr(self, "_packed16_vw_active", False):
+                self._pw_has_wave_ops = True
             self.headers.add("packed16_bf16")
             self._packed16_bufs.add(var)
             uid = f"{abs(hash((var, idx_str))) & 0xFFFF:04x}"

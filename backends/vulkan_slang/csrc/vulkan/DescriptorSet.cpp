@@ -166,6 +166,7 @@ void bind_buffers(VkDevice device,
                   VkDescriptorSet set,
                   const VkBuffer* buffers,
                   const VkDeviceSize* sizes,
+                  const VkDeviceSize* offsets,
                   uint32_t count) {
     // Stack-allocated arrays — capacity grows with descriptor indexing.
     // Without descriptor indexing: 32 bindings (sgd_batch15 uses 30).
@@ -176,10 +177,11 @@ void bind_buffers(VkDevice device,
     VkWriteDescriptorSet writes[MAX_BINDINGS];
 
     for (uint32_t i = 0; i < count; i++) {
+        VkDeviceSize off = offsets ? offsets[i] : 0;
         buf_infos[i] = {};
         buf_infos[i].buffer = buffers[i];
-        buf_infos[i].offset = 0;
-        buf_infos[i].range = sizes[i];
+        buf_infos[i].offset = off;
+        buf_infos[i].range = (sizes[i] > off) ? (sizes[i] - off) : VK_WHOLE_SIZE;
 
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -197,7 +199,7 @@ void bind_buffers(VkDevice device,
                   VkDescriptorSet set,
                   const std::vector<VkBuffer>& buffers,
                   const std::vector<VkDeviceSize>& sizes) {
-    bind_buffers(device, set, buffers.data(), sizes.data(),
+    bind_buffers(device, set, buffers.data(), sizes.data(), nullptr,
                  static_cast<uint32_t>(buffers.size()));
 }
 
@@ -205,6 +207,7 @@ void bind_buffers_indexed(VkDevice device,
                           VkDescriptorSet set,
                           const VkBuffer* buffers,
                           const VkDeviceSize* sizes,
+                          const VkDeviceSize* offsets,
                           const uint32_t* descriptor_counts,
                           uint32_t num_bindings) {
     // Same MAX cap as bind_buffers — applies to total buffers, not bindings.
@@ -223,10 +226,11 @@ void bind_buffers_indexed(VkDevice device,
             "bind_buffers_indexed: total buffers exceeds MAX_BINDINGS cap");
     }
     for (uint32_t b = 0; b < total; ++b) {
+        VkDeviceSize off = offsets ? offsets[b] : 0;
         buf_infos[b] = {};
         buf_infos[b].buffer = buffers[b];
-        buf_infos[b].offset = 0;
-        buf_infos[b].range = sizes[b];
+        buf_infos[b].offset = off;
+        buf_infos[b].range = (sizes[b] > off) ? (sizes[b] - off) : VK_WHOLE_SIZE;
     }
 
     // One VkWriteDescriptorSet per binding. Each consumes descriptor_counts[i]
