@@ -117,6 +117,7 @@ from .reflection import (  # noqa: F401
     _get_reflected_descriptor_counts_from_src,
     get_reflected_binding_count,
     get_reflected_descriptor_counts,
+    get_reflected_pc_size,
     get_reflection_json,
     reflection_layout,
 )

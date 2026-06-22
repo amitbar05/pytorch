@@ -27829,6 +27829,135 @@ class TestT72AotiCppWrapperCodegen:
         )
 
 
+class TestAOTIAddmmBmmPC:
+    """S4.0 — addmm/bmm AOTI codegen pc_size_bytes regression.
+
+    The addmm/bmm ExternKernelOut path bypassed ``VulkanCppWrapperGpu``'s
+    push-constant metadata, emitting ``pc_size_bytes=0`` in the AOTI
+    ``torch_vulkan_aoti_make_kernel`` call while the SPIR-V kernel expects
+    96 bytes (19 uint32 + 5 float from ``_MM_PC_FORMAT = "19I5f"``).
+
+    Fix (S4.0):
+    - ``runtime/reflection.py``: added ``get_reflected_pc_size(spv)`` that
+      reads ``push_constant_size`` from slangc reflection JSON.
+    - ``cpp_wrapper_gpu.py``: ``_generate_kernel_call_helper`` now calls
+      ``get_reflected_pc_size(spv)`` instead of trusting ``inductor_meta``
+      (which the Vulkan scheduling path never sets with ``n_pc``).
+    - ``cpp_wrapper_gpu.py``: ``generate_extern_kernel_out`` override routes
+      Vulkan ``ExternKernelOut`` (mm/addmm/bmm) through Vulkan AOTI dispatch
+      rather than the default CppWrapperCpu ATen path.
+
+    Both end-to-end tests are ``xfail(strict=True)`` because the full AOTI
+    compile pipeline is blocked by ``_AOTI_PRIVATEUSE1_BLOCKER`` (fake-trace
+    crash on aten.permute in FunctionalTensor). When that blocker resolves,
+    the tests flip to PASSED and confirm ``pc_size_bytes=96`` is present in
+    the generated C++ wrapper.
+    """
+
+    _BUG_ROOT_COMPONENT = "aoti-codegen"
+
+    @staticmethod
+    def _aoti_compile_and_capture_cpp(model: torch.nn.Module, inputs: tuple) -> str:
+        """Attempt AOTI compile and return the generated C++ wrapper text.
+
+        Raises on failure (e.g. the PF.60 RecursionError blocker) so the
+        caller can mark as xfail.
+        """
+        import tempfile
+
+        ep = torch.export.export(model, inputs, strict=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            so_path = torch._inductor.aot_compile(ep.module(), inputs, options={"aot_inductor.output_path": f"{tmp}/model.so"})
+            # Read the generated C++ wrapper if available alongside the .so
+            cpp_path = so_path.replace(".so", ".cpp")
+            try:
+                with open(cpp_path) as f:
+                    return f.read()
+            except FileNotFoundError:
+                return ""
+
+    @pytest.mark.xfail(strict=True, reason=_AOTI_PRIVATEUSE1_BLOCKER)
+    def test_aoti_addmm_pc_size(self):
+        """S4.0: addmm path must emit pc_size_bytes=96 in AOTI wrapper.
+
+        A model containing ``torch.addmm`` exercises the
+        ``install_external_addmm`` → ``ExternKernelOut`` path through the
+        Slang tiled matmul kernel (``_MM_PC_FORMAT = "19I5f"`` = 96 bytes).
+        The generated C++ wrapper must have ``torch_vulkan_aoti_make_kernel``
+        called with ``pc_size_bytes=96u``, not ``0u``.
+        """
+        torch.manual_seed(0)
+
+        class AddMMModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(32, 64))
+                self.bias = torch.nn.Parameter(torch.randn(32))
+
+            def forward(self, x):
+                # addmm(bias, x, weight.T) — exercises aten.addmm lowering
+                return torch.addmm(self.bias, x, self.weight.t())
+
+        model = AddMMModel().to("vulkan:0").eval()
+        x = torch.randn(8, 64, device="vulkan:0")
+
+        cpp = self._aoti_compile_and_capture_cpp(model, (x,))
+        assert "96u" in cpp, (
+            f"S4.0: addmm AOTI wrapper missing pc_size_bytes=96u; "
+            f"found: {[l for l in cpp.splitlines() if 'pc_size_bytes' in l or 'make_kernel' in l][:5]}"
+        )
+
+    @pytest.mark.xfail(strict=True, reason=_AOTI_PRIVATEUSE1_BLOCKER)
+    def test_aoti_bmm_pc_size(self):
+        """S4.0: bmm path must emit pc_size_bytes=96 in AOTI wrapper.
+
+        A model containing ``torch.bmm`` exercises the
+        ``install_external_bmm`` → ``ExternKernelOut`` path through the
+        Slang tiled BMM kernel (same 96-byte PC struct as mm/addmm).
+        """
+        torch.manual_seed(0)
+
+        class BMMModel(torch.nn.Module):
+            def forward(self, a, b):
+                return torch.bmm(a, b)
+
+        model = BMMModel().to("vulkan:0").eval()
+        a = torch.randn(4, 16, 32, device="vulkan:0")
+        b = torch.randn(4, 32, 16, device="vulkan:0")
+
+        cpp = self._aoti_compile_and_capture_cpp(model, (a, b))
+        assert "96u" in cpp, (
+            f"S4.0: bmm AOTI wrapper missing pc_size_bytes=96u; "
+            f"found: {[l for l in cpp.splitlines() if 'pc_size_bytes' in l or 'make_kernel' in l][:5]}"
+        )
+
+    def test_aoti_mm_pc_struct_is_96_bytes(self):
+        """S4.0 unit test: MM push-constant struct is exactly 96 bytes.
+
+        ``_MM_PC_FORMAT = "19I5f"`` (19 uint32 + 5 float) = 96 bytes.
+        This is the authoritative byte count that must appear as
+        ``pc_size_bytes=96u`` in AOTI ``torch_vulkan_aoti_make_kernel`` calls
+        for mm/addmm/bmm kernels.  SPIR-V reflection's ``push_constant_size``
+        field will report 96 for these kernels, and
+        ``VulkanCppWrapperGpu._generate_kernel_call_helper`` (S4.0 fix) reads
+        it from reflection rather than from ``inductor_meta``.
+        """
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import _pack_mm_pc
+
+        pc = _pack_mm_pc(
+            M=8, N=8, K=8,
+            stride_a_m=8, stride_a_k=1,
+            stride_b_k=8, stride_b_n=1,
+            stride_c_m=8, stride_c_n=1,
+            tile_m=8, tile_n=8, tile_k=8,
+            m_per_thread=1, n_per_thread=1,
+        )
+        assert len(pc) == 96, (
+            f"S4.0: _pack_mm_pc returned {len(pc)} bytes, expected 96 "
+            f"(MM_PC_FORMAT='19I5f' = 19×uint32 + 5×float = 96 B)"
+        )
+
+
 class TestMLPForwardGPUUtilization:
     """P5.9 — Compiled MLP forward host-overhead regression gate
     (post-PF.5 revision).

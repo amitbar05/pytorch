@@ -156,6 +156,19 @@ def get_reflected_binding_count(spv: bytes) -> int | None:
     layout = reflection_layout(refl_json)
     return len(layout["bindings"])
 
+def get_reflected_pc_size(spv: bytes) -> int:
+    """Extract push-constant struct size in bytes from SPIR-V reflection.
+
+    Returns 0 when reflection JSON is not cached (e.g. old slangc without
+    ``-reflection-json`` support), or when the kernel has no push constants.
+    """
+    hash_key = hashlib.sha256(spv).hexdigest()
+    refl_json = get_reflection_json(hash_key)
+    if refl_json is None:
+        return 0
+    return reflection_layout(refl_json)["push_constant_size"]
+
+
 def _get_reflected_buffer_count_from_cache_key(
     src: str,
     entry: str = "computeMain",
