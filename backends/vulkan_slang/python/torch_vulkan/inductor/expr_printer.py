@@ -76,14 +76,18 @@ class VulkanExprPrinter(ExprPrinter_):
 
     @staticmethod
     def _mul_needs_parens(s: str) -> bool:
-        """True when the printed string `s` has a binary +/- at top level.
+        """True when the printed string `s` has a binary +/- or / at top level.
 
         Inductor sometimes wraps Add expressions in an `Identity` node so that
         ``isinstance(factor, sympy.Add)`` returns False.  Rather than chasing
         every wrapper type, we check the already-printed string: if it contains
-        a `+` or a `-` that is not the very first character (i.e. unary minus
-        on a plain negative literal), the factor is an addition/subtraction and
-        must be wrapped in parentheses when used as a Mul operand.
+        a `+`, `-`, or `/` that is not the very first character (i.e. unary
+        minus on a plain negative literal), the factor is an addition,
+        subtraction, or division and must be wrapped in parentheses when used
+        as a Mul operand.  Division is included because Slang's `*` and `/`
+        have the same precedence and are left-associative: without parens,
+        ``X * a/b * Y`` is ``((X*a)/b)*Y`` which differs from ``X*(a/b)*Y``
+        under integer truncation.
         """
         depth = 0
         for i, c in enumerate(s):
@@ -91,12 +95,14 @@ class VulkanExprPrinter(ExprPrinter_):
                 depth += 1
             elif c == ')':
                 depth -= 1
-            elif depth == 0 and c in '+-' and i > 0:
+            elif depth == 0 and c in '+-/' and i > 0:
                 return True
         return False
 
     def _print_Identity(self, expr: sympy.Expr) -> str:
         """Unwrap Inductor's Identity() wrapper and print the inner expression."""
+        if not expr.args:
+            return "0"
         return self.doprint(expr.args[0])
 
     def _print_Mul(self, expr: sympy.Expr) -> str:

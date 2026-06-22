@@ -6,6 +6,22 @@
 
 namespace vulkan {
 
+// Query minStorageBufferOffsetAlignment once and cache it.  The Vulkan
+// spec requires VkDescriptorBufferInfo.offset to be aligned to this
+// value.  For float32 tensors (element_size=4), storage_offset*4 is
+// always a multiple of 4; on hardware where minAlignment <= 4 this is
+// guaranteed.  For narrower dtypes the caller must ensure alignment
+// (e.g. by .clone() so the descriptor offset is 0).
+static VkDeviceSize get_min_storage_buffer_offset_alignment() {
+    static VkDeviceSize alignment = []() {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(
+            Context::instance().physical_device(), &props);
+        return props.limits.minStorageBufferOffsetAlignment;
+    }();
+    return alignment;
+}
+
 DescriptorPool::DescriptorPool(VkDevice device, uint32_t max_sets)
     : device_(device) {
 
@@ -181,7 +197,36 @@ void bind_buffers(VkDevice device,
         buf_infos[i] = {};
         buf_infos[i].buffer = buffers[i];
         buf_infos[i].offset = off;
-        buf_infos[i].range = (sizes[i] > off) ? (sizes[i] - off) : VK_WHOLE_SIZE;
+        VkDeviceSize min_align = get_min_storage_buffer_offset_alignment();
+        if (off != 0 && (off % min_align) != 0) {
+            // Spec violation: storage-buffer descriptor offset must be aligned
+            // to minStorageBufferOffsetAlignment.  Fall back to offset=0 with
+            // the full buffer range so vkUpdateDescriptorSets stays valid.
+            // The caller should .clone() the tensor to preserve the offset.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr,
+                    "WARNING: VkDescriptorBufferInfo.offset=%lu misaligned "
+                    "(minStorageBufferOffsetAlignment=%lu).  Falling back to "
+                    "offset=0.  Clone the tensor to preserve offset semantics.\\n",
+                    (unsigned long)off, (unsigned long)min_align);
+            }
+            off = 0;
+        }
+        buf_infos[i].range =
+            (sizes[i] > off) ? (sizes[i] - off) : VK_WHOLE_SIZE;
+        if (buf_infos[i].range == VK_WHOLE_SIZE) {
+            static bool warned_vws = false;
+            if (!warned_vws) {
+                warned_vws = true;
+                fprintf(stderr,
+                    "WARNING: bind_buffers VK_WHOLE_SIZE fallback for buffer "
+                    "%u (sizes[%u]=%lu <= off=%lu).  This may indicate a "
+                    "tensor view beyond the buffer end.\\n",
+                    i, i, (unsigned long)sizes[i], (unsigned long)off);
+            }
+        }
 
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -230,7 +275,31 @@ void bind_buffers_indexed(VkDevice device,
         buf_infos[b] = {};
         buf_infos[b].buffer = buffers[b];
         buf_infos[b].offset = off;
-        buf_infos[b].range = (sizes[b] > off) ? (sizes[b] - off) : VK_WHOLE_SIZE;
+        VkDeviceSize min_align = get_min_storage_buffer_offset_alignment();
+        if (off != 0 && (off % min_align) != 0) {
+            static bool warned_idx = false;
+            if (!warned_idx) {
+                warned_idx = true;
+                fprintf(stderr,
+                    "WARNING: bind_buffers_indexed VkDescriptorBufferInfo"
+                    ".offset=%lu misaligned (minStorageBufferOffsetAlignment"
+                    "=%lu).  Falling back to offset=0.\\n",
+                    (unsigned long)off, (unsigned long)min_align);
+            }
+            off = 0;
+        }
+        buf_infos[b].range =
+            (sizes[b] > off) ? (sizes[b] - off) : VK_WHOLE_SIZE;
+        if (buf_infos[b].range == VK_WHOLE_SIZE) {
+            static bool warned_vws_idx = false;
+            if (!warned_vws_idx) {
+                warned_vws_idx = true;
+                fprintf(stderr,
+                    "WARNING: bind_buffers_indexed VK_WHOLE_SIZE fallback for "
+                    "buffer %u (sizes[%u]=%lu <= off=%lu).\\n",
+                    b, b, (unsigned long)sizes[b], (unsigned long)off);
+            }
+        }
     }
 
     // One VkWriteDescriptorSet per binding. Each consumes descriptor_counts[i]
