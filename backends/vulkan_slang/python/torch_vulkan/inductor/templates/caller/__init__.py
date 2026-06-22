@@ -72,19 +72,6 @@ from .optimizer import (
     install_external_optimizer,
     prewarm_optimizer_templates,
 )
-from .persistent_pointwise import (  # C6.3: micro-batching fusion
-    dispatch_persistent_pointwise,
-    OP_ADD_SCALAR,
-    OP_FILL,
-    OP_GELU_TANH,
-    OP_IDENTITY,
-    OP_MUL_SCALAR,
-    OP_POW,
-    OP_RELU,
-    OP_SIGMOID,
-    OP_SUB,
-    OP_TANH,
-)
 from .rng import (
     _dispatch_philox_rng,
     _philox_seed_from_torch,

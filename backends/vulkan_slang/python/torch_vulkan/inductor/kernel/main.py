@@ -143,26 +143,6 @@ class VulkanKernel(
             cls._device_simd_group_size = 64
         return cls._device_simd_group_size
 
-    def should_use_persistent_reduction(self) -> bool:
-        """Determine whether the reduction loop should use a persistent
-        grid-stride pattern (one threadgroup loops over chunks).
-
-        Currently not wired into codegen — the reduction path always
-        uses the cooperative/non-cooperative branching from
-        ``should_use_cooperative_reduction`` instead.  This method is
-        retained for a future C3 task (see ROADMAP.md pillar C3).
-        """
-        rnumel = sympy.S.One
-        for rd in self.range_trees:
-            if rd.is_reduction:
-                rnumel = rnumel * rd.numel
-        if is_dynamic(rnumel):
-            return True
-        rn = int(rnumel)
-        if rn > 8192:
-            return False
-        return True
-
     def _has_welford_reduction(self) -> bool:
         """True if any reduction in this kernel is a welford variant.
 
