@@ -8518,6 +8518,48 @@ class TestConv1dCompile:
 
         torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-3, atol=1e-3)
 
+    def test_s3_5b_conv1d_backward_grad_input_not_primal(self):
+        """S3.5b regression: conv1d compiled backward must not return primal x as x.grad.
+
+        Root cause: _conv1d_backward did input_4d = input.unsqueeze(-1) then
+        called conv2d_backward(input_4d, ...).  input_4d is a dead intermediate
+        in the AoT backward graph; the Inductor memory planner reused its buffer
+        for conv2d_backward[0] (grad-input).  Because input_4d is a view of
+        primals_3 (primal x), grad-input ended up sharing x's buffer and the
+        backward returned x itself as x.grad (all-zero after zero_() on the
+        primal buffer, or the primal values themselves).
+
+        Fix: conv1d_backward_core opaque non-autograd op takes 3-D tensors
+        directly so input is a backward graph INPUT (never freed), and its fake
+        kernel derives outputs from input (FT proxy) producing fresh storage
+        refs so FunctionalTensorMode doesn't conservatively alias the output
+        to input.
+        """
+        import torch.nn as nn
+
+        torch._dynamo.reset()
+        m = nn.Conv1d(8, 16, kernel_size=3, padding=1).to("vulkan:0")
+        x = torch.randn(2, 8, 32, device="vulkan:0", requires_grad=True)
+
+        @torch.compile(backend="inductor")
+        def fn(x):
+            return m(x).sum()
+
+        y = fn(x)
+        y.backward()
+
+        # x.grad must NOT be the primal tensor (all same values) or all-zero.
+        assert x.grad is not None, "x.grad is None after backward"
+        assert not torch.all(x.grad == x.detach()), (
+            "S3.5b regression: x.grad equals primal x — "
+            "conv1d_backward_core buffer-reuse aliasing not fixed"
+        )
+        # Must also not be all-zero (which can happen with a similar aliasing
+        # bug when the planner zeroed the buffer before use).
+        assert x.grad.abs().max() > 1e-6, (
+            "S3.5b regression: x.grad is all-zero — backward not computing gradients"
+        )
+
     def test_m6_conv1d_groups_matches_cpu(self):
         """M6 Phase 1: Grouped Conv1d (groups=2) matches CPU.
 

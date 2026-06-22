@@ -485,6 +485,12 @@ def register() -> None:
         _conv_bwd_reg_low(torch.ops.torch_vulkan.conv2d_backward.default)(
             _get_conv2d_backward_custom_op_lowering()
         )
+    # S3.5b: conv1d_backward_core — opaque non-autograd op taking 3-D tensors.
+    # Registered by _ensure_conv1d_backward_core_op_registered() on first
+    # backward compile.  make_fallback emits an extern_kernel node so Inductor
+    # doesn't try to decompose or pattern-match it.
+    if hasattr(torch.ops.torch_vulkan, "conv1d_backward_core"):
+        make_fallback(torch.ops.torch_vulkan.conv1d_backward_core.default)
     if hasattr(torch.ops.torch_vulkan, "max_pool2d_scatter_bwd"):
         make_fallback(torch.ops.torch_vulkan.max_pool2d_scatter_bwd.default)
 

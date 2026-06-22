@@ -316,6 +316,48 @@ def _ensure_conv1d_with_optional_bias_op_registered() -> "object":
         return input.new_empty((N, C_out, L_out))
 
     conv_op.register_fake(_conv1d_fake)
+
+    def _conv1d_setup_ctx(ctx, inputs, output):
+        input, weight, bias, stride, padding, dilation, groups = inputs
+        ctx.save_for_backward(input, weight)
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.groups = groups
+        ctx.has_bias = bias is not None
+
+    def _conv1d_backward(ctx, grad_output):
+        # S3.5b: delegate to the new conv1d_backward_core opaque op.
+        #
+        # Old code: input_4d = input.unsqueeze(-1) + conv2d_backward + squeeze.
+        # The view ``input_4d`` is an INTERMEDIATE in the AoT backward graph
+        # (dead after conv2d_backward), so the Inductor memory planner reused
+        # its buffer for conv2d_backward[0] (grad-input).  Since input_4d is a
+        # view of primals_3 (primal x), grad-input aliased primals_3 and the
+        # backward returned x itself as x.grad.
+        #
+        # conv1d_backward_core takes 3-D tensors directly → ``input`` is a
+        # backward graph INPUT (never freed), eliminating the buffer-reuse
+        # aliasing.  Its fake kernel derives outputs from ``input`` (a
+        # FunctionalTensor proxy) so FunctionalTensorMode produces fresh FT
+        # storage refs, preventing the conservative alias analysis that
+        # concluded conv2d_backward[0] ≡ input_4d ≡ primals_3.
+        from .conv_backward import _ensure_conv1d_backward_core_op_registered
+        _ensure_conv1d_backward_core_op_registered()
+
+        input, weight = ctx.saved_tensors
+        s = ctx.stride[0] if ctx.stride else 1
+        p = ctx.padding[0] if ctx.padding else 0
+        d = ctx.dilation[0] if ctx.dilation else 1
+        g_inp, g_w, g_b = torch.ops.torch_vulkan.conv1d_backward_core.default(
+            input, grad_output, weight,
+            [s], [p], [d],
+            int(ctx.groups), ctx.has_bias,
+        )
+        gb = g_b if ctx.has_bias else None
+        return g_inp, g_w, gb, None, None, None, None
+
+    conv_op.register_autograd(_conv1d_backward, setup_context=_conv1d_setup_ctx)
     return torch.ops.torch_vulkan.conv1d_with_optional_bias.default
 
 
@@ -328,4 +370,7 @@ from .conv_gn_relu import (  # noqa: E402, F401
     _dispatch_group_norm_slang,
     _ensure_conv2d_gn_relu_fused_op_registered,
 )
-from .conv_backward import _ensure_conv2d_backward_op_registered  # noqa: E402, F401
+from .conv_backward import (  # noqa: E402, F401
+    _ensure_conv1d_backward_core_op_registered,
+    _ensure_conv2d_backward_op_registered,
+)

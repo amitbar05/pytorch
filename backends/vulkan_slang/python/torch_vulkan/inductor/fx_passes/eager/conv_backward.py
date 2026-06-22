@@ -1,8 +1,13 @@
-"""Opaque conv2d_backward custom-op registration (M22b split from conv.py).
+"""Opaque conv2d_backward / conv1d_backward_core custom-op registrations.
 
-Contains ``_ensure_conv2d_backward_op_registered`` — the M17.8.d.2 opaque
-non-autograd custom op that prevents AOTAutograd from decomposing the conv
-backward into ``empty_like`` sub-ops that the partitioner collapses to zeros.
+M22b: split from conv.py.
+M17.8.d.2: ``conv2d_backward`` opaque non-autograd op prevents AOTAutograd
+  from decomposing conv backward into ``empty_like`` sub-ops.
+S3.5b (2026-06-22): ``conv1d_backward_core`` opaque non-autograd op for the
+  conv1d backward path.  Takes 3D tensors directly (no Python-side unsqueeze)
+  so that (a) ``grad_output`` is never concretised into an FX constant and
+  (b) no ``input_4d`` intermediate is created that the partitioner can
+  buffer-reuse for the gradient output, which was aliasing ``gi → primals_3``.
 
 TRAIN.7 (2026-05-27): The eager impl now routes fp32 Vulkan groups==1 through
 ``_slang_tile_conv2d_bwd`` (single Slang compute dispatch via
@@ -11,6 +16,134 @@ TRAIN.7 (2026-05-27): The eager impl now routes fp32 Vulkan groups==1 through
 """
 
 from __future__ import annotations
+
+
+def _ensure_conv1d_backward_core_op_registered() -> "object":
+    """Register ``torch_vulkan::conv1d_backward_core`` — a non-autograd opaque op.
+
+    S3.5b root-cause:  in ``_conv1d_backward`` the old code built a 4-D view
+    ``input_4d = input.unsqueeze(-1)`` and passed it as the first arg of
+    ``conv2d_backward``.  That view is an *intermediate* in the backward FX
+    graph — dead after ``conv2d_backward`` — so the Inductor memory planner
+    reused its buffer for ``conv2d_backward[0]`` (grad-input).  Because
+    ``input_4d`` is a view of ``primals_3`` (the primal x), grad-input ended
+    up sharing ``primals_3``'s buffer and the backward graph returned ``x``
+    itself as grad_input instead of the computed gradient.
+
+    This op takes *3-D* tensors directly (no Python-side unsqueeze/squeeze)
+    so ``input`` is passed as a *backward graph input* (not an intermediate).
+    Graph inputs are never freed by the memory planner, so the buffer-reuse
+    aliasing cannot occur.
+
+    The fake kernel derives all outputs from ``input`` (a FunctionalTensor
+    proxy) rather than from the possibly-concrete ``grad_output`` so that
+    FunctionalTensorMode produces true-fresh FT outputs rather than falling
+    back to conservative alias analysis (which assumed output aliases input).
+
+    Idempotent — safe to call multiple times.
+    """
+    import torch
+    from torch import Tensor
+
+    op_name = "torch_vulkan::conv1d_backward_core"
+    existing = getattr(torch.ops.torch_vulkan, "conv1d_backward_core", None)
+    if existing is not None and hasattr(existing, "default"):
+        return existing.default
+
+    def _conv1d_backward_core_impl(
+        input: Tensor,
+        grad_output: Tensor,
+        weight: Tensor,
+        stride: list[int],
+        padding: list[int],
+        dilation: list[int],
+        groups: int,
+        has_bias: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Eager: lift 3-D → 4-D, run conv2d_backward, squeeze back to 3-D."""
+        use_slang_bwd = (
+            int(groups) == 1
+            and input.device.type == "vulkan"
+            and input.dtype == torch.float32
+            and grad_output.dtype == torch.float32
+            and weight.dtype == torch.float32
+        )
+
+        s = int(stride[0]) if stride else 1
+        p = int(padding[0]) if padding else 0
+        d = int(dilation[0]) if dilation else 1
+
+        if use_slang_bwd:
+            from ...templates.caller.conv import _slang_tile_conv2d_bwd
+
+            # 1-D → 2-D via (N, C, L) → (N, C, L, 1)  [H=L, W=1]
+            inp_4d = input.unsqueeze(-1)
+            go_4d = grad_output.unsqueeze(-1)
+            w_4d = weight.unsqueeze(-1)
+
+            g_inp_4d = torch.zeros_like(inp_4d)
+            g_w_4d = torch.zeros_like(w_4d)
+            _slang_tile_conv2d_bwd(
+                inp_4d, w_4d, go_4d, g_inp_4d, g_w_4d,
+                stride=(s, 1), padding=(p, 0), dilation=(d, 1),
+                bias=None, grad_bias=None,
+            )
+            g_inp = g_inp_4d.squeeze(-1)
+            g_w = g_w_4d.squeeze(-1)
+            g_b = go_4d.squeeze(-1).sum([0, 2]) if has_bias else None
+            if has_bias:
+                _ = g_b[0].item()
+            if not has_bias:
+                g_b = grad_output.new_empty((0,))
+            return g_inp, g_w, g_b
+
+        # CPU / fallback: aten.convolution_backward on 1-D strides
+        result = torch.ops.aten.convolution_backward.default(
+            grad_output, input, weight, None,
+            list(stride), list(padding), list(dilation),
+            False, [0], int(groups),
+            [True, True, bool(has_bias)],
+        )
+        g_inp = result[0] if result[0] is not None else input.new_empty(input.shape).zero_()
+        g_w = result[1] if result[1] is not None else weight.new_empty(weight.shape).zero_()
+        if has_bias:
+            g_b = result[2] if len(result) > 2 and result[2] is not None else grad_output.new_empty((weight.shape[0],)).zero_()
+        else:
+            g_b = grad_output.new_empty((0,))
+        return g_inp, g_w, g_b
+
+    _conv1d_backward_core_impl.__annotations__ = {
+        "input": Tensor, "grad_output": Tensor, "weight": Tensor,
+        "stride": list[int], "padding": list[int], "dilation": list[int],
+        "groups": int, "has_bias": bool,
+        "return": tuple[Tensor, Tensor, Tensor],
+    }
+    bwd1d_op = torch.library.custom_op(op_name, mutates_args=())(_conv1d_backward_core_impl)
+
+    def _conv1d_backward_core_fake(
+        input, grad_output, weight, stride, padding, dilation, groups, has_bias
+    ):
+        # S3.5b: derive ALL outputs from ``input`` (a FunctionalTensor proxy),
+        # NOT from ``grad_output`` which may be a concrete Vulkan tensor during
+        # AoT backward tracing.  Deriving from a concrete arg causes
+        # FunctionalTensorMode to fall back to conservative alias analysis
+        # (assume output aliases first FT input = ``input``) which incorrectly
+        # concludes grad_input = primals_3 (the primal x).
+        #
+        # ``new_empty`` is non-aliasing: the fresh FT it returns has a distinct
+        # storage_ref so AoT correctly treats grad_input as an independent
+        # computation, saves primals_3 as a forward residual, and produces the
+        # right backward graph.
+        g_inp = input.new_empty(input.shape)
+        g_w = input.new_empty(weight.shape)
+        if has_bias:
+            g_b = input.new_empty((weight.shape[0],))
+        else:
+            g_b = input.new_empty((0,))
+        return g_inp, g_w, g_b
+
+    bwd1d_op.register_fake(_conv1d_backward_core_fake)
+    return torch.ops.torch_vulkan.conv1d_backward_core.default
 
 
 def _ensure_conv2d_backward_op_registered() -> "object":
@@ -153,11 +286,13 @@ def _ensure_conv2d_backward_op_registered() -> "object":
     def _conv2d_backward_fake(
         input, grad_output, weight, stride, padding, dilation, groups, has_bias
     ):
-        # Shape inference for the opaque op. Use ``new_empty(shape)`` (M18.3
-        # canonical) so the proxy tracer treats these as storage-bound
-        # allocations rather than shape-only proxies.
-        g_inp = input.new_empty(input.shape)
-        g_w = weight.new_empty(weight.shape)
+        # Shape inference for the opaque op.  Derive all outputs from
+        # ``grad_output`` (NOT from ``input`` / ``weight``) so that AoT
+        # autograd cannot alias g_inp→input or g_w→weight via the
+        # unsqueeze/new_empty/squeeze chain that _conv1d_backward builds
+        # (M17.8.d.2 variant: squeeze(new_empty(unsqueeze(x,-1)),-1) → x).
+        g_inp = grad_output.new_empty(input.shape)
+        g_w = grad_output.new_empty(weight.shape)
         if has_bias:
             g_b = grad_output.new_empty((weight.shape[0],))
         else:

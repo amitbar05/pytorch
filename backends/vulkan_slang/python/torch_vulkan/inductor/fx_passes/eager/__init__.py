@@ -15,7 +15,10 @@ from .conv import (
     _ensure_conv1d_with_optional_bias_op_registered,
     _ensure_conv2d_with_optional_bias_op_registered,
 )
-from .conv_backward import _ensure_conv2d_backward_op_registered
+from .conv_backward import (
+    _ensure_conv1d_backward_core_op_registered,
+    _ensure_conv2d_backward_op_registered,
+)
 from .conv_gn_relu import _ensure_conv2d_gn_relu_fused_op_registered
 from .conv_relu import _ensure_conv2d_relu_fused_op_registered
 from .optimizer import (
@@ -89,6 +92,10 @@ def register_eager_patch_custom_ops() -> None:
     # tracing through ``torch.empty_like`` sub-ops (which the partitioner
     # collapses to literal zeros).
     _ensure_conv2d_backward_op_registered()
+    # S3.5b: opaque non-autograd conv1d_backward_core custom op — takes 3-D
+    # tensors directly (no Python-side unsqueeze) to avoid the buffer-reuse
+    # aliasing that caused gi → primals_3 in the broken backward graph.
+    _ensure_conv1d_backward_core_op_registered()
     # M18.8.b pre-grad fusion DISABLED (correctness fix):
     # The fusion inserted ``conv2d_gn_relu_fused.default`` before AOTAutograd,
     # causing AOTAutograd to use the ``register_autograd`` + ``setup_context``
@@ -107,6 +114,7 @@ def register_eager_patch_custom_ops() -> None:
 __all__ = [
     "_ensure_addmm_gelu_op_registered",
     "_ensure_adaptive_avg_pool2d_op_registered",
+    "_ensure_conv1d_backward_core_op_registered",
     "_ensure_conv1d_with_optional_bias_op_registered",
     "_ensure_conv2d_backward_op_registered",
     "_ensure_conv2d_gn_relu_fused_op_registered",
