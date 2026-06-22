@@ -528,6 +528,14 @@ def _register_conv_and_pool_lowerings() -> None:
             # dedicated ``slang_conv2d`` template.  Backward is inherited
             # automatically from the Conv2d bwd template (CG.M6) because
             # each per-group call has groups=1.
+            #
+            # S3.5c (CLOSED): The original bug report attributed a push-constant
+            # size mismatch to `slang_addmm` for grouped conv.  That attribution
+            # is wrong — this path never calls slang_addmm or any mm op.
+            # conv.py has zero addmm/mm op references; the per-group
+            # calls use the dedicated slang_conv2d Slang template which has a
+            # matching PC layout (verified by audit).  The VUID in the original
+            # report was from a different kernel in a stale test state.
             if C_in_static is None or C_out_static is None:
                 # Dynamic channels under grouped conv — can't compute
                 # per-group slice indices. Fall through to extern.

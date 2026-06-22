@@ -8563,8 +8563,13 @@ class TestConv1dCompile:
     def test_m6_conv1d_groups_matches_cpu(self):
         """M6 Phase 1: Grouped Conv1d (groups=2) matches CPU.
 
-        The reshape-to-Conv2d lowering preserves the groups parameter;
-        Conv2d eager fallback handles groups>1 correctly."""
+        The reshape-to-Conv2d lowering preserves the groups parameter.
+        For groups>1, the Conv2d lowering decomposes into per-group groups=1
+        calls via aten.slice + aten.cat, each routed through the
+        dedicated slang_conv2d Slang template (_VulkanConv2dExternKernel
+        → _slang_tile_conv2d).  This path never calls slang_addmm or
+        any mm op — the original S3.5c bug attribution to slang_addmm
+        push-constant mismatch was invalid."""
         import torch.nn as nn
 
         torch._dynamo.reset()
