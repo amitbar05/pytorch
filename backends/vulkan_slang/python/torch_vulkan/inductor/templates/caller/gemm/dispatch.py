@@ -123,11 +123,20 @@ def _check_workgroup_fits(
     tile_n: int,
     m_per_thread: int = 1,
     n_per_thread: int = 1,
-    max_wg: int = 1024,
+    max_wg: int | None = None,
 ) -> bool:
     """Return True iff the (tile_m, tile_n, m_per_thread, n_per_thread) shape's
     workgroup size fits the device's max_workgroup_invocations limit. Tiles that
-    fail this would crash at pipeline creation; we filter them upfront."""
+    fail this would crash at pipeline creation; we filter them upfront.
+
+    S0.1 Slice B: ``max_wg`` defaults to None → reads from the device profile
+    (so RDNA3/server GPUs allow 1024+ WG tiles, mobile GPUs are capped correctly).
+    Explicit callers that already pass a device-accurate ``max_wg`` are unaffected.
+    """
+    if max_wg is None:
+        from ...device_profile import profile_limit
+
+        max_wg = profile_limit("max_workgroup_size", 1024)
     wg_m = tile_m // m_per_thread
     wg_n = tile_n // n_per_thread
     return (

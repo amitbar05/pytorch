@@ -143,7 +143,9 @@ int aoti_torch_as_strided_vulkan(
 
     auto result = self->as_strided(size, stride, storage_offset);
 
-    if (out_handle) *out_handle = result.unsafeGetTensorImpl();
+    // MS.2: allocate on heap so the handle stays valid after this function
+    // returns.  Matches the pattern in aoti_torch_empty_strided_vulkan (line 125).
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(result)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;
@@ -152,7 +154,11 @@ int aoti_torch_as_strided_vulkan(
 }
 
 int aoti_torch_delete(void* handle) {
-  (void)handle;
+  // MS.1: free the at::Tensor allocated by heap-new in the shim functions
+  // (empty_strided, zeros, ones, full, as_strided).  The RAII destructor
+  // of RAIIAtenTensorHandle calls this for every intermediate tensor; a
+  // no-op would leak every intermediate allocated by the shim layer.
+  delete reinterpret_cast<at::Tensor*>(handle);
   return 0;
 }
 
@@ -169,7 +175,8 @@ int aoti_torch_zeros_vulkan(
         .dtype(dtype);
     auto tensor = at::zeros(size, options);
 
-    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    // MS.2: heap-allocate so the handle survives function return.
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(tensor)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;
@@ -190,7 +197,8 @@ int aoti_torch_ones_vulkan(
         .dtype(dtype);
     auto tensor = at::ones(size, options);
 
-    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    // MS.2: heap-allocate so the handle survives function return.
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(tensor)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;
@@ -212,7 +220,8 @@ int aoti_torch_full_vulkan(
         .dtype(dtype);
     auto tensor = at::full(size, fill_value, options);
 
-    if (out_handle) *out_handle = tensor.unsafeGetTensorImpl();
+    // MS.2: heap-allocate so the handle survives function return.
+    if (out_handle) *out_handle = static_cast<void*>(new at::Tensor(std::move(tensor)));
     return 0;
   } catch (...) {
     if (out_handle) *out_handle = nullptr;

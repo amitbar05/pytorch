@@ -45,16 +45,23 @@ def get_wg_size_variants(
 ) -> list[int]:
     """Return candidate workgroup sizes for autotuning.
 
-    For pointwise kernels: [256, 512]
-    For reduction kernels: [64, 128, 256]
+    S0.1 Slice A: candidates are capped at the device ``max_workgroup_size``
+    from the warm-up profile so we never submit a kernel that the driver will
+    reject and so RDNA3 / server GPUs get 1024-size candidates automatically.
+
+    For pointwise kernels: [128, 256, 512, 1024] filtered by device max.
+    For reduction kernels: [64, 128, 256, 512] filtered by device max.
     """
+    from .device_profile import profile_limit
+
+    max_wg = profile_limit("max_workgroup_size", 1024)
     if _autotune_level() < 2:
         if is_reduction:
-            return [128, 256]
-        return [256]
+            return [w for w in [128, 256] if w <= max_wg] or [min(128, max_wg)]
+        return [w for w in [256] if w <= max_wg] or [min(256, max_wg)]
     if is_reduction:
-        return [64, 128, 256]
-    return [128, 256, 512]
+        return [w for w in [64, 128, 256, 512] if w <= max_wg] or [min(64, max_wg)]
+    return [w for w in [128, 256, 512, 1024] if w <= max_wg] or [min(128, max_wg)]
 
 
 def _cache_key(kernel_hash: str, device_name: str) -> str:
