@@ -271,6 +271,40 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
             "};\n"
         )
 
+    def generate_extern_kernel_out(self, node) -> None:
+        """S4.0: intercept ExternKernelOut for Vulkan mm/addmm/bmm in AOTI mode.
+
+        The parent CppWrapperCpu.generate_extern_kernel_out emits C++ ATen calls
+        that bypass the Vulkan AOTI ABI. For Vulkan ExternKernelOut nodes,
+        emit the SPIR-V kernel handle + dispatch via _generate_kernel_call_helper.
+        Falls back to parent if no SPIR-V cache entry is known.
+        """
+        try:
+            dev = node.get_device()
+        except (AttributeError, NotImplementedError):
+            dev = None
+
+        if dev is None or dev.type != "vulkan":
+            return super().generate_extern_kernel_out(node)
+
+        kernel_name = getattr(node, "python_kernel_name", None)
+        if kernel_name is not None and kernel_name in self._spv_blobs:
+            input_names = [inp.codegen_reference() for inp in node.inputs]
+            out_name = node.codegen_reference()
+            call_args = input_names + [out_name, "1", "1", "1"]
+            self._generate_kernel_call_helper(
+                kernel_name, call_args, device=dev, triton=False,
+            )
+            return
+
+        import warnings
+        warnings.warn(
+            f"S4.0: VulkanCppWrapperGpu.generate_extern_kernel_out: "
+            f"no SPIR-V cache entry for '{kernel_name}' — falling back to CppWrapperCpu.",
+            stacklevel=2,
+        )
+        super().generate_extern_kernel_out(node)
+
     def _generate_kernel_call_helper(
         self,
         kernel_name: str,
@@ -364,16 +398,14 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
                 else:
                     n_buffers = _vk_rt._get_reflected_buffer_count_from_cache_key("") or 0
 
-            # Determine pc_size_bytes — prefer metadata, fall back to inductor_meta
-            pc_size_bytes = 0
-            n_pc = inductor_meta.get("n_pc", 0) if inductor_meta else 0
-            if n_pc == 0:
-                from .scheduling import get_kernel_meta as _gkma
-                meta = _gkma(V.graph.wrapper_code, key)
-                if meta is not None:
-                    n_pc = meta.get("n_pc", 0)
-            if n_pc > 0:
-                pc_size_bytes = n_pc * 4
+            # S4.0: use SPIR-V reflection for pc_size_bytes — authoritative for all Vulkan kernels.
+            # mm/addmm/bmm get 96 (19I5f PC struct); static-specialised pointwise gets 0.
+            pc_size_bytes = _vk_rt.get_reflected_pc_size(spv)
+            if pc_size_bytes == 0 and inductor_meta:
+                # Fallback for old slangc without -reflection-json.
+                n_pc = inductor_meta.get("n_pc", 0)
+                if n_pc > 0:
+                    pc_size_bytes = n_pc * 4
 
             self._spv_metadata[key] = {
                 "n_buffers": n_buffers,
@@ -414,8 +446,11 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         #   call_args = [buf0, buf1, ..., bufN-1, pc0, pc1, ..., wg_x, wg_y, wg_z]
         # where the last 3 args are always workgroup dimensions
         # and any push-constant ints sit between buffers and wg dims.
-        n_pc = inductor_meta.get("n_pc", 0) if inductor_meta else 0
         n_outputs = inductor_meta.get("n_outputs", 1) if inductor_meta else 1
+        # S4.0: derive n_pc from stored n_buffers + call_args length so
+        # mm/addmm/bmm ExternKernelOut nodes (inductor_meta=None) get the right split.
+        _meta_n_buffers = self._spv_metadata.get(key, {}).get("n_buffers", 0)
+        n_pc = max(0, n_args - 3 - _meta_n_buffers)
 
         # Separate args: last 3 are wg dims, preceding n_pc are push constants
         n_args = len(call_args)
@@ -667,12 +702,23 @@ def collect_aoti_spv_bundle() -> dict[str, bytes]:
     return bundle
 
 
-def emit_aoti_spv_header(bundle: dict[str, bytes]) -> str:
+def emit_aoti_spv_header(
+    bundle: dict[str, bytes],
+    metadata: Optional[dict[str, dict]] = None,
+) -> str:
     """Generate a C++ header fragment containing all SPIR-V blobs as
     static const arrays, plus initialization code to register them with
     the Vulkan runtime.
 
     Returns a C++ string suitable for inclusion in the generated ``.cpp``.
+
+    Parameters
+    ----------
+    bundle:
+        Mapping from cache key to SPIR-V bytes.
+    metadata:
+        Optional per-key overrides: ``{"n_buffers": int, "pc_size_bytes": int}``.
+        When omitted, both values are derived from SPIR-V reflection.
     """
     lines: list[str] = []
     lines.append("// ── Auto-generated SPIR-V bundle for Vulkan AOTI (DR.8 / T7.5) ──")
@@ -706,12 +752,11 @@ def emit_aoti_spv_header(bundle: dict[str, bytes]) -> str:
 
     lines.append("static AotiKernelInit _vk_aoti_kernels[] = {")
     for key, c_name, spv in c_names:
-        # Determine n_buffers from reflection
-        n_buf = _vk_rt.get_reflected_binding_count(spv)
-        if n_buf is None:
-            n_buf = 0
+        key_meta = (metadata or {}).get(key, {})
+        n_buf = key_meta.get("n_buffers") or _vk_rt.get_reflected_binding_count(spv) or 0
+        pc_size_bytes = key_meta.get("pc_size_bytes", 0)
         lines.append(
-            f'    {{nullptr, "{key}", {c_name}_data, {len(spv) // 4}, {n_buf}u, 0u}},'
+            f'    {{nullptr, "{key}", {c_name}_data, {len(spv) // 4}, {n_buf}u, {pc_size_bytes}u}},'
         )
     lines.append("};")
     lines.append("")
