@@ -64455,7 +64455,7 @@ class TestAOTIAddmmBmmPC:
             "S4.0: emit_aoti_spv_header must accept 'metadata' parameter"
         )
         p = sig.parameters["metadata"]
-        assert p.default is None or p.default is inspect.Parameter.empty or p.default is None, (
+        assert p.default is None, (
             "S4.0: metadata parameter must default to None"
         )
 

@@ -166,7 +166,7 @@ def get_reflected_pc_size(spv: bytes) -> int:
     refl_json = get_reflection_json(hash_key)
     if refl_json is None:
         return 0
-    return reflection_layout(refl_json)["push_constant_size"]
+    return reflection_layout(refl_json).get("push_constant_size", 0)
 
 def _get_reflected_buffer_count_from_cache_key(
     src: str,

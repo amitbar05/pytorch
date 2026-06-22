@@ -449,11 +449,11 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         n_outputs = inductor_meta.get("n_outputs", 1) if inductor_meta else 1
         # S4.0: derive n_pc from stored n_buffers + call_args length so
         # mm/addmm/bmm ExternKernelOut nodes (inductor_meta=None) get the right split.
+        n_args = len(call_args)
         _meta_n_buffers = self._spv_metadata.get(key, {}).get("n_buffers", 0)
         n_pc = max(0, n_args - 3 - _meta_n_buffers)
 
         # Separate args: last 3 are wg dims, preceding n_pc are push constants
-        n_args = len(call_args)
         assert n_args >= 3, (
             f"Expected at least 3 args (wg dims), got {n_args}: {call_args}"
         )
@@ -753,8 +753,8 @@ def emit_aoti_spv_header(
     lines.append("static AotiKernelInit _vk_aoti_kernels[] = {")
     for key, c_name, spv in c_names:
         key_meta = (metadata or {}).get(key, {})
-        n_buf = key_meta.get("n_buffers") or _vk_rt.get_reflected_binding_count(spv) or 0
-        pc_size_bytes = key_meta.get("pc_size_bytes", 0)
+        n_buf = key_meta["n_buffers"] if "n_buffers" in key_meta else (_vk_rt.get_reflected_binding_count(spv) or 0)
+        pc_size_bytes = key_meta["pc_size_bytes"] if "pc_size_bytes" in key_meta else (_vk_rt.get_reflected_pc_size(spv) or 0)
         lines.append(
             f'    {{nullptr, "{key}", {c_name}_data, {len(spv) // 4}, {n_buf}u, {pc_size_bytes}u}},'
         )
