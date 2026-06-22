@@ -126,15 +126,10 @@ from .reflection_ext import (  # noqa: F401
     _extract_linktime_spec_constants,
     _harvest_reflection_metrics,
     _load_spv_baselines,
-    _optimized_numthreads_by_hash,
-    _parse_numthreads_from_source,
     _parse_reflection_metrics,
-    _pick_numthreads_from_reflection,
     _reflection_cache,
-    _rewrite_numthreads_in_source,
     _save_spv_baselines,
     get_cached_metrics_for_key,
-    get_optimized_numthreads,
     get_reflection_metrics,
     reset_reflection_baselines,
 )
@@ -279,87 +274,10 @@ def _process_reflection(
     if not _cfg.reflection_routing():
         return
 
-    metrics = _reflection_metrics_by_hash.get(hash_key, {})
-    vgprs = metrics.get("vgprs")
-    if vgprs is None:
-        return
-
-    current_nt = _parse_numthreads_from_source(src)
-    if current_nt is None:
-        return
-
-    shared_mem = metrics.get("shared_mem")
-    loop_depth = metrics.get("loop_depth")
-    optimal_nt = _pick_numthreads_from_reflection(
-        vgprs, shared_mem, loop_depth, current_nt,
-    )
-    if optimal_nt == current_nt:
-        _optimized_numthreads_by_hash[hash_key] = current_nt
-        return
-
-    # Recompile with optimized numthreads.
-    new_src = _rewrite_numthreads_in_source(src, optimal_nt)
-    _compile_with_optimized_numthreads(
-        new_src, optimal_nt, entry="computeMain", hash_key=hash_key,
-        config_key=config_key, src=src,
-    )
-    _optimized_numthreads_by_hash[hash_key] = optimal_nt
-
-
-def _compile_with_optimized_numthreads(
-    new_src: str,
-    optimal_nt: tuple[int, int, int],
-    *,
-    entry: str,
-    hash_key: str,
-    config_key: str | None,
-    src: str,
-) -> None:
-    """Second-pass compile with rewritten numthreads; replace cached SPV on success."""
-    with tempfile.TemporaryDirectory() as td:
-        new_src_path = os.path.join(td, "kernel_opt.slang")
-        new_out_path = os.path.join(td, "kernel_opt.spv")
-        new_refl_path = os.path.join(td, "kernel_opt.refl.json")
-        with open(new_src_path, "w") as f:
-            f.write(new_src)
-        cmd3 = [
-            _get_slangc(),
-            new_src_path,
-            "-target",
-            "spirv",
-            "-entry",
-            entry,
-            "-o",
-            new_out_path,
-            "-reflection-json",
-            new_refl_path,
-            "-matrix-layout-row-major",
-            "-ignore-capabilities",
-        ]
-        try:
-            proc3 = _run_slangc(cmd3, hash_key)
-        except SlangCompileTimeout:
-            return  # keep Pass-1 SPV
-        if proc3.returncode != 0:
-            return
-
-        with open(new_out_path, "rb") as f:
-            spv2 = f.read()
-        _cache_by_hash[hash_key] = spv2
-        _disk_cache_write(hash_key, spv2)
-
-        try:
-            with open(new_refl_path) as f:
-                refl_blob2 = f.read()
-            _reflection_cache[hash_key] = refl_blob2
-            _disk_reflection_write(hash_key, refl_blob2)
-            from torch_vulkan.inductor import config as _cfg
-            if _cfg.reflection_enabled():
-                _harvest_reflection_metrics(
-                    hash_key, refl_blob2, spv2, new_src, config_key,
-                )
-        except (FileNotFoundError, OSError):
-            pass
+    # SP.2: removed dead numthreads-rewrite recompile path.
+    # _rewrite_numthreads_in_source / _compile_with_optimized_numthreads
+    # compiled a second SPV but the caller always received the original;
+    # _optimized_numthreads_by_hash had zero consumers.
 
 
 def _compile_slang_to_spirv_inner(

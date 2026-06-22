@@ -36267,34 +36267,17 @@ class TestDR7ReflectionRouting:
         )
 
     def test_dr7_numthreads_parsing(self):
-        """_parse_numthreads_from_source correctly extracts numthreads."""
-        from torch_vulkan.inductor.runtime import _parse_numthreads_from_source
-
-        src = '[shader("compute")]\n[numthreads(256, 1, 1)]\nvoid main() {}'
-        nt = _parse_numthreads_from_source(src)
-        assert nt == (256, 1, 1), f"DR.7 fail: expected (256,1,1), got {nt}"
-
-        src2 = '[shader("compute")]\n[numthreads(64, 4, 2)]\nvoid main() {}'
-        nt2 = _parse_numthreads_from_source(src2)
-        assert nt2 == (64, 4, 2), f"DR.7 fail: expected (64,4,2), got {nt2}"
-
-        # No numthreads → None
-        src3 = '[shader("compute")]\nvoid main() {}'
-        nt3 = _parse_numthreads_from_source(src3)
-        assert nt3 is None, f"DR.7 fail: expected None, got {nt3}"
-
-    def test_dr7_numthreads_rewrite(self):
-        """_rewrite_numthreads_in_source replaces numthreads correctly."""
-        from torch_vulkan.inductor.runtime import _rewrite_numthreads_in_source
-
-        src = '[shader("compute")]\n[numthreads(256, 1, 1)]\nvoid main() {}'
-        new_src = _rewrite_numthreads_in_source(src, (64, 1, 1))
-        assert "[numthreads(64, 1, 1)]" in new_src, (
-            f"DR.7 fail: rewrite did not produce expected numthreads: {new_src}"
-        )
-        assert "[numthreads(256, 1, 1)]" not in new_src, (
-            f"DR.7 fail: old numthreads still present after rewrite: {new_src}"
-        )
+        """_extract_wg_from_numthreads extracts total WG size from a
+        numthreads attribute string (used by the surviving WG-autotune path)."""
+        from torch_vulkan.inductor.runtime.dispatch import _extract_wg_from_numthreads
+        # 1D workgroup
+        assert _extract_wg_from_numthreads("[numthreads(256, 1, 1)]") == 256
+        # 2D workgroup
+        assert _extract_wg_from_numthreads("[numthreads(16, 8, 1)]") == 128
+        # 3D workgroup
+        assert _extract_wg_from_numthreads("[numthreads(8, 4, 2)]") == 64
+        # Malformed / missing numthreads falls back to 256
+        assert _extract_wg_from_numthreads("no numthreads here") == 256
 
     def test_dr7_two_pass_does_not_break_correctness(self):
         """A simple pointwise shader compiles and produces correct

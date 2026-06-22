@@ -144,7 +144,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | 🔴 **OPEN** — latent, triggers on fp16 reduction kernels with GroupNorm |
 | **CG.expr** | **`VulkanExprPrinter._mul_needs_parens` misses `/` division** (`expr_printer.py:_mul_needs_parens`): scans only `+`/`-` at top level; a `Mul` factor containing division (e.g. `(a/b)*stride`) emits without parentheses → wrong Slang index arithmetic. Fix: also return `True` when top-level `/` present. | 🔴 **OPEN** — latent; triggered by division-based stride expressions |
 | **SP.1** | **Async compile still serial: `.result()` blocks caller** (`runtime/slangc.py:552-560`): `compile_slang_to_spirv` calls `pool.submit(...).result()` on cache-miss — overlap never happens. Fix: return a `Future` on cache-miss; callers await lazily. Prerequisite for S3.4. | 🔴 **OPEN** — blocks S3.4 |
-| **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` runs but rewritten source is never recompiled — `get_optimized_numthreads` has no callers outside `slangc.py`. Wire into `make_vulkan_kernel:_maybe_autotune_wg` or remove. | 🔴 **OPEN** — dead code / wasted compile time |
+| **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` ran but the rewritten source was compiled then silently discarded by Phase 6; `get_optimized_numthreads` had zero consumers. Removed dead path (3 files). | ✅ **FIXED 2026-06-22** — dead recompile path removed |
 | **MS.2** | **Use-after-free: AOTI shim `zeros/ones/full/as_strided` return dangling `AtenTensorHandle`** (`csrc/backend/aoti_shims.cpp:146,172,193,215`): each function returned `tensor.unsafeGetTensorImpl()` of a local `at::Tensor` that was destroyed on return. Fix: allocate with `new at::Tensor(std::move(tensor))` at all four sites (matching `empty_strided_vulkan`). | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
 | **MS.1** | **Memory leak: `aoti_torch_delete` is a no-op** (`csrc/backend/aoti_shims.cpp:154-156`): `RAIIAtenTensorHandle` destructor calls this for every intermediate tensor; the handle was silently discarded. Fix: `delete reinterpret_cast<at::Tensor*>(handle)`. Fixed together with MS.2. | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
 
@@ -1468,6 +1468,8 @@ and both test files are unaffected.
   `wc -l kernel/pointwise.py` reports < 800.
 
 ---
+
+✅ **FIXED 2026-06-22** — dead path removed (Option A)
 
 ### SP.1 — Wire or remove the dead numthreads-rewrite path in `reflection_ext.py`
 
