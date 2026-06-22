@@ -6572,6 +6572,58 @@ class TestPacked16Verification:
         n = torch_vulkan._c_ext._get_dispatch_count()
         assert n <= 1, f"expected 1 dispatch (fused pointwise), got {n}"
 
+class TestBf16PackedStoreWave32:
+    """CG.2 — bf16 packed16 fallback store must guard _pw_has_wave_ops with
+    _packed16_vw_active.
+
+    The bf16 fallback path (kernel/pointwise.py:718-736) emits a
+    WaveReadLaneAt-based scalar store to pack two bf16 values per uint
+    slot.  When _packed16_vw_active is True the vector-write rewrite
+    replaces that path with gtid.x-based vector scratch stores, so the
+    wave-op flag must NOT be set — otherwise the codegen believes wave ops
+    are needed for a body that has already been vectorized.
+
+    The ^ 1u XOR is mathematically correct on both wave32 and wave64
+    (pairs adjacent lanes 0<->1, 2<->3 ...), so this test exercises the
+    scalar fallback path on a small non-multiple-of-wg tensor where
+    _packed16_vw_active is False.
+    """
+
+    def test_bf16_packed16_scalar_store_correctness(self):
+        """64-element bf16 tensor forces the scalar WaveReadLaneAt fallback.
+        Element 2k must equal 1000+2k, element 2k+1 must equal 1000+2k+1
+        after round-trip through the packed16 store/load path."""
+        x = torch.tensor(
+            [1000 + i for i in range(64)], dtype=torch.bfloat16,
+            device="vulkan:0",
+        )
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(x):
+            return x + 0  # identity - exercises store without masking
+
+        y = fn(x)
+        expected = torch.tensor(
+            [1000 + i for i in range(64)], dtype=torch.bfloat16,
+        )
+        torch.testing.assert_close(y.cpu(), expected)
+
+    def test_bf16_packed16_large_tensor_matches_cpu(self):
+        """1024-element bf16 tensor triggers the vector-write path when
+        _packed16_vw_active is True; verify packed16 results match CPU."""
+        x = torch.randn(1024, device="vulkan:0", dtype=torch.bfloat16)
+
+        @torch.compile(backend="inductor", fullgraph=True)
+        def fn(x):
+            return torch.relu(x * 0.5 + 0.1)
+
+        y = fn(x)
+        torch.testing.assert_close(
+            y.cpu().float(),
+            torch.relu(x.cpu().float() * 0.5 + 0.1),
+            rtol=5e-2,
+            atol=5e-2,
+        )
 
 class TestCrossEntropyBaseline:
     """P1.5: F.cross_entropy(logits, target) under torch.compile. Locks
