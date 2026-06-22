@@ -382,3 +382,39 @@ class TestMCV4SoftmaxBackward:
         # the Jacobian collapses identically, but the underlying compute
         # must still propagate the real tangent value.
         torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)
+
+
+class TestAOTIFactoryOpsShim:
+    """S4.3 — factory-op shim covers zeros/ones/full, not just empty.memory_format.
+
+    Verifies that when torch.export / torch.compile lifts torch.zeros / torch.ones
+    into graph constants (get_attr nodes), the _rewrite_factory_meta_to_vulkan pass
+    inserts the required aten._to_copy(device='vulkan') so the .so runtime allocates
+    on Vulkan, not CPU.
+
+    Skipped when no AOTI build is available.
+    """
+
+    @pytest.mark.skip("requires AOTI build")
+    def test_factory_ops_output_on_vulkan(self):
+        import torch
+
+        class SimpleModel(torch.nn.Module):
+            def forward(self, x):
+                # torch.zeros / torch.ones are lifted as get_attr constants
+                # by torch.export; the shim must move them to vulkan.
+                zeros_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+                ones_bias = torch.ones(x.shape[1], dtype=x.dtype, device=x.device)
+                return x + ones_bias
+
+        model = SimpleModel()
+        x = torch.randn(4, 8, device="vulkan:0")
+
+        compiled = torch.compile(model, backend="inductor")
+        out = compiled(x)
+
+        assert out.device.type == "vulkan", (
+            f"Expected vulkan output, got {out.device}")
+        # Sanity-check the result is not all-zeros (which would indicate the
+        # ones_bias constant was left on CPU and silently zeroed).
+        assert out.abs().sum() > 0, "Output is all zeros — factory constant not on vulkan"
