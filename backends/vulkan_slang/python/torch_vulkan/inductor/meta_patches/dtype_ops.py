@@ -12,89 +12,14 @@ import torch
 
 # ── Activation backward ops ──────────────────────────────────────────────────
 
-
-def _threshold_backward_fake(grad_output, input, threshold):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _leaky_relu_backward_fake(
-    grad_output, input_or_result, negative_slope, self_is_result
-):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _elu_backward_fake(
-    grad_output, alpha, scale, input_scale, is_result, self_or_result
-):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _selu_backward_fake(
-    grad_output, input_or_result, alpha, scale, input_scale, is_result
-):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
 def _hardtanh_backward_fake(grad_output, input, min_val, max_val):
     return torch.empty(
         list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
     )
 
 
-def _silu_backward_fake(grad_output, input_or_result):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
 
 
-def _gelu_backward_fake(grad_output, input, approximate="none"):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _mish_backward_fake(grad_output, input):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _hardswish_backward_fake(grad_output, input):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _hardsigmoid_backward_fake(grad_output, input):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _softplus_backward_fake(grad_output, input, beta, threshold):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _sigmoid_backward_fake(grad_output, output):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _tanh_backward_fake(grad_output, output):
-    return torch.empty(
-        list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
 
 
 def _softmax_backward_data_fake(grad_output, output, dim, input_dtype):
@@ -106,50 +31,7 @@ def _softmax_backward_data_fake(grad_output, output, dim, input_dtype):
 def _log_softmax_backward_data_fake(grad_output, output, dim, input_dtype):
     return torch.empty(
         list(grad_output.shape), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _avg_pool2d_backward_fake(
-    grad_output,
-    input,
-    kernel_size,
-    stride,
-    padding,
-    ceil_mode,
-    count_include_pad,
-    divisor_override,
-):
-    return torch.empty(list(input.shape), dtype=input.dtype, device=input.device)
-
-
-def _max_pool2d_with_indices_backward_fake(
-    grad_output, input, kernel_size, stride, padding, dilation, ceil_mode, indices
-):
-    return torch.empty(list(input.shape), dtype=input.dtype, device=input.device)
-
-
-def _linear_backward_fake(input, grad_output, weight, output_mask):
-    gi = (
-        torch.empty(list(input.shape), dtype=input.dtype, device=input.device)
-        if output_mask[0]
-        else torch.empty(0, dtype=input.dtype, device=input.device)
-    )
-    gw = (
-        torch.empty(list(weight.shape), dtype=weight.dtype, device=weight.device)
-        if output_mask[1]
-        else torch.empty(0, dtype=weight.dtype, device=weight.device)
-    )
-    gb = (
-        torch.empty(
-            [weight.size(0)], dtype=grad_output.dtype, device=grad_output.device
-        )
-        if output_mask[2]
-        else torch.empty(0, dtype=grad_output.dtype, device=grad_output.device)
-    )
-    return gi, gw, gb
-
-
-# ── Loss backward ops ────────────────────────────────────────────────────────
+    )# ── Loss backward ops ────────────────────────────────────────────────────────
 
 
 def _nll_loss_backward_fake(

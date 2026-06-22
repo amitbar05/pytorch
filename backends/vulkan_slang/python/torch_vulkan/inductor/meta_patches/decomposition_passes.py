@@ -67,10 +67,6 @@ def _patch_decompositions() -> None:
         # joint trace even if the pre-grad rewrite misses.
         return torch.where(self > 0, self, torch.zeros_like(self))
 
-    def _gelu_bwd(grad_output, self, approximate="none"):
-        # Use the built-in gelu_backward which inductor can lower
-        return torch.ops.aten.gelu_backward(grad_output, self, approximate=approximate)
-
     # M18.3 (2026-05-18): torch.empty_like(t) → t.new_empty(t.shape).
     # Same bug class as M17.8.d.2: under AOTAutograd's proxy tracer the
     # symbolic ``aten.empty_like`` call can be recorded into the FX graph
@@ -170,7 +166,6 @@ def _patch_decompositions() -> None:
     replacements = {
         aten.hardtanh_backward.default: _hardtanh_bwd,
         aten.relu.default: _relu_fwd_decomp,
-        aten.gelu_backward.default: _gelu_bwd,
         aten._softmax_backward_data.default: _softmax_bwd,
         aten._log_softmax_backward_data.default: _log_softmax_bwd,
         aten.linear_backward.default: _linear_bwd,
@@ -192,110 +187,6 @@ def _patch_decompositions() -> None:
     }
     decomposition_table.update(replacements)
 
-
-def _patch_pre_grad_passes_for_optimizer_foreach() -> None:
-    """T4.8 pre-grad pass: detect optimizer-step patterns on the forward
-    graph BEFORE AOTAutograd functionalizes in-place mutations.
-
-    M15.2 audit (b): workaround for missing foreach lowerings. Should be
-    replaced by proper foreach_add/foreach_mul/etc. lowerings in the
-    Inductor backend. See roadmap M14 (op coverage).
-    """
-
-    # Dynamo traces ``p.add_(g, alpha=-lr)`` as ``aten.add_.Tensor``.
-    # AOTAutograd then functionalizes this into the
-    # ``(mul.Tensor -> add.Tensor -> copy_)`` triplet.  If we intercept
-    # the pre-grad graph, we can rewrite contiguous per-param add_/mul_/
-    # addcdiv_/addcmul_ sequences directly into ``torch_vulkan::foreach_*``
-    # custom ops, bypassing the functionalization dance.
-
-    # Vulkan-only: only fires when the graph's tensors originate from a
-    # Vulkan device, detected by the same three strategies used in
-    # ``_patch_pre_grad_passes_for_relu_rewrite``.
-    import torch
-    import torch._inductor.compile_fx as _cfx
-
-    if getattr(_cfx, "_vulkan_foreach_rewrite_patched", False):
-        return
-
-    _orig = _cfx.run_pre_grad_passes
-
-    def _patched(model_, example_inputs_):
-        from ..fx_passes.functional.optimizer import (
-            _fuse_optimizer_step_to_foreach,
-        )
-
-        # Reuse the relu-rewrite detector (same Vulkan-detection logic).
-        # Must import the function here to avoid circular imports.
-        try:
-            # Quick device check — reuse the same strategies as
-            # _patch_pre_grad_passes_for_relu_rewrite.
-            inputs = example_inputs_ or ()
-            is_vulkan = False
-            for t in inputs:
-                if not isinstance(t, torch.Tensor):
-                    continue
-                try:
-                    if t.device.type in ("vulkan", "privateuseone"):
-                        is_vulkan = True
-                        break
-                except Exception:
-                    pass
-                try:
-                    fd = getattr(t, "fake_device", None)
-                    if fd is not None and fd.type in ("vulkan", "privateuseone"):
-                        is_vulkan = True
-                        break
-                except Exception:
-                    pass
-            if not is_vulkan and isinstance(model_, torch.fx.GraphModule):
-                try:
-                    for node in model_.graph.nodes:
-                        if node.op != "placeholder":
-                            continue
-                        val = node.meta.get("val") if hasattr(node, "meta") else None
-                        if val is None:
-                            continue
-                        for v in val if isinstance(val, (list, tuple)) else [val]:
-                            if not isinstance(v, torch.Tensor):
-                                continue
-                            try:
-                                if v.device.type in ("vulkan", "privateuseone"):
-                                    is_vulkan = True
-                                    break
-                            except Exception:
-                                pass
-                            try:
-                                fd = getattr(v, "fake_device", None)
-                                if fd is not None and fd.type in (
-                                    "vulkan",
-                                    "privateuseone",
-                                ):
-                                    is_vulkan = True
-                                    break
-                            except Exception:
-                                pass
-                        if is_vulkan:
-                            break
-                except Exception:
-                    pass
-
-            if is_vulkan and isinstance(model_, torch.fx.GraphModule):
-                try:
-                    _fuse_optimizer_step_to_foreach(model_)
-                except Exception as e:
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "Vulkan pre-grad foreach rewrite failed: %s", e
-                    )
-        except Exception:
-            pass
-
-        return _orig(model_, example_inputs_)
-
-    _cfx.run_pre_grad_passes = _patched
-    _cfx._vulkan_foreach_rewrite_patched = True
 
 
 def _patch_pre_grad_passes_for_relu_rewrite() -> None:

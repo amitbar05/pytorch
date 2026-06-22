@@ -46,6 +46,11 @@ def _register_backward_meta_decomps() -> None:
             return grad_output.new_empty(grad_output.shape)
 
         for op, fn in [
+            # G.1: meta decomp entries — the only FakeTensor dispatch path for
+            # these 6 ops (no _OP_IMPLS fake_impl exists). FakeTensorMode
+            # _dispatch_impl checks meta_table first; these fire before
+            # decompose() and return the correct shape/dtype without mixing
+            # devices. The AOT compute path uses bwd_diff or dedicated lowering.
             (aten.gelu_backward.default, _bwd_meta_like_grad),
             (aten.silu_backward.default, _bwd_meta_like_grad),
             (aten.leaky_relu_backward.default, _bwd_meta_like_grad),

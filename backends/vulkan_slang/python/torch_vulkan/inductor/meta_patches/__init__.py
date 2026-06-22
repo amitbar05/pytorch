@@ -26,7 +26,6 @@ from torch._library.simple_registry import singleton
 
 # ── AutogradPrivateUse1 pyimpls ─────────────────────────────────────────────
 from .autograd_registrations import (
-    _register_activation_autograd_pyimpl,
     _register_permute_family_autograd_pyimpl,
     _register_view_symint_autograd_pyimpl,
 )
@@ -35,7 +34,6 @@ from .autograd_registrations import (
 from .decomposition_passes import (
     _patch_decompositions,
     _patch_pre_grad_passes_for_conv_gn_relu_fusion,
-    _patch_pre_grad_passes_for_optimizer_foreach,
     _patch_pre_grad_passes_for_relu_rewrite,
 )
 
@@ -55,9 +53,6 @@ from .dtype_ops import (
     _elu_fake,
     _expand_backward_fake,
     _gelu_fake,
-    _hardsigmoid_backward_fake,
-    _hardswish_backward_fake,
-    _hardtanh_backward_fake,
     _hardtanh_fake,
     _leaky_relu_fake,
     _linear_fake,
@@ -65,23 +60,17 @@ from .dtype_ops import (
     _max_dim_fake,
     _mean_dim_fake,
     _min_dim_fake,
-    _mish_backward_fake,
     _nll_loss_backward_fake,
     _permute_backward_fake,
     _repeat_backward_fake,
     _reshape_alias_fake,
     _select_backward_fake,
-    _selu_backward_fake,
-    _sigmoid_backward_fake,
     _slice_backward_fake,
     _softmax_fake,
-    _softplus_backward_fake,
     _softplus_fake,
     _squeeze_backward_fake,
     _sum_dim_fake,
     _t_backward_fake,
-    _tanh_backward_fake,
-    _threshold_backward_fake,
     _transpose_backward_fake,
     _unary_fake,
     _unsqueeze_backward_fake,
@@ -361,16 +350,6 @@ _OP_IMPLS: dict[str, Callable] = {
     "aten::_fft_c2r": _fft_c2r_fake,
     # SVD
     "aten::linalg_svd": _linalg_svd_fake,
-    # Activation backward ops
-    "aten::hardtanh_backward": _hardtanh_backward_fake,
-    "aten::threshold_backward": _threshold_backward_fake,
-    "aten::selu_backward": _selu_backward_fake,
-    "aten::mish_backward": _mish_backward_fake,
-    "aten::hardswish_backward": _hardswish_backward_fake,
-    "aten::hardsigmoid_backward": _hardsigmoid_backward_fake,
-    "aten::softplus_backward": _softplus_backward_fake,
-    "aten::sigmoid_backward": _sigmoid_backward_fake,
-    "aten::tanh_backward": _tanh_backward_fake,
     # Loss backward
     "aten::nll_loss_backward": _nll_loss_backward_fake,
     "aten::_cross_entropy_loss_backward": _cross_entropy_loss_backward_fake,
@@ -448,9 +427,6 @@ def apply() -> None:
     # AOTAutograd lift the result as a frozen tensor constant and Inductor
     # constant-fold it to garbage uniform values).
     _register_permute_family_autograd_pyimpl()
-    # relu ← clamp_min decomposition handles the Vulkan-aware backward
-    # through clamp's working AutogradPrivateUse1 C++ adapter.
-
     # Override decompositions for activation backward ops that hit a PyTorch 2.11
     # FakeTensorMode bug: torch.where(cond, 0.0_scalar, tensor) returns shape []
     # instead of the tensor's shape. These decompositions avoid the scalar-first
@@ -512,10 +488,6 @@ def apply() -> None:
     # against meta-cascaded saved outputs.
     _patch_pre_grad_passes_for_relu_rewrite()
 
-    # T4.8: optimizer foreach step pattern matching on the pre-grad graph
-    # catches in-place ``add_/mul_/addcdiv_/addcmul_`` sequences BEFORE
-    # AOTAutograd functionalization decomposes them into triplets/doublets.
-    _patch_pre_grad_passes_for_optimizer_foreach()
 
     # M17.2 Phase 2 DISABLED (correctness fix):
     # Pre-grad fusion caused AOTAutograd to use register_autograd setup_context

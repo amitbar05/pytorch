@@ -328,75 +328,6 @@ def _convolution_backward_overrideable_fake(
 # ── Normalization backward ops ────────────────────────────────────────────────
 
 
-def _native_batch_norm_backward_fake(
-    grad_out,
-    input,
-    weight,
-    running_mean,
-    running_var,
-    save_mean,
-    save_var,
-    train,
-    eps,
-    output_mask,
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    C = int(input.size(1))
-    grad_weight = (
-        grad_out.new_empty((C,)) if output_mask[1] else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        grad_out.new_empty((C,)) if output_mask[2] else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
-def _native_layer_norm_backward_fake(
-    grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    grad_weight = (
-        weight.new_empty(weight.shape)
-        if (output_mask[1] and weight is not None)
-        else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        bias.new_empty(bias.shape)
-        if (output_mask[2] and bias is not None)
-        else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
-def _native_group_norm_backward_fake(
-    grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    grad_weight = (
-        grad_out.new_empty((int(C),))
-        if output_mask[1]
-        else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        grad_out.new_empty((int(C),))
-        if output_mask[2]
-        else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
-# ── Indexing ops ──────────────────────────────────────────────────────────────
-
-
 def _gather_fake(self, dim, index, sparse_grad=False):
     # M-pipeline-9: not `torch.empty_like(index, dtype=...)` — see M18.3.
     return index.new_empty(index.shape, dtype=self.dtype)
@@ -428,25 +359,6 @@ def _repeat_interleave_self_int_fake(self, repeats, dim=None, output_size=None):
 
 
 # ── Upsample backward ops ─────────────────────────────────────────────────────
-
-
-def _upsample_bilinear2d_backward_fake(
-    grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
-):
-    return torch.empty(
-        list(input_size), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _upsample_nearest2d_backward_fake(
-    grad_output, output_size, input_size, scales_h=None, scales_w=None
-):
-    return torch.empty(
-        list(input_size), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-# ── Attention ────────────────────────────────────────────────────────
 
 
 def _sdpa_fake(
