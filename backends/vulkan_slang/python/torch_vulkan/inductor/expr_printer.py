@@ -76,13 +76,13 @@ class VulkanExprPrinter(ExprPrinter_):
 
     @staticmethod
     def _mul_needs_parens(s: str) -> bool:
-        """True when the printed string `s` has a binary +/- at top level.
+        """True when the printed string `s` has a binary +/- or / at top level.
 
         Inductor sometimes wraps Add expressions in an `Identity` node so that
         ``isinstance(factor, sympy.Add)`` returns False.  Rather than chasing
         every wrapper type, we check the already-printed string: if it contains
         a `+` or a `-` that is not the very first character (i.e. unary minus
-        on a plain negative literal), the factor is an addition/subtraction and
+        on a plain negative literal), the factor is an addition/subtraction/division and
         must be wrapped in parentheses when used as a Mul operand.
         """
         depth = 0
@@ -91,7 +91,7 @@ class VulkanExprPrinter(ExprPrinter_):
                 depth += 1
             elif c == ')':
                 depth -= 1
-            elif depth == 0 and c in '+-' and i > 0:
+            elif depth == 0 and c in '+-/' and i > 0:
                 return True
         return False
 
