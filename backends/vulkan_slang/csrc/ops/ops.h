@@ -38,6 +38,8 @@ at::Tensor vulkan_exp(const at::Tensor& self);
 at::Tensor vulkan_log(const at::Tensor& self);
 at::Tensor vulkan_sqrt(const at::Tensor& self);
 at::Tensor vulkan_rsqrt(const at::Tensor& self);
+at::Tensor vulkan_reciprocal(const at::Tensor& self);
+at::Tensor& vulkan_reciprocal_out(const at::Tensor& self, at::Tensor& out);
 at::Tensor vulkan_ceil(const at::Tensor& self);
 at::Tensor vulkan_floor(const at::Tensor& self);
 at::Tensor vulkan_round(const at::Tensor& self);
@@ -63,6 +65,7 @@ at::Tensor vulkan_ge_scalar(const at::Tensor& self, const at::Scalar& other);
 // Activations
 at::Tensor vulkan_relu(const at::Tensor& self);
 at::Tensor& vulkan_relu_(at::Tensor& self);
+at::Tensor vulkan_threshold(const at::Tensor& self, const at::Scalar& threshold, const at::Scalar& value);
 at::Tensor vulkan_sigmoid(const at::Tensor& self);
 at::Tensor vulkan_tanh(const at::Tensor& self);
 at::Tensor vulkan_gelu(const at::Tensor& self, c10::string_view approximate);
@@ -105,6 +108,8 @@ at::Tensor vulkan_mean(const at::Tensor& self, at::OptionalIntArrayRef dim,
                        bool keepdim, std::optional<at::ScalarType> dtype);
 at::Tensor vulkan_amax(const at::Tensor& self, at::IntArrayRef dim, bool keepdim);
 at::Tensor vulkan_amin(const at::Tensor& self, at::IntArrayRef dim, bool keepdim);
+at::Tensor vulkan_max(const at::Tensor& self);
+at::Tensor vulkan_min(const at::Tensor& self);
 std::tuple<at::Tensor, at::Tensor> vulkan_max_dim(const at::Tensor& self, int64_t dim, bool keepdim);
 std::tuple<at::Tensor, at::Tensor> vulkan_max_dim_out(const at::Tensor& self, int64_t dim, bool keepdim,
                                                        at::Tensor& values_out, at::Tensor& indices_out);
@@ -128,12 +133,26 @@ at::Tensor vulkan_norm_ScalarOpt_dim(const at::Tensor& self,
 
 // BLAS
 at::Tensor vulkan_mm(const at::Tensor& self, const at::Tensor& mat2);
+// Out-variant. Inductor's compiled BW emits ``aten.mm.out`` to reuse
+// pre-allocated output buffers (PF.13.b memory-planning).
+at::Tensor& vulkan_mm_out(const at::Tensor& self, const at::Tensor& mat2,
+                          at::Tensor& out);
 // Matmul with explicit transpose flags — avoids GPU permute copy from .t()
 at::Tensor vulkan_mm_ex(const at::Tensor& self, const at::Tensor& mat2,
                          bool transpose_a, bool transpose_b);
 at::Tensor vulkan_addmm(const at::Tensor& bias, const at::Tensor& self, const at::Tensor& mat2,
                          const at::Scalar& beta, const at::Scalar& alpha);
+// Out-variant. Inductor's compiled BW emits ``aten.addmm.out`` for
+// memory-planned linear backward graphs.
+at::Tensor& vulkan_addmm_out(const at::Tensor& self, const at::Tensor& mat1,
+                              const at::Tensor& mat2,
+                              const at::Scalar& beta, const at::Scalar& alpha,
+                              at::Tensor& out);
 at::Tensor vulkan_bmm(const at::Tensor& self, const at::Tensor& mat2);
+// Out-variant. Inductor's compiled BW emits ``aten.bmm.out`` for
+// memory-planned batched-matmul backward graphs.
+at::Tensor& vulkan_bmm_out(const at::Tensor& self, const at::Tensor& mat2,
+                           at::Tensor& out);
 // Batched matmul with explicit transpose flags — avoids GPU permute copy
 at::Tensor vulkan_bmm_ex(const at::Tensor& self, const at::Tensor& mat2,
                           bool transpose_a, bool transpose_b, float scale = 1.0f);
@@ -189,6 +208,26 @@ at::Tensor vulkan_index_select(const at::Tensor& self, int64_t dim, const at::Te
 at::Tensor& vulkan_masked_fill(at::Tensor& self, const at::Tensor& mask, const at::Scalar& value);
 at::Tensor vulkan_masked_scatter(const at::Tensor& self, const at::Tensor& mask, const at::Tensor& source);
 at::Tensor& vulkan_masked_scatter_(at::Tensor& self, const at::Tensor& mask, const at::Tensor& source);
+// OP.1.a-fast: aten::nonzero — GPU-native two-pass scan.
+// Returns int64 tensor of shape (N, ndim) where N = count of nonzero elements.
+// Falls back to CPU roundtrip for non-Vulkan or non-float inputs.
+at::Tensor vulkan_nonzero(const at::Tensor& self);
+
+// FFT (forward primitives — backward via decomposition through these)
+at::Tensor vulkan_fft_r2c(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, bool onesided);
+at::Tensor vulkan_fft_c2c(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, bool forward);
+at::Tensor vulkan_fft_c2r(const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, int64_t last_dim_size);
+
+// Linalg
+// _linalg_svd(A, full_matrices, compute_uv, *, driver=None) -> (U, S, Vh)
+// GPU one-sided Jacobi for M >= N, N <= 32, M <= 256; compute_uv=false returns
+// empty U/Vh placeholders.
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+vulkan_linalg_svd(const at::Tensor& A, bool full_matrices, bool compute_uv,
+    std::optional<c10::string_view> driver);
 
 // Convolution
 at::Tensor vulkan_conv2d(const at::Tensor& input, const at::Tensor& weight,
@@ -390,22 +429,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_native_group_norm_backward
 std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_native_batch_norm_backward(const at::Tensor& grad_out, const at::Tensor& input, const std::optional<at::Tensor>& weight, const std::optional<at::Tensor>& running_mean, const std::optional<at::Tensor>& running_var, const std::optional<at::Tensor>& save_mean, const std::optional<at::Tensor>& save_invstd, bool train, double eps, std::array<bool, 3> output_mask);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_linear_backward(const at::Tensor& self, const at::Tensor& grad_output, const at::Tensor& weight, std::array<bool, 3> output_mask);
 
-// Phase 3: Model coverage ops
+// Legacy eager-only ops (M16: model_ops.cpp → legacy_eager.cpp)
 at::Tensor vulkan_triu(const at::Tensor& self, int64_t diagonal);
-at::Tensor vulkan_tril(const at::Tensor& self, int64_t diagonal);
-at::Tensor vulkan_constant_pad_nd(const at::Tensor& self, c10::IntArrayRef pad, const at::Scalar& value);
-at::Tensor vulkan_index_tensor(const at::Tensor& self, const c10::List<std::optional<at::Tensor>>& indices);
-at::Tensor vulkan_repeat(const at::Tensor& self, c10::IntArrayRef repeats);
-at::Tensor vulkan_repeat_interleave_self_int(const at::Tensor& self, int64_t repeats,
-    std::optional<int64_t> dim, std::optional<int64_t> output_size);
-at::Tensor vulkan_stack(at::TensorList tensors, int64_t dim);
-std::vector<at::Tensor> vulkan_chunk(const at::Tensor& self, int64_t chunks, int64_t dim);
-at::Tensor vulkan_erf(const at::Tensor& self);
-at::Tensor& vulkan_erf_(at::Tensor& self);
-at::Tensor vulkan_narrow(const at::Tensor& self, int64_t dim, int64_t start, int64_t length);
-at::Tensor vulkan_flip(const at::Tensor& self, at::IntArrayRef dims);
-at::Tensor vulkan_roll(const at::Tensor& self, at::IntArrayRef shifts, at::IntArrayRef dims);
-at::Tensor vulkan_unsafe_view(const at::Tensor& self, at::IntArrayRef size);
 at::Tensor vulkan_contiguous(const at::Tensor& self, at::MemoryFormat memory_format);
 at::Tensor vulkan_to_copy(const at::Tensor& self, std::optional<at::ScalarType> dtype,
     std::optional<at::Layout> layout, std::optional<at::Device> device,
@@ -416,28 +441,13 @@ at::Tensor vulkan_as_strided(const at::Tensor& self, at::IntArrayRef size,
 const at::Tensor& vulkan_resize_(const at::Tensor& self, at::IntArrayRef size,
     std::optional<at::MemoryFormat> memory_format);
 
-// AMP ops
-void vulkan_amp_non_finite_check_and_unscale_(at::TensorList scaled_grads,
-    at::Tensor& found_inf, const at::Tensor& inv_scale);
-
-at::Tensor& vulkan_amp_update_scale_(at::Tensor& current_scale, at::Tensor& growth_tracker,
-    const at::Tensor& found_inf, double scale_growth_factor,
-    double scale_backoff_factor, int64_t growth_interval);
-
 // Additional unary ops
-at::Tensor vulkan_reciprocal(const at::Tensor& self);
-at::Tensor vulkan_sin(const at::Tensor& self);
-at::Tensor vulkan_cos(const at::Tensor& self);
 at::Tensor vulkan_tan(const at::Tensor& self);
 at::Tensor vulkan_atan(const at::Tensor& self);
 at::Tensor vulkan_log2(const at::Tensor& self);
 at::Tensor vulkan_log10(const at::Tensor& self);
 at::Tensor vulkan_log1p(const at::Tensor& self);
-at::Tensor vulkan_logical_not(const at::Tensor& self);
-at::Tensor vulkan_bitwise_not(const at::Tensor& self);
-at::Tensor& vulkan_bitwise_and_out(const at::Tensor& self, const at::Tensor& other, at::Tensor& out);
-at::Tensor& vulkan_random_from(at::Tensor& self, int64_t from, std::optional<int64_t> to,
-                                std::optional<at::Generator> generator);
+
 
 // Check ops
 at::Tensor vulkan_isnan(const at::Tensor& self);
@@ -454,9 +464,7 @@ at::Tensor vulkan_cumprod(const at::Tensor& self, int64_t dim,
     std::optional<at::ScalarType> dtype);
 
 // Loss ops
-at::Tensor vulkan_mse_loss(const at::Tensor& self, const at::Tensor& target, int64_t reduction);
-at::Tensor vulkan_mse_loss_backward(const at::Tensor& grad_output, const at::Tensor& self,
-    const at::Tensor& target, int64_t reduction);
+
 at::Tensor vulkan_binary_cross_entropy(const at::Tensor& self, const at::Tensor& target,
     const std::optional<at::Tensor>& weight, int64_t reduction);
 at::Tensor vulkan_binary_cross_entropy_backward(const at::Tensor& grad_output,

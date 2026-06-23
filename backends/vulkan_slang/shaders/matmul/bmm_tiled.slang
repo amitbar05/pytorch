@@ -7,6 +7,20 @@
 // When transpose_b=0: B is [b, K, N]  (contiguous)
 // When transpose_b=1: B is [b, N, K]  (contiguous, treated as transposed)
 // scale: multiply output by this constant (fused at no extra cost)
+//
+// M22.13-extras: derive ``lrow`` / ``lcol`` from a linearised
+// ``tid_local`` instead of reading ``lid.x`` / ``lid.y`` directly. The
+// raw ``lid.x``/``lid.y`` form triggers the same slangc 2026.5+ wave64
+// scalarisation bug on RDNA1 that affected ``mm_tiled.slang`` pre-
+// M22.13-followup: 3+ structured-buffer bindings + both ``lid.x`` and
+// ``lid.y`` used to address different buffers cause the compiler to
+// fold ``lid.x`` to a constant for lanes with ``lid.x >= 1``,
+// collapsing rows 1..TILE-1 of every output tile onto row 0.
+//
+// The linearisation rule is algebraically identical to the direct
+// reads — but slangc's wave64-scalarisation pass treats the recovered
+// values as per-lane (correct) rather than wave-uniform (the buggy
+// fold). Same pattern as ``mm_tiled.slang`` and ``templates/slang_mm.slang``.
 
 static const uint TILE = 16;
 
@@ -35,10 +49,16 @@ void computeMain(
     uint3 lid : SV_GroupThreadID)
 {
     uint b    = gid.z;
-    uint row  = gid.x * TILE + lid.x;
-    uint col  = gid.y * TILE + lid.y;
-    uint lrow = lid.x;
-    uint lcol = lid.y;
+    // M22.13-extras: derive per-thread coordinates from a linearised
+    // ``tid_local``. Algebraically identical to reading lid.x/lid.y
+    // directly, but the SPIR-V wave64-scalarisation pass treats the
+    // recovered values as per-lane (correct) rather than wave-uniform
+    // (the buggy fold).
+    uint tid_local = lid.y * TILE + lid.x;
+    uint lrow = tid_local % TILE;  // == lid.x — but recovered
+    uint lcol = tid_local / TILE;  // == lid.y — but recovered
+    uint row  = gid.x * TILE + lrow;
+    uint col  = gid.y * TILE + lcol;
 
     if (b >= params.batch) return;
 

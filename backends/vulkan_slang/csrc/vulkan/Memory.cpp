@@ -35,8 +35,7 @@ VulkanBuffer::VulkanBuffer(VmaAllocator allocator, VkDeviceSize size, BufferType
             break;
         case BufferType::HostVisible:
             alloc_ci.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-            alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                             VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
             break;
         case BufferType::Staging:
             alloc_ci.usage = VMA_MEMORY_USAGE_CPU_ONLY;
@@ -137,6 +136,9 @@ void VulkanBuffer::read(void* data, VkDeviceSize read_size, VkDeviceSize offset)
 
     void* ptr = nullptr;
     vmaMapMemory(allocator_, allocation_, &ptr);
+    // Invalidate the CPU cache for this range before reading so GPU/host
+    // writes are visible. A no-op on HOST_COHERENT memory; required on
+    // HOST_CACHED memory.
     vmaInvalidateAllocation(allocator_, allocation_, offset, read_size);
     std::memcpy(data, static_cast<const char*>(ptr) + offset, read_size);
     vmaUnmapMemory(allocator_, allocation_);

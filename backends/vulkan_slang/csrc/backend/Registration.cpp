@@ -2,6 +2,7 @@
 #include "../vulkan/Context.h"
 #include "../ops/ops.h"
 #include "../ops/dispatch.h"
+#include "MetaGuard.h"
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/native/CPUFallback.h>
@@ -14,6 +15,18 @@ namespace torch_vulkan {
 at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_blocking) {
     auto& alloc = VulkanAllocator::instance();
 
+    // A1 (2026-06-16): only skip genuinely-storageless (fake / meta) tensors.
+    // The previous ``get_buffer(self.data_ptr()) == nullptr → return`` guard
+    // was correct only for the H2D direction (self = Vulkan). For the D2H
+    // (Vulkan→CPU) direction ``self`` is the CPU *destination*, which never
+    // has a Vulkan buffer, so that guard silently skipped EVERY ``.cpu()``
+    // readback — leaving the CPU tensor uninitialized and corrupting all
+    // host-side results. Each direction below validates the buffer on its own
+    // Vulkan-side tensor instead.
+    if (is_null_storage(self) || is_null_storage(src)) {
+        return self;
+    }
+
     if (self.device().type() == c10::DeviceType::PrivateUse1 &&
         src.device().type() == c10::DeviceType::CPU) {
         // CPU → Vulkan (with dtype conversion if needed)
@@ -22,9 +35,18 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
             src_contig = src_contig.to(self.scalar_type());
         }
         auto* buf = alloc.get_buffer(self.data_ptr());
-        TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+        if (buf == nullptr) {
+            return self;
+        }
         buf->write(src_contig.data_ptr(),
                    static_cast<VkDeviceSize>(src_contig.nbytes()));
+        // Notify the dispatch layer that this buffer was host-written.
+        // The next dispatch_shader that reads it will emit a HOST→COMPUTE
+        // pipeline barrier (Vulkan spec §7.1.2: host writes require an
+        // explicit barrier to become visible in the GPU compute domain,
+        // even on HOST_COHERENT memory where vkFlushMappedMemoryRanges
+        // is not needed).
+        ops::notify_host_write(buf->buffer());
         return self;
     }
 
@@ -32,16 +54,35 @@ at::Tensor& vulkan_copy_(at::Tensor& self, const at::Tensor& src, bool non_block
         src.device().type() == c10::DeviceType::PrivateUse1) {
         // Note: VulkanBuffer::read() auto-flushes pending GPU work via callback
         // Vulkan → CPU (read raw bytes, then convert dtype on CPU if needed)
-        if (src.scalar_type() == self.scalar_type()) {
-            auto* buf = alloc.get_buffer(src.data_ptr());
-            TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+        //
+        // M18.9-followup (2026-05-24): guard against non-contiguous src.
+        // VulkanBuffer::read() copies raw bytes from the underlying VkBuffer
+        // and ignores stride / storage_offset.  All current Vulkan ops
+        // materialise a fresh contiguous buffer rather than creating metadata-
+        // only views (slicing, permuting, as_strided all run GPU shaders), so
+        // src.is_contiguous() is true in practice.  However, vulkan_view /
+        // vulkan_reshape do produce zero-copy views sharing the same storage,
+        // and future view ops could do the same.  The defensive contiguous()
+        // call costs nothing in the common case (one is_contiguous() check)
+        // and prevents silent data corruption if a non-contiguous src ever
+        // reaches this path.  .contiguous() on a Vulkan tensor routes through
+        // the Vulkan→Vulkan branch above, which uses dispatch_strided_copy to
+        // respect strides correctly before the host readback.
+        const at::Tensor& src_read = src.is_contiguous() ? src : src.contiguous();
+        if (src_read.scalar_type() == self.scalar_type()) {
+            auto* buf = alloc.get_buffer(src_read.data_ptr());
+            if (buf == nullptr) {
+                return self;  // fake / storageless src during tracing
+            }
             buf->read(self.data_ptr(),
                       static_cast<VkDeviceSize>(self.nbytes()));
         } else {
             // Read into a temp CPU tensor with src's dtype, then convert
-            auto tmp = at::empty(src.sizes(), src.options().device(c10::kCPU));
-            auto* buf = alloc.get_buffer(src.data_ptr());
-            TORCH_CHECK(buf, "Vulkan tensor has no backing buffer");
+            auto tmp = at::empty(src_read.sizes(), src_read.options().device(c10::kCPU));
+            auto* buf = alloc.get_buffer(src_read.data_ptr());
+            if (buf == nullptr) {
+                return self;  // fake / storageless src during tracing
+            }
             buf->read(tmp.data_ptr(),
                       static_cast<VkDeviceSize>(tmp.nbytes()));
             self.copy_(tmp);
@@ -87,14 +128,37 @@ at::Tensor vulkan_empty(
 
     auto dtype = dtype_opt.value_or(at::ScalarType::Float);
     auto device = device_opt.value_or(c10::Device(c10::DeviceType::PrivateUse1, 0));
+    // 2026-05-20: normalize unindexed ``vulkan`` (DeviceIndex == -1) to
+    // ``vulkan:0``. PyTorch's autograd engine cross-checks the gradient
+    // device against the parameter device exactly. If the user creates
+    // tensors via ``torch.randn(..., device="vulkan")`` they land with
+    // ``device.index == -1``, while every allocation we make goes to
+    // device 0 — the eventual ``CompiledFunctionBackward`` returns
+    // ``vulkan:0`` and trips
+    // ``RuntimeError: returned an invalid gradient ... expected device
+    //   vulkan but got vulkan:0``. Normalizing the user-supplied device
+    // index here, at the entry point to PrivateUse1 tensor creation,
+    // closes that mismatch class for every model and every input.
+    if (device.is_privateuseone() && device.index() < 0) {
+        device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    }
 
     auto nbytes = c10::elementSize(dtype);
     for (auto s : size) nbytes *= s;
 
+    // M22.9-followup: route storage allocation through the explicit-
+    // device ``VulkanAllocator::allocate(nbytes, device.index())``
+    // overload. The base ``allocate(nbytes)`` reads
+    // ``Context::current_device()`` which races under concurrent
+    // multi-GPU allocations; the explicit overload binds the storage
+    // to the requested device unconditionally.
     auto allocator = &VulkanAllocator::instance();
+    auto data_ptr = allocator->allocate(
+        static_cast<size_t>(nbytes), device.index());
     auto storage = c10::Storage(
         c10::Storage::use_byte_size_t(),
         static_cast<int64_t>(nbytes),
+        std::move(data_ptr),
         allocator,
         /*resizable=*/false);
 
@@ -108,6 +172,12 @@ at::Tensor vulkan_empty(
     // Set sizes and strides
     auto* impl = tensor.unsafeGetTensorImpl();
     impl->set_sizes_contiguous(size);
+
+    // M22.9: bind the requested device to the impl's dispatch keys.
+    // M22.9-followup: the allocator now also receives the device via
+    // the explicit overload above, so the storage's DataPtr-device
+    // matches what we stamp here.
+    impl->_change_backend_component_keys(device);
 
     return tensor;
 }
@@ -146,6 +216,29 @@ at::Tensor vulkan_copy_from(const at::Tensor& self, const at::Tensor& dst, bool 
     return dst_mut;
 }
 
+// ── set_.source_Storage (needed for AOT Autograd deepcopy) ──────
+at::Tensor& vulkan_set_source_storage(at::Tensor& self, c10::Storage source) {
+    // Metadata-only: reassign the storage of self to the given source.
+    // AOT Autograd calls this during copy.deepcopy(bw_module) to detach
+    // and reassign tensor storage for backward graph construction.
+    self.unsafeGetTensorImpl()->set_storage_keep_dtype(source);
+    return self;
+}
+
+// ── set_.source_Storage_storage_offset ─────────────────────────
+at::Tensor& vulkan_set_source_storage_offset(
+    at::Tensor& self,
+    c10::Storage source,
+    c10::SymInt storage_offset,
+    c10::SymIntArrayRef size,
+    c10::SymIntArrayRef stride) {
+    // Full metadata reassignment during AOT Autograd deepcopy of bw_module.
+    auto* impl = self.unsafeGetTensorImpl();
+    impl->set_storage_keep_dtype(source);
+    impl->set_sizes_and_strides(size, stride, storage_offset);
+    return self;
+}
+
 // ── empty_strided ───────────────────────────────────────────────
 at::Tensor vulkan_empty_strided(
     c10::IntArrayRef size,
@@ -154,9 +247,60 @@ at::Tensor vulkan_empty_strided(
     std::optional<at::Layout> layout_opt,
     std::optional<at::Device> device_opt,
     std::optional<bool> pin_memory_opt) {
-    // For now, ignore strides and create contiguous
-    return vulkan_empty(size, dtype_opt, layout_opt, device_opt,
-                        pin_memory_opt, c10::MemoryFormat::Contiguous);
+    // TRAIN.1: Create a tensor with the exact requested strides.
+    // The inductor's kernel codegen uses these strides to compute
+    // load/store memory offsets, so the tensor metadata MUST match
+    // what the kernels expect.
+    auto dtype = dtype_opt.value_or(at::ScalarType::Float);
+    auto device = device_opt.value_or(c10::Device(c10::DeviceType::PrivateUse1, 0));
+    // 2026-05-20: normalize unindexed ``vulkan`` (DeviceIndex == -1) to
+    // ``vulkan:0`` — see ``vulkan_empty`` for rationale.
+    if (device.is_privateuseone() && device.index() < 0) {
+        device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    }
+
+    // Compute the required storage size: max linear offset + 1.
+    // For a tensor with shape (d0,...,dn) and strides (s0,...,sn),
+    // the maximum offset is sum((di-1)*si) for all dimensions.
+    // We also handle the case where strides are < 0 by taking the min offset.
+    int64_t max_offset = 0;
+    int64_t min_offset = 0;
+    for (size_t i = 0; i < size.size(); i++) {
+        int64_t end_offset = (size[i] - 1) * stride[i];
+        if (end_offset > 0) max_offset += end_offset;
+        else min_offset += end_offset;
+    }
+    int64_t num_elements = max_offset - min_offset + 1;
+    auto nbytes = c10::elementSize(dtype) * num_elements;
+    if (nbytes <= 0) nbytes = c10::elementSize(dtype);  // scalar or empty
+
+    // M22.9-followup: explicit-device allocator path (see `vulkan_empty`
+    // above for rationale).
+    auto allocator = &VulkanAllocator::instance();
+    auto data_ptr = allocator->allocate(
+        static_cast<size_t>(nbytes), device.index());
+    auto storage = c10::Storage(
+        c10::Storage::use_byte_size_t(),
+        static_cast<int64_t>(nbytes),
+        std::move(data_ptr),
+        allocator,
+        /*resizable=*/false);
+
+    auto type_meta = caffe2::TypeMeta::fromScalarType(dtype);
+
+    auto tensor = at::detail::make_tensor<c10::TensorImpl>(
+        std::move(storage),
+        c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+        type_meta);
+
+    // Set sizes AND custom strides (not set_sizes_contiguous).
+    auto* impl = tensor.unsafeGetTensorImpl();
+    impl->set_sizes_and_strides(size, stride);
+
+    // M22.9: same device-binding fix as `vulkan_empty` — see comment there.
+    impl->_change_backend_component_keys(device);
+
+    return tensor;
 }
 
 // ── zero_ ───────────────────────────────────────────────────────
@@ -211,13 +355,10 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_batch_norm_adapter(
     return std::make_tuple(result, at::Tensor(), at::Tensor());
 }
 
-// native_group_norm has different signature in 2.10
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_group_norm_adapter(
-    const at::Tensor& input, const std::optional<at::Tensor>& weight_opt,
-    const std::optional<at::Tensor>& bias_opt,
-    int64_t N, int64_t C, int64_t HxW, int64_t group, double eps) {
-    return ops::vulkan_group_norm(input, group, weight_opt, bias_opt, eps);
-}
+// M22.12: `vulkan_group_norm_adapter` (int64_t N/C/HxW variant) deleted —
+// dead refactor leftover. The registered group_norm adapter is
+// `vulkan_group_norm_symint_adapter` (SymInt N/C/HxW), which the dispatcher
+// wires up at line ~926.
 
 // scaled_dot_product_attention: PyTorch 2.10 adds `bool enable_gqa`
 static at::Tensor vulkan_sdpa_adapter(
@@ -243,13 +384,12 @@ static at::Tensor vulkan_nll_loss_backward_adapter(
                                           ignore_index.expect_int(), total_weight);
 }
 
-// cross_entropy_loss: ignore_index is SymInt in 2.10
-static at::Tensor vulkan_cross_entropy_loss_adapter(
-    const at::Tensor& self, const at::Tensor& target,
-    const std::optional<at::Tensor>& weight, int64_t reduction,
-    c10::SymInt ignore_index, double label_smoothing) {
-    return ops::vulkan_cross_entropy_loss(self, target, weight, reduction, ignore_index.expect_int(), label_smoothing);
-}
+// M22.12: `vulkan_cross_entropy_loss_adapter` deleted — see the
+// "NOTE: cross_entropy_loss NOT registered" comment near `m.impl(...)` for
+// nll_loss below. PyTorch decomposes cross_entropy_loss via
+// CompositeImplicitAutograd into log_softmax + nll_loss, so we never bind
+// an adapter for the fused op directly. The `ops::vulkan_cross_entropy_loss`
+// underlying function is still callable from other paths if needed.
 
 // convolution_overrideable: the actual dispatch point for conv1d/conv2d/conv_transpose2d
 static at::Tensor vulkan_convolution_overrideable_adapter(
@@ -286,8 +426,14 @@ static at::Tensor vulkan_convolution_overrideable_adapter(
         TORCH_CHECK(s.size() == 3 && p.size() == 3 && d.size() == 3,
                     "conv3d: expected 3D stride/padding/dilation");
 
-        int64_t N = input.size(0), C_in = input.size(1);
-        int64_t D = input.size(2), H = input.size(3), W = input.size(4);
+        // M22.10: only the temporal extent `D` of the input is used in
+        // this scope (for the D_out formula and the t_in bounds check).
+        // The batch (`N`), input-channel (`C_in`), and spatial (`H`,
+        // `W`) extents are derived inside the inner ops::vulkan_conv2d
+        // call from the slice it receives; locals for them were stale
+        // refactor leftovers — see the -Wunused-variable warnings in
+        // `agent_space/full_rebuild_2026_05_18.log`.
+        int64_t D = input.size(2);
         int64_t C_out = weight.size(0);
         int64_t kD = weight.size(2);
         int64_t sD = s[0], sH = s[1], sW = s[2];
@@ -351,12 +497,38 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_convolution_backwar
     c10::SymIntArrayRef dilation, bool transposed,
     c10::SymIntArrayRef output_padding, c10::SymInt groups,
     std::array<bool, 3> output_mask) {
-    // CPU fallback for convolution backward
-    // Must convert to f32 for CPU backward (f16/bf16 not well-supported on CPU)
+    // CPU fallback for convolution backward.
+    // Must convert to f32 for CPU backward (f16/bf16 not well-supported on CPU).
+    //
+    // M18.9 (2026-05-18): under ``torch.compile``, Inductor's wrapper
+    // routinely passes ``reinterpret_tensor`` views (non-contiguous, e.g.
+    // permuted-stride views of saved-for-backward tensors) into the
+    // ``extern_kernels.conv2d_backward(...)`` call that lands here via
+    // ``aten.convolution_backward.default``. The Vulkan→CPU copy path
+    // in ``vulkan_copy_`` (see ``Registration.cpp:31-50``) reads
+    // ``self.nbytes()`` raw bytes from the underlying buffer, ignoring
+    // stride / storage_offset — so a non-contiguous Vulkan view
+    // materialises to a CPU tensor with the WRONG element ordering,
+    // and ``at::convolution_backward(grad_cpu, input_cpu, weight_cpu,
+    // ...)`` then computes valid CPU math on garbage data, producing
+    // wrong-magnitude gradients (audit numbers: conv.weight ratio 0.60,
+    // conv.bias 5.66 in the conv+GN compile path; conv-only ratio
+    // 0.08 in ``test_conv_compile_backward_matches_cpu``).
+    //
+    // Same bug class as M22.13: ``reinterpret_tensor`` views breaking
+    // C++ kernels when called from the compile path. Same fix pattern:
+    // materialise to a contiguous Vulkan tensor BEFORE the .cpu()
+    // copy. ``.contiguous()`` on Vulkan routes through
+    // ``vulkan_contiguous`` → ``dispatch_strided_copy`` which respects
+    // stride correctly, producing a fresh row-major buffer that
+    // ``.cpu()`` then reads byte-for-byte without mis-interpretation.
     auto orig_dtype = grad_output.scalar_type();
-    auto grad_cpu = grad_output.cpu().to(at::kFloat);
-    auto input_cpu = input.cpu().to(at::kFloat);
-    auto weight_cpu = weight.cpu().to(at::kFloat);
+    auto grad_contig = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    auto input_contig = input.is_contiguous() ? input : input.contiguous();
+    auto weight_contig = weight.is_contiguous() ? weight : weight.contiguous();
+    auto grad_cpu = grad_contig.cpu().to(at::kFloat);
+    auto input_cpu = input_contig.cpu().to(at::kFloat);
+    auto weight_cpu = weight_contig.cpu().to(at::kFloat);
     auto result = at::convolution_backward(
         grad_cpu, input_cpu, weight_cpu,
         /*bias_sizes_opt=*/output_mask[2] ? std::optional<c10::IntArrayRef>(c10::IntArrayRef{weight.size(0)}) : std::nullopt,
@@ -369,16 +541,13 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_convolution_backwar
         output_mask[2] ? std::get<2>(result).to(orig_dtype).to(dev) : at::Tensor());
 }
 
-// convolution: intercept before _convolution decomposition to handle None bias
-static at::Tensor vulkan_convolution_adapter(
-    const at::Tensor& input, const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_opt,
-    c10::SymIntArrayRef stride, c10::SymIntArrayRef padding,
-    c10::SymIntArrayRef dilation, bool transposed,
-    c10::SymIntArrayRef output_padding, c10::SymInt groups) {
-    return vulkan_convolution_overrideable_adapter(
-        input, weight, bias_opt, stride, padding, dilation, transposed, output_padding, groups);
-}
+// M22.12: `vulkan_convolution_adapter` (aten::convolution interceptor)
+// deleted — dead refactor leftover. It was a trampoline into
+// `vulkan_convolution_overrideable_adapter`. We register the
+// overrideable adapter directly against `convolution_overrideable`
+// at line ~941, which is the canonical hook for PrivateUse1 conv
+// dispatch in PyTorch 2.10+. There's no plain `aten::convolution`
+// binding (PyTorch decomposes it before reaching the dispatcher).
 
 // upsample_nearest2d: SymInt output_size in 2.10
 static at::Tensor vulkan_upsample_nearest2d_adapter(
@@ -572,45 +741,6 @@ static at::Tensor vulkan_eye_m_adapter(
     return ops::vulkan_eye_m(n.expect_int(), m.expect_int(), dtype_opt, layout_opt, device_opt, pin_memory_opt);
 }
 
-// triu/tril: SymInt diagonal in 2.10
-static at::Tensor vulkan_triu_adapter(const at::Tensor& self, c10::SymInt diagonal) {
-    return ops::vulkan_triu(self, diagonal.expect_int());
-}
-static at::Tensor vulkan_tril_adapter(const at::Tensor& self, c10::SymInt diagonal) {
-    return ops::vulkan_tril(self, diagonal.expect_int());
-}
-
-// repeat: SymInt repeats in 2.10
-static at::Tensor vulkan_repeat_adapter(const at::Tensor& self, c10::SymIntArrayRef repeats) {
-    return ops::vulkan_repeat(self, symint_to_int(repeats));
-}
-
-// repeat_interleave: SymInt repeats in 2.10
-static at::Tensor vulkan_repeat_interleave_self_int_adapter(
-    const at::Tensor& self, c10::SymInt repeats,
-    std::optional<int64_t> dim, std::optional<c10::SymInt> output_size) {
-    std::optional<int64_t> os;
-    if (output_size.has_value()) os = output_size->expect_int();
-    return ops::vulkan_repeat_interleave_self_int(self, repeats.expect_int(), dim, os);
-}
-
-// constant_pad_nd: SymInt pad in 2.10
-static at::Tensor vulkan_constant_pad_nd_adapter(
-    const at::Tensor& self, c10::SymIntArrayRef pad, const at::Scalar& value) {
-    return ops::vulkan_constant_pad_nd(self, symint_to_int(pad), value);
-}
-
-// narrow: SymInt start/length in 2.10
-static at::Tensor vulkan_narrow_adapter(const at::Tensor& self, int64_t dim,
-    c10::SymInt start, c10::SymInt length) {
-    return ops::vulkan_narrow(self, dim, start.expect_int(), length.expect_int());
-}
-
-// _unsafe_view: SymInt size in 2.10
-static at::Tensor vulkan_unsafe_view_adapter(const at::Tensor& self, c10::SymIntArrayRef size) {
-    return ops::vulkan_unsafe_view(self, symint_to_int(size));
-}
-
 // _to_copy: SymInt-aware in 2.10
 static at::Tensor vulkan_to_copy_adapter(const at::Tensor& self,
     std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
@@ -634,40 +764,22 @@ static const at::Tensor& vulkan_resize_adapter(const at::Tensor& self,
     return ops::vulkan_resize_(self, symint_to_int(size), memory_format);
 }
 
-// roll: SymInt in 2.10
-static at::Tensor vulkan_roll_adapter(const at::Tensor& self,
-    c10::SymIntArrayRef shifts, at::IntArrayRef dims) {
-    return ops::vulkan_roll(self, symint_to_int(shifts), dims);
-}
-
 // topk: SymInt k in 2.10
 static std::tuple<at::Tensor, at::Tensor> vulkan_topk_adapter(
     const at::Tensor& self, c10::SymInt k, int64_t dim, bool largest, bool sorted) {
     return ops::vulkan_topk(self, k.expect_int(), dim, largest, sorted);
 }
 
-// embedding autograd adapter (SymInt padding_idx)
-static at::Tensor vulkan_embedding_autograd_adapter(
-    const at::Tensor& weight, const at::Tensor& indices,
-    c10::SymInt padding_idx, bool scale_grad_by_freq, bool sparse) {
-    return ops::vulkan_embedding_autograd(weight, indices, padding_idx.expect_int(), scale_grad_by_freq, sparse);
-}
-
-// layer_norm autograd adapter (SymInt normalized_shape)
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_layer_norm_autograd_adapter(
-    const at::Tensor& input, c10::SymIntArrayRef normalized_shape,
-    const std::optional<at::Tensor>& weight_opt, const std::optional<at::Tensor>& bias_opt,
-    double eps) {
-    return ops::vulkan_layer_norm_autograd(input, symint_to_int(normalized_shape), weight_opt, bias_opt, eps);
-}
-
-// group_norm autograd adapter (SymInt N/C/HxW)
-static std::tuple<at::Tensor, at::Tensor, at::Tensor> vulkan_group_norm_autograd_symint_adapter(
-    const at::Tensor& input, const std::optional<at::Tensor>& weight_opt,
-    const std::optional<at::Tensor>& bias_opt,
-    c10::SymInt N, c10::SymInt C, c10::SymInt HxW, int64_t group, double eps) {
-    return ops::vulkan_group_norm_autograd(input, group, weight_opt, bias_opt, eps);
-}
+// M22.12: deleted three dead autograd-namespace adapters here —
+// `vulkan_embedding_autograd_adapter`,
+// `vulkan_layer_norm_autograd_adapter`, and
+// `vulkan_group_norm_autograd_symint_adapter`. None of them were ever
+// reached: the registered autograd dispatch wires up
+// `vulkan_convolution_overrideable_autograd_adapter` (just below) plus the
+// non-autograd plain adapters that already live in
+// `TORCH_LIBRARY_IMPL(aten, PrivateUse1, m)`. The underlying
+// `ops::vulkan_*_autograd` implementations they wrapped are still in use
+// from `csrc/ops/autograd_ops.cpp` and are not affected by these deletions.
 
 // convolution_overrideable autograd adapter
 static at::Tensor vulkan_convolution_overrideable_autograd_adapter(
@@ -714,6 +826,20 @@ static at::Tensor vulkan_sdpa_autograd_adapter(
     return ops::vulkan_sdpa_autograd(query, key, value, attn_mask, dropout_p, is_causal, scale);
 }
 
+// _fft_c2c: SymInt[] dim in 2.10 — convert to IntArrayRef
+static at::Tensor vulkan_fft_c2c_adapter(
+    const at::Tensor& self, c10::SymIntArrayRef dim,
+    int64_t normalization, bool forward) {
+    return ops::vulkan_fft_c2c(self, symint_to_int(dim), normalization, forward);
+}
+
+// _fft_c2r: SymInt last_dim_size in 2.10 — convert to int64_t
+static at::Tensor vulkan_fft_c2r_adapter(
+    const at::Tensor& self, at::IntArrayRef dim,
+    int64_t normalization, c10::SymInt last_dim_size) {
+    return ops::vulkan_fft_c2r(self, dim, normalization, last_dim_size.expect_int());
+}
+
 // arange.default: only end param
 static at::Tensor vulkan_arange_default_adapter(
     const at::Scalar& end,
@@ -741,6 +867,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("fill_.Scalar", vulkan_fill_scalar);
     m.impl("_copy_from_and_resize", vulkan_copy_from_and_resize);
     m.impl("_copy_from", vulkan_copy_from);
+    m.impl("set_.source_Storage", vulkan_set_source_storage);
+    m.impl("set_.source_Storage_storage_offset", vulkan_set_source_storage_offset);
     m.impl("zero_", vulkan_zero_);
     m.impl("clone", ops::vulkan_clone);
     m.impl("_local_scalar_dense", vulkan_local_scalar_dense);
@@ -776,6 +904,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("log", ops::vulkan_log);
     m.impl("sqrt", ops::vulkan_sqrt);
     m.impl("rsqrt", ops::vulkan_rsqrt);
+    // TRAIN.9 (2026-05-27): reciprocal required by clip_grad_norm_ which
+    // calls `max_norm / (total_norm + 1e-6)` → __rdiv__ → self.reciprocal()
+    // Without this, any training loop with gradient clipping crashes.
+    m.impl("reciprocal", ops::vulkan_reciprocal);
+    m.impl("reciprocal.out", ops::vulkan_reciprocal_out);
     m.impl("ceil", ops::vulkan_ceil);
     m.impl("floor", ops::vulkan_floor);
     m.impl("round", ops::vulkan_round);
@@ -801,6 +934,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Activations
     m.impl("relu", ops::vulkan_relu);
     m.impl("relu_", ops::vulkan_relu_);
+    // C1: threshold forward — required for inductor relu decomposition.
+    m.impl("threshold", ops::vulkan_threshold);
     m.impl("sigmoid", ops::vulkan_sigmoid);
     m.impl("tanh", ops::vulkan_tanh);
     m.impl("gelu", ops::vulkan_gelu);
@@ -832,6 +967,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("mean.dim", ops::vulkan_mean);
     m.impl("amax", ops::vulkan_amax);
     m.impl("amin", ops::vulkan_amin);
+    m.impl("max", ops::vulkan_max);
+    m.impl("min", ops::vulkan_min);
     m.impl("max.dim", ops::vulkan_max_dim);
     m.impl("min.dim", ops::vulkan_min_dim);
     m.impl("prod.dim_int", ops::vulkan_prod);
@@ -857,7 +994,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("t", ops::vulkan_t);
     m.impl("expand", vulkan_expand_adapter);
     m.impl("cat", ops::vulkan_cat);
-    m.impl("narrow", vulkan_narrow_adapter);
+    // NOTE: narrow decomposes to slice — no PrivateUse1 registration needed.
     m.impl("select.int", vulkan_select_adapter);
     m.impl("slice.Tensor", vulkan_slice_adapter);
     m.impl("split.Tensor", vulkan_split_adapter);
@@ -889,8 +1026,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
     // BLAS
     m.impl("mm", ops::vulkan_mm);
+    m.impl("mm.out", ops::vulkan_mm_out);
     m.impl("addmm", ops::vulkan_addmm);
+    m.impl("addmm.out", ops::vulkan_addmm_out);
     m.impl("bmm", ops::vulkan_bmm);
+    m.impl("bmm.out", ops::vulkan_bmm_out);
     m.impl("linear", ops::vulkan_linear);
     m.impl("_scaled_mm", ops::vulkan_scaled_mm);
 
@@ -899,8 +1039,6 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("nll_loss_backward", vulkan_nll_loss_backward_adapter);
     // NOTE: cross_entropy_loss NOT registered — let PyTorch decompose via
     // CompositeImplicitAutograd into log_softmax + nll_loss for proper autograd backward
-    m.impl("mse_loss", ops::vulkan_mse_loss);
-    m.impl("mse_loss_backward", ops::vulkan_mse_loss_backward);
     m.impl("binary_cross_entropy", ops::vulkan_binary_cross_entropy);
     m.impl("binary_cross_entropy_backward", ops::vulkan_binary_cross_entropy_backward);
     m.impl("binary_cross_entropy_with_logits", ops::vulkan_binary_cross_entropy_with_logits);
@@ -965,24 +1103,12 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("_foreach_lerp_.Scalar", ops::vulkan_foreach_lerp_);
     m.impl("_foreach_maximum.List", ops::vulkan_foreach_maximum);
 
-    // AMP ops
-    m.impl("_amp_foreach_non_finite_check_and_unscale_",
-           ops::vulkan_amp_non_finite_check_and_unscale_);
-    m.impl("_amp_update_scale_", ops::vulkan_amp_update_scale_);
-
     // Additional unary ops
-    m.impl("reciprocal", ops::vulkan_reciprocal);
-    m.impl("sin", ops::vulkan_sin);
-    m.impl("cos", ops::vulkan_cos);
     m.impl("tan", ops::vulkan_tan);
     m.impl("atan", ops::vulkan_atan);
     m.impl("log2", ops::vulkan_log2);
     m.impl("log10", ops::vulkan_log10);
     m.impl("log1p", ops::vulkan_log1p);
-    m.impl("logical_not", ops::vulkan_logical_not);
-    m.impl("bitwise_not", ops::vulkan_bitwise_not);
-    m.impl("bitwise_and.Tensor_out", ops::vulkan_bitwise_and_out);
-    m.impl("random_.from", ops::vulkan_random_from);
 
     // Check ops
     m.impl("isnan", ops::vulkan_isnan);
@@ -991,21 +1117,39 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Additional binary ops
     m.impl("atan2", ops::vulkan_atan2);
 
-    // Phase 3: Model coverage ops
-    m.impl("triu", vulkan_triu_adapter);
-    m.impl("tril", vulkan_tril_adapter);
-    m.impl("constant_pad_nd", vulkan_constant_pad_nd_adapter);
-    m.impl("index.Tensor", ops::vulkan_index_tensor);
-    m.impl("repeat", vulkan_repeat_adapter);
-    m.impl("repeat_interleave.self_int", vulkan_repeat_interleave_self_int_adapter);
-    m.impl("stack", ops::vulkan_stack);
-    m.impl("erf", ops::vulkan_erf);
-    m.impl("erf_", ops::vulkan_erf_);
-    m.impl("flip", ops::vulkan_flip);
-    m.impl("roll", vulkan_roll_adapter);
-    m.impl("_unsafe_view", vulkan_unsafe_view_adapter);
+    // Legacy eager-only ops (M16: model_ops.cpp → legacy_eager.cpp)
+    m.impl("_to_copy", vulkan_to_copy_adapter);
     m.impl("as_strided", vulkan_as_strided_adapter);
     m.impl("resize_", vulkan_resize_adapter);
+
+    // FFT (OP.4-eager-followup) — eager FFT path on Vulkan.
+    // Inductor `make_fallback` lowerings in lowerings/fft.py also depend on these
+    // PrivateUse1 implementations being live. Numerical-parity tests in
+    // tests/test_fft_svd.py and the two skipif-gated cases in TestFftLowerings
+    // activate once these are registered.
+    m.impl("_fft_r2c", ops::vulkan_fft_r2c);
+    m.impl("_fft_c2c", vulkan_fft_c2c_adapter);
+    m.impl("_fft_c2r", vulkan_fft_c2r_adapter);
+
+    // OP.4-fft-followup-2: view_as_complex / view_as_real — pure metadata views.
+    // These reinterpret a tensor's storage between real `[..., 2]` and complex
+    // `[...]` shapes (no data movement; just dtype + shape change). They're the
+    // next link in the FFT decomposition chain after _fft_r2c/_fft_c2c/_fft_c2r.
+    //
+    // Path 1: reuse upstream's backend-agnostic view impl (`at::native::*` from
+    // ATen/native/ComplexHelper.h, exported as TORCH_API by libtorch_cpu.so).
+    // It builds a VIEW TensorImpl over our existing storage and key_set so the
+    // resulting tensor stays on PrivateUse1 — no Vulkan-specific code needed.
+    m.impl("view_as_complex", &at::native::view_as_complex);
+    m.impl("view_as_real", &at::native::view_as_real);
+
+    // _linalg_svd(A, full_matrices, compute_uv, *, driver=None) -> (U, S, Vh)
+    // GPU Jacobi forward; compute_uv=false returns empty U/Vh placeholders.
+    m.impl("_linalg_svd", &ops::vulkan_linalg_svd);
+
+    // OP.1.a-fast: nonzero — GPU-native two-pass scan for Vulkan float tensors.
+    // Falls back to CPU roundtrip for non-Vulkan or non-float inputs.
+    m.impl("nonzero", ops::vulkan_nonzero);
 
     // Missing registrations for implemented ops
     m.impl("masked_scatter_", ops::vulkan_masked_scatter_);
@@ -1031,6 +1175,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("softplus_backward", ops::vulkan_softplus_backward);
     m.impl("mish_backward", ops::vulkan_mish_backward);
     m.impl("avg_pool2d_backward", ops::vulkan_avg_pool2d_backward);
+    m.impl("_adaptive_avg_pool2d_backward", ops::vulkan_adaptive_avg_pool2d_backward);
     m.impl("max_pool2d_with_indices", ops::vulkan_max_pool2d_with_indices);
     m.impl("max_pool2d_with_indices_backward", ops::vulkan_max_pool2d_with_indices_backward);
     m.impl("embedding_dense_backward", ops::vulkan_embedding_dense_backward);

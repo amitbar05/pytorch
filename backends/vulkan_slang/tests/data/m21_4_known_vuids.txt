@@ -1,0 +1,13 @@
+# M21.4 — known/accepted VUIDs for the validation stress harness.
+#
+# Each non-comment / non-empty line is a VUID name (e.g. ``VUID-foo-bar-01234``)
+# that the stress harness should NOT fail on. Lines starting with ``#`` are
+# comments — use them to justify why the VUID was accepted (e.g. "driver bug
+# X, tracked at Y").
+#
+# Format:
+#   <VUID-name>  # optional justification
+#
+# Empty by default — every VUID surfaced by the harness must be triaged into
+# either (a) a real bug → file as a new roadmap item, or (b) accepted-pending
+# → add a line here with justification.

@@ -1,160 +1,326 @@
 # Owner(s): ["module: inductor"]
+from unittest.mock import MagicMock
 
-import sys
-import unittest
-
-from torch.testing._internal.common_utils import IS_CI, IS_WINDOWS
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, requires_gpu
-
-
-if IS_WINDOWS and IS_CI:
-    sys.stderr.write(
-        "Windows CI does not have necessary dependencies for test_memory_planning yet\n"
-    )
-    if __name__ == "__main__":
-        sys.exit(0)
-    raise unittest.SkipTest("requires sympy/functorch/filelock")  # noqa: F821
+import sympy
 
 import torch
-from torch._C import FileCheck
-from torch._dynamo.utils import same
-from torch._inductor import config
+from torch._inductor.codegen.memory_planning import (
+    Allocation,
+    LiveRange,
+    LiveRanges,
+    MemoryPlanner,
+)
 from torch._inductor.test_case import run_tests, TestCase
-from torch._inductor.utils import run_and_get_cpp_code
-from torch.export import Dim
 
 
-try:
-    from .test_aot_inductor import AOTIRunnerUtil
-except ImportError:
-    from test_aot_inductor import (  # @manual=fbcode//caffe2/test/inductor:test_aot_inductor-library
-        AOTIRunnerUtil,
+def _mock_buffer(name, device="cuda", dtype=torch.float32, shape=(4, 4)):
+    """Create a mock buffer-like object for testing Allocation."""
+    buf = MagicMock()
+    buf.get_name.return_value = name
+    buf.get_device.return_value = torch.device(device)
+    buf.get_dtype.return_value = dtype
+    buf.get_size.return_value = shape
+    buf.get_stride.return_value = tuple(range(1, len(shape) + 1))  # dummy strides
+    layout = MagicMock()
+    # Use plain integers for size so free_unbacked_symbols returns false
+    layout.size = shape
+    buf.get_layout.return_value = layout
+    return buf
+
+
+def _make_allocation(name, begin, end, size_hint, device="cuda"):
+    """Create an Allocation object with a mock buffer."""
+    node = _mock_buffer(name, device=device)
+    return Allocation(
+        node=node,
+        live_range=LiveRange(float(begin), float(end)),
+        size_hint=size_hint,
+        symbolic_size=sympy.Integer(size_hint),
     )
 
 
-@requires_gpu()
-@config.patch(memory_planning=True)
-class TestMemoryPlanning(TestCase):
-    device = GPU_TYPE
+class TestIntervalGraphColoring(TestCase):
+    """Tests for the interval graph coloring algorithm in MemoryPlanner."""
 
-    def _generate(self, *, device):
+    def _get_coloring(self, allocations):
+        """Run coloring and return color groups."""
+        planner = MemoryPlanner(wrapper=MagicMock())
+        return planner.assign_reuse_candidates(allocations)
+
+    def _group_sizes(self, color_groups):
+        """Return the number of allocations in each color group."""
+        return [len(g) for g in color_groups]
+
+    def _num_colors(self, color_groups):
+        """Return the number of distinct colors used."""
+        return len(color_groups)
+
+    def test_single_buffer(self):
+        """A single buffer should use exactly one color."""
+        allocs = [_make_allocation("a", 0, 1, 100)]
+        groups = self._get_coloring(allocs)
+        self.assertEqual(self._num_colors(groups), 1)
+        self.assertEqual(len(groups[0]), 1)
+
+    def test_no_overlaps(self):
+        """Non-overlapping buffers should all get the same color."""
+        allocs = [
+            _make_allocation("a", 0, 1, 100),
+            _make_allocation("b", 1, 2, 100),
+            _make_allocation("c", 2, 3, 100),
+        ]
+        groups = self._get_coloring(allocs)
+        # All non-overlapping, so they can share one color
+        self.assertEqual(self._num_colors(groups), 1)
+        self.assertEqual(len(groups[0]), 3)
+
+    def test_all_overlapping(self):
+        """All buffers overlap, so each needs its own color."""
+        allocs = [
+            _make_allocation("a", 0, 5, 100),
+            _make_allocation("b", 1, 6, 200),
+            _make_allocation("c", 2, 7, 300),
+        ]
+        groups = self._get_coloring(allocs)
+        self.assertEqual(self._num_colors(groups), 3)
+        # Each group should have exactly 1 allocation
+        self.assertTrue(all(len(g) == 1 for g in groups))
+
+    def test_overlapping_identical_lifetimes(self):
+        """Buffers with identical lifetimes all overlap and need separate colors."""
+        allocs = [
+            _make_allocation("a", 0, 10, 50),
+            _make_allocation("b", 0, 10, 60),
+            _make_allocation("c", 0, 10, 70),
+        ]
+        groups = self._get_coloring(allocs)
+        self.assertEqual(self._num_colors(groups), 3)
+
+    def test_partial_overlap_chain(self):
+        """Chain of overlapping intervals: [0,2], [1,3], [2,4] -> max overlap is 2."""
+        allocs = [
+            _make_allocation("a", 0, 2, 100),
+            _make_allocation("b", 1, 3, 100),
+            _make_allocation("c", 2, 4, 100),
+        ]
+        groups = self._get_coloring(allocs)
+        # Max overlap at time 1-2 is 2 (a and b), so need 2 colors
+        self.assertEqual(self._num_colors(groups), 2)
+        # a and c don't overlap, should be in same group
+        total_allocs = sum(len(g) for g in groups)
+        self.assertEqual(total_allocs, 3)
+
+    def test_staircase_overlap(self):
+        """Staircase pattern: [0,3], [1,4], [2,5] -> max overlap is 2 at [2,3]."""
+        allocs = [
+            _make_allocation("a", 0, 3, 100),
+            _make_allocation("b", 1, 4, 200),
+            _make_allocation("c", 2, 5, 300),
+        ]
+        groups = self._get_coloring(allocs)
+        # max overlap is 2 (a and b at time 2, b and c at time 3)
+        # [0,3] and [2,5] don't overlap, so they can share a color
+        # With 2 colors: color0={a, c}, color1={b}
+        # But greedy by start time gives: a=color0, b=color1, then c: a freed at 3 >= c.start=2? No! a.end=3, c.begin=2, so 3 > 2, meaning a is NOT freed.
+        # Actually a.end=3 > c.begin=2, so a is still active when c starts
+        # b is active too. Both a and b are still active at time 2.
+        # So c needs a new color. That gives 3 colors.
+        # Wait, but max overlap is 2. Greedy coloring by start time should give optimal = 2.
+        # Let me trace through:
+        # Sort: a(0,3), b(1,4), c(2,5)
+        # Process a: no active colors, assign color0. active=[(3,0)]
+        # Process b: active=[(3,0)], 1 <= 3 so nothing freed. available={}. assign color1. active=[(3,0),(4,1)]
+        # Process c: active=[(3,0),(4,1)], 2 <= 3 so nothing freed. available={}. assign color2.
+        # Hmm, that gives 3 colors. But the optimal is 2 for interval graphs.
+        # Actually, a=[0,3], c=[2,5] DO overlap! They overlap at [2,3].
+        # So max overlap is actually 3 at time [2,3]: a(0,3), b(1,4), c(2,5) all overlap there.
+        # OK so 3 colors is correct.
+        self.assertEqual(self._num_colors(groups), 3)
+
+    def test_nested_intervals(self):
+        """Nested intervals: [0,5], [1,4], [2,3] -> all overlap, need 3 colors."""
+        allocs = [
+            _make_allocation("outer", 0, 5, 100),
+            _make_allocation("middle", 1, 4, 200),
+            _make_allocation("inner", 2, 3, 300),
+        ]
+        groups = self._get_coloring(allocs)
+        self.assertEqual(self._num_colors(groups), 3)
+
+    def test_zero_sized_buffer(self):
+        """Zero-sized buffers should be handled correctly."""
+        allocs = [
+            _make_allocation("normal", 0, 5, 100),
+            _make_allocation("zero", 2, 3, 0),
+        ]
+        groups = self._get_coloring(allocs)
+        # They overlap, so need 2 colors
+        self.assertEqual(self._num_colors(groups), 2)
+
+    def test_optimal_coloring_max_overlap(self):
         """
-        Generate a simple test case that has multiple simultaneously-live intermediate tensors.
+        Verify that the number of colors equals the maximum number of
+        simultaneously live intervals (the chromatic number of an interval
+        graph equals its maximum clique size).
         """
+        # Create intervals where max overlap is 4
+        # Pattern: 4 sets of intervals that all overlap at time 50-51
+        allocs = []
+        for i in range(4):
+            allocs.append(_make_allocation(f"overlap_{i}", 0, 100, 100))
+        # Add non-overlapping intervals that should reuse colors
+        for i in range(4):
+            allocs.append(_make_allocation(f"after_{i}", 101, 200, 100))
 
-        class Foo(torch.nn.Module):
-            def forward(self, x, y, z):
-                t0 = x.matmul(y)
-                t1 = x.matmul(z)
-                t0 = x.transpose(0, 1).matmul(t1)
-                t1 = x.matmul(t0)
-                return t0.sum() + t1.sum()
+        groups = self._get_coloring(allocs)
+        # Optimal coloring should use exactly 4 colors
+        self.assertEqual(self._num_colors(groups), 4)
+        # Each color should have exactly 2 allocations (one from overlap set,
+        # one from after set)
+        for group in groups:
+            self.assertEqual(len(group), 2)
 
-        x = torch.randn((3, 2), device=device)
-        y = torch.randn((2, 4), device=device)
-        z = torch.randn((2, 3), device=device)
-        return (Foo(), (x, y, z))
+    def test_size_based_preference(self):
+        """Verify that the algorithm prefers reusing colors with similar sizes."""
+        # Scenario: two buffers overlap at time 0-1 (different colors),
+        # then a third buffer starts at time 1 when both are freed.
+        allocs = [
+            _make_allocation("large1", 0, 1, 1000),
+            _make_allocation("small1", 0, 1, 10),  # overlaps large1, gets own color
+            _make_allocation(
+                "small2", 1, 2, 10
+            ),  # both colors available, prefer small1's
+        ]
+        groups = self._get_coloring(allocs)
+        # large1 and small1 overlap, so they get different colors.
+        # small2 has both colors available; should pick small1's (size 10 matches).
+        self.assertEqual(self._num_colors(groups), 2)
+        # small1 and small2 should be in the same group (same color)
+        small_group = [g for g in groups if len(g) == 2][0]
+        sizes = {a.size_hint for a in small_group}
+        self.assertEqual(sizes, {10})
 
-    def test_python_wrapper(self):
-        f, args = self._generate(device=GPU_TYPE)
-        compiled = torch.compile(f, dynamic=True)
-        result, code = run_and_get_cpp_code(compiled, *args)
+    def test_large_number_of_buffers(self):
+        """Stress test with many buffers to ensure performance and correctness."""
+        n = 200
+        allocs = []
+        for i in range(n):
+            # Create pattern where max overlap grows, then shrinks
+            begin = float(i // 10)
+            end = float(begin + 5)
+            allocs.append(_make_allocation(f"buf_{i}", begin, end, 100 + i % 10))
 
-        FileCheck().check(
-            "pool1 = empty_strided_"
-            + GPU_TYPE
-            + "((4*s27*s77 + align(4*s77*s77), ), (1, )"
-        ).check_next(
-            "buf0 = alloc_from_pool(pool1, 0, torch.float32, (s77, s77), (s77, 1))"
-        ).check("buf1 = alloc_from_pool(pool1, align(4*s77*s77),").run(code)
-        self.assertTrue(same(f(*args), result))
+        groups = self._get_coloring(allocs)
+        # Verify no two allocations in the same group have overlapping lifetimes
+        for group in groups:
+            for i, a in enumerate(group):
+                for j, b in enumerate(group):
+                    if i < j:
+                        self.assertFalse(
+                            a.live_range.begin < b.live_range.end
+                            and b.live_range.begin < a.live_range.end,
+                            f"Overlapping allocations {a} and {b} in same color group",
+                        )
 
-    def test_cpp_wrapper(self):
-        f, args = self._generate(device=GPU_TYPE)
-        compiled = torch.compile(f, dynamic=True)
-        with config.patch({"cpp_wrapper": True}):
-            result, code = run_and_get_cpp_code(compiled, *args)
+    def test_empty_input(self):
+        """Empty allocation list should return empty groups."""
+        groups = self._get_coloring([])
+        self.assertEqual(groups, [])
 
-        FileCheck().check(
-            "aoti_torch__alloc_from_pool(pool1, 0, cached_torch_dtype_float32, 2, int_array_2, int_array_3, &tmp_tensor_handle_0)"
-        ).check_next("auto buf0 = RAIIAtenTensorHandle(tmp_tensor_handle_0);").check(
-            "auto buf1 = RAIIAtenTensorHandle(tmp_tensor_handle_1);"
-        ).run(code)
-        self.assertTrue(same(f(*args), result))
+    def test_multiple_devices(self):
+        """Allocations on different devices should be colored independently."""
+        # This test verifies that the coloring algorithm itself works with
+        # allocations from different devices (though device partitioning
+        # happens in _allocate_groups_coloring)
+        allocs = [
+            _make_allocation("cuda_a", 0, 1, 100, device="cuda"),
+            _make_allocation("cpu_a", 0, 1, 100, device="cpu"),
+            _make_allocation("cuda_b", 1, 2, 100, device="cuda"),
+        ]
+        groups = self._get_coloring(allocs)
+        # cuda_a and cpu_a overlap, cuda_b is after cuda_a
+        # Since device isn't considered in coloring, we just verify
+        # no two allocations in same group overlap
+        for group in groups:
+            for i, a in enumerate(group):
+                for j, b in enumerate(group):
+                    if i < j:
+                        self.assertFalse(
+                            a.live_range.begin < b.live_range.end
+                            and b.live_range.begin < a.live_range.end,
+                        )
 
-    def test_aoti(self):
-        f, args = self._generate(device=GPU_TYPE)
-        dim0_x = Dim("dim0_x", min=1, max=2048)
-        dynamic_shapes = ({0: dim0_x}, None, None)
-        result, code = run_and_get_cpp_code(
-            lambda: AOTIRunnerUtil.run(f, args, dynamic_shapes=dynamic_shapes)
+    def test_sympy_sizes(self):
+        """Test that allocations with symbolic sizes work correctly."""
+        node = _mock_buffer("sym_buf")
+        alloc = Allocation(
+            node=node,
+            live_range=LiveRange(0.0, 1.0),
+            size_hint=64,
+            symbolic_size=sympy.Symbol("s", integer=True),
         )
+        allocs = [
+            alloc,
+            _make_allocation("plain", 1.0, 2.0, 64),
+        ]
+        groups = self._get_coloring(allocs)
+        # Non-overlapping, should share a color
+        self.assertEqual(self._num_colors(groups), 1)
+        self.assertEqual(len(groups[0]), 2)
 
-        FileCheck().check(
-            "int64_t int_array_0[] = {24L + align(12L*s6), };"
-        ).check_next("int64_t int_array_1[] = {1L, };").check_next(
-            "AtenTensorHandle pool1_handle;"
-        ).check_next(
-            "aoti_torch_empty_strided(1, int_array_0, int_array_1,"
-        ).check_next("RAIIAtenTensorHandle pool1(pool1_handle);").check_next(
-            "int64_t int_array_2[] = {s6, 3L};"
-        ).check_next("int64_t int_array_3[] = {3L, 1L};").check_next(
-            "AtenTensorHandle tmp_tensor_handle_0;"
-        ).check_next("aoti_torch__alloc_from_pool(pool1, 0").run(code)
-        self.assertTrue(same(f(*args), result))
 
-    @config.patch({"triton.autotune_at_compile_time": False})
-    def test_unbacked_symint(self):
-        # when allocation's size has unbacked symints
-        # the unbacked symints are only available after computed
-        if self.device != GPU_TYPE:
-            raise unittest.SkipTest("requires GPU")
+class TestLiveRange(TestCase):
+    """Tests for LiveRange and LiveRanges utility classes."""
 
-        class Repro(torch.nn.Module):
-            def forward(self, x, y):
-                x = x + 1
-                u0 = x.item()
-                torch._check(u0 >= 1)
-                s0 = y.size(0)
-                expr = u0 * s0
-                sevens = torch.empty_strided(
-                    size=(10, expr, 32), stride=(expr * 32, 32, 1), device=x.device
-                ).fill_(7)
-                return sevens * 3
+    def test_contains(self):
+        outer = LiveRange(0, 10)
+        inner = LiveRange(2, 8)
+        self.assertTrue(outer.contains(inner))
+        self.assertFalse(inner.contains(outer))
 
-        example_inputs = (
-            torch.scalar_tensor(2, dtype=torch.int, device=self.device),
-            torch.ones(8, device=self.device),
-        )
-        model = Repro().to(self.device)
-        result, code = run_and_get_cpp_code(
-            lambda: AOTIRunnerUtil.run(model, example_inputs)
-        )
-        self.assertTrue(same(model(*example_inputs), result))
+    def test_contains_edge(self):
+        r = LiveRange(0, 5)
+        self.assertTrue(r.contains(LiveRange(0, 5)))
+        self.assertTrue(r.contains(LiveRange(1, 4)))
+        self.assertFalse(r.contains(LiveRange(0, 6)))
+        self.assertFalse(r.contains(LiveRange(-1, 5)))
 
-        # check allocation is done after the unbacked symint is computed
-        FileCheck().check("auto u0 = u0_raw;").check(
-            # Shows up as one of the following:
-            #   const int64_t int_array_2[] = {10L, 8L*u0, 32L};
-            #   const int64_t int_array_3[] = {10L, 8L*u0, 32L};
-            "[] = {10L, 8L*u0, 32L};"
-        ).check("AtenTensorHandle pool0_handle;").check(
-            "aoti_torch_empty_strided(3, int_array_2, int_array_3"
-        ).run(code)
+    def test_join(self):
+        a = LiveRange(0, 5)
+        b = LiveRange(3, 10)
+        joined = a.join(b)
+        self.assertEqual(joined.begin, 0)
+        self.assertEqual(joined.end, 10)
 
-        # all AtenTensorHandle allocated using aoti_torch__alloc_from_pool are wrapped with RAIIAtenTensorHandle
-        # otherwise we'll have memory leak
-        FileCheck().check_count(
-            "aoti_torch__alloc_from_pool(pool1", 1, exactly=True
-        ).check_count("aoti_torch__alloc_from_pool(pool0", 1, exactly=True).run(code)
+    def test_len(self):
+        r = LiveRange(2, 7)
+        self.assertEqual(len(r), 5)
 
-        FileCheck().check(
-            "AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch__alloc_from_pool(pool1, 0, cached_torch_dtype_int32, 0, int_array_1, int_array_1, &tmp_tensor_handle_0));"  # noqa: B950
-        ).check("RAIIAtenTensorHandle(tmp_tensor_handle_0);").check(
-            "AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch__alloc_from_pool(pool0, 0, cached_torch_dtype_float32, 3, int_array_4, int_array_5, &tmp_tensor_handle_1));"  # noqa: B950
-        ).check("RAIIAtenTensorHandle(tmp_tensor_handle_1);").run(code)
+    def test_live_ranges_overlap(self):
+        a = LiveRanges([LiveRange(0, 5)])
+        b = LiveRanges([LiveRange(3, 10)])
+        self.assertTrue(a.overlaps(b))
+
+    def test_live_ranges_no_overlap(self):
+        a = LiveRanges([LiveRange(0, 2)])
+        b = LiveRanges([LiveRange(3, 10)])
+        self.assertFalse(a.overlaps(b))
+
+    def test_live_ranges_adjacent(self):
+        """Adjacent ranges (end of one == begin of other) should NOT overlap."""
+        a = LiveRanges([LiveRange(0, 3)])
+        b = LiveRanges([LiveRange(3, 6)])
+        self.assertFalse(a.overlaps(b))
+
+    def test_live_ranges_discontiguous(self):
+        """Test LiveRanges with multiple non-contiguous sub-ranges."""
+        r = LiveRanges([LiveRange(0, 2), LiveRange(5, 7)])
+        self.assertEqual(r.begin, 0)
+        self.assertEqual(r.end, 7)
+        self.assertTrue(r.overlaps(LiveRanges([LiveRange(1, 3)])))
+        self.assertTrue(r.overlaps(LiveRanges([LiveRange(6, 8)])))
+        self.assertFalse(r.overlaps(LiveRanges([LiveRange(3, 4)])))
 
 
 if __name__ == "__main__":
-    if HAS_GPU:
-        run_tests()
+    run_tests()

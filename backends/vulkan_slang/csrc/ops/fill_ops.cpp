@@ -57,20 +57,23 @@ at::Tensor vulkan_clone(const at::Tensor& self, std::optional<at::MemoryFormat> 
     uint32_t numel = static_cast<uint32_t>(self.numel());
     if (numel == 0) return output;
 
-    if (!self.is_contiguous()) {
-        // Non-contiguous: use strided copy shader for float32 (handles arbitrary strides, up to 5D).
+    bool needs_strided_copy = !self.is_contiguous() || self.storage_offset() > 0;
+    if (needs_strided_copy) {
+        // Non-contiguous OR contiguous-with-offset (e.g. _reinterpret_tensor from
+        // Inductor grouped-conv slice): the simple copy shader reads from buf[0],
+        // so it would silently skip the storage offset. dispatch_strided_copy
+        // passes storage_offset_src to the shader and handles both cases.
         if (self.scalar_type() == at::kFloat) {
             dispatch_strided_copy(self, output);
             return output;
         }
-        // Non-float32 non-contiguous: should not occur in practice (vulkan_t returns
-        // contiguous GPU copy for non-float32 types). Raise TORCH_CHECK to surface bugs.
-        TORCH_CHECK(false, "vulkan_clone: non-contiguous non-float32 tensor not supported "
+        // Non-float32 offset/non-contiguous: should not occur in practice.
+        TORCH_CHECK(false, "vulkan_clone: non-contiguous or offset non-float32 tensor not supported "
                     "(dtype=", self.scalar_type(), ")");
     }
 
     if (self.scalar_type() == at::kFloat) {
-        // Use GPU copy shader for float32
+        // Use GPU copy shader for float32 (contiguous, no offset)
         struct { uint32_t numel; } params{numel};
         uint32_t workgroups = (numel + 255) / 256;
         dispatch_shader("copy_copy_fwd",

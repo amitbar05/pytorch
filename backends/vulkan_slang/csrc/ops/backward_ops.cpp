@@ -7,6 +7,7 @@
 #include "dispatch.h"
 #include "dtype_utils.h"
 #include "../generated/shaders.h"
+#include "../backend/MetaGuard.h"
 
 #include <cstring>
 
@@ -16,6 +17,10 @@ namespace torch_vulkan { namespace ops {
 // grad_input = grad_output * (self > threshold) — single pass
 at::Tensor vulkan_threshold_backward(
     const at::Tensor& grad_output, const at::Tensor& self, const at::Scalar& threshold) {
+    if (is_null_storage(grad_output) || is_null_storage(self)) {
+        const at::Tensor& src = is_null_storage(grad_output) ? self : grad_output;
+        return make_vulkan_null(src, grad_output.sizes().vec(), grad_output.scalar_type());
+    }
     auto go_c = grad_output.contiguous();
     auto self_c = self.contiguous();
     auto orig_dtype = self_c.scalar_type();
@@ -384,13 +389,18 @@ std::tuple<at::Tensor, at::Tensor> vulkan_max_pool2d_with_indices(
                     workgroups, 1, 1,
                     &params, sizeof(params));
 
-    // Read uint indices back and convert to Long
-    auto& alloc = VulkanAllocator::instance();
-    std::vector<uint32_t> idx_buf(total);
-    alloc.get_buffer(indices_float.data_ptr())->read(idx_buf.data(), total * sizeof(uint32_t));
+    // Read uint indices back via .cpu() (guarantees GPU→CPU sync via PyTorch
+    // dispatch) and convert to Long.  VulkanBuffer::read() skips the GPU
+    // barrier when the buffer is not tracked as in-flight, causing races.
+    auto indices_float_cpu = indices_float.cpu();   // submits cmd-buf + waits
+    auto* fptr = indices_float_cpu.data_ptr<float>();
     auto indices_cpu = at::empty({N, C, oH, oW}, at::TensorOptions().dtype(at::kLong));
     auto* lptr = indices_cpu.data_ptr<int64_t>();
-    for (uint32_t i = 0; i < total; i++) lptr[i] = static_cast<int64_t>(idx_buf[i]);
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t u;
+        std::memcpy(&u, &fptr[i], sizeof(uint32_t));
+        lptr[i] = static_cast<int64_t>(u);
+    }
     auto indices_long = indices_cpu.to(self.device());
 
     return {cast_from_float32(values, orig_dtype), indices_long};
@@ -421,8 +431,10 @@ at::Tensor vulkan_max_pool2d_with_indices_backward(
     int64_t sH = stride[0], sW = stride.size() > 1 ? stride[1] : sH;
     int64_t pH = padding[0], pW = padding.size() > 1 ? padding[1] : pH;
 
-    // Convert Long indices to uint stored as float on Vulkan
-    auto indices_cpu = indices.cpu().contiguous();
+    // Convert Long indices to uint32 for the backward shader.
+    // Use .cpu() for Vulkan tensors to guarantee GPU→CPU sync before reading.
+    auto indices_cpu = indices.device().type() == c10::DeviceType::PrivateUse1
+        ? indices.cpu() : indices;
     auto indices_float = at::empty({static_cast<int64_t>(output_numel)}, go_c.options());
     {
         auto& alloc = VulkanAllocator::instance();

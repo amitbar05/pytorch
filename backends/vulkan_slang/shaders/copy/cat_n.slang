@@ -48,16 +48,30 @@ void computeMain(uint3 tid : SV_DispatchThreadID) {
     uint dim_idx = rem / params.inner_size;
     uint inner = rem % params.inner_size;
 
-    // Find which input tensor this dim_idx belongs to
+    // Find which input tensor this dim_idx belongs to.
+    //
+    // OP.12 / AMD RADV bug workaround (2026-05-09): on AMD RADV the
+    // SPIR-V compiler miscompiles dynamic push-constant array indexing
+    // with an index computed inside a preceding loop — `dim_offsets[which]`
+    // and `dim_sizes[which]` would read slot 0 instead of the resolved
+    // slot, producing diff~5 vs CPU on cat axis>0.  Track the needed
+    // values *inside* the loop so the post-loop access disappears.
+    // See memory: AMD RADV dynamic push-constant array indexing bug.
     uint which = 0;
-    for (uint i = 0; i < params.n_inputs - 1; i++) {
-        if (dim_idx >= params.dim_offsets[i + 1]) {
-            which = i + 1;
+    uint base_offset = 0u;
+    uint cur_dim_size = params.dim_sizes[0];
+    for (uint i = 1; i < params.n_inputs; i++) {
+        uint off_i = params.dim_offsets[i];
+        uint sz_i = params.dim_sizes[i];
+        if (dim_idx >= off_i) {
+            which = i;
+            base_offset = off_i;
+            cur_dim_size = sz_i;
         }
     }
 
-    uint local_dim_idx = dim_idx - params.dim_offsets[which];
-    uint src = outer * (params.dim_sizes[which] * params.inner_size) +
+    uint local_dim_idx = dim_idx - base_offset;
+    uint src = outer * (cur_dim_size * params.inner_size) +
                local_dim_idx * params.inner_size + inner;
 
     out[tid.x] = read_input(which, src);

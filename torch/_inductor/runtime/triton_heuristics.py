@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections import namedtuple
-from typing import Any, Generic, Literal, TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 import torch
 from torch._dynamo.utils import counters, set_feature_use
@@ -32,24 +32,24 @@ from torch.utils._ordered_set import OrderedSet
 from ..triton_bundler import TritonBundler
 from ..utils import (
     GPU_KERNEL_BIN_EXTS,
+    XPU_KERNEL_FORMAT,
     prefix_is_reduction,
     tlx_only_cuda_options,
     triton_version_uses_attrs_dict,
-    XPU_KERNEL_FORMAT,
 )
 from . import triton_helpers
 from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
-from .coordinate_descent_tuner import CoordescTuner
+from .coordinate_descent_tuner import CoordescTuner, CoordescTunerConfig
 from .hints import (
     _NUM_THREADS_PER_WARP,
+    TRITON_MAX_BLOCK,
+    TRITON_MAX_RSPLIT,
     AutotuneHint,
     DeviceProperties,
     HeuristicType,
     ReductionHint,
     TileHint,
-    TRITON_MAX_BLOCK,
-    TRITON_MAX_RSPLIT,
 )
 from .runtime_utils import (
     cache_dir,
@@ -68,23 +68,23 @@ from .runtime_utils import (
     validate_triton_config,
 )
 from .static_triton_launcher import (
-    statically_launched_kernel_by_device,
     StaticallyLaunchedCudaKernel,
     StaticallyLaunchedXpuKernel,
+    statically_launched_kernel_by_device,
 )
 from .triton_compat import (
+    HAS_WARP_SPEC,
     ASTSource,
-    autograd_profiler,
-    cc_warp_size,
     CompiledKernel,
     Config,
     GPUTarget,
-    HAS_WARP_SPEC,
     IntelGPUError,
     KernelInterface,
-    knobs,
     OutOfResources,
     PTXASError,
+    autograd_profiler,
+    cc_warp_size,
+    knobs,
     triton,
 )
 from .triton_helpers import get_constexprs
@@ -399,6 +399,22 @@ class CachingAutotuner(KernelInterface):
 
         self.size_hints = size_hints
         self.is_mix_order_reduction = self.inductor_meta.get("RSPLIT_SIZE") is not None
+
+        # Build CoordescTunerConfig from global config
+        from .. import config as inductor_config
+
+        coordesc_tuner_config = CoordescTunerConfig(
+            max_iterations=inductor_config.coordinate_descent_max_iterations,
+            early_stop_threshold=inductor_config.coordinate_descent_early_stop_threshold,
+            early_stop_patience=inductor_config.coordinate_descent_early_stop_patience,
+            adaptive_step=inductor_config.coordinate_descent_adaptive_step,
+            multi_field_tuning=inductor_config.coordinate_descent_multi_field_tuning,
+            multi_field_tuning_for_mm=inductor_config.coordinate_descent_multi_field_tuning_for_mm,
+            warmup_samples=inductor_config.coordinate_descent_warmup_samples,
+            check_all_directions=inductor_config.coordinate_descent_check_all_directions,
+            search_radius=inductor_config.coordinate_descent_search_radius,
+        )
+
         self.coordesc_tuner = CoordescTuner(
             is_mm=False,
             is_native_matmul=triton_meta.get("native_matmul", False),
@@ -406,6 +422,7 @@ class CachingAutotuner(KernelInterface):
             name=self.fn.__name__,
             size_hints=size_hints,
             inductor_meta=self.inductor_meta,
+            tuner_config=coordesc_tuner_config,
         )
         self.filename = filename
 

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import heapq
 import itertools
+import logging
 import pprint
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import sympy
 
@@ -14,7 +16,7 @@ from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._ordered_set import OrderedSet
 
 from .. import config
-from ..utils import _align, align, cache_on_self, CachedMethod, IndentedBuffer
+from ..utils import CachedMethod, IndentedBuffer, _align, align, cache_on_self
 from ..virtualized import V
 from .wrapper import (
     AllocateLine,
@@ -25,11 +27,11 @@ from .wrapper import (
     ReuseLine,
 )
 
-
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 
+log = logging.getLogger(__name__)
 @dataclasses.dataclass
 class LiveRange:
     """
@@ -748,6 +750,194 @@ class MemoryPlanner:
             if group.is_output:
                 group.update_usage(timestep)
 
+    def assign_reuse_candidates(
+        self, allocations: list[Allocation]
+    ) -> list[list[Allocation]]:
+        """
+        Interval graph coloring for optimal buffer reuse.
+
+        Models each buffer's lifetime as a LiveRange interval, constructs
+        an interval graph where overlapping intervals conflict, and uses a
+        greedy coloring algorithm. Colors represent shared memory allocations.
+
+        The algorithm:
+        1. Sorts allocations by start time
+        2. Maintains a min-heap of active intervals keyed by end time
+        3. When an interval ends, its color becomes available for reuse
+        4. When choosing among available colors, picks the one whose last
+           allocation was closest in size to minimize fragmentation
+        5. If no colors are available, allocates a new one
+
+        For interval graphs, any greedy coloring by start time produces an
+        optimal coloring (number of colors = maximum overlap). The size-based
+        preference is a tie-breaking heuristic that doesn't affect optimality.
+
+        Complexity: O(n log n + n * d) where n is number of allocations and
+        d is the maximum number of simultaneously active colors (bounded by
+        the maximum interval overlap, typically small in practice).
+
+        Returns groups of allocations (by color) that can share memory.
+        """
+        if not allocations:
+            return []
+
+        # Sort by live_range.begin (start time) for greedy interval graph coloring
+        sorted_allocs = sorted(allocations, key=lambda a: a.live_range.begin)
+
+        # Min-heap of (end_time, color_id) tracking active intervals
+        active_heap: list[tuple[float, int]] = []
+        # Set of color ids whose intervals have ended and are available for reuse
+        available_colors: set[int] = set()
+        # Maps color_id to list of allocations with that color
+        color_to_allocs: dict[int, list[Allocation]] = {}
+        # Maps color_id to the size_hint of the last allocation assigned to it
+        color_last_size: dict[int, int] = {}
+        next_color = 0
+
+        for alloc in sorted_allocs:
+            # Free colors whose intervals have ended before this allocation starts
+            while active_heap and active_heap[0][0] <= alloc.live_range.begin:
+                _, color = heapq.heappop(active_heap)
+                available_colors.add(color)
+
+            target_size = alloc.size_hint
+
+            if available_colors:
+                # Find the available color whose last allocation had
+                # the most similar size to minimize fragmentation
+                best_color = next(iter(available_colors))
+                best_diff = abs(color_last_size.get(best_color, 0) - target_size)
+                for candidate in available_colors:
+                    last_size = color_last_size.get(candidate, 0)
+                    diff = abs(last_size - target_size)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_color = candidate
+                available_colors.remove(best_color)
+                color = best_color
+            else:
+                color = next_color
+                next_color += 1
+                color_to_allocs[color] = []
+
+            color_to_allocs[color].append(alloc)
+            color_last_size[color] = target_size
+            heapq.heappush(active_heap, (float(alloc.live_range.end), color))
+
+        return [
+            color_to_allocs[c]
+            for c in sorted(
+                color_to_allocs,
+                key=lambda c: color_to_allocs[c][0].live_range.begin,
+            )
+        ]
+
+    def _allocate_groups_coloring(
+        self,
+        outputs: list[Allocation],
+        intermediates: list[Allocation],
+    ) -> None:
+        """
+        Allocate buffer groups using interval graph coloring.
+
+        Buffers are grouped by device, then colored so that non-overlapping
+        buffers share the same memory allocation (pool). This minimizes the
+        number of distinct memory allocations while respecting output
+        constraints.
+        """
+        # Collect all allocations grouped by device
+        device_to_allocations: dict[torch.device, list[Allocation]] = (
+            collections.defaultdict(list)
+        )
+
+        for alloc in outputs:
+            device_to_allocations[alloc.device].append(alloc)
+        for alloc in intermediates:
+            device_to_allocations[alloc.device].append(alloc)
+
+        # Set for O(1) membership checks
+        output_set = OrderedSet(id(a) for a in outputs)
+
+        for device, dev_allocs in device_to_allocations.items():
+            # Separate outputs and intermediates for this device
+            dev_outputs = [a for a in dev_allocs if id(a) in output_set]
+            dev_intermediates = [a for a in dev_allocs if id(a) not in output_set]
+
+            can_expand = config.memory_pool != "none"
+
+            # Total bytes if every allocation got its own buffer (no reuse).
+            # `dev_allocs` already includes both `dev_outputs` and
+            # `dev_intermediates`, so a single sum is enough — adding
+            # `dev_outputs` again would double-count and inflate the
+            # savings ratio logged below.
+            total_size_no_reuse = sum(a.size_hint for a in dev_allocs)
+
+            if config.memory_pool == "combined":
+                # Color all allocations together
+                color_groups = self.assign_reuse_candidates(dev_allocs)
+                for group in color_groups:
+                    for block in group:
+                        block.mark_allocated()
+                    pool = AllocationPool(
+                        device=device,
+                        root=TemporalSplit(list(group)),
+                        can_expand=can_expand,
+                    )
+                    self.pools.get_pools(group[0]).append(pool)
+            else:
+                # Outputs: each gets its own pool or share via coloring
+                if config.memory_pool == "outputs":
+                    # Color outputs together for sharing
+                    if dev_outputs:
+                        color_groups = self.assign_reuse_candidates(dev_outputs)
+                        for group in color_groups:
+                            for block in group:
+                                block.mark_allocated()
+                            pool = AllocationPool(
+                                device=device,
+                                root=TemporalSplit(list(group)),
+                                can_expand=can_expand,
+                            )
+                            self.pools.get_pools(group[0]).append(pool)
+                else:
+                    # "intermediates" or "none": outputs each get unique storage
+                    for block in dev_outputs:
+                        block.mark_allocated()
+                        pool = AllocationPool(
+                            device=device,
+                            root=TemporalSplit([block]),
+                            can_expand=can_expand,
+                        )
+                        self.pools.get_pools(block).append(pool)
+
+                # Intermediates: color together for optimal sharing
+                if dev_intermediates:
+                    color_groups = self.assign_reuse_candidates(dev_intermediates)
+                    for group in color_groups:
+                        for block in group:
+                            block.mark_allocated()
+                        pool = AllocationPool(
+                            device=device,
+                            root=TemporalSplit(list(group)),
+                            can_expand=can_expand,
+                        )
+                        self.pools.get_pools(group[0]).append(pool)
+
+            # Log memory savings for this device
+            peak_pool_size = sum(
+                p.root.get_size_hint() for p in self.pools.get_pools(dev_allocs[0])
+            )
+            if total_size_no_reuse > 0:
+                savings_pct = 100.0 * (1.0 - peak_pool_size / total_size_no_reuse)
+                log.debug(
+                    "Memory planning [%s]: %d allocs, total=%d, peak=%d, saved=%.1f%%",
+                    device,
+                    len(dev_allocs),
+                    total_size_no_reuse,
+                    peak_pool_size,
+                    savings_pct,
+                )
+
     def allocate_groups(self):
         """
         Assign every allocation to a specific location in a specific AllocationPool.
@@ -767,23 +957,26 @@ class MemoryPlanner:
             else:
                 intermediates.append(group.allocation)
 
-        for block in sorted(
-            outputs,
-            key=lambda x: (
-                x.size_hint,
-                -len(x.live_range),
-            ),
-        ):
-            self.pools.allocate_output(block)
+        if config.aggressive_memory_reuse:
+            self._allocate_groups_coloring(outputs, intermediates)
+        else:
+            for block in sorted(
+                outputs,
+                key=lambda x: (
+                    x.size_hint,
+                    -len(x.live_range),
+                ),
+            ):
+                self.pools.allocate_output(block)
 
-        for block in sorted(
-            intermediates,
-            key=lambda x: (
-                -x.size_hint,
-                -len(x.live_range),
-            ),
-        ):
-            self.pools.allocate(block)
+            for block in sorted(
+                intermediates,
+                key=lambda x: (
+                    -x.size_hint,
+                    -len(x.live_range),
+                ),
+            ):
+                self.pools.allocate(block)
 
         self.pools.finalize()
 

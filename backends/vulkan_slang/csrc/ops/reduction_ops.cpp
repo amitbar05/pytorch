@@ -235,6 +235,18 @@ at::Tensor vulkan_amin(const at::Tensor& self, at::IntArrayRef dim, bool keepdim
                       "reduction_min_dim_fwd", shaders::reduction_min_dim_fwd, shaders::reduction_min_dim_fwd_size);
 }
 
+// ── max / min (no-dim) ──────────────────────────────────────────
+// aten.max(Tensor self) and aten.min(Tensor self) reduce over all
+// elements (no dim argument).  These are thin wrappers around
+// vulkan_amax / vulkan_amin with an empty dim list.
+at::Tensor vulkan_max(const at::Tensor& self) {
+    return vulkan_amax(self, at::IntArrayRef(), false);
+}
+
+at::Tensor vulkan_min(const at::Tensor& self) {
+    return vulkan_amin(self, at::IntArrayRef(), false);
+}
+
 // ── max.dim / min.dim (values + indices) ────────────────────────
 std::tuple<at::Tensor, at::Tensor> vulkan_max_dim(const at::Tensor& self, int64_t dim, bool keepdim) {
     auto values = vulkan_amax(self, at::IntArrayRef({dim}), keepdim);

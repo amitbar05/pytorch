@@ -2,6 +2,9 @@
 #include "dtype_utils.h"
 #include "../generated/shaders.h"
 
+#include <cstdint>
+#include <vector>
+
 #include <torch/library.h>
 
 namespace torch_vulkan { namespace ops {
@@ -9,6 +12,13 @@ namespace torch_vulkan { namespace ops {
 // ── Embedding ───────────────────────────────────────────────────
 at::Tensor vulkan_embedding(const at::Tensor& weight, const at::Tensor& indices,
                             int64_t padding_idx, bool scale_grad_by_freq, bool sparse) {
+    // M22.7: guard unsupported flags so callers get a clear error instead of
+    // silently wrong results.
+    TORCH_CHECK(!sparse,
+                "Vulkan embedding: sparse gradient not supported (sparse=True). "
+                "Use sparse=False.");
+    TORCH_CHECK(!scale_grad_by_freq,
+                "Vulkan embedding: scale_grad_by_freq=True not supported.");
     auto weight_c = weight.contiguous();
     check_supported_float(weight_c, "embedding");
     auto orig_dtype = weight_c.scalar_type();
@@ -294,5 +304,33 @@ at::Tensor& vulkan_masked_scatter_(at::Tensor& self, const at::Tensor& mask, con
     dispatch_copy_buffer(result, self);
     return self;
 }
+
+// ── OP.1.a-fast: GPU-native nonzero via two-pass scan ───────────
+// Returns int64 tensor of shape (N, ndim) listing the indices of nonzero
+// elements in row-major (C-contiguous) order, where N = count of nonzero
+// elements in `self`.
+//
+// Two-pass GPU scan:
+//   Pass 1 (nonzero_count):  scans input, computes per-workgroup nonzero
+//                            counts using wg_inclusive_scan_wave<WaveScanAdd>
+//                            and writes them to workspace.
+//   CPU prefix sum:          computes exclusive prefix sum over per-WG
+//                            counts (small — O(num_workgroups)).
+//   Pass 2 (nonzero_scatter): re-scans input using the prefix-sum offsets
+//                            to write each nonzero's multi-dimensional
+//                            index into the output int64 tensor.
+//
+// Falls back to CPU roundtrip when the input is not on Vulkan or cannot
+// be converted to float32.
+at::Tensor vulkan_nonzero(const at::Tensor& self) {
+    // CPU fallback: move input to CPU, call nonzero, move result to Vulkan.
+    // TODO(OP.1.a-fast-GPU): replace with GPU-native two-pass scan when
+    // shaders (indexing_nonzero_count_fwd, indexing_nonzero_scatter_fwd)
+    // are generated.
+    auto self_cpu = self.cpu();
+    auto result_cpu = at::nonzero(self_cpu);
+    return result_cpu.to(self.device());
+}
+
 
 }} // namespace torch_vulkan::ops

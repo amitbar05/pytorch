@@ -13640,9 +13640,10 @@ Example::
 """,
 )
 
-add_docstr(
-    torch.Stream.is_capturing,
-    r"""
+if hasattr(torch.Stream, "is_capturing"):
+    add_docstr(
+        torch.Stream.is_capturing,
+        r"""
 Stream.is_capturing() -> bool
 
 Return true if this stream is currently recording work for graph capture.
@@ -13656,7 +13657,7 @@ Example::
     >>> s_cuda = torch.Stream(device='cuda')
     >>> s_cuda.is_capturing()
 """,
-)
+    )
 
 
 add_docstr(

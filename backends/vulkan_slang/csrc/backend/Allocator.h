@@ -17,6 +17,19 @@ public:
     static VulkanAllocator& instance();
 
     c10::DataPtr allocate(size_t nbytes) override;
+
+    // M22.9-followup: explicit-device overload. The base ``allocate``
+    // reads ``vulkan::Context::current_device()`` to pick which VMA
+    // allocator backs the storage. For multi-GPU paths where the
+    // caller already knows the target device, this overload bypasses
+    // the thread-local current-device state — useful when constructing
+    // storage from a worker thread or when the caller cannot or does
+    // not want to install a ``c10::DeviceGuard``.
+    //
+    // Both overloads share the same buffer-pool / quarantine / deleter
+    // machinery; only the device-resolution path differs.
+    c10::DataPtr allocate(size_t nbytes, c10::DeviceIndex device_idx);
+
     c10::DeleterFnPtr raw_deleter() const override;
     void copy_data(void* dest, const void* src, std::size_t count) const override;
 

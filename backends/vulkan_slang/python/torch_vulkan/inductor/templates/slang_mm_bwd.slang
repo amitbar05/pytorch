@@ -1,0 +1,297 @@
+// CG.M5 -- Matmul backward via [Differentiable] tile_inner_madd
+// Single-kernel backward computes BOTH dA and dB in one dispatch.
+//
+// Link-time specialization constants override the defaults when defined
+// BEFORE the `import mm_tile;` statement, or via -specialize-const flags.
+// Slang resolves the importing module's definitions over the defaults.
+//
+// Usage (specialize at link time):
+//   slangc wrapper.slang -I <module_dir> -o kernel.spv
+//   where wrapper.slang defines `static const int TILE_M = 64;` etc.
+//   BEFORE `import bwd_mm_tile;`.
+
+// -- Link-time specialization constants --
+static const int TILE_M = /*{{*/ tile_m /*}}64*/;
+static const int TILE_N = /*{{*/ tile_n /*}}64*/;
+static const int TILE_K = /*{{*/ tile_k /*}}16*/;
+/*{%*/ set m_per_thread = m_per_thread | default(1) /*%}*/
+/*{%*/ set n_per_thread = n_per_thread | default(1) /*%}*/
+static const int M_PER_THREAD = /*{{*/ m_per_thread /*}}1*/;
+static const int N_PER_THREAD = /*{{*/ n_per_thread /*}}1*/;
+
+// -- Derived constants --
+static const int WG_M = TILE_M / M_PER_THREAD;
+static const int WG_N = TILE_N / N_PER_THREAD;
+static const int TILE_A_ELEMS = TILE_M * TILE_K;
+static const int TILE_B_ELEMS = TILE_K * TILE_N;
+static const int TILE_C_ELEMS = TILE_M * TILE_N;
+static const int WG_SIZE = WG_M * WG_N;
+
+// -- CG.M5: Differentiable scalar inner -- inlined for standalone compilation --
+// Autodiff derivatives:
+//   dL/da = dL/dout * b    (gradient w.r.t. A element)
+//   dL/db = dL/dout * a    (gradient w.r.t. B element)
+// `acc` is marked no_diff -- it is a dummy intermediate (always 0) used only
+// to chain the output gradient into the autodiff propagation.
+[Differentiable]
+float tile_inner_madd(float a, float b, no_diff float acc)
+{
+    return acc + a * b;
+}
+
+// -- Push-constant struct --
+// A.6: Monolithic PC layout -- batch strides always present (zero when the
+// flag is clear), gated by ``pc.flags``.  Eliminates the binary-incompat
+// risk that the prior Jinja conditional struct posed against Python's
+// ``struct.pack`` (anti-goal #6).
+static const uint MM_BWD_FLAG_BATCH = 2u;
+
+struct BwdPC {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a_m;
+    uint stride_a_k;
+    uint stride_b_k;
+    uint stride_b_n;
+    uint stride_dc_m;
+    uint stride_dc_n;
+    uint stride_da_m;
+    uint stride_da_k;
+    uint stride_db_k;
+    uint stride_db_n;
+    // Always present; ignored unless MM_BWD_FLAG_BATCH is set.
+    uint stride_a_b;
+    uint stride_b_b;
+    uint stride_dc_b;
+    uint stride_da_b;
+    uint stride_db_b;
+    // A.6: Bitmask of MM_BWD_FLAG_* gates.
+    uint flags;
+};
+
+[[vk::push_constant]] BwdPC pc;
+
+// M20.2: Restore ParameterBlock<KernelArgs> (reverts the M17.1 per-binding
+// workaround). See slang_mm.slang for the full rationale.
+// Binding order: a=0, b=1, dc=2, da=3, db=4 (within ParameterBlock struct).
+struct KernelArgs {
+    StructuredBuffer</*{{*/ dtype_a /*}}float*/> a;
+    StructuredBuffer</*{{*/ dtype_b /*}}float*/> b;
+    StructuredBuffer</*{{*/ dtype_c /*}}float*/> dc;
+    RWStructuredBuffer</*{{*/ dtype_a /*}}float*/> da;
+    RWStructuredBuffer</*{{*/ dtype_b /*}}float*/> db;
+};
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
+
+// +32 bank-conflict padding (M20)
+groupshared /*{{*/ dtype_acc /*}}float*/ tile_a[TILE_A_ELEMS + 32];
+groupshared /*{{*/ dtype_acc /*}}float*/ tile_b[TILE_B_ELEMS + 32];
+groupshared /*{{*/ dtype_acc /*}}float*/ tile_dc[TILE_C_ELEMS + 32];
+
+// -- Load helpers --
+
+[ForceInline]
+void load_tiles_bwd(
+    uint k_base,
+    uint row_base,
+    uint col_base,
+    uint M, uint N, uint K,
+    uint stride_a_m, uint stride_a_k,
+    uint stride_b_k, uint stride_b_n,
+    uint stride_dc_m, uint stride_dc_n,
+    // A.6: Always pass batch offsets (zero on non-batch path). The caller
+    // picks values from pc.flags so the helper signature is stable.
+    uint batch_a_off, uint batch_b_off, uint batch_dc_off,
+    uint3 lid)
+{
+    uint tid = lid.y * WG_N + lid.x;
+
+    // Load A tile: TILE_M * TILE_K floats.
+    [unroll]
+    for (uint i = tid; i < (uint)TILE_A_ELEMS; i += (uint)WG_SIZE) {
+        uint local_m = i / (uint)TILE_K;
+        uint local_k = i % (uint)TILE_K;
+        uint global_m = row_base + local_m;
+        uint global_k = k_base + local_k;
+        /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
+        if (global_m < M && global_k < K) {
+            v = (/*{{*/ dtype_acc /*}}float*/)args.a[batch_a_off + global_m * stride_a_m + global_k * stride_a_k];
+        }
+        tile_a[i] = v;
+    }
+
+    // Load B tile: TILE_K * TILE_N floats.
+    [unroll]
+    for (uint j = tid; j < (uint)TILE_B_ELEMS; j += (uint)WG_SIZE) {
+        uint local_k = j / (uint)TILE_N;
+        uint local_n = j % (uint)TILE_N;
+        uint global_k = k_base + local_k;
+        uint global_n = col_base + local_n;
+        /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
+        if (global_k < K && global_n < N) {
+            v = (/*{{*/ dtype_acc /*}}float*/)args.b[batch_b_off + global_k * stride_b_k + global_n * stride_b_n];
+        }
+        tile_b[j] = v;
+    }
+
+    // Load dC tile: TILE_M * TILE_N floats (only on first K tile pass --
+    // dC is reused across all K tiles).  Marked with a flag so the caller
+    // can skip redundant loads for kb > 0.
+    [unroll]
+    for (uint c = tid; c < (uint)TILE_C_ELEMS; c += (uint)WG_SIZE) {
+        uint local_m = c / (uint)TILE_N;
+        uint local_n = c % (uint)TILE_N;
+        uint global_m = row_base + local_m;
+        uint global_n = col_base + local_n;
+        /*{{*/ dtype_acc /*}}float*/ v = (/*{{*/ dtype_acc /*}}float*/)0.0;
+        if (global_m < M && global_n < N) {
+            v = (/*{{*/ dtype_acc /*}}float*/)args.dc[batch_dc_off + global_m * stride_dc_m + global_n * stride_dc_n];
+        }
+        tile_dc[c] = v;
+    }
+}
+
+// -- MMA backward using bwd_diff(tile_inner_madd) --
+// For each kk in [0, TILE_K), for each per-thread (mi, ni):
+//   a = tile_a[mi * TILE_K + kk], b = tile_b[kk * TILE_N + ni], dc = tile_dc[mi * TILE_N + ni]
+//   bwd_diff(tile_inner_madd)(dp_a, dp_b, dp_acc_with_seed_dc)
+//   -> dp_a.d = dc * b  (dA contribution)
+//   -> dp_b.d = dc * a  (dB contribution)
+[ForceInline]
+void mma_bwd_tile(
+    uint k_base,
+    uint K,
+    uint3 lid,
+    inout /*{{*/ dtype_acc /*}}float*/ dA_acc[M_PER_THREAD][TILE_K],
+    inout /*{{*/ dtype_acc /*}}float*/ dB_acc[TILE_K][N_PER_THREAD])
+{
+    uint k_end = min((uint)TILE_K, K - k_base);
+    // Cap the unroll factor at 16 to stay within VGPR budget on RDNA1.
+    [unroll(TILE_K <= 16 ? TILE_K : 16)]
+    for (uint kk = 0; kk < k_end; kk++) {
+        // Load M_PER_THREAD A values (one column of the register tile).
+        /*{{*/ dtype_acc /*}}float*/ a_reg[M_PER_THREAD];
+        [unroll]
+        for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+            uint local_m = lid.y * (uint)M_PER_THREAD + mi;
+            a_reg[mi] = tile_a[local_m * (uint)TILE_K + kk];
+        }
+        // Load N_PER_THREAD B values (one row of the register tile).
+        /*{{*/ dtype_acc /*}}float*/ b_reg[N_PER_THREAD];
+        [unroll]
+        for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+            uint local_n = lid.x * (uint)N_PER_THREAD + ni;
+            b_reg[ni] = tile_b[kk * (uint)TILE_N + local_n];
+        }
+
+        // Compute dA/dB via bwd_diff over the scalar inner.
+        [unroll]
+        for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+            [unroll]
+            for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+                // Re-load dC for the current (mi, ni) -- each iteration uses
+                // its own dc value from tile_dc.
+                uint local_m = lid.y * (uint)M_PER_THREAD + mi;
+                uint local_n = lid.x * (uint)N_PER_THREAD + ni;
+                /*{{*/ dtype_acc /*}}float*/ dc_val = tile_dc[local_m * (uint)TILE_N + local_n];
+
+                DifferentialPair</*{{*/ dtype_acc /*}}float*/> dp_a = diffPair(a_reg[mi], (/*{{*/ dtype_acc /*}}float*/)0.0);
+                DifferentialPair</*{{*/ dtype_acc /*}}float*/> dp_b = diffPair(b_reg[ni], (/*{{*/ dtype_acc /*}}float*/)0.0);
+                // acc is no_diff: pass raw 0.0. dc_val is output derivative.
+                bwd_diff(tile_inner_madd)(dp_a, dp_b, (/*{{*/ dtype_acc /*}}float*/)0.0, dc_val);
+                dA_acc[mi][kk] += dp_a.getDifferential();
+                dB_acc[kk][ni] += dp_b.getDifferential();
+            }
+        }
+    }
+}
+
+// -- Entry point --
+[shader("compute")]
+// M17.1: Use Jinja-computed literals to avoid slangc 2026.5+ E39999.
+[numthreads(/*{{*/ tile_n // n_per_thread /*}}64*/, /*{{*/ tile_m // m_per_thread /*}}64*/, 1)]
+void computeMain(
+    uint3 gtid : SV_DispatchThreadID,
+    uint3 lid : SV_GroupThreadID,
+    uint3 gid : SV_GroupID)
+{
+    uint row_base = gid.y * TILE_M;
+    uint col_base = gid.x * TILE_N;
+    // A.6: Batch offsets gated by MM_BWD_FLAG_BATCH at runtime.
+    uint batch_a_off = 0u;
+    uint batch_b_off = 0u;
+    uint batch_dc_off = 0u;
+    uint batch_da_store_off = 0u;
+    uint batch_db_store_off = 0u;
+    if ((pc.flags & MM_BWD_FLAG_BATCH) != 0u) {
+        batch_a_off = gid.z * pc.stride_a_b;
+        batch_b_off = gid.z * pc.stride_b_b;
+        batch_dc_off = gid.z * pc.stride_dc_b;
+        batch_da_store_off = gid.z * pc.stride_da_b;
+        batch_db_store_off = gid.z * pc.stride_db_b;
+    }
+
+    // Per-thread register accumulators for dA and dB.
+    // dA: [M_PER_THREAD][TILE_K] -- each thread accumulates its M rows across full TILE_K.
+    // dB: [TILE_K][N_PER_THREAD] -- each thread accumulates its N cols across full TILE_K.
+    /*{{*/ dtype_acc /*}}float*/ dA_acc[M_PER_THREAD][TILE_K];
+    /*{{*/ dtype_acc /*}}float*/ dB_acc[TILE_K][N_PER_THREAD];
+    [unroll]
+    for (uint _mi = 0; _mi < (uint)M_PER_THREAD; _mi++) {
+        [unroll]
+        for (uint _kk = 0; _kk < (uint)TILE_K; _kk++) {
+            dA_acc[_mi][_kk] = (/*{{*/ dtype_acc /*}}float*/)0.0;
+        }
+    }
+    [unroll]
+    for (uint _kk = 0; _kk < (uint)TILE_K; _kk++) {
+        [unroll]
+        for (uint _ni = 0; _ni < (uint)N_PER_THREAD; _ni++) {
+            dB_acc[_kk][_ni] = (/*{{*/ dtype_acc /*}}float*/)0.0;
+        }
+    }
+
+    uint k_blocks = (pc.K + TILE_K - 1u) / TILE_K;
+
+    // Single-stage pipeline: load A/B/dC -> compute bwd -> barrier -- repeat.
+    for (uint kb = 0; kb < k_blocks; kb++) {
+        uint k_base = kb * TILE_K;
+        load_tiles_bwd(
+            k_base,
+            row_base, col_base, pc.M, pc.N, pc.K,
+            pc.stride_a_m, pc.stride_a_k,
+            pc.stride_b_k, pc.stride_b_n,
+            pc.stride_dc_m, pc.stride_dc_n,
+            batch_a_off, batch_b_off, batch_dc_off,
+            lid);
+        GroupMemoryBarrierWithGroupSync();
+        mma_bwd_tile(k_base, pc.K, lid, dA_acc, dB_acc);
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Store accumulated dA and dB.
+    // dA: each thread writes M_PER_THREAD rows x TILE_K columns.
+    [unroll]
+    for (uint mi = 0; mi < (uint)M_PER_THREAD; mi++) {
+        uint row = row_base + lid.y * (uint)M_PER_THREAD + mi;
+        if (row >= pc.M) continue;
+        [unroll]
+        for (uint kk = 0; kk < (uint)TILE_K; kk++) {
+            if (kk >= pc.K) continue;
+            args.da[batch_da_store_off + row * pc.stride_da_m + kk * pc.stride_da_k] = (/*{{*/ dtype_a /*}}float*/)dA_acc[mi][kk];
+        }
+    }
+    // dB: each thread writes TILE_K rows x N_PER_THREAD columns.
+    [unroll]
+    for (uint ni = 0; ni < (uint)N_PER_THREAD; ni++) {
+        uint col = col_base + lid.x * (uint)N_PER_THREAD + ni;
+        if (col >= pc.N) continue;
+        [unroll]
+        for (uint kk = 0; kk < (uint)TILE_K; kk++) {
+            if (kk >= pc.K) continue;
+            args.db[batch_db_store_off + kk * pc.stride_db_k + col * pc.stride_db_n] = (/*{{*/ dtype_b /*}}float*/)dB_acc[kk][ni];
+        }
+    }
+}

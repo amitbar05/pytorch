@@ -1,0 +1,130 @@
+// Philox RNG template — parameterized Philox4x32-10 counter-based RNG.
+//
+// T4.6: Single template replaces all rng_ops.cpp shader bodies.
+// Parameters:
+//   output_dtype  — f32, f16, or bf16 output type
+//   rng_mode      — "uniform" (1 output per thread) or "normal" (Box-Muller, 2 outputs)
+//   fused_dropout — if true, applies dropout mask + scale after RNG
+//
+// For fused dropout: adds a second binding (input tensor), a scale push constant,
+// and applies out[i] = mask * input[i] * scale where mask = (rand >= dropout_p ? 1 : 0).
+//
+// N+1.10 — Buffer bindings are wrapped in a single
+// ``ParameterBlock<KernelArgs>``.  Slang assigns one descriptorTableSlot
+// per struct field in declaration order (set 0, binding 0..N-1),
+// matching the descriptorCount=1 layout the runtime expects.  The
+// runtime passes tensors in the same order as struct fields here, so no
+// `[[vk::binding(N)]]` literals are emitted.  Mirrors the
+// foreach_optimizer.py.jinja round-3 pattern (no array-of-structs, so
+// the descriptor-array caveat documented there does not bite us).
+
+struct PC {
+    uint  total_elements;
+    uint  seed_lo;
+    uint  seed_hi;
+    uint  offset;
+/*{%*/ if fused_dropout /*%}*/
+    float dropout_p;      // dropout probability p; keep prob = 1-p
+/*{%*/ endif /*%}*/
+};
+
+[[vk::push_constant]] PC pc;
+
+// All buffer bindings live in this ParameterBlock.  Field order is the
+// canonical binding order; the dispatch caller passes tensors in the
+// same order (output, [output2 if normal], [input if fused_dropout]).
+// No `[[vk::binding(N)]]` literals appear anywhere in this template.
+struct KernelArgs {
+    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> output;
+/*{%*/ if rng_mode == "normal" /*%}*/
+    RWStructuredBuffer</*{{*/ output_dtype /*}}float*/> output2;
+/*{%*/ endif /*%}*/
+/*{%*/ if fused_dropout /*%}*/
+    StructuredBuffer</*{{*/ output_dtype /*}}float*/> input;
+/*{%*/ endif /*%}*/
+};
+// M21.3.01: explicit Set 0 binding (slangc 2026.7.1 defaults to Set 1)
+[[vk::binding(0, 0)]] ParameterBlock<KernelArgs> args;
+
+import helpers;
+
+// ── Inline Philox (avoids per-kernel recompile of helpers.slang) ─────────
+
+[ForceInline]
+uint _mulhi32(uint a, uint b) {
+    uint a_lo = a & 0xFFFFu;
+    uint a_hi = a >> 16;
+    uint b_lo = b & 0xFFFFu;
+    uint b_hi = b >> 16;
+    uint p0 = a_lo * b_lo;
+    uint p1 = a_lo * b_hi;
+    uint p2 = a_hi * b_lo;
+    uint p3 = a_hi * b_hi;
+    uint carry = ((p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu)) >> 16;
+    return p3 + (p1 >> 16) + (p2 >> 16) + carry;
+}
+
+[ForceInline]
+uint2 _philox_round(uint2 ctr, uint2 key) {
+    uint lo = ctr.x;
+    uint hi = ctr.y;
+    uint product_lo = lo * 0xD2511F53u;
+    uint product_hi = _mulhi32(lo, 0xD2511F53u);
+    ctr.x = hi ^ key.x ^ product_hi;
+    ctr.y = product_lo;
+    return ctr;
+}
+
+[ForceInline]
+uint2 _philox_bumpkey(uint2 key) {
+    key.x += 0x9E3779B9u;
+    key.y += 0xBB67AE85u;
+    return key;
+}
+
+[ForceInline]
+float _philox_uniform(uint counter, uint seed_lo, uint seed_hi) {
+    uint2 ctr = uint2(counter, 0u);
+    uint2 key = uint2(seed_lo, seed_hi);
+    [unroll]
+    for (uint r = 0; r < 10; r++) {
+        ctr = _philox_round(ctr, key);
+        key = _philox_bumpkey(key);
+    }
+    return float(ctr.x) / 4294967296.0f;
+}
+
+[ForceInline]
+float2 _philox_normal(uint counter, uint seed_lo, uint seed_hi) {
+    float u1 = _philox_uniform(counter, seed_lo, seed_hi);
+    uint2 bumped = _philox_bumpkey(uint2(seed_lo, seed_hi));
+    float u2 = _philox_uniform(counter + 1u, bumped.x, bumped.y);
+    float r = sqrt(-2.0f * log(max(u1, 1e-10f)));
+    float a = 2.0f * 3.141592653589793f * u2;
+    return float2(r * cos(a), r * sin(a));
+}
+
+// ── Entry point ──────────────────────────────────────────────────────────
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void computeMain(uint3 tid : SV_DispatchThreadID) {
+    uint idx = tid.x;
+    /*{%*/ if rng_mode == "normal" /*%}*/
+    uint counter = pc.offset + idx;
+    if (idx >= pc.total_elements) return;
+    float2 n = _philox_normal(counter, pc.seed_lo, pc.seed_hi);
+    args.output[idx] = (/*{{*/ output_dtype /*}}float*/)n.x;
+    args.output2[idx] = (/*{{*/ output_dtype /*}}float*/)n.y;
+    /*{%*/ elif fused_dropout /*%}*/
+    if (idx >= pc.total_elements) return;
+    float r = _philox_uniform(pc.offset + idx, pc.seed_lo, pc.seed_hi);
+    float scale = 1.0f / (1.0f - pc.dropout_p);
+    float mask = (r >= pc.dropout_p) ? 1.0f : 0.0f;
+    args.output[idx] = (/*{{*/ output_dtype /*}}float*/)(mask * (float)args.input[idx] * scale);
+    /*{%*/ else /*%}*/
+    if (idx >= pc.total_elements) return;
+    float r = _philox_uniform(pc.offset + idx, pc.seed_lo, pc.seed_hi);
+    args.output[idx] = (/*{{*/ output_dtype /*}}float*/)r;
+    /*{%*/ endif /*%}*/
+}

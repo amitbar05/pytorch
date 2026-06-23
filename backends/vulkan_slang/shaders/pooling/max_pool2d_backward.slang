@@ -15,7 +15,7 @@ struct Params {
 };
 
 [[vk::binding(0)]] StructuredBuffer<float> grad_output;   // [N, C, oH, oW]
-[[vk::binding(1)]] StructuredBuffer<float> indices;        // [N, C, oH, oW] max indices (as float bits)
+[[vk::binding(1)]] StructuredBuffer<uint> indices;         // [N, C, oH, oW] max indices (uint, avoids subnormal FTZ)
 [[vk::binding(2)]] RWStructuredBuffer<float> grad_input;   // [N, C, iH, iW]
 [[vk::push_constant]] Params params;
 
@@ -33,6 +33,10 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
 
     float sum = 0.0f;
     uint out_base = bc * params.oH * params.oW;
+    // spatial position (within the per-channel H×W plane) for this thread.
+    // Indices are stored as ih * iW + iw (no batch/channel offset), matching
+    // the PyTorch ATen contract for max_pool2d_with_indices.
+    uint spatial_pos = ih * params.iW + iw;
 
     // Compute range of output positions whose window covers (ih, iw)
     // oh * sH - pH <= ih < oh * sH - pH + kH
@@ -50,8 +54,8 @@ void computeMain(uint3 tid : SV_DispatchThreadID)
     for (uint oh = oh_start; oh <= oh_end; oh++) {
         for (uint ow = ow_start; ow <= ow_end; ow++) {
             uint out_idx = out_base + oh * params.oW + ow;
-            uint stored_idx = asuint(indices[out_idx]);
-            if (stored_idx == tid.x) {
+            uint stored_idx = indices[out_idx];   // spatial index ih_max * iW + iw_max
+            if (stored_idx == spatial_pos) {
                 sum += grad_output[out_idx];
             }
         }
