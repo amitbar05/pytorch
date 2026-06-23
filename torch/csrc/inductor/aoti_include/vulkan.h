@@ -16,7 +16,8 @@
 
 // Forward-declare CPU mm (used as fallback in our Vulkan shim).
 // Full declaration lives in aoti_torch/generated/c_shim_cpu.h.
-AOTITorchError aoti_torch_cpu_mm_out(
+// Must be extern "C" to match the C-linkage definition in c_shim_cpu.h.
+extern "C" AOTITorchError aoti_torch_cpu_mm_out(
     AtenTensorHandle out, AtenTensorHandle self, AtenTensorHandle mat2);
 
 // Forward-declare Vulkan AOTI runtime opaque handles.
@@ -30,7 +31,6 @@ struct AotiVulkanModelHandle;
         std::string("Vulkan AOTI stub not implemented: ") + std::string(#name) \
         + "().  Rebuild _C_ext with AOTI runtime support, or link against "   \
         "libtorch_vulkan_aoti.so.");                                          \
-    return AOTI_RUNTIME_FAILURE;                                              \
   }
 
 // ── Allocation ──────────────────────────────────────────────────────
