@@ -855,6 +855,105 @@ def _patch_compile_fx_for_backward() -> None:
         )
 
 
+def _rewrite_factory_meta_to_vulkan(
+    gm: "torch.fx.GraphModule",
+) -> "torch.fx.GraphModule":
+    """Rewrite meta-device factory ops and CPU training constants to vulkan.
+
+    Stage 1 — call_function nodes whose target is a factory op and whose
+    device kwarg is torch.device('meta') are rewritten to vulkan:0.
+    node.meta['val'] is restamped in lock-step when a FakeMode is in scope.
+
+    Stage 2 — get_attr nodes whose target contains _exported_training and
+    whose meta['val'] is on a non-vulkan device get an aten._to_copy.default
+    node inserted immediately after them. All downstream users of the original
+    get_attr are rewired to the copy node; the copy node retains the original
+    get_attr as its first argument so the graph remains acyclic.
+    """
+    _vulkan_dev = torch.device("vulkan", 0)
+    _ft = torch._subclasses.fake_tensor
+
+    _FACTORY_OPS = frozenset((
+        torch.ops.aten.empty.memory_format,
+        torch.ops.aten.empty_strided.default,
+        torch.ops.aten.zeros.default,
+        torch.ops.aten.ones.default,
+        torch.ops.aten.full.default,
+        torch.ops.aten.empty_like.default,
+        torch.ops.aten.zeros_like.default,
+        torch.ops.aten.ones_like.default,
+        torch.ops.aten.full_like.default,
+    ))
+
+    fm = None
+    for _n in gm.graph.nodes:
+        _v = _n.meta.get("val")
+        if isinstance(_v, _ft.FakeTensor):
+            fm = _v.fake_mode
+            break
+
+    structure_modified = False
+
+    # Stage 1: factory-op device kwargs meta -> vulkan (no new nodes)
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in _FACTORY_OPS:
+            continue
+        kw_device = node.kwargs.get("device")
+        if not (isinstance(kw_device, torch.device) and kw_device.type == "meta"):
+            continue
+        node.kwargs = {**node.kwargs, "device": _vulkan_dev}
+        val = node.meta.get("val")
+        if (
+            fm is not None
+            and isinstance(val, _ft.FakeTensor)
+            and val.device.type == "meta"
+        ):
+            node.meta["val"] = _ft.FakeTensor.__new__(
+                _ft.FakeTensor, fm, val, device=_vulkan_dev
+            )
+
+    # Stage 2: get_attr for _exported_training* CPU constants -> _to_copy
+    for node in list(gm.graph.nodes):
+        if node.op != "get_attr":
+            continue
+        target = node.target
+        if not (isinstance(target, str) and "_exported_training" in target):
+            continue
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor) and val.device.type == "vulkan":
+            continue
+
+        with gm.graph.inserting_after(node):
+            copy_node = gm.graph.call_function(
+                torch.ops.aten._to_copy.default,
+                (node,),
+                {"device": _vulkan_dev},
+            )
+
+        if fm is not None and isinstance(val, _ft.FakeTensor):
+            # FakeTensor.__new__ requires elem.device == 'meta'
+            _meta_elem = torch.empty(
+                tuple(val.shape), dtype=val.dtype, device="meta"
+            )
+            copy_node.meta["val"] = _ft.FakeTensor.__new__(
+                _ft.FakeTensor, fm, _meta_elem, device=_vulkan_dev
+            )
+        elif isinstance(val, torch.Tensor):
+            copy_node.meta = dict(node.meta)
+
+        node.replace_all_uses_with(
+            copy_node,
+            delete_user_cb=lambda user: user is not copy_node,
+        )
+        structure_modified = True
+
+    if structure_modified:
+        gm.graph.lint()
+        gm.recompile()
+
+    return gm
+
+
 def _skip_misc_patterns_for_vulkan() -> None:
     try:
         from torch._inductor.fx_passes import misc_patterns as _mp

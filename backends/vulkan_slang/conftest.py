@@ -24,10 +24,18 @@ import glob
 import os
 import re
 import shutil
+import sys
 from typing import Optional
 
 _BACKEND_ROOT = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_BACKEND_ROOT, "..", ".."))
+
+# Ensure this backend's python/ directory is first on sys.path so that
+# worktree runs (where the editable install points to a different tree)
+# still import the correct torch_vulkan package.
+_PYTHON_ROOT = os.path.join(_BACKEND_ROOT, "python")
+if _PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, _PYTHON_ROOT)
 
 
 def _version_key(path: str) -> tuple[int, ...]:

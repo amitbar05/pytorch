@@ -64490,3 +64490,210 @@ class TestAOTIAddmmBmmPC:
         from torch_vulkan.inductor.cpp_wrapper_gpu import emit_aoti_spv_header, collect_aoti_spv_bundle
         bundle = collect_aoti_spv_bundle()
         assert any("96u" in emit_aoti_spv_header(bundle) for _ in [1]), "Expected pc_size_bytes=96 in AOTI header"
+
+
+# ── S4.0 — reflected push-constant size robustness ────────────────────────
+
+
+class TestS40ReflectedPcSize:
+    """S4.0: get_reflected_pc_size returns 0 when push_constant_size is absent."""
+
+    _fake_spv = b'\x03\x02\x23\x07' * 16  # 64 bytes of SPIR-V magic
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
+    def test_get_reflected_pc_size_missing_key(self):
+        """S4.0: JSON without push_constant_size returns 0, no KeyError."""
+        import unittest.mock
+        from torch_vulkan.inductor.runtime import get_reflected_pc_size
+
+        with unittest.mock.patch(
+            'torch_vulkan.inductor.runtime.reflection.get_reflection_json',
+            return_value='{"parameters": []}',
+        ):
+            result = get_reflected_pc_size(self._fake_spv)
+        assert result == 0, (
+            f"S4.0: expected 0 when push_constant_size absent, got {result}"
+        )
+
+    def test_get_reflected_pc_size_empty_json(self):
+        """S4.0: empty JSON object returns 0, no KeyError."""
+        import unittest.mock
+        from torch_vulkan.inductor.runtime import get_reflected_pc_size
+
+        with unittest.mock.patch(
+            'torch_vulkan.inductor.runtime.reflection.get_reflection_json',
+            return_value='{}',
+        ):
+            result = get_reflected_pc_size(self._fake_spv)
+        assert result == 0, (
+            f"S4.0: expected 0 for empty JSON, got {result}"
+        )
+
+
+# ── S4.0 — emit_aoti_spv_header metadata parameter ─────────────────────────
+
+
+class TestS40EmitAotiSpvHeaderMetadata:
+    """S4.0: emit_aoti_spv_header metadata parameter contract."""
+
+    _fake_spv = b'\x03\x02\x23\x07' * 16
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
+    def _emit(self, metadata):
+        from torch_vulkan.inductor.cpp_wrapper_gpu import emit_aoti_spv_header
+        return emit_aoti_spv_header({'k': self._fake_spv}, metadata=metadata)
+
+    def test_emit_aoti_spv_header_metadata_key_absent(self):
+        """S4.0: key absent in metadata falls back to reflection, produces valid C++."""
+        hdr = self._emit(metadata={})
+        assert 'static const uint32_t' in hdr, (
+            "S4.0: expected C++ array declaration in header (key absent)"
+        )
+
+    def test_emit_aoti_spv_header_metadata_value_none(self):
+        """S4.0: None metadata value must NOT raise TypeError."""
+        hdr = self._emit(metadata={'k': None})
+        assert 'static const uint32_t' in hdr, (
+            "S4.0: expected valid C++ header with None metadata value"
+        )
+
+    def test_emit_aoti_spv_header_metadata_value_zero(self):
+        """S4.0: integer-0 metadata value must NOT raise TypeError."""
+        hdr = self._emit(metadata={'k': 0})
+        assert 'static const uint32_t' in hdr, (
+            "S4.0: expected valid C++ header with 0 metadata value"
+        )
+
+    def test_emit_aoti_spv_header_explicit_zero_values_honoured(self):
+        """S4.0: explicit {'n_buffers': 0, 'pc_size_bytes': 0} honoured, not overridden."""
+        hdr = self._emit(metadata={'k': {'n_buffers': 0, 'pc_size_bytes': 0}})
+        assert 'static const uint32_t' in hdr, (
+            "S4.0: expected C++ array declaration in header"
+        )
+        assert '0u' in hdr, (
+            "S4.0: explicit zero values should appear as 0u in the init table"
+        )
+
+
+# ── S4.3 — _rewrite_factory_meta_to_vulkan pass ─────────────────────────────
+
+
+class TestS43RewriteFactoryMetaToVulkan:
+    """S4.3: _rewrite_factory_meta_to_vulkan FX pass correctness."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
+    def _meta_fake(self, shape):
+        """Return (FakeTensorMode, FakeTensor on meta device) for a given shape."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        mode = FakeTensorMode()
+        with mode:
+            ft = torch.empty(shape, device='meta')
+        return mode, ft
+
+    def _cpu_fake(self, shape, mode=None):
+        """Return a FakeTensor on CPU for a given shape."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        if mode is None:
+            mode = FakeTensorMode()
+        with mode:
+            ft = torch.empty(shape)
+        return ft
+
+    def test_factory_op_meta_device_rewritten_to_vulkan(self):
+        """S4.3: aten.empty.memory_format kwargs['device']='meta' -> 'vulkan'; meta['val'] restamped."""
+        from torch_vulkan.inductor.meta_patches.joint_graph_passes import (
+            _rewrite_factory_meta_to_vulkan,
+        )
+
+        mode, meta_ft = self._meta_fake([2, 3])
+
+        g = torch.fx.Graph()
+        node = g.call_function(
+            torch.ops.aten.empty.memory_format,
+            ([2, 3],),
+            {'device': torch.device('meta')},
+        )
+        g.output(node)
+        gm = torch.fx.GraphModule({}, g)
+        node.meta['val'] = meta_ft
+
+        _rewrite_factory_meta_to_vulkan(gm)
+
+        assert node.kwargs['device'].type == 'vulkan', (
+            "S4.3: factory op device kwarg not rewritten from 'meta' to 'vulkan'"
+        )
+        assert node.meta['val'].device.type == 'vulkan', (
+            "S4.3: factory op meta['val'] not restamped to vulkan device"
+        )
+
+    def test_get_attr_cpu_constant_gets_to_copy_inserted(self):
+        """S4.3: get_attr '_exported_training_const' on CPU gets _to_copy.default inserted."""
+        from torch_vulkan.inductor.meta_patches.joint_graph_passes import (
+            _rewrite_factory_meta_to_vulkan,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        cpu_const = torch.randn(4, 4)
+        mode = FakeTensorMode()
+        cpu_ft = self._cpu_fake([4, 4], mode=mode)
+
+        g = torch.fx.Graph()
+        ga_node = g.get_attr('_exported_training_const')
+        g.output(ga_node)
+        gm = torch.fx.GraphModule({'_exported_training_const': cpu_const}, g)
+        ga_node.meta['val'] = cpu_ft
+
+        _rewrite_factory_meta_to_vulkan(gm)
+
+        to_copy_nodes = [
+            n for n in gm.graph.nodes
+            if n.op == 'call_function'
+            and n.target is torch.ops.aten._to_copy.default
+        ]
+        assert len(to_copy_nodes) == 1, (
+            f"S4.3: expected 1 _to_copy.default node, got {len(to_copy_nodes)}"
+        )
+        copy_node = to_copy_nodes[0]
+        assert copy_node.meta['val'].device.type == 'vulkan', (
+            "S4.3: _to_copy node meta['val'] not on vulkan device"
+        )
+        assert len(ga_node.users) == 1 and copy_node in ga_node.users, (
+            "S4.3: original get_attr should have exactly one user: the inserted _to_copy node"
+        )
+
+    def test_non_exported_get_attr_not_rewritten(self):
+        """S4.3: get_attr targeting 'weight' (no _exported_training substring) left unchanged."""
+        from torch_vulkan.inductor.meta_patches.joint_graph_passes import (
+            _rewrite_factory_meta_to_vulkan,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        cpu_const = torch.randn(4, 4)
+        mode = FakeTensorMode()
+        cpu_ft = self._cpu_fake([4, 4], mode=mode)
+
+        g = torch.fx.Graph()
+        ga_node = g.get_attr('weight')
+        g.output(ga_node)
+        gm = torch.fx.GraphModule({'weight': cpu_const}, g)
+        ga_node.meta['val'] = cpu_ft
+
+        _rewrite_factory_meta_to_vulkan(gm)
+
+        to_copy_nodes = [
+            n for n in gm.graph.nodes
+            if n.op == 'call_function'
+            and n.target is torch.ops.aten._to_copy.default
+        ]
+        assert len(to_copy_nodes) == 0, (
+            "S4.3: no _to_copy.default should be inserted for non-exported get_attr 'weight'"
+        )
