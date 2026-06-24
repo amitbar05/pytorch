@@ -40014,6 +40014,76 @@ class TestM99ComboBatcher:
         assert torch.isfinite(out.cpu()).all()
 
 
+class TestDispatchBatcherLifecycle:
+    def test_flush_reenters_batch_mode_within_block(self):
+        """M17.5 lifecycle: _begin_batch is called in __enter__ and again
+        at the end of _flush() so that direct dispatches after a sync
+        point accumulate in a fresh command buffer."""
+        from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+
+        call_log = []
+
+        def _fake_begin():
+            call_log.append("begin")
+
+        def _fake_end():
+            call_log.append("end")
+
+        _orig_begin = DispatchBatcher._begin_batch
+        _orig_end = DispatchBatcher._end_batch
+        _orig_probed = DispatchBatcher._batch_probed
+        _orig_current = DispatchBatcher._current
+        # Use staticmethod to prevent Python's descriptor protocol from binding
+        # the function as a method (C extension functions don't bind, but plain
+        # Python functions do — staticmethod matches that behaviour).
+        DispatchBatcher._begin_batch = staticmethod(_fake_begin)
+        DispatchBatcher._end_batch = staticmethod(_fake_end)
+        DispatchBatcher._batch_probed = True
+        DispatchBatcher._current = None
+
+        try:
+            batcher = DispatchBatcher()
+            outputs = {}
+
+            def kernel_a(out, val):
+                out.fill_(val)
+
+            def kernel_b(out, val):
+                out.fill_(val)
+
+            with batcher:
+                out_a = torch.zeros(8)
+                batcher.add(kernel_a, out_a, 3.14)
+                outputs["a"] = out_a
+
+                batcher._flush()
+
+                out_b = torch.zeros(8)
+                batcher.add(kernel_b, out_b, 2.71)
+                outputs["b"] = out_b
+
+            # 6-event lifecycle:
+            #   __enter__                  → begin
+            #   explicit _flush(kernel_a)  → end, begin   (re-entry — the M17.5 fix)
+            #   __exit__._flush(kernel_b)  → end, begin   (re-entry again)
+            #   __exit__._end_batch        → end
+            assert call_log == ["begin", "end", "begin", "end", "begin", "end"], (
+                f"Expected lifecycle [begin,end,begin,end,begin,end], got {call_log}"
+            )
+
+            torch.testing.assert_close(
+                outputs["a"], torch.full((8,), 3.14)
+            )
+            torch.testing.assert_close(
+                outputs["b"], torch.full((8,), 2.71)
+            )
+        finally:
+            DispatchBatcher._begin_batch = _orig_begin
+            DispatchBatcher._end_batch = _orig_end
+            DispatchBatcher._batch_probed = _orig_probed
+            DispatchBatcher._current = _orig_current
+
+
 class TestM173AdaptiveAvgPool2d:
     """M17.3 — ``aten._adaptive_avg_pool2d.default`` forward lowering.
 
