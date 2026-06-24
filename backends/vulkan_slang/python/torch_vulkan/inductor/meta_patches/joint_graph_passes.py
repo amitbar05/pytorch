@@ -725,6 +725,13 @@ def _install_joint_partition_device_fix() -> None:
                 return False
             return isinstance(attr, torch.Tensor) and attr.device.type == "cpu"
 
+        fm = None
+        for _n in fx_g.graph.nodes:
+            _v = _n.meta.get("val")
+            if isinstance(_v, _ft.FakeTensor):
+                fm = _v.fake_mode
+                break
+
         modified = False
         for node in list(fx_g.graph.nodes):
             if node.op != "call_function":
