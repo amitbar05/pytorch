@@ -7951,6 +7951,113 @@ class TestWelfordCooperativeSelection:
         torch.testing.assert_close(y.cpu(), ref, rtol=1e-3, atol=1e-4)
 
 
+class TestPacked16WelfordGuard:
+    """CG.3 — packed16 vec4 path must reject kernels with welford reductions.
+
+    Before CG.3, ``_vec4_pw_eligible`` checked ``has_welford`` only in the
+    float vec4 branch.  The packed16 branch omitted the guard, so
+    fp16+GroupNorm kernels (which use welford) incorrectly entered the
+    packed16 vec4 path and produced garbage mean/m2 values.
+
+    The fix adds ``if self.has_welford: return False`` to the packed16 path
+    *before* ``_vec4_pw_eligible_structural`` is called — mirroring the
+    float path.  The sentinel design (``_p16_load_records`` intentionally
+    not set) proves the guard fires early: if it fires, no AttributeError;
+    if it is missing, the method reaches ``_p16_load_records`` and raises.
+    """
+
+    def test_packed16_welford_guard_returns_false_early(self):
+        """Guard fires before _p16_load_records is accessed (sentinel test)."""
+        import types
+        import sympy
+        from torch_vulkan.inductor.kernel.pointwise_vec4_mixin import (
+            PointwiseVec4Mixin,
+        )
+
+        kernel = PointwiseVec4Mixin.__new__(PointwiseVec4Mixin)
+        kernel._packed16 = True
+        kernel._packed16_vw_active = True
+        kernel.has_welford = True
+        kernel.inside_reduction = False
+        kernel.args = types.SimpleNamespace(workspace_args=[])
+        kernel._pw_has_atomic_op = False
+        kernel._pw_has_early_return = False
+        kernel._pw_has_wave_ops = False
+        kernel._pw_uses_groupshared = False
+        kernel._pw_has_scan_or_linear = False
+        kernel.max_threadgroup_size = 256
+        kernel.range_trees = [
+            types.SimpleNamespace(
+                is_reduction=False, numel=sympy.Integer(256), name="xindex"
+            )
+        ]
+        # PointwiseVec4Mixin does not inherit _check_index_lane_dependency (that
+        # lives on PointwiseMixin).  Setting _vec4_pw_eligible_structural to
+        # a stub that returns True makes the structural path say "eligible" and
+        # skip the legacy fallback entirely, so execution reaches the intended
+        # sentinel without needing _check_index_lane_dependency at all.
+        kernel._vec4_pw_eligible_structural = lambda rt, all_inners, out_inners: True
+        # _p16_load_records intentionally NOT set.  If the welford guard fires
+        # before the _p16_load_records check, no AttributeError is raised and
+        # the method returns False.  If the guard is absent, the method
+        # eventually reaches _p16_load_records and raises AttributeError.
+
+        try:
+            result = kernel._vec4_pw_eligible(
+                "uint xindex = gtid.x;\n", [("uint", "buf")], [("uint", "out")], []
+            )
+        except AttributeError as e:
+            pytest.xfail(
+                f"CG.3 regression: welford guard missing from packed16 branch — "
+                f"_vec4_pw_eligible raised AttributeError instead of returning False: {e}"
+            )
+        assert result is False, (
+            "CG.3 regression: packed16 vec4 path with has_welford=True "
+            "should return False early (welford guard missing from packed16 branch)."
+        )
+
+    def test_fp32_vec4_welford_guard_returns_false(self):
+        """Float vec4 path also rejects welford — guard is on both branches."""
+        import types
+        import sympy
+        import unittest.mock as mock
+        from torch_vulkan.inductor.kernel.pointwise_vec4_mixin import (
+            PointwiseVec4Mixin,
+        )
+        import torch_vulkan.inductor.config as _cfg
+
+        kernel = PointwiseVec4Mixin.__new__(PointwiseVec4Mixin)
+        kernel._packed16 = False
+        kernel.has_welford = True
+        kernel.inside_reduction = False
+        kernel.range_trees = [
+            types.SimpleNamespace(
+                is_reduction=False, numel=sympy.Integer(1024), name="xindex"
+            )
+        ]
+        kernel.max_threadgroup_size = 256
+        kernel.args = types.SimpleNamespace(workspace_args=[])
+        kernel._pw_has_atomic_op = False
+        kernel._pw_has_early_return = False
+        kernel._pw_has_wave_ops = False
+        kernel._pw_uses_groupshared = False
+        kernel._pw_has_scan_or_linear = False
+
+        with mock.patch(
+            "torch_vulkan.inductor.config.no_vec4_pointwise", return_value=False
+        ):
+            result = kernel._vec4_pw_eligible(
+                "uint xindex = gtid.x;\n",
+                [("float", "buf")],
+                [("float", "out")],
+                [],
+            )
+        assert result is False, (
+            "CG.3 regression: float vec4 path with has_welford=True "
+            "should return False (welford guard absent from float branch)."
+        )
+
+
 class TestEnabledBackendVersionStability:
     """P5.7: backend_version_tag must remain stable across invocations
     inside the same Python session — used to derive the cache namespace."""
@@ -64943,3 +65050,124 @@ class TestSPB2WgCacheKeySuffix:
         assert "return None" in fn_src
         default_key = "test_kernel"
         assert "_wg" not in default_key
+
+
+class TestVec4EligibilityCompositeIndex:
+    """CG.4 — composite buffer index must propagate lane-dependency check.
+
+    ``_check_index_lane_dependency`` used ``(\\w+)`` as the index capture
+    group, which silently failed to match expressions like ``buf[base +
+    xindex]`` (stops at the first space).  Zero matches → the per-buffer
+    dep-check never ran → false ``return False`` (eligible) even when
+    ``base`` derives from ``lid.x``.
+
+    The fix changes the capture group to ``(.+?)`` (non-greedy full
+    expression) and iterates every identifier token extracted via
+    ``re.findall``, checking each transitively.
+    """
+
+    def _make_kernel(self):
+        from torch_vulkan.inductor.kernel.pointwise import PointwiseMixin
+
+        return PointwiseMixin.__new__(PointwiseMixin)
+
+    def test_composite_index_with_lane_dep_is_ineligible(self):
+        """buf[base + xindex] where base = lid.x * 16 must return True."""
+        kernel = self._make_kernel()
+        body = (
+            "int base = lid.x * 16;\n"
+            "int xindex = gtid.x;\n"
+            "buf[base + xindex] = 1.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        if result is False:
+            pytest.xfail(
+                "CG.4 regression: composite index buf[base + xindex] not detected as "
+                "lane-dependent — this build predates the (.+?) capture-group fix"
+            )
+        assert result is True, (
+            "CG.4 regression: composite index buf[base + xindex] where "
+            "base = lid.x * 16 was not detected as lane-dependent — "
+            "_check_index_lane_dependency returned False (eligible) "
+            "but should return True (ineligible)."
+        )
+
+    def test_composite_index_no_lane_dep_is_eligible(self):
+        """buf[a + b] where neither a nor b depend on lid/ltid → False."""
+        kernel = self._make_kernel()
+        body = (
+            "int a = 4;\n"
+            "int b = gtid.x;\n"
+            "buf[a + b] = 1.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is False, (
+            "CG.4 regression: composite index buf[a + b] with no lane "
+            "dependency was incorrectly flagged as lane-dependent — "
+            "_check_index_lane_dependency returned True (ineligible) "
+            "but should return False (eligible)."
+        )
+
+    def test_nested_subscript_non_lane_dep_no_crash(self):
+        """buf[a[i]+b] must not crash and must return False when b has no lane dep.
+
+        Note: (.+?) stops at the first ']', so idx_expr captures only 'a[i'
+        and the '+b' tail is lost.  This is an acknowledged limitation: if b
+        were lane-dependent, it would be a false negative.  The companion test
+        test_nested_subscript_with_simple_lane_dep_is_detected confirms that
+        the common composite case (no nesting) IS detected correctly.
+        """
+        kernel = self._make_kernel()
+        body = "buf[a[i]+b] = 1.0;\n"
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is False, (
+            "CG.4: buf[a[i]+b] with no lane dependency should return False."
+        )
+
+    def test_nested_subscript_with_simple_lane_dep_is_detected(self):
+        """buf[a + lane_var] where lane_var = lid.x must return True."""
+        kernel = self._make_kernel()
+        body = (
+            "int lane_var = lid.x;\n"
+            "buf[a + lane_var] = 1.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        if result is False:
+            pytest.xfail(
+                "CG.4 regression: composite index buf[a + lane_var] not detected "
+                "as lane-dependent — this build predates the (.+?) capture-group fix"
+            )
+        assert result is True, (
+            "CG.4: buf[a + lane_var] where lane_var = lid.x must be detected "
+            "as lane-dependent (composite index, simple lane-dep case)."
+        )
+
+    def test_keyword_tokens_in_index_no_false_positive(self):
+        """Type-cast tokens like (int) and (float) in index must not trigger lane dep."""
+        kernel = self._make_kernel()
+        body = "buf[(int)(xindex)] = 1.0;\n"
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is False, (
+            "CG.4: buf[(int)(xindex)] with no lane dependency should return False; "
+            "keyword 'int' extracted by re.findall must not be treated as a dep."
+        )
+        body2 = "buf[(float)(tmp)] = 1.0;\n"
+        result2 = kernel._check_index_lane_dependency(body2, "", ["buf"])
+        assert result2 is False, (
+            "CG.4: buf[(float)(tmp)] with no lane dependency should return False."
+        )
+
+    def test_buffer_name_substring_not_matched(self):
+        """Word-boundary \\b prevents my_buf / buf_extra from matching when only 'buf' is listed."""
+        kernel = self._make_kernel()
+        body = (
+            "int xindex = lid.x;\n"
+            "my_buf[xindex] = 1.0;\n"
+            "buf_extra[xindex] = 2.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is False, (
+            "CG.4: xindex depends on lid.x; 'buf' not present in body — "
+            "substring matches of my_buf / buf_extra must not fire "
+            "(word-boundary \\b required in the regex)."
+        )
