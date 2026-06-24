@@ -683,6 +683,100 @@ def _install_joint_partition_device_fix() -> None:
             fx_g.recompile()
         return fx_g
 
+    def _rewrite_factory_meta_to_vulkan(fx_g):
+        """S4.3 — extend factory-op device stamping to all _FACTORY_OPS.
+
+        Two sub-cases are handled here:
+
+        1. **Factory op still in the graph with device='meta'** (edge case
+           where _stamp_factory_devices Stage 1 missed it): update the device
+           kwarg to 'vulkan' and re-stamp node.meta['val'].
+
+        2. **Constant-folded factory op → get_attr pointing to a CPU tensor**
+           (the main S4.3 bug): torch.export lifts the concrete result of
+           torch.zeros/ones/full/etc. as a graph-module constant. The joint
+           graph then has a ``get_attr`` node whose ``node.meta['val']`` is a
+           real CPU ``torch.Tensor`` (not a FakeTensor). Stage 1 of
+           _stamp_factory_devices only rewrites ``call_function`` nodes, and
+           Stage 2 calls _val_has_meta_tensor() which returns False for a
+           real CPU tensor — so the constant is silently left on CPU. At .so
+           runtime the tensor is allocated on the default CPU device instead
+           of Vulkan.
+
+        Fix for case 2: insert ``aten._to_copy.default(get_attr,
+           device='vulkan')`` immediately after the get_attr node and update
+           the downstream uses so the partitioner sees a coherent device.
+           We only apply this to get_attr nodes whose target is in the graph
+           module's state dict under an ``_exported_training`` prefix — those
+           are the torch.export constant entries, not user model parameters
+           or buffers.
+
+        Vulkan-only — gated by the outer _has_vulkan_input check in _chained.
+        """
+        def _is_factory_constant_getattr(node, fx_g):
+            if node.op != "get_attr":
+                return False
+            target = node.target
+            if not isinstance(target, str) or not target.startswith("_exported_training"):
+                return False
+            try:
+                attr = getattr(fx_g, target, None)
+            except Exception:
+                return False
+            return isinstance(attr, torch.Tensor) and attr.device.type == "cpu"
+
+        modified = False
+        for node in list(fx_g.graph.nodes):
+            if node.op != "call_function":
+                continue
+            if node.target not in _FACTORY_OPS:
+                continue
+            # Case 1: factory op still in the graph, device kwarg is meta
+            # (edge case — Stage 1 should normally catch this).
+            kw_device = node.kwargs.get("device")
+            if isinstance(kw_device, torch.device) and kw_device.type == "meta":
+                new_kwargs = dict(node.kwargs)
+                new_kwargs["device"] = _vulkan_dev
+                node.kwargs = new_kwargs
+                val = node.meta.get("val")
+                if (
+                    fm is not None
+                    and isinstance(val, _ft.FakeTensor)
+                    and val.device.type == "meta"
+                ):
+                    node.meta["val"] = _restamp_to_vulkan(val, fm)
+                modified = True
+
+        # Case 2: constant-folded factory op → get_attr → CPU tensor.
+        if fm is not None:
+            for node in list(fx_g.graph.nodes):
+                if not _is_factory_constant_getattr(node, fx_g):
+                    continue
+                # Insert aten._to_copy.default(node, device='vulkan') right
+                # after the get_attr.  This is the minimal, correct way to
+                # move a concrete constant tensor to the Vulkan device in the
+                # FX graph without touching any model parameter/buffer nodes.
+                with fx_g.graph.inserting_after(node):
+                    to_node = fx_g.graph.call_function(
+                        torch.ops.aten._to_copy.default,
+                        (node,),
+                        {"device": _vulkan_dev, "dtype": None, "non_blocking": False},
+                    )
+                # Stamp the new node's val so the partitioner sees vulkan.
+                src_val = node.meta.get("val")
+                if isinstance(src_val, torch.Tensor):
+                    to_node.meta["val"] = fm.from_tensor(
+                        torch.empty_like(src_val, device=_vulkan_dev),
+                        static_shapes=True,
+                    )
+                node.replace_all_uses_with(to_node)
+                modified = True
+
+        if modified:
+            fx_g.graph.lint()
+            fx_g.recompile()
+        return fx_g
+
     def _chained(fx_g, joint_inputs):
         if callable(existing):
             fx_g = existing(fx_g, joint_inputs)
@@ -697,6 +791,12 @@ def _install_joint_partition_device_fix() -> None:
             # also might leave tangents unused) but BEFORE device-stamp /
             # lifetime annotation (which expect a coherent graph).
             fx_g = _rewrite_constant_folded_tangent(fx_g)
+            # S4.3: extend factory-op shim to all _FACTORY_OPS.
+            # Runs after _rewrite_constant_folded_tangent (which may also
+            # leave tangents unused) but BEFORE _stamp_factory_devices so
+            # the get_attr → _to_copy(vulkan) rewrites are visible when
+            # the device-stamp pass walks the graph.
+            fx_g = _rewrite_factory_meta_to_vulkan(fx_g)
             fx_g = _stamp_factory_devices(fx_g)
             # PF.40: annotate node.meta["lifetime_class"] on the joint
             # graph. The annotation propagates into fw_module / bw_module
