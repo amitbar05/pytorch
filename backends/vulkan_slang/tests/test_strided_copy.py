@@ -75,7 +75,6 @@ def test_clone_offset_view_propagation():
     assert (result == 42.0).all(), f"Expected all 42, got {result.unique()}"
 
 
-@pytest.mark.skipif(not _vulkan_available(), reason="Vulkan device required")
 class TestDescriptorByteOffsetPerDtype:
     """S3.5: off_bytes = storage_offset * element_size computed correctly per dtype."""
 
@@ -94,7 +93,6 @@ class TestDescriptorByteOffsetPerDtype:
         )
 
 
-@pytest.mark.skipif(not _vulkan_available(), reason="Vulkan device required")
 def test_strided_copy_float16_offset_view():
     """S3.5: float16 slice (nominal storage_offset=4) clones to correct values."""
     src = torch.arange(32, dtype=torch.float16).to("vulkan:0")[4:]
@@ -102,7 +100,6 @@ def test_strided_copy_float16_offset_view():
     assert torch.equal(dst, torch.arange(4, 32, dtype=torch.float16))
 
 
-@pytest.mark.skipif(not _vulkan_available(), reason="Vulkan device required")
 def test_strided_copy_non_contiguous_float16():
     """S3.5: non-contiguous float16 slice ([:, 2:]) clones correctly."""
     z = torch.arange(32, dtype=torch.float16).reshape(4, 8).to("vulkan:0")[:, 2:]

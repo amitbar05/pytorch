@@ -64759,6 +64759,10 @@ class TestS43RewriteFactoryMetaToVulkan:
 class TestAotiShimHandleLifetime:
     """MS.1/MS.2: aoti_torch_zeros_vulkan returns a non-null handle; aoti_torch_delete frees it without crash."""
 
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
     def test_aoti_zeros_handle_roundtrip(self):
         import ctypes
         import glob
