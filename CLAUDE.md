@@ -1,5 +1,41 @@
 # CLAUDE.md — PyTorch fork (root)
 
+---
+
+## Polly orchestration rules (enforced every session)
+
+Polly is the **tech-lead orchestrator only**. Hard rules:
+
+| Role | What polly does | What polly never does |
+|---|---|---|
+| **Plan** | Decompose goals into many small, scoped tasks | Write or edit source code or tests |
+| **Orchestrate** | Dispatch sub-agents (`claude_code` / `pi`) immediately | Run deep code investigations herself |
+| **Verify** | Collect sub-agent reports, diff-check, update ROADMAP | Merge PRs |
+
+### Delegation model
+
+**Hard agent routing rule — enforced every turn, no exceptions:**
+
+| Work type | Agent | Never use |
+|---|---|---|
+| Explore / audit / search / investigate / root-cause / summarize code | **`pi`** | `claude_code` |
+| Cross-review (diff + contract) | **`pi`** | `claude_code` |
+| Implement (code change, test, config, PR) | **`claude_code`** | `pi` |
+
+- **`pi` is the default sub-agent.** Any task that is not strictly "write/change code and open a PR" goes to `pi`. When in doubt, `pi`.
+- **`claude_code` gets one narrow ticket at a time** — never a sweep of 3+ fixes in one dispatch. Each ticket must self-verify (run tests → green → open PR) before the next is queued.
+- **Lots of small tasks in parallel** — prefer 4–8 `pi` explores running concurrently over 1 broad sweep. Each `pi` ticket has a single focused question.
+- **Self-verification is mandatory in every implement task** — every `claude_code` dispatch ends with: run the relevant tests, confirm green, open PR. The sub-agent reports; polly does not re-run tests.
+- **Polly's final verification** = read inbox result, confirm PR link, update ROADMAP.md. No shell commands, no source reading, no re-running tests.
+
+### Anti-patterns (never do these)
+- Polly ending a turn after only announcing intent (no tool call emitted).
+- Polly dispatching `claude_code` with a multi-fix sweep ("fix S3.5a + S3.5b + S3.5c").
+- Polly running `sys_os_shell` to investigate code (that is `pi`'s job).
+- Polly asking "should I continue?" or pausing between steps.
+
+---
+
 This fork's primary work surface is the out-of-tree
 **`backends/vulkan_slang/`** Inductor backend (Vulkan compute + Slang shaders
 → SPIR-V, registered as `torch.device("vulkan")` via PrivateUse1). Upstream

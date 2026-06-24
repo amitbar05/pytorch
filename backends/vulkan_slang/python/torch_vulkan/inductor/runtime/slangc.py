@@ -631,7 +631,7 @@ def batch_compile_slang_to_spirv(
             continue
         inc_tag = "" if not include_paths else "\nINC=" + "|".join(include_paths)
         hash_key = hashlib.sha256(
-            (entry + "\n" + _normalize_slang_source(src) + inc_tag).encode()
+            (entry + "\n" + _normalize_slang_source(src) + inc_tag + _get_device_subgroup_size_tag()).encode()
         ).hexdigest()
         if hash_key in _cache_by_hash:
             spv = _cache_by_hash[hash_key]
