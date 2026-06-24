@@ -94,18 +94,33 @@ private:
     static bool async_reset_enabled();
 };
 
-// Bind storage buffers to a descriptor set
+// Bind storage buffers to a descriptor set.
+// offsets[i] is the byte offset into buffer[i] (from tensor storage_offset);
+// passing offsets=nullptr uses 0 for all bindings.
+void bind_buffers(VkDevice device,
+                  VkDescriptorSet set,
+                  const VkBuffer* buffers,
+                  const VkDeviceSize* sizes,
+                  const VkDeviceSize* offsets,
+                  uint32_t count);
+
+// Legacy overload: vectors, no per-buffer offsets (all offset=0)
 void bind_buffers(VkDevice device,
                   VkDescriptorSet set,
                   const std::vector<VkBuffer>& buffers,
                   const std::vector<VkDeviceSize>& sizes);
 
-// Stack-allocated version to avoid heap allocation per dispatch
-void bind_buffers(VkDevice device,
-                  VkDescriptorSet set,
-                  const VkBuffer* buffers,
-                  const VkDeviceSize* sizes,
-                  uint32_t count);
+// N+1.5: bind buffers to a layout that may include descriptor arrays
+// (per-binding descriptorCount > 1). The buffers/sizes/offsets arrays are
+// flat: total = sum(descriptor_counts). Each binding consumes
+// descriptor_counts[i] consecutive entries.
+void bind_buffers_indexed(VkDevice device,
+                          VkDescriptorSet set,
+                          const VkBuffer* buffers,
+                          const VkDeviceSize* sizes,
+                          const VkDeviceSize* offsets,
+                          const uint32_t* descriptor_counts,
+                          uint32_t num_bindings);
 
 // N+1.5: bind buffers to a layout that may include descriptor arrays
 // (per-binding descriptorCount > 1). The buffers/sizes arrays are flat:
