@@ -211,6 +211,8 @@ class PointwiseVec4Mixin:
                 return False
             if int(rt.numel) == 0:
                 return False
+            if self.has_welford:
+                return False
 
             all_inners_p16 = [n for _, n in all_decls]
             out_inners_p16 = {n for _, n in out_decls + inout_decls}
