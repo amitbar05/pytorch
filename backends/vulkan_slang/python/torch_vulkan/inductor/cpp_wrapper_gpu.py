@@ -526,6 +526,7 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         grid_z: int,
         num_outputs: int,
         output_allocations: "list[dict] | None" = None,
+        spec_constants: "list[tuple[int, int]] | None" = None,
     ) -> None:
         """Emit C++ AOTI dispatch for an extern kernel with embedded SPIR-V.
 
@@ -537,8 +538,30 @@ class VulkanCppWrapperGpu(CppWrapperCpu):
         Called from extern-kernel ``codegen()`` methods when
         ``V.graph.aot_mode`` is True, replacing the Python function-call
         emission that would leak Python syntax into the C++ wrapper.
+
+        ``spec_constants`` is a list of ``(constant_id, value)`` pairs.
+        AOTI pipeline creation (``torch_vulkan_aoti_make_kernel``) does not
+        pass ``VkSpecializationInfo``, so these values are baked into the
+        Slang source as ``[[vk::constant_id(N)]]`` defaults before compiling
+        to SPIR-V.  The resulting ``OpSpecConstant`` defaults are used by
+        Vulkan when no override is given at pipeline creation time.
         """
+        import re
+
         from .runtime.slangc import compile_slang_to_spirv
+
+        # 0. Bake spec-constant values into Slang source defaults (AOTI mode:
+        #    torch_vulkan_aoti_make_kernel does not pass VkSpecializationInfo).
+        if spec_constants:
+            for sc_id, sc_val in spec_constants:
+                # Match: [[vk::constant_id(N)]] const <type> <name> = <old>;
+                # Replaces the default value so the compiled SPIR-V
+                # OpSpecConstant carries the correct value as its default.
+                slang_src = re.sub(
+                    rf'(\[\[vk::constant_id\({sc_id}\)\]\][^\n=]+=\s*)\d+u?(\s*;)',
+                    rf'\g<1>{sc_val}u\2',
+                    slang_src,
+                )
 
         # 1. Compile Slang → SPIR-V (uses disk + in-memory cache, threadsafe)
         try:

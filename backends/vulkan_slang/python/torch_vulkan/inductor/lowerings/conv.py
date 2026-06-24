@@ -390,32 +390,50 @@ def _register_conv_and_pool_lowerings() -> None:
             cache_key = (
                 f"slang_conv2d_{tile_w}x{tile_h}x{tile_c}"
                 f"_t{threads_w}x{threads_h}_{dtype_s}"
-                f"{'_' + epilogue if epilogue else ''}_msf5"
+                f"_k{int(kH)}x{int(kW)}_s{int(sH)}x{int(sW)}"
+                f"_p{int(pH)}x{int(pW)}_d{int(dH)}x{int(dW)}_g1"
+                f"{'_' + epilogue if epilogue else ''}_scpc1"
             )
 
-            # 3. Compute push constants (matching _slang_tile_conv2d layout)
+            # 3. Compute push constants — 20 uint32s = 80 bytes (_scpc1 layout).
+            # kH/kW/sH/sW/pH/pW/groups/dH/dW and tile_w/tile_h/tile_c are
+            # promoted to spec-constants (IDs 35-43 and 30-32) to match
+            # the _slang_tile_conv2d Python-path layout.
             in_stride = in_layout.stride
             w_stride = w_layout.stride
             out_stride = out_layout.stride
+            stride_bias = 1 if has_bias else 0
 
             pc_values = [
                 int(N), int(C_in), int(C_out),
                 int(iH), int(iW), int(oH), int(oW),
-                int(kH), int(kW),
-                int(sH), int(sW), int(pH), int(pW),
-                1,  # groups
-                int(dH), int(dW),
                 int(in_stride[0]), int(in_stride[1]),
                 int(in_stride[2]), int(in_stride[3]),
                 int(w_stride[0]), int(w_stride[1]),
                 int(w_stride[2]), int(w_stride[3]),
                 int(out_stride[0]), int(out_stride[1]),
                 int(out_stride[2]), int(out_stride[3]),
-                int(tile_w), int(tile_h), int(tile_c),
+                stride_bias,
             ]
-            # stride_bias = 1 if bias present, else 0
-            stride_bias = 1 if has_bias else 0
-            pc_values.append(stride_bias)
+
+            # Spec-constants mirror _slang_tile_conv2d (IDs 30-34: tile dims;
+            # 35-43: shape params promoted from push-constants).
+            spec_constants_aoti = [
+                (30, int(tile_w)),
+                (31, int(tile_h)),
+                (32, int(tile_c)),
+                (33, int(threads_w)),
+                (34, int(threads_h)),
+                (35, 1),  # groups — AOTI conv path only fires for groups=1
+                (36, int(kH)),
+                (37, int(kW)),
+                (38, int(sH)),
+                (39, int(sW)),
+                (40, int(pH)),
+                (41, int(pW)),
+                (42, int(dH)),
+                (43, int(dW)),
+            ]
 
             # 4. Compute grid
             grid_x = (int(oW) + tile_w - 1) // tile_w
@@ -465,6 +483,7 @@ def _register_conv_and_pool_lowerings() -> None:
                 grid_z=grid_z,
                 num_outputs=1,
                 output_allocations=output_allocations,
+                spec_constants=spec_constants_aoti,
             )
 
     # M-pipeline-2: this lowering targets a CUSTOM op

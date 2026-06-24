@@ -140,7 +140,11 @@ def _slang_tile_conv2d_gn_relu(
     # M-SF.5 follow-up: push-constant struct shrunk from 132 → 128 bytes
     # (dropped _pad field) to stay within Vulkan's guaranteed 128-byte
     # maxPushConstantsSize.  Bumping tag forces SPIR-V recompile.
-    cache_key = f"conv_gn_relu_{dtype_s}_mcg3_wg64_msf5"
+    cache_key = (
+        f"conv_gn_relu_{dtype_s}"
+        f"_k{kH}x{kW}_s{sH}x{sW}_p{pH}x{pW}_d{dH}x{dW}_g1"
+        f"_mcg3_wg64_scpc1"
+    )
 
     # Ensure contiguous for direct buffer access
     if not input_t.is_contiguous():
