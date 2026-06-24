@@ -311,6 +311,12 @@ def _register_optimizer_lowerings() -> None:
                 })
 
             # 10. Emit AOTI dispatch
+            if self.algorithm == "adamw":
+                _num_outputs = n_params * 3  # params + momentums + v_buffers
+            elif self.algorithm in ("sgd_momentum", "lion"):
+                _num_outputs = n_params * 2  # params + momentums
+            else:
+                _num_outputs = n_params      # params only (plain sgd)
             wrapper.emit_aoti_extern_dispatch(
                 slang_src=slang_src,
                 cache_key=cache_key,
@@ -319,7 +325,7 @@ def _register_optimizer_lowerings() -> None:
                 grid_x=grid_x,
                 grid_y=grid_y,
                 grid_z=grid_z,
-                num_outputs=n_params * 3,
+                num_outputs=_num_outputs,
                 output_allocations=output_allocations if output_allocations else None,
             )
 

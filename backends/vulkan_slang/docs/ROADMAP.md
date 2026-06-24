@@ -18,6 +18,8 @@
 > CG.1–CG.4 (codegen correctness), and SP.1–SP.3 (Slang/SPIR-V pipeline)
 > based on a cross-vendor read-only audit of all kernel, runtime, lowering,
 > and AOTI-emit source files. New E4/E5 coverage items added.
+>
+> **2026-06-24 merge wave:** PRs #3 (S3.5a + SP.B1/B2 + conv-lowering), #5 (S4.0 AOTI pc_size), #6 (CG.3 Welford guard), #9 (S4.2 extern-C ABI), #10 (S4.3 factory shim) squash-merged to `main`. All five passed independent cross-vendor (`claude_code` → `pi`) review before merge. CG.4 PR in progress.
 
 ---
 
@@ -138,10 +140,10 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S3.5b** | **Conv1d backward x.grad=0** (`test_m6_conv1d_backward_matches_cpu` + `test_s3_5b_conv1d_backward_grad_input_not_primal`): Root cause was AoT backward graph buffer-reuse aliasing: `input_4d = input.unsqueeze(-1)` created a dead intermediate that Inductor's memory planner reused for `conv2d_backward[0]` (grad-input). Since `input_4d` is a view of `primals_3` (primal x), grad-input aliased x, returning x itself as x.grad. **Fix**: new `conv1d_backward_core` opaque non-autograd custom op takes 3-D tensors directly (no Python-side unsqueeze), with a fake kernel deriving outputs from `input` (FT proxy) so FunctionalTensorMode produces fresh storage refs. Forward graph now saves `primals_3` as residual; backward graph uses it as a proper graph INPUT (not freed/reused). | ✅ **CLOSED 2026-06-22** — `fx_passes/eager/conv_backward.py` + `conv.py` + `lowerings/__init__.py` |
 | **S3.5c** | **Grouped conv push-constant size mismatch** (`test_m6_conv1d_groups_matches_cpu`): Original bug claimed `slang_addmm_8_8_8_s1_r1x1` SPIR-V declared 52 bytes but layout got 48 bytes (VUID-VkComputePipelineCreateInfo-layout-07987). **Three 2026-06-22 audits conclusively show this attribution is wrong**: (1) no Python path produces 48-byte PC for `slang_addmm` — both `compile_and_dispatch` and `emit_aoti_extern_dispatch` emit 96 bytes; (2) the `groups>1` conv path uses per-group `_VulkanConv2dExternKernel` + `aten.cat`, never `slang_addmm`; (3) the test docstring explicitly states "Conv2d eager fallback handles groups>1 correctly" — so there is no Slang kernel for this path at all. The VUID error was likely from a different kernel in a stale test run, now superseded by the S3.5 commit. Needs GPU re-run to verify. | 🟡 **NEEDS GPU VERIFY** — original root cause is invalid; test likely already passes; re-run to confirm |
 | **S3.5d** | **Conv2d backward `.item()` intentional GPU pipeline drain** (`fx_passes/eager/conv_backward.py:99`): `grad_bias[0].item()` is a deliberate sync barrier inserted to prevent stale gradient data in the FallbackKernel compiled path. NOT removable without a proper Vulkan submission fence in the C++ dispatch layer. Performance stall on every conv bwd+bias; correctness preserved. Proper fix: C++ submission tracking in `csrc/ops/dispatch.cpp`. | 🟡 **KNOWN LIMITATION** — intentional; fix requires C++ dispatch change |
-| **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **CLOSED 2026-06-22** — PR #5 (`fix/s4-0-aoti-mm-pc`), pending review. Tests: 4 pass, 2 xfail/strict (upstream M1 blocker). |
+| **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **MERGED 2026-06-24** — PR #5, cross-review PASS (2 fix rounds) |
 | **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): The `(value, index)` pair is encoded as `float2({value}, float({index}))` — casting index to float truncates to 24-bit mantissa precision. Fix: emit `uint2` pair or a dedicated struct. | 🔴 **OPEN** — silent wrong results for large tensors |
 | **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | 🔴 **OPEN** — latent, wave32 only |
-| **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | 🔴 **OPEN** — latent, triggers on fp16 reduction kernels with GroupNorm |
+| **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | ✅ **MERGED 2026-06-24** — PR #6, cross-review PASS |
 | **SP.1** | **Async compile still serial: `.result()` blocks caller** (`runtime/slangc.py:552-560`): `compile_slang_to_spirv` calls `pool.submit(...).result()` on cache-miss — overlap never happens. Fix: return a `Future` on cache-miss; callers await lazily. Prerequisite for S3.4. | 🔴 **OPEN** — blocks S3.4 |
 | **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` runs but rewritten source is never recompiled — `get_optimized_numthreads` has no callers outside `slangc.py`. Wire into `make_vulkan_kernel:_maybe_autotune_wg` or remove. | 🔴 **OPEN** — dead code / wasted compile time |
 | **MS.2** | **Use-after-free: AOTI shim `zeros/ones/full/as_strided` return dangling `AtenTensorHandle`** (`csrc/backend/aoti_shims.cpp:146,172,193,215`): each function returned `tensor.unsafeGetTensorImpl()` of a local `at::Tensor` that was destroyed on return. Fix: allocate with `new at::Tensor(std::move(tensor))` at all four sites (matching `empty_strided_vulkan`). | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
@@ -2022,15 +2024,15 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 
 | # | Item | Files | LOC | Severity | Status |
 |---|------|-------|-----|----------|--------|
-| 1 | MS.1+MS.2 | `csrc/backend/aoti_shims.cpp` | ~8 | 🔴 CRITICAL | Fix spec confirmed |
+| 1 | MS.1+MS.2 | `csrc/backend/aoti_shims.cpp` | ~8 | 🔴 CRITICAL | ✅ MERGED PR #3 2026-06-24 |
 | 2 | SP.B4 | `python/torch_vulkan/inductor/runtime/dispatch.py:1010` | 1 | 🔴 HIGH | Fix spec confirmed |
 | 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | Fix spec confirmed |
 | 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | Fix spec confirmed |
 | 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | Fix spec confirmed |
-| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | Fix spec confirmed |
-| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | Fix spec confirmed |
+| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ MERGED PR #6 2026-06-24 |
+| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | 🔧 PR in progress |
 | 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | Fix spec confirmed |
-| 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | Fix spec confirmed (Bug A: ExternKernelOut meta gap; Bug B: emit_aoti_spv_header hardcodes 0u) |
+| 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |
 | 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | Fix spec confirmed |
 | 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | Fix spec confirmed |
 | 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | Fix spec confirmed |
@@ -2135,24 +2137,24 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S3.1 (compiled foreach optimizer) ✅
 │   ├─ S3.2 (tiny-kernel fusion)         ✅ FIXED 2026-06-21
 │   ├─ S3.5 (conv1d stride+ReinterpretView) ✅ COMMITTED 2026-06-22
-│   │   ├─ S3.5a (storage-offset in bind_buffers) 🔴 fix in-flight
-│   │   ├─ S3.5b (conv1d backward x.grad=0)       🔴 in-flight
+│   │   ├─ S3.5a (storage-offset in bind_buffers) ✅ MERGED PR #3 2026-06-24
+│   │   ├─ S3.5b (conv1d backward x.grad=0)       ✅ MERGED PR #3 2026-06-24
 │   │   └─ S3.5c (grouped conv PC size mismatch)   🟡 FALSE ATTRIBUTION — test uses eager fallback; needs GPU verify
 │   ├─ S3.3 (persistent reduction wiring) 🔴 dead code
 │   └─ S3.4 (batch-dispatch overlap)      🟡 ◀── needs SP.2 first
 │
 ├─ S4 DEPLOY
-│   ├─ MS.1+MS.2 (aoti_shims.cpp: delete no-op + dangling handle) 🔴 CRITICAL ◀── crashes any AOTI model using zeros/ones
-│   ├─ S4.0 (AOTI pc_size_bytes via SPIR-V reflection) ✅ CLOSED PR #5
+│   ├─ MS.1+MS.2 (aoti_shims.cpp: delete no-op + dangling handle) ✅ MERGED PR #3 2026-06-24
+│   ├─ S4.0 (AOTI n_pc=0 for MM templates) ✅ MERGED PR #5 2026-06-24
 │   ├─ S4.1 (full-step .so) ⛔ blocked upstream (torch.export empty.memory_format)
-│   ├─ S4.2 (AOTI dispatch gaps: pool/scatter/rng/bwd_diff) 🔴
-│   └─ S4.3 (A2.6 factory-op shim → all _FACTORY_OPS) 🔴
+│   ├─ S4.2 (AOTI dispatch gaps: pool/scatter/rng/bwd_diff) ✅ MERGED PR #9 2026-06-24
+│   └─ S4.3 (A2.6 factory-op shim → all _FACTORY_OPS) ✅ MERGED PR #10 2026-06-24
 │
 ├─ Codegen correctness (CG)
 │   ├─ CG.1 (argmin/argmax uint2 index > 16M) 🔴
 │   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) 🔴
-│   ├─ CG.3 (packed16+welford guard bypass) 🔴
-│   ├─ CG.4 (vec4 eligibility regex false-positive) 🔴
+│   ├─ CG.3 (packed16+welford guard bypass) ✅ MERGED PR #6 2026-06-24
+│   ├─ CG.4 (vec4 eligibility regex false-positive) 🔧 PR in progress
 │   └─ CG.5 (pointwise.py split to ≤800 L) ⛔
 │
 ├─ Slang/SPIR-V pipeline (SP)
@@ -2167,7 +2169,7 @@ prepare_device(level, timeout_s, validate)
 blockers: S3.5a/b/c (conv1d/grouped conv regressions, in-flight). **Critical
 path to realize the warm-up vision:** S0.2 → S0.1 (probe drives codegen) ∥
 S2.3 (validation actually runs). **Critical path to AOTI Python-free deploy:**
-S4.0 (MM n_pc=0 bug) → S4.2 (dispatch gaps) → S4.3 (factory shim) → S4.1.
+S4.0/S4.2/S4.3 ✅ all merged 2026-06-24; sole remaining blocker: S4.1 (upstream `torch.export` `empty.memory_format` gap).
 **Perf critical path:** SP.2 (async non-blocking) → S3.4 (batch-dispatch
 overlap). Breadth (E4 pool-bwd, E5 SDPA-bwd) and codegen quality (CG.*) follow
 correctness.
@@ -2268,6 +2270,40 @@ the upstream tracker without adding actionable work — mark them as `tracked-up
 
 **New implement ticket (cleanup)**:  
 See `§ 2.5` ticket 16: delete the 13 immediately-removable items (~80 LOC net).
+
+---
+
+## § 3.7 — Pipeline scoreboard (2026-06-24)
+
+> Auto-updated by polly after each merge wave. Single source of truth for “what’s merged, what’s open, what’s next.”
+
+### Merged to `main` (squash-merged 2026-06-24)
+
+| PR | Branch | Content | Cross-review |
+|---|---|---|---|
+| #3 | `fix/sp-b1-subgroup-cache-key` | S3.5a storage-offset + SP.B1/B2 + conv-lowering + expr-printer | ✅ PASS |
+| #5 | `fix/s4-0-aoti-mm-pc` | S4.0 AOTI addmm/bmm pc_size_bytes (2 fix rounds) | ✅ PASS |
+| #6 | `fix-cg3-packed16-welford-guard` | CG.3 packed16+Welford guard bypass | ✅ PASS |
+| #9 | `fix-s4-2-aoti-dispatch-clean` | S4.2 extern "C" ABI in vulkan.h | ✅ PASS |
+| #10 | `fix-s4-3-factory-shim-clean` | S4.3 `_rewrite_factory_meta_to_vulkan` pass | ✅ PASS |
+
+### Open / in-progress
+
+| Status | Item | Branch / Notes |
+|---|---|---|
+| 🔧 PR in progress | CG.4 vec4 eligibility regex | `fix/cg4-composite-index-regex` — rebasing onto updated main |
+| ⛔ Blocked upstream | S4.1 full-step AOTI `.so` | `torch.export` `empty.memory_format` gap; no upstream fix for PrivateUse1 |
+| 🔴 Open | CG.1 argmin/argmax uint2 index | Silent wrong result for tensors >16M elements |
+| 🔴 Open | CG.2 bf16 packed16 wave32 guard | Latent, wave32 GPUs only |
+| 🔴 Open | SP.1 async compile blocking | `.result()` call blocks; prerequisite for S3.4 |
+| 🔴 Open | SP.2 numthreads dead code | Wire or delete `_rewrite_numthreads_in_source` |
+| 🔴 Open | SP.3 SPIR-V cache key PC-layout | Cache collision risk |
+
+### Risk register
+
+- **CI skipped** — fork doesn’t trigger upstream PyTorch CI matrix; all green on local tests only.
+- **ABI rebuild required** — `pip install -e . --no-build-isolation` needed after S4.2 C++ header changes (PR #9).
+- **Orphaned local branches** — ~20 local-only branches remain; `fix-s4-2-aoti-pool` confirmed empty (superseded by PR #9).
 
 ---
 

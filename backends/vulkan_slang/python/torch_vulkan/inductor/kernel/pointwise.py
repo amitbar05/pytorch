@@ -383,14 +383,16 @@ class PointwiseMixin(PointwiseLoadMixin, PointwiseVec4Mixin):
         # Now check: for each I/O buffer, does its index variable depend
         # on a lane-ID?  We look at patterns like `buf_name[<var>]`.
         buf_access_re = re.compile(
-            r"\b(" + "|".join(re.escape(n) for n in all_inners) + r")\s*\[\s*(\w+)\s*\]"
+            r"\b(" + "|".join(re.escape(n) for n in all_inners) + r")\s*\[\s*(.+?)\s*\]"
         )
         for m in buf_access_re.finditer(body_str):
-            idx_var = m.group(2)
-            # Check if idx_var or any of its transitive deps reference lane IDs
-            closure = self._transitive_dep_closure(deps, {idx_var})
-            if "__lane_id__" in closure:
-                return True
+            # The index may be a composite expression (e.g. base + xindex).
+            # Extract every identifier token and check each transitively.
+            for idx_var in re.findall(r"\b([a-zA-Z_]\w*)\b", m.group(2)):
+                # Check if idx_var or any of its transitive deps reference lane IDs
+                closure = self._transitive_dep_closure(deps, {idx_var})
+                if "__lane_id__" in closure:
+                    return True
         return False
 
     def _can_register_tile(self, tile_size: int) -> bool:
