@@ -710,6 +710,11 @@ def emit_aoti_spv_header(
     static const arrays, plus initialization code to register them with
     the Vulkan runtime.
 
+    ``metadata`` is an optional dict keyed by the same string keys used in
+    ``bundle``.  When a key's value is a ``dict`` with ``n_buffers`` and/or
+    ``pc_size_bytes`` entries those explicit values are used; any other value
+    (``None``, ``0``, absent key) falls back to SPIR-V reflection.
+
     Returns a C++ string suitable for inclusion in the generated ``.cpp``.
 
     Parameters
@@ -752,9 +757,25 @@ def emit_aoti_spv_header(
 
     lines.append("static AotiKernelInit _vk_aoti_kernels[] = {")
     for key, c_name, spv in c_names:
-        key_meta = (metadata or {}).get(key, {})
-        n_buf = key_meta["n_buffers"] if "n_buffers" in key_meta else (_vk_rt.get_reflected_binding_count(spv) or 0)
-        pc_size_bytes = key_meta["pc_size_bytes"] if "pc_size_bytes" in key_meta else (_vk_rt.get_reflected_pc_size(spv) or 0)
+        key_meta = (metadata or {}).get(key)
+        if isinstance(key_meta, dict) and "n_buffers" in key_meta:
+            n_buf = key_meta["n_buffers"]
+        else:
+            try:
+                n_buf = _vk_rt.get_reflected_binding_count(spv)
+            except Exception:
+                n_buf = None
+            if n_buf is None:
+                n_buf = 0
+        if isinstance(key_meta, dict) and "pc_size_bytes" in key_meta:
+            pc_size_bytes = key_meta["pc_size_bytes"]
+        else:
+            try:
+                pc_size_bytes = _vk_rt.get_reflected_pc_size(spv)
+            except Exception:
+                pc_size_bytes = None
+            if pc_size_bytes is None:
+                pc_size_bytes = 0
         lines.append(
             f'    {{nullptr, "{key}", {c_name}_data, {len(spv) // 4}, {n_buf}u, {pc_size_bytes}u}},'
         )
