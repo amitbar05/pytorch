@@ -12274,6 +12274,58 @@ class TestVec4PointwiseF32:
                 )
 
 
+class TestVec4EligibilityCompositeIndex:
+    """CG.4 — composite buffer index must propagate lane-dependency check.
+
+    ``_check_index_lane_dependency`` used ``(\\w+)`` as the index capture
+    group, which silently failed to match expressions like ``buf[base +
+    xindex]`` (stops at the first space).  Zero matches → the per-buffer
+    dep-check never ran → false ``return False`` (eligible) even when
+    ``base`` derives from ``lid.x``.
+
+    The fix changes the capture group to ``(.+?)`` (non-greedy full
+    expression) and iterates every identifier token extracted via
+    ``re.findall``, checking each transitively.
+    """
+
+    def _make_kernel(self):
+        from torch_vulkan.inductor.kernel.pointwise import PointwiseMixin
+
+        return PointwiseMixin.__new__(PointwiseMixin)
+
+    def test_composite_index_with_lane_dep_is_ineligible(self):
+        """buf[base + xindex] where base = lid.x * 16 must return True."""
+        kernel = self._make_kernel()
+        body = (
+            "int base = lid.x * 16;\n"
+            "int xindex = gtid.x;\n"
+            "buf[base + xindex] = 1.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is True, (
+            "CG.4 regression: composite index buf[base + xindex] where "
+            "base = lid.x * 16 was not detected as lane-dependent — "
+            "_check_index_lane_dependency returned False (eligible) "
+            "but should return True (ineligible)."
+        )
+
+    def test_composite_index_no_lane_dep_is_eligible(self):
+        """buf[a + b] where neither a nor b depend on lid/ltid → False."""
+        kernel = self._make_kernel()
+        body = (
+            "int a = 4;\n"
+            "int b = gtid.x;\n"
+            "buf[a + b] = 1.0;\n"
+        )
+        result = kernel._check_index_lane_dependency(body, "", ["buf"])
+        assert result is False, (
+            "CG.4 regression: composite index buf[a + b] with no lane "
+            "dependency was incorrectly flagged as lane-dependent — "
+            "_check_index_lane_dependency returned True (ineligible) "
+            "but should return False (eligible)."
+        )
+
+
 class TestM194Vec4WaveOpsOrdering:
     """M19.4 — vec4 progressive-fallback ordering of `_pw_has_wave_ops`.
 
