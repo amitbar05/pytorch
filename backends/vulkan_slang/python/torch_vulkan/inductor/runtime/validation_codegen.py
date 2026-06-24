@@ -132,6 +132,8 @@ def _build_validation_env(env_extra: Optional[dict[str, str]] = None) -> dict[st
     real GPU, no autotune (would recurse), no prewarm.
     """
     env = os.environ.copy()
+    # VK_INSTANCE_LAYERS is only needed for subprocess validation runs.
+    # In-process validation uses TORCH_VULKAN_VALIDATION (set before import).
     env["VK_INSTANCE_LAYERS"] = "VK_LAYER_KHRONOS_validation"
     env["VK_LAYER_ENABLES"] = (
         "VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,"
