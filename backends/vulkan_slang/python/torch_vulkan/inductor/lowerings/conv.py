@@ -613,33 +613,26 @@ def _register_conv_and_pool_lowerings() -> None:
     # _VulkanConv2dExternKernel.  Replaces the default
     # extern_kernels.convolution path (→ eager C++ Vulkan) with the
     # Slang template dispatch for groups==1, non-transposed, 4D input.
-    # For transposed, groups>1, or non-4D (e.g. conv3d), fall through to
-    # FallbackKernel which routes to the C++ Vulkan convolution at runtime.
+    # For groups>1 or transposed conv, returns NotImplemented so the
+    # existing fallback paths handle them.
     # ═════════════════════════════════════════════════════════════════════
     @register_lowering(aten.convolution.default, type_promotion_kind=None)
     def _vulkan_aten_convolution(
         input, weight, bias, stride, padding, dilation,
         transposed, output_padding, groups,
     ):
-        # Fast path: groups==1, non-transposed, 4D → Slang template.
-        if (
-            not bool(transposed)
-            and int(groups) == 1
-            and len(input.get_size()) == 4
-            and len(weight.get_size()) == 4
-            and input.get_device().type == "vulkan"
-        ):
-            return _vulkan_conv2d_with_optional_bias(
-                input, weight, bias, stride, padding, dilation, groups
-            )
-        # Fallback: transposed / groups>1 / conv3d / non-Vulkan device.
-        # Use fallback_handler (not FallbackKernel.create directly) so the
-        # MultiOutput result is wrapped via wrap_for_lowering() → TensorBox,
-        # which validate_ir requires.
-        from torch._inductor.lowering import fallback_handler as _fallback_handler
-        return _fallback_handler(aten.convolution.default, add_to_fallback_set=False)(
-            input, weight, bias, stride, padding, dilation,
-            transposed, output_padding, groups,
+        if bool(transposed):
+            return NotImplemented
+        if int(groups) != 1:
+            return NotImplemented
+        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
+            return NotImplemented
+        if input.get_device().type != "vulkan":
+            return NotImplemented
+        # Delegate to the existing conv2d custom-op lowering which
+        # creates a _VulkanConv2dExternKernel → _slang_tile_conv2d.
+        return _vulkan_conv2d_with_optional_bias(
+            input, weight, bias, stride, padding, dilation, groups
         )
 
     # ═════════════════════════════════════════════════════════════════════

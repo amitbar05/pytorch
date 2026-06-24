@@ -391,48 +391,6 @@ def _get_conv_backward_lowering_impl():
                 output_padding, groups, output_mask,
             )
 
-        # Conv1d backward: reshape 3D tensors to 4D, delegate to 4D path, then
-        # squeeze results back. Mirrors the _conv1d_to_conv2d_lowering pattern
-        # in conv.py. Without this, the 3D guard below returns NotImplemented and
-        # the FallbackKernel produces zero gradients for conv1d.
-        if len(input.get_size()) == 3 and len(weight.get_size()) == 3:
-            from torch._inductor.lowering import lowerings as _lowerings
-            unsq = _lowerings[aten.unsqueeze.default]
-            # squeeze.dim squeezes a specific dim; squeeze.default (no-arg) squeezes
-            # all size-1 dims but its lowering signature doesn't accept a dim arg.
-            sq = _lowerings[aten.squeeze.dim]
-            clone_fn = _lowerings[aten.clone.default]
-
-            go_4d = unsq(grad_output, -1)
-            inp_4d = unsq(input, -1)
-            w_4d = unsq(weight, -1)
-
-            def _1d_to_2d(v, second):
-                if isinstance(v, (list, tuple)):
-                    return (int(v[0]), second)
-                return (int(v), second)
-
-            stride_2d = _1d_to_2d(stride, 1)
-            padding_2d = _1d_to_2d(padding, 0)
-            dilation_2d = _1d_to_2d(dilation, 1)
-            output_padding_2d = _1d_to_2d(output_padding, 0)
-
-            results_4d = _vulkan_convolution_backward(
-                go_4d, inp_4d, w_4d, bias_sizes,
-                stride_2d, padding_2d, dilation_2d,
-                transposed, output_padding_2d, groups, output_mask,
-            )
-            if results_4d is NotImplemented:
-                return NotImplemented
-
-            # Squeeze dummy W dim from grad_input and grad_weight.
-            # Only squeeze if result is genuinely 4D (output_mask[i]==False
-            # returns a 1-element placeholder that must not be squeezed).
-            gi_4d, gw_4d, gb = results_4d
-            gi_3d = sq(clone_fn(gi_4d), -1) if len(gi_4d.get_size()) == 4 else gi_4d
-            gw_3d = sq(clone_fn(gw_4d), -1) if len(gw_4d.get_size()) == 4 else gw_4d
-            return [gi_3d, gw_3d, gb]
-
         if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
             return NotImplemented
 

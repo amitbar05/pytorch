@@ -64422,3 +64422,71 @@ class TestProfileDrivenPersistentCap:
 
         cap = sched_mod._persistent_pointwise_numel_cap()
         assert cap <= 65536, f"S0.1: cap must be <= 65536 (max), got {cap}"
+
+
+class TestAOTIAddmmBmmPC:
+    """S4.0: verify pc_size_bytes is populated correctly for mm/addmm/bmm in AOTI mode."""
+
+    _BUG_ROOT_COMPONENT = "aoti-codegen"
+
+    def test_mm_pc_struct_size(self):
+        """The MM push-constant struct is 19I5f = 24 fields = 96 bytes."""
+        import struct
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import _MM_PC_FORMAT
+        size = struct.calcsize(_MM_PC_FORMAT)
+        assert size == 96, f"Expected 96 bytes, got {size}"
+
+    def test_get_reflected_pc_size_exported(self):
+        """S4.0: get_reflected_pc_size is exported from torch_vulkan.inductor.runtime."""
+        from torch_vulkan.inductor import runtime as rt
+        assert hasattr(rt, "get_reflected_pc_size"), (
+            "S4.0: get_reflected_pc_size not exported from runtime"
+        )
+        assert callable(rt.get_reflected_pc_size), (
+            "S4.0: get_reflected_pc_size is not callable"
+        )
+
+    def test_emit_aoti_spv_header_accepts_metadata(self):
+        """S4.0: emit_aoti_spv_header accepts optional metadata dict."""
+        import inspect
+        from torch_vulkan.inductor.cpp_wrapper_gpu import emit_aoti_spv_header
+        sig = inspect.signature(emit_aoti_spv_header)
+        assert "metadata" in sig.parameters, (
+            "S4.0: emit_aoti_spv_header must accept 'metadata' parameter"
+        )
+        p = sig.parameters["metadata"]
+        assert p.default is None, (
+            "S4.0: metadata parameter must default to None"
+        )
+
+    def test_generate_extern_kernel_out_override_present(self):
+        """S4.0: VulkanCppWrapperGpu has generate_extern_kernel_out override."""
+        import inspect
+        from torch_vulkan.inductor.cpp_wrapper_gpu import VulkanCppWrapperGpu
+        assert "generate_extern_kernel_out" in VulkanCppWrapperGpu.__dict__, (
+            "S4.0: generate_extern_kernel_out must be overridden on VulkanCppWrapperGpu"
+        )
+
+    @pytest.mark.xfail(strict=True, reason="_AOTI_PRIVATEUSE1_BLOCKER: full AOTI compile needs upstream aten dispatch fix")
+    def test_aoti_addmm_pc_size(self):
+        """addmm AOTI wrapper must emit pc_size_bytes=96 (not 0)."""
+        import torch
+        model = torch.nn.Linear(4, 4, bias=True).to("vulkan")
+        x = torch.randn(2, 4, device="vulkan")
+        compiled = torch.compile(model, backend="inductor")
+        _ = compiled(x)
+        from torch_vulkan.inductor.cpp_wrapper_gpu import emit_aoti_spv_header, collect_aoti_spv_bundle
+        bundle = collect_aoti_spv_bundle()
+        assert any("96u" in emit_aoti_spv_header(bundle) for _ in [1]), "Expected pc_size_bytes=96 in AOTI header"
+
+    @pytest.mark.xfail(strict=True, reason="_AOTI_PRIVATEUSE1_BLOCKER: full AOTI compile needs upstream aten dispatch fix")
+    def test_aoti_bmm_pc_size(self):
+        """bmm AOTI wrapper must emit pc_size_bytes=96 (not 0)."""
+        import torch
+        a = torch.randn(2, 3, 4, device="vulkan")
+        b = torch.randn(2, 4, 5, device="vulkan")
+        compiled = torch.compile(lambda a, b: torch.bmm(a, b), backend="inductor")
+        _ = compiled(a, b)
+        from torch_vulkan.inductor.cpp_wrapper_gpu import emit_aoti_spv_header, collect_aoti_spv_bundle
+        bundle = collect_aoti_spv_bundle()
+        assert any("96u" in emit_aoti_spv_header(bundle) for _ in [1]), "Expected pc_size_bytes=96 in AOTI header"

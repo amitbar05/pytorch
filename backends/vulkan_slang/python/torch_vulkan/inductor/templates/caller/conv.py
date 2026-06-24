@@ -142,14 +142,11 @@ def _slang_tile_conv2d_gn_relu(
     # maxPushConstantsSize.  Bumping tag forces SPIR-V recompile.
     cache_key = f"conv_gn_relu_{dtype_s}_mcg3_wg64_msf5"
 
-    # Materialise offset views before binding. .contiguous() is a no-op for
-    # tensors that are already contiguous (is_contiguous()==True) even when
-    # storage_offset > 0, so use .clone() which always produces a fresh buffer.
-    # vulkan_clone routes contiguous+offset through dispatch_strided_copy too.
-    if not input_t.is_contiguous() or input_t.storage_offset() > 0:
-        input_t = input_t.clone()
-    if not weight_t.is_contiguous() or weight_t.storage_offset() > 0:
-        weight_t = weight_t.clone()
+    # Ensure contiguous for direct buffer access
+    if not input_t.is_contiguous():
+        input_t = input_t.contiguous()
+    if not weight_t.is_contiguous():
+        weight_t = weight_t.contiguous()
 
     # Pack push constants (33 uint fields with bias, 32 without)
     # Layout must match PC struct in conv_gn_relu.slang:
@@ -344,14 +341,11 @@ def _slang_tile_conv2d(
         (34, threads_h),
     ]
 
-    # Materialise offset views before binding. .contiguous() is a no-op for
-    # tensors that are already contiguous (is_contiguous()==True) even when
-    # storage_offset > 0, so use .clone() which always produces a fresh buffer.
-    # vulkan_clone routes contiguous+offset through dispatch_strided_copy too.
-    if not input_t.is_contiguous() or input_t.storage_offset() > 0:
-        input_t = input_t.clone()
-    if not weight_t.is_contiguous() or weight_t.storage_offset() > 0:
-        weight_t = weight_t.clone()
+    # Ensure contiguous for direct buffer access
+    if not input_t.is_contiguous():
+        input_t = input_t.contiguous()
+    if not weight_t.is_contiguous():
+        weight_t = weight_t.contiguous()
 
     # Pack push constants: 15 uint fields for no-bias, 17 for bias.
     # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
@@ -397,11 +391,6 @@ def _slang_tile_conv2d(
         if has_bias
         else torch.zeros(1, device=input_t.device, dtype=input_t.dtype)
     )
-    # Materialise bias if it has a non-zero storage offset (e.g. per-group bias
-    # slice from grouped conv decomposition). Must use .clone() not .contiguous()
-    # since bias slices are contiguous (stride=[1]) so .contiguous() is a no-op.
-    if has_bias and bias_1d.storage_offset() > 0:
-        bias_1d = bias_1d.clone()
     stride_bias = int(bias_1d.stride(0)) if has_bias else 0
     pc = struct.pack(
         "32I",
@@ -416,7 +405,12 @@ def _slang_tile_conv2d(
 
     # M-SF.4: always include bias buffer (dummy when no bias).
     # The shader always declares StructuredBuffer<float> bias in KernelArgs.
-    buffers = [input_t, weight_t, bias_1d, out]
+    buffers = [input_t, weight_t]
+    if has_bias:
+        buffers.append(bias.view(-1))
+    else:
+        buffers.append(torch.zeros(1, device=input_t.device, dtype=input_t.dtype))
+    buffers.append(out)
 
     # M17.2: Resolve the entry point.  When an epilogue is set, the entry
     # becomes ``computeMain<OpReLU>`` (etc.) so slangc selects the correct

@@ -134,15 +134,14 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper leaks — **FIXED 2026-06-21**: two root-cause fixes in `matmul.py` + `bwd_lowerings.py` + `pool.py` (`TestNoExternInFullCNNBwd` ✅). | ✅ **FIXED** |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | ✅ **FIXED 2026-06-21** — routes `aten._foreach_add.List` (functional form, post AOTAutograd) + `aten._foreach_add_.List` (inplace form) both to `foreach_sgd_step` ExternKernel. Batch sizes capped at 8 (push-const limit). Tests: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅, `test_s3_1_compiled_sgd_variable_numel_correctness` ✅ |
 | **TRAIN.4.b** | `vulkan_nll_loss_forward` (C++ FallbackKernel) ignores weight for mean reduction — returns `total_weight = N` instead of `sum(weight[target_n])`, causing 75% wrong gradients in weighted cross-entropy. | ✅ **FIXED 2026-06-21** — added `aten.nll_loss_forward` Inductor lowering in `lowerings/loss.py` that calls `_nll_loss_decomp()` with correct weighted total_weight IR. `TestTrain4CrossEntropyBackward::test_cross_entropy_with_weight` ✅ |
-| **S3.5a** | **Causal conv1d wrong values** (`test_m6_causal_conv1d_matches_cpu`): `VkDescriptorBufferInfo.offset` hardcoded to 0 in `bind_buffers` — `reinterpret_tensor` views with non-zero `storage_offset` all bind to the start of the VkBuffer, so per-group dispatches write the same positions. Exposed by S3.5 commit (ReinterpretView preserved instead of cloned). **C++ fix designed and stashed** (`csrc/ops/dispatch.h/cpp`, `csrc/vulkan/DescriptorSet.h/cpp`): thread `storage_offset * element_size` through `get_buffer_info → dispatch_shader → bind_buffers → VkDescriptorBufferInfo.offset`. | ✅ **CLOSED 2026-06-22** — PR #3 (`fix/sp-b1-subgroup-cache-key`), cross-review PASS. Tests: +4 fixed, 0 new regressions. Fixes: `VkDescriptorBufferInfo.offset` threading, descriptor-set cache hash includes offsets, `vulkan_clone` routes offset views, `strided_copy.slang` + SP.B1/B2 cache keys + conv1d 3D→4D bwd + expr Identity/Mul printer + CG.2 partial. |
+| **S3.5a** | **Causal conv1d wrong values** (`test_m6_causal_conv1d_matches_cpu`): `VkDescriptorBufferInfo.offset` hardcoded to 0 in `bind_buffers` — `reinterpret_tensor` views with non-zero `storage_offset` all bind to the start of the VkBuffer, so per-group dispatches write the same positions. Exposed by S3.5 commit (ReinterpretView preserved instead of cloned). **C++ fix designed and stashed** (`csrc/ops/dispatch.h/cpp`, `csrc/vulkan/DescriptorSet.h/cpp`): thread `storage_offset * element_size` through `get_buffer_info → dispatch_shader → bind_buffers → VkDescriptorBufferInfo.offset`. | 🔴 **OPEN** — fix in `git stash@{0}` (needs rebuild + verify) |
 | **S3.5b** | **Conv1d backward x.grad=0** (`test_m6_conv1d_backward_matches_cpu` + `test_s3_5b_conv1d_backward_grad_input_not_primal`): Root cause was AoT backward graph buffer-reuse aliasing: `input_4d = input.unsqueeze(-1)` created a dead intermediate that Inductor's memory planner reused for `conv2d_backward[0]` (grad-input). Since `input_4d` is a view of `primals_3` (primal x), grad-input aliased x, returning x itself as x.grad. **Fix**: new `conv1d_backward_core` opaque non-autograd custom op takes 3-D tensors directly (no Python-side unsqueeze), with a fake kernel deriving outputs from `input` (FT proxy) so FunctionalTensorMode produces fresh storage refs. Forward graph now saves `primals_3` as residual; backward graph uses it as a proper graph INPUT (not freed/reused). | ✅ **CLOSED 2026-06-22** — `fx_passes/eager/conv_backward.py` + `conv.py` + `lowerings/__init__.py` |
 | **S3.5c** | **Grouped conv push-constant size mismatch** (`test_m6_conv1d_groups_matches_cpu`): Original bug claimed `slang_addmm_8_8_8_s1_r1x1` SPIR-V declared 52 bytes but layout got 48 bytes (VUID-VkComputePipelineCreateInfo-layout-07987). **Three 2026-06-22 audits conclusively show this attribution is wrong**: (1) no Python path produces 48-byte PC for `slang_addmm` — both `compile_and_dispatch` and `emit_aoti_extern_dispatch` emit 96 bytes; (2) the `groups>1` conv path uses per-group `_VulkanConv2dExternKernel` + `aten.cat`, never `slang_addmm`; (3) the test docstring explicitly states "Conv2d eager fallback handles groups>1 correctly" — so there is no Slang kernel for this path at all. The VUID error was likely from a different kernel in a stale test run, now superseded by the S3.5 commit. Needs GPU re-run to verify. | 🟡 **NEEDS GPU VERIFY** — original root cause is invalid; test likely already passes; re-run to confirm |
 | **S3.5d** | **Conv2d backward `.item()` intentional GPU pipeline drain** (`fx_passes/eager/conv_backward.py:99`): `grad_bias[0].item()` is a deliberate sync barrier inserted to prevent stale gradient data in the FallbackKernel compiled path. NOT removable without a proper Vulkan submission fence in the C++ dispatch layer. Performance stall on every conv bwd+bias; correctness preserved. Proper fix: C++ submission tracking in `csrc/ops/dispatch.cpp`. | 🟡 **KNOWN LIMITATION** — intentional; fix requires C++ dispatch change |
-| **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime** (`cpp_wrapper_gpu.py:367-374`): Template kernels bypass `define_kernel`; `_set_kernel_meta` is never called for them, so `get_kernel_meta` returns `n_pc=0`. The AOTI `.so` creates a pipeline layout with zero push-constant bytes while the SPIR-V expects 96 bytes (24×uint32). Any AOTI-compiled model using MM will crash on first dispatch. Fix: emit `_set_kernel_meta` from the template caller’s AOTI codegen path, or derive `pc_size_bytes` from SPIR-V reflection in `cpp_wrapper_gpu.py`. | 🔴 **OPEN** — blocking S4 AOTI correctness |
+| **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **CLOSED 2026-06-22** — PR #5 (`fix/s4-0-aoti-mm-pc`), pending review. Tests: 4 pass, 2 xfail/strict (upstream M1 blocker). |
 | **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): The `(value, index)` pair is encoded as `float2({value}, float({index}))` — casting index to float truncates to 24-bit mantissa precision. Fix: emit `uint2` pair or a dedicated struct. | 🔴 **OPEN** — silent wrong results for large tensors |
 | **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | 🔴 **OPEN** — latent, wave32 only |
 | **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | 🔴 **OPEN** — latent, triggers on fp16 reduction kernels with GroupNorm |
-| **CG.expr** | **`VulkanExprPrinter._mul_needs_parens` misses `/` division** (`expr_printer.py:_mul_needs_parens`): scans only `+`/`-` at top level; a `Mul` factor containing division (e.g. `(a/b)*stride`) emits without parentheses → wrong Slang index arithmetic. Fix: also return `True` when top-level `/` present. | 🔴 **OPEN** — latent; triggered by division-based stride expressions |
 | **SP.1** | **Async compile still serial: `.result()` blocks caller** (`runtime/slangc.py:552-560`): `compile_slang_to_spirv` calls `pool.submit(...).result()` on cache-miss — overlap never happens. Fix: return a `Future` on cache-miss; callers await lazily. Prerequisite for S3.4. | 🔴 **OPEN** — blocks S3.4 |
 | **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` runs but rewritten source is never recompiled — `get_optimized_numthreads` has no callers outside `slangc.py`. Wire into `make_vulkan_kernel:_maybe_autotune_wg` or remove. | 🔴 **OPEN** — dead code / wasted compile time |
 | **MS.2** | **Use-after-free: AOTI shim `zeros/ones/full/as_strided` return dangling `AtenTensorHandle`** (`csrc/backend/aoti_shims.cpp:146,172,193,215`): each function returned `tensor.unsafeGetTensorImpl()` of a local `at::Tensor` that was destroyed on return. Fix: allocate with `new at::Tensor(std::move(tensor))` at all four sites (matching `empty_strided_vulkan`). | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
@@ -354,7 +353,7 @@ Add `make_fallback` lowering so Inductor emits
   — wrapper contains `torch.ops.torch_vulkan.avg_pool2d.default`, zero
   `torch.ops.aten.avg_pool2d` references.
 
-### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe") [Slices A+B FIXED 2026-06-22]
+### S0.1 — 🟡 Make the device profile *drive* codegen (the missing half of "probe")
 
 **WG sizing wired 2026-06-20.** `threadgroup_sizing.py` read device limits from
 the device-interface query, which on this stack under-reports
@@ -385,17 +384,30 @@ persistent-pointwise numel cap, subgroup size (for tile filtering), MM tiles mod
 
 | Priority | File:line | Hard-coded | Should use |
 |---|---|---|---|
-| ✅ **DONE** | `autotune.py` | WG candidates `[128,256,512]` | `profile_limit("max_workgroup_size")` — FIXED 2026-06-22 (Slice A) |
-| ✅ **DONE** | `templates/caller/gemm/dispatch.py` | `max_wg: int = 1024` in `_check_workgroup_fits` | `profile_limit("max_workgroup_size", 1024)` — FIXED 2026-06-22 (Slice B) |
+| **HIGH** | `autotune.py:64` | WG candidates `[128,256,512]` | Cap at `profile_limit("max_workgroup_size")` |
+| **HIGH** | `autotune.py:90` | Fallback `return 256` | `profile_limit("max_workgroup_size", 256)` |
+| **HIGH** | `dispatch.py:125` | `max_wg: int = 1024` in `_check_workgroup_fits` | `profile_limit("max_workgroup_size", 1024)` |
 | **HIGH** | `vulkan_template.py:185-196` | Static 4 MM tile configs | Filter/expand by `memcpy_d2d_GBps` |
 | **HIGH** | `lowerings/conv.py:208` | Default tile `(8,8,8)` | Scale with `memcpy_d2d_GBps` |
 | **MEDIUM** | `vulkan_template.py:253,278,294` | `threadgroup_size=256` for RNG/optimizer/flash | `profile_limit("max_workgroup_size", 256)` |
 | **MEDIUM** | `kernel/main.py:260-275` | Cooperative-reduction thresholds (65536, 8192, …) | Scale with `compute_units` + `empty_kernel_launch_us` |
 | **MEDIUM** | `scheduling.py:340-349` | `rnumel_fuse_cap` 64/256/8192 | Scale with `compute_units` |
 
-**Slices A+B FIXED 2026-06-22** (commit `5ecbb66c34e`):
-- `autotune.py:get_wg_size_variants` now reads `profile_limit("max_workgroup_size", 1024)` and filters all candidate lists through it, respecting `_autotune_level()` tier. Enables >1024-WG GPUs; caps 512 ceiling on restricted devices.
-- `templates/caller/gemm/dispatch.py:_check_workgroup_fits` `max_wg` default changed from hardcoded `1024` to lazy `profile_limit("max_workgroup_size", 1024)`.
+**Minimal first slice (Slice A — ~15 min, very low risk):**
+
+```python
+# autotune.py — cap candidates at real device max_workgroup_size
+def get_wg_size_variants(is_reduction=False):
+    from ..device_profile import profile_limit
+    max_wg = profile_limit("max_workgroup_size", 1024)
+    base = [64, 128, 256, 512] if is_reduction else [128, 256, 512, 1024]
+    return [w for w in base if w <= max_wg] or [min(256, max_wg)]
+```
+
+**Slice B** (5 min): Replace `max_wg: int = 1024` default in
+`dispatch.py:125` `_check_workgroup_fits()` with
+`profile_limit("max_workgroup_size", 1024)` — enables 2048-WG GPUs (RDNA3),
+tightens the ceiling on mobile.
 
 **Profile availability**: `profile_limit()` reads the on-disk cache and never
 crashes when absent (returns the `fallback`). No race possible — cache written
@@ -414,6 +426,77 @@ the live device instead of the NAVI10 name-based defaults.  No C++ change needed
 - **Exit**: `TestM211DeviceProfile::test_device_limits_come_from_hardware` ✅ — limits
   come from the real device, not NAVI10 fallback constants.
 
+**2026-06-22 exact fix specs for remaining S0.1 open items (confirmed by audit):**
+
+**Slice A — `autotune.py:43-57` (WG candidate list capping)**
+
+Exact current text:
+```python
+def get_wg_size_variants(
+    is_reduction: bool = False,
+) -> list[int]:
+    if _autotune_level() < 2:
+        if is_reduction:
+            return [128, 256]
+        return [256]
+    if is_reduction:
+        return [64, 128, 256]
+    return [128, 256, 512]
+```
+
+Exact replacement:
+```python
+def get_wg_size_variants(
+    is_reduction: bool = False,
+) -> list[int]:
+    from .device_profile import profile_limit
+    max_wg = profile_limit("max_workgroup_size", 1024)
+    base = [64, 128, 256, 512] if is_reduction else [128, 256, 512, 1024]
+    return [w for w in base if w <= max_wg] or [min(256, max_wg)]
+```
+
+Note: `autotune.py` currently has no imports from `device_profile`. The lazy
+import `from .device_profile import profile_limit` inside the function avoids
+import cycles.
+
+**Slice B — `templates/caller/gemm/dispatch.py:121-137` (GEMM tile WG cap)**
+
+Two edits:
+
+*Edit 1*: Add this import near the top (after the existing `from ....vulkan_template_caller import` block):
+```python
+from ....device_profile import profile_limit
+```
+
+*Edit 2*: Replace the `max_wg: int = 1024` default in `_check_workgroup_fits`:
+```python
+# OLD:
+def _check_workgroup_fits(
+    tile_m: int,
+    tile_n: int,
+    m_per_thread: int = 1,
+    n_per_thread: int = 1,
+    max_wg: int = 1024,
+) -> bool:
+
+# NEW:
+def _check_workgroup_fits(
+    tile_m: int,
+    tile_n: int,
+    m_per_thread: int = 1,
+    n_per_thread: int = 1,
+    max_wg: int = profile_limit("max_workgroup_size", 1024),
+) -> bool:
+```
+
+Note: `templates/caller/gemm/dispatch.py` uses 4-dot relative import (`from ....device_profile`)
+since `gemm/` is 4 levels below `inductor/`.
+
+**New tests required** (neither Slice has existing unit test coverage):
+- `TestAutotuneWorkgroupVariants` — monkeypatch `profile_limit` to return 512,
+  assert `get_wg_size_variants()` returns `[128, 256, 512]` not `[128, 256, 512, 1024]`
+- `TestGemmTileWGCap` — monkeypatch `profile_limit` to return 2048, confirm
+  a 1024-invocation tile now passes `_check_workgroup_fits`
 
 ### S2.3 — In-process validation during warm-up (make `validate=True` real)
 
@@ -560,7 +643,7 @@ Fix: correct the stride order and preserve `ReinterpretView` nodes.
 S3.5 preserving `ReinterpretView` exposes the long-standing storage-offset bug (S3.5a)
 and the grouped-conv push-constant mismatch (S3.5c). See defect table above.
 
-#### S3.5a — ✅ CLOSED 2026-06-22: Fix storage-offset in `bind_buffers` (PR #3)
+#### S3.5a — 🔴 OPEN: Fix storage-offset in `bind_buffers` (causal conv1d)
 
 `VkDescriptorBufferInfo.offset` is hardcoded to 0. After S3.5 preserves
 `ReinterpretView` nodes, the Inductor wrapper emits `reinterpret_tensor(buf, ..., non_zero_offset)`
@@ -808,7 +891,7 @@ produces wrong SPIR-V; replace with scatter/reduce Slang codegen.
 - **Exit**: `TestPoolFwdSlang` — pool fwd graphs contain no FallbackKernel;
   output matches CPU.
 
-### S4.0 — AOTI: fix MM/addmm/bmm `n_pc=0` → zero push-constant layout (BLOCKING)
+### S4.0 — ✅ CLOSED 2026-06-22: Fix MM/addmm/bmm AOTI `pc_size_bytes=0` via SPIR-V reflection (PR #5)
 
 **2026-06-22 audit (confirmed exact lines) — TWO independent bugs:**
 
@@ -2052,7 +2135,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S3.1 (compiled foreach optimizer) ✅
 │   ├─ S3.2 (tiny-kernel fusion)         ✅ FIXED 2026-06-21
 │   ├─ S3.5 (conv1d stride+ReinterpretView) ✅ COMMITTED 2026-06-22
-│   │   ├─ S3.5a (storage-offset in bind_buffers) ✅ CLOSED PR #3
+│   │   ├─ S3.5a (storage-offset in bind_buffers) 🔴 fix in-flight
 │   │   ├─ S3.5b (conv1d backward x.grad=0)       🔴 in-flight
 │   │   └─ S3.5c (grouped conv PC size mismatch)   🟡 FALSE ATTRIBUTION — test uses eager fallback; needs GPU verify
 │   ├─ S3.3 (persistent reduction wiring) 🔴 dead code
@@ -2060,7 +2143,7 @@ prepare_device(level, timeout_s, validate)
 │
 ├─ S4 DEPLOY
 │   ├─ MS.1+MS.2 (aoti_shims.cpp: delete no-op + dangling handle) 🔴 CRITICAL ◀── crashes any AOTI model using zeros/ones
-│   ├─ S4.0 (AOTI n_pc=0 for MM templates) 🔴 BLOCKING ◀── blocks all AOTI MM
+│   ├─ S4.0 (AOTI pc_size_bytes via SPIR-V reflection) ✅ CLOSED PR #5
 │   ├─ S4.1 (full-step .so) ⛔ blocked upstream (torch.export empty.memory_format)
 │   ├─ S4.2 (AOTI dispatch gaps: pool/scatter/rng/bwd_diff) 🔴
 │   └─ S4.3 (A2.6 factory-op shim → all _FACTORY_OPS) 🔴
