@@ -229,6 +229,8 @@ class PointwiseVec4Mixin:
                 if not self._vec4_pw_eligible_legacy(body_str, rt, all_inners_p16):
                     return False
 
+            if self.has_welford:
+                return False
             if not self._p16_load_records or not self._p16_store_records:
                 return False
             return True
