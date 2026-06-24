@@ -1,4 +1,55 @@
-> **⚠️ This project is WIP, early stages.**
+> **⚠️ Early stages — expect rough edges, missing ops, and breaking changes.**
+
+---
+
+# PyTorch Vulkan/Slang Inductor Backend
+
+An **out-of-tree PyTorch backend** that runs models on **Vulkan GPUs** using
+[Slang](https://shader-slang.com/) shaders compiled to SPIR-V.  It plugs into
+PyTorch's Inductor codegen pipeline, so standard `torch.compile` workflows work
+without any model-specific changes.
+
+## What it does
+
+- **`torch.device("vulkan")`** — registers via `PrivateUse1`; all tensors and
+  ops execute on the GPU, no CPU fallbacks.
+- **`torch.compile(backend="inductor")`** — auto-generates Slang/SPIR-V kernels
+  for pointwise, reduction, matmul, conv, and more.  No hand-written `.slang`
+  files per model, no per-op `csrc/` entries.
+- **Training-capable** — forward + backward pass, autograd, and multi-step
+  training loops work end-to-end on GPU today.
+- **AOTI (Ahead-Of-Time Inference)** — Python-less `.so` deployment path is
+  in active development.
+
+## Status
+
+| Area | State |
+|---|---|
+| Eager mode (all registered ops) | ✅ Working |
+| `torch.compile` (pointwise / reduction / mm / conv) | ✅ Working |
+| End-to-end training (loss decreases, correct gradients) | ✅ Working |
+| AOTI `.so` deployment | 🚧 In progress |
+| Op coverage breadth | 🚧 Expanding |
+| Autotune / workgroup sizing | 🚧 In progress |
+
+Tested on **AMD Radeon RX 5600 XT (RDNA1)** with the ROCm Vulkan driver.
+Other Vulkan-capable GPUs (NVIDIA, Intel) should work but are untested.
+
+## Quick start
+
+```python
+import torch
+import torch_vulkan          # registers the backend
+
+x = torch.randn(4, 4, device="vulkan")
+y = torch.compile(lambda t: t @ t)(x)
+print(y.cpu())
+```
+
+See [`backends/vulkan_slang/`](backends/vulkan_slang/) for build instructions,
+the roadmap, and tests.
+
+---
 
 ![PyTorch Logo](https://github.com/pytorch/pytorch/raw/main/docs/source/_static/img/pytorch-logo-dark.png)
 
