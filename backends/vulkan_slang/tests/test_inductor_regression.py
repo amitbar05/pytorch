@@ -7962,10 +7962,10 @@ class TestPacked16WelfordGuard:
     The fix adds ``if self.has_welford: return False`` to the packed16 path
     *before* ``_vec4_pw_eligible_structural`` is called — mirroring the
     float path.  With ``has_welford=True`` the guard fires at that check and
-    returns False before ``_p16_load_records`` is ever accessed; the explicit
-    empty-list values below ensure that if the has_welford guard were removed,
-    the ``not self._p16_load_records`` check (also in the packed16 block)
-    would still return False cleanly rather than raising AttributeError.
+    returns False before ``_p16_load_records`` is ever accessed; the sentinel
+    records below are truthy (non-empty) so that if the has_welford guard were
+    removed, the ``not self._p16_load_records`` check would NOT return False
+    and the assertion would catch the regression.
     """
 
     def test_packed16_welford_guard_returns_false_early(self):
@@ -7999,11 +7999,12 @@ class TestPacked16WelfordGuard:
         # skip the legacy fallback entirely, so execution reaches the intended
         # guard without needing _check_index_lane_dependency at all.
         kernel._vec4_pw_eligible_structural = lambda rt, all_inners, out_inners: True
-        # Explicitly set to [] (falsy): if the has_welford guard fires (line 214),
-        # the method returns False before reaching this check; if the guard were
-        # absent, not self._p16_load_records would be True and still return False.
-        kernel._p16_load_records = []    # falsy → triggers return-False at line 236
-        kernel._p16_store_records = []   # same guard checks both
+        # Truthy sentinels: if the has_welford guard fires (line 214), the method
+        # returns False before reaching these; if the guard were absent, the
+        # _p16_load_records check would NOT fire (non-empty) and the test would
+        # fail the assert below — correctly surfacing the regression.
+        kernel._p16_load_records = [("uint", "buf")]   # truthy: ensures test fails if welford guards removed
+        kernel._p16_store_records = [("uint", "out")]  # truthy: same — real return-False comes from has_welford guard
 
         try:
             result = kernel._vec4_pw_eligible(
