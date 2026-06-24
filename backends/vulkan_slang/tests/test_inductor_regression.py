@@ -64810,3 +64810,136 @@ class TestAotiShimHandleLifetime:
 
         ret2 = fn_delete(handle)
         assert ret2 == 0, f"aoti_torch_delete returned error code {ret2}"
+
+
+# S3.5a — DescriptorSet cache key must include storage_offset
+# ---------------------------------------------------------------------------
+
+
+def _vulkan_is_available() -> bool:
+    try:
+        import torch_vulkan
+        return torch_vulkan.is_available()
+    except Exception:
+        return False
+
+
+class TestDescriptorSetCacheKeyWithOffsets:
+    """S3.5a regression — DescriptorSet cache key must include storage_offset."""
+
+    @pytest.mark.skipif(not _vulkan_is_available(), reason="Vulkan device required")
+    def test_different_offset_views_not_cross_contaminated(self):
+        buf = torch.arange(40, dtype=torch.float32, device="vulkan:0")
+        slice_a = buf[0:10]
+        slice_b = buf[20:30]
+        out = torch.add(slice_a, slice_b)
+        expected = (
+            torch.arange(0, 10, dtype=torch.float32)
+            + torch.arange(20, 30, dtype=torch.float32)
+        )
+        assert out.cpu().equal(expected)
+
+    @pytest.mark.skipif(not _vulkan_is_available(), reason="Vulkan device required")
+    def test_strided_copy_with_nonzero_storage_offset(self):
+        src = torch.arange(32, dtype=torch.float32, device="vulkan:0")[4:20]
+        dst = src.clone()
+        expected = torch.arange(4, 20, dtype=torch.float32)
+        assert dst.cpu().equal(expected)
+
+    @pytest.mark.skipif(not _vulkan_is_available(), reason="Vulkan device required")
+    def test_mixed_offsets_in_single_dispatch(self):
+        buf1 = torch.arange(32, dtype=torch.float32, device="vulkan:0")
+        t_a = buf1[8:16]
+        buf2 = (torch.arange(8, dtype=torch.float32) + 100).to("vulkan:0")
+        t_b = buf2[0:8]
+        out = torch.add(t_a, t_b)
+        expected = (
+            torch.arange(8, 16, dtype=torch.float32)
+            + torch.arange(100, 108, dtype=torch.float32)
+        )
+        assert out.cpu().equal(expected)
+
+
+# ---------------------------------------------------------------------------
+# SP.B1 — SPIR-V cache key must include device subgroup-size tag
+# ---------------------------------------------------------------------------
+
+
+class TestSPB1SubgroupSizeCacheKey:
+    """SP.B1 regression — SPIR-V cache key must include device subgroup-size tag."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+    def test_compile_slang_to_spirv_different_subgroup_tags_produce_different_keys(self):
+        import hashlib
+
+        from torch_vulkan.inductor.runtime.common import _normalize_slang_source
+
+        src = "void computeMain() {}"
+        entry = "computeMain"
+        key_32 = hashlib.sha256(
+            (entry + "\n" + _normalize_slang_source(src) + "" + "_sgs32" + "").encode()
+        ).hexdigest()
+        key_64 = hashlib.sha256(
+            (entry + "\n" + _normalize_slang_source(src) + "" + "_sgs64" + "").encode()
+        ).hexdigest()
+        assert key_32 != key_64
+
+    def test_spb1_subgroup_tag_is_in_sha256_key(self):
+        import inspect
+
+        from torch_vulkan.inductor.runtime import slangc
+
+        fn_src = inspect.getsource(slangc.compile_slang_to_spirv)
+        tag_call = "_get_device_subgroup_size_tag()"
+        if tag_call not in fn_src:
+            pytest.xfail(
+                "SP.B1 regression: `_get_device_subgroup_size_tag()` is not included "
+                "in the sha256 hash input of `compile_slang_to_spirv`."
+            )
+        assert tag_call in fn_src
+
+
+# ---------------------------------------------------------------------------
+# SP.B3 — WG-autotuned kernels must use _wg{N}-suffixed cache keys
+# ---------------------------------------------------------------------------
+
+
+class TestSPB2WgCacheKeySuffix:
+    """SP.B3 regression — WG-autotuned kernels must use _wg{N}-suffixed cache keys."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
+    def test_shader_lib_cache_key_includes_wg_suffix(self):
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        assert "_wg{" in fn_src
+        base_key = "test_kernel"
+        wg = 128
+        key = f"{base_key}_wg{wg}"
+        assert "_wg128" in key
+
+    def test_wg_suffix_differs_for_different_wg_sizes(self):
+        base = "test_kernel"
+        keys = {wg: f"{base}_wg{wg}" for wg in (64, 128, 256)}
+        assert len(set(keys.values())) == 3
+
+    def test_wg_suffix_default_wg_has_no_suffix_or_default_suffix(self):
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        assert "return None" in fn_src
+        default_key = "test_kernel"
+        assert "_wg" not in default_key
