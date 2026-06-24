@@ -64749,3 +64749,64 @@ class TestS43RewriteFactoryMetaToVulkan:
         assert len(to_copy_nodes) == 0, (
             "S4.3: no _to_copy.default should be inserted for non-exported get_attr 'weight'"
         )
+
+
+# ---------------------------------------------------------------------------
+# MS.1/MS.2 — AOTI shim handle lifetime (ctypes round-trip)
+# ---------------------------------------------------------------------------
+
+
+class TestAotiShimHandleLifetime:
+    """MS.1/MS.2: aoti_torch_zeros_vulkan returns a non-null handle; aoti_torch_delete frees it without crash."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        pass
+
+    def test_aoti_zeros_handle_roundtrip(self):
+        import ctypes
+        import glob
+        import os
+
+        # Locate the compiled extension .so that exports the AOTI shims.
+        base = os.path.join(os.path.dirname(__file__), "..", "python", "torch_vulkan")
+        build_base = os.path.join(
+            os.path.dirname(__file__), "..", "build",
+            "lib.linux-x86_64-cpython-312", "torch_vulkan",
+        )
+        candidates = []
+        for d in (base, build_base):
+            candidates += glob.glob(os.path.join(d, "_C*.so"))
+            candidates += glob.glob(os.path.join(d, "libvulkan_aoti*.so"))
+            candidates += glob.glob(os.path.join(d, "_C_ext*.so"))
+
+        if not candidates:
+            pytest.skip("AOTI .so not available")
+
+        lib = ctypes.CDLL(candidates[0])
+
+        # aoti_torch_zeros_vulkan(int64_t* size_ptr, int64_t size_len, int64_t dtype, void** out) -> int
+        fn_zeros = lib.aoti_torch_zeros_vulkan
+        fn_zeros.restype = ctypes.c_int
+        fn_zeros.argtypes = [
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+
+        # aoti_torch_delete(void* handle) -> int
+        fn_delete = lib.aoti_torch_delete
+        fn_delete.restype = ctypes.c_int
+        fn_delete.argtypes = [ctypes.c_void_p]
+
+        size_arr = (ctypes.c_int64 * 1)(4)
+        dtype_float32 = 6  # at::ScalarType::Float
+        handle = ctypes.c_void_p(None)
+
+        ret = fn_zeros(size_arr, 1, dtype_float32, ctypes.byref(handle))
+        assert ret == 0, f"aoti_torch_zeros_vulkan returned error code {ret}"
+        assert handle.value is not None, "aoti_torch_zeros_vulkan returned null handle"
+
+        ret2 = fn_delete(handle)
+        assert ret2 == 0, f"aoti_torch_delete returned error code {ret2}"
