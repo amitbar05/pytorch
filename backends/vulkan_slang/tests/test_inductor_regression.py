@@ -39951,8 +39951,13 @@ class TestDispatchBatcherLifecycle:
                 batcher.add(kernel_b, out_b, 2.71)
                 outputs["b"] = out_b
 
-            assert call_log == ["begin", "end", "begin", "end"], (
-                f"Expected lifecycle [begin, end, begin, end], got {call_log}"
+            # 6-event lifecycle:
+            #   __enter__                  → begin
+            #   explicit _flush(kernel_a)  → end, begin   (re-entry — the M17.5 fix)
+            #   __exit__._flush(kernel_b)  → end, begin   (re-entry again)
+            #   __exit__._end_batch        → end
+            assert call_log == ["begin", "end", "begin", "end", "begin", "end"], (
+                f"Expected lifecycle [begin,end,begin,end,begin,end], got {call_log}"
             )
 
             torch.testing.assert_close(
