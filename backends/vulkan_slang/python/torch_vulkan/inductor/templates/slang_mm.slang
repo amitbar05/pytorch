@@ -26,8 +26,8 @@ import pointwise;
 // N+1.11: Tile sizes are specialization constants (`[[vk::constant_id]]`).
 // They determine groupshared array sizes, numthreads, and local array
 // dimensions at SPIR-V compile time.  Actual loop bounds use push-constant
-// values from `pc.tile_m`, `pc.tile_n`, `pc.tile_k`, `pc.m_per_thread`,
-// `pc.n_per_thread`.  This lets a single SPIR-V module serve multiple tile
+// values from `TILE_M`, `TILE_N`, `TILE_K`, `M_PER_THREAD`,
+// `N_PER_THREAD`.  This lets a single SPIR-V module serve multiple tile
 // configurations that share the same shape class -- different (TILE_M,
 // TILE_N, TILE_K) combos that produce identical groupshared footprints
 // and workgroup dimensions share ONE compilation.
@@ -71,14 +71,6 @@ struct PC {
     uint stride_a_b;
     uint stride_b_b;
     uint stride_c_b;
-    // N+1.11: Runtime tile sizes -- loop bounds use these push-constant
-    // values so the same SPIR-V module (with fixed groupshared / numthreads
-    // from specialization constants) handles multiple tile configurations.
-    uint tile_m;
-    uint tile_n;
-    uint tile_k;
-    uint m_per_thread;
-    uint n_per_thread;
     // A.6: Bitmask of MM_FLAG_* gates above.
     uint flags;
     // Always present; ignored unless their corresponding flag is set.
@@ -187,8 +179,8 @@ void mma_tile(uint stage, uint k_base, uint local_row, uint local_col, uint3 lid
     uint off_a = 0;
     uint off_b = 0;
 /*{%*/ endif /*%}*/
-    // N+1.11: k_end uses pc.tile_k for the inner-product loop bound.
-    uint k_end = min(pc.tile_k, pc.K - k_base);
+    // N+1.11: k_end uses TILE_K for the inner-product loop bound.
+    uint k_end = min(TILE_K, pc.K - k_base);
     // Inner-product loop: each k-step pulls one row of A and one col of B from
     // LDS into per-thread registers, then does an outer product into `acc`.
     // Cap the unroll factor at 16 -- full-unroll on tile_k=64 with a 4x4
@@ -202,22 +194,22 @@ void mma_tile(uint stage, uint k_base, uint local_row, uint local_col, uint3 lid
         // Load M_PER_THREAD A values (one column of the register tile).
         /*{{*/ dtype_acc /*}}float*/ a_reg[M_PER_THREAD];
         [unroll]
-        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-            uint local_m = local_row * pc.m_per_thread + mi;
+        for (uint mi = 0; mi < M_PER_THREAD; mi++) {
+            uint local_m = local_row * M_PER_THREAD + mi;
             a_reg[mi] = tile_a[off_a + local_m * TILE_K + kk];
         }
         // Load N_PER_THREAD B values (one row of the register tile).
         /*{{*/ dtype_acc /*}}float*/ b_reg[N_PER_THREAD];
         [unroll]
-        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint local_n = local_col * pc.n_per_thread + ni;
+        for (uint ni = 0; ni < N_PER_THREAD; ni++) {
+            uint local_n = local_col * N_PER_THREAD + ni;
             b_reg[ni] = tile_b[off_b + kk * TILE_N + local_n];
         }
         // Outer-product accumulate.
         [unroll]
-        for (uint mi = 0; mi < pc.m_per_thread; mi++) {
+        for (uint mi = 0; mi < M_PER_THREAD; mi++) {
             [unroll]
-            for (uint ni = 0; ni < pc.n_per_thread; ni++) {
+            for (uint ni = 0; ni < N_PER_THREAD; ni++) {
                 acc[mi][ni] += a_reg[mi] * b_reg[ni];
             }
         }
@@ -235,9 +227,9 @@ void computeMain<Epilogue : IDifferentiable>(
                  uint3 gtid : SV_DispatchThreadID,
                  uint3 lid : SV_GroupThreadID,
                  uint3 gid : SV_GroupID) {
-    // N+1.11: row_base/col_base use pc.tile_m/pc.tile_n for correct grid offset.
-    uint row_base = gid.y * pc.tile_m;
-    uint col_base = gid.x * pc.tile_n;
+    // N+1.11: row_base/col_base use TILE_M/TILE_N for correct grid offset.
+    uint row_base = gid.y * TILE_M;
+    uint col_base = gid.x * TILE_N;
     // A.6: Batch offsets gated by MM_FLAG_BATCH at runtime.  For non-batch
     // matmul, the caller packs stride_*_b as 0 and grid_z=1, so the math is
     // a no-op even without the gate; the explicit gate keeps intent clear.
@@ -260,22 +252,22 @@ void computeMain<Epilogue : IDifferentiable>(
     uint local_col = tid % WG_N;
 
     // N+1.11: Early exit for threads outside the runtime workgroup.
-    if (local_row >= pc.tile_m / pc.m_per_thread || local_col >= pc.tile_n / pc.n_per_thread) return;
+    if (local_row >= TILE_M / M_PER_THREAD || local_col >= TILE_N / N_PER_THREAD) return;
 
     // Per-thread register accumulator: holds an (M_PER_THREAD x N_PER_THREAD)
     // sub-tile of the workgroup's TILE_M x TILE_N output block.
     // N+1.11: Array dimensions use spec-constant M_PER_THREAD, N_PER_THREAD.
     /*{{*/ dtype_acc /*}}float*/ acc[M_PER_THREAD][N_PER_THREAD];
     [unroll]
-    for (uint _mi = 0; _mi < pc.m_per_thread; _mi++) {
+    for (uint _mi = 0; _mi < M_PER_THREAD; _mi++) {
         [unroll]
-        for (uint _ni = 0; _ni < pc.n_per_thread; _ni++) {
+        for (uint _ni = 0; _ni < N_PER_THREAD; _ni++) {
             acc[_mi][_ni] = (/*{{*/ dtype_acc /*}}float*/)0.0;
         }
     }
 
-    // N+1.11: k_blocks uses pc.tile_k for the K-loop bound.
-    uint k_blocks = (pc.K + pc.tile_k - 1u) / pc.tile_k;
+    // N+1.11: k_blocks uses TILE_K for the K-loop bound.
+    uint k_blocks = (pc.K + TILE_K - 1u) / TILE_K;
 /*{%*/ if num_stages > 1 /*%}*/
 
     // Prefetch stage 0
@@ -286,10 +278,10 @@ void computeMain<Epilogue : IDifferentiable>(
 
     for (uint kb = 0; kb < k_blocks; kb++) {
         // Compute on current stage
-        mma_tile(kb & 1u, kb * pc.tile_k, local_row, local_col, lid, acc);
+        mma_tile(kb & 1u, kb * TILE_K, local_row, local_col, lid, acc);
         // Prefetch next stage (if any)
         if (kb + 1 < k_blocks) {
-            load_tiles((kb + 1u) & 1u, (kb + 1u) * pc.tile_k, row_base, col_base,
+            load_tiles((kb + 1u) & 1u, (kb + 1u) * TILE_K, row_base, col_base,
                        batch_a_off, batch_b_off, lid);
             GroupMemoryBarrierWithGroupSync();
         }
@@ -297,7 +289,7 @@ void computeMain<Epilogue : IDifferentiable>(
 /*{%*/ else /*%}*/
 
     for (uint kb = 0; kb < k_blocks; kb++) {
-        uint k_base = kb * pc.tile_k;
+        uint k_base = kb * TILE_K;
         load_tiles(0, k_base, row_base, col_base, batch_a_off, batch_b_off, lid);
         GroupMemoryBarrierWithGroupSync();
         mma_tile(0, k_base, local_row, local_col, lid, acc);
@@ -307,14 +299,14 @@ void computeMain<Epilogue : IDifferentiable>(
 
     // Epilogue + store: each thread writes its M_PER_THREAD x N_PER_THREAD
     // register block to the output tensor.
-    // N+1.11: Loop bounds use pc.m_per_thread, pc.n_per_thread.
+    // N+1.11: Loop bounds use M_PER_THREAD, N_PER_THREAD.
     [unroll]
-    for (uint mi = 0; mi < pc.m_per_thread; mi++) {
-        uint row = row_base + local_row * pc.m_per_thread + mi;
+    for (uint mi = 0; mi < M_PER_THREAD; mi++) {
+        uint row = row_base + local_row * M_PER_THREAD + mi;
         if (row >= pc.M) continue;
         [unroll]
-        for (uint ni = 0; ni < pc.n_per_thread; ni++) {
-            uint col = col_base + local_col * pc.n_per_thread + ni;
+        for (uint ni = 0; ni < N_PER_THREAD; ni++) {
+            uint col = col_base + local_col * N_PER_THREAD + ni;
             if (col >= pc.N) continue;
             /*{{*/ dtype_acc /*}}float*/ v = acc[mi][ni];
             // A.6: Epilogue blocks gated by pc.flags at runtime, not Jinja.

@@ -42,8 +42,8 @@ _TRUST_INDUCTOR = os.environ.get("TORCH_VULKAN_TRUST_INDUCTOR") == "1"
 # block in ``templates/slang_mm.slang`` (and the link-time wrapper in
 # ``render.py``).
 #
-# Layout: 19 uint + 5 float = 96 bytes (well below the 128 B push-constant
-# limit on RDNA1).
+# Layout: 14 uint + 5 float = 76 bytes (tile_m/n/k/m_per_thread/n_per_thread
+# removed — redundant with spec-constants baked into SPIR-V at render time).
 MM_FLAG_BIAS = 1
 MM_FLAG_BATCH = 2
 MM_FLAG_ALPHA = 4
@@ -52,7 +52,7 @@ MM_FLAG_SCALE = 16
 MM_FLAG_CLAMP = 32
 
 # Format string for ``struct.pack`` — must match the Slang struct field order.
-_MM_PC_FORMAT = "19I5f"
+_MM_PC_FORMAT = "14I5f"
 
 
 def _pack_mm_pc(
@@ -65,11 +65,6 @@ def _pack_mm_pc(
     stride_b_n: int,
     stride_c_m: int,
     stride_c_n: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    m_per_thread: int,
-    n_per_thread: int,
     *,
     stride_bias_n: int = 0,
     stride_a_b: int = 0,
@@ -88,6 +83,9 @@ def _pack_mm_pc(
     fields default to 0 / 0.0 when their corresponding ``MM_FLAG_*`` bit is
     clear, so a single helper serves every mm dispatch (mm / addmm / bmm /
     addmm+gelu).
+
+    tile_m/tile_n/tile_k/m_per_thread/n_per_thread are NOT packed anymore —
+    they are covered by spec-constants baked into SPIR-V at Jinja render time.
     """
     return struct.pack(
         _MM_PC_FORMAT,
@@ -104,11 +102,6 @@ def _pack_mm_pc(
         stride_a_b,
         stride_b_b,
         stride_c_b,
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
         flags,
         alpha,
         beta,
@@ -227,11 +220,6 @@ def _slang_tile_mm(
         stride_b_n,
         out.stride(0),
         out.stride(1),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
     )
 
     grid_x = (N + tile_n - 1) // tile_n
@@ -336,11 +324,6 @@ def _slang_tile_addmm(
         stride_b_n,
         out.stride(0),
         out.stride(1),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
         stride_bias_n=stride_bias_n,
         flags=MM_FLAG_BIAS,
     )
@@ -424,10 +407,7 @@ def _slang_tile_addmm_gelu(
     if not _TRUST_INDUCTOR and not bias_1d.is_contiguous():
         bias_1d = bias_1d.contiguous()
 
-    # A.6: Pre-A.6 this path packed only 10 uints, leaving pc.tile_m /
-    # pc.tile_n / pc.tile_k / pc.m_per_thread / pc.n_per_thread (the N+1.11
-    # runtime tile fields) reading garbage on the GPU.  The unified packer
-    # writes the full layout, closing that latent miscompute risk.
+    # A.6: Monolithic PC layout — tile fields now live in spec-constants.
     pc = _pack_mm_pc(
         M,
         N,
@@ -438,11 +418,6 @@ def _slang_tile_addmm_gelu(
         1,
         out.stride(0),
         out.stride(1),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
         stride_bias_n=1,
         flags=MM_FLAG_BIAS,
     )
@@ -531,11 +506,6 @@ def _slang_tile_bmm(
         b.stride(2),
         out.stride(1),
         out.stride(2),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
         stride_a_b=a.stride(0),
         stride_b_b=b.stride(0),
         stride_c_b=out.stride(0),
