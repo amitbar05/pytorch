@@ -323,9 +323,10 @@ def _analyze_smem_bank_conflict_risk(
 
 # ── N.3.a — Wave-native compute dtype (generic wg_reduce_wave<W,T>) ──
 # Maps PyTorch source dtype → PyTorch dtype used for the wave reduction path.
-# f16 stays native (half); bf16 widens to f32 (no bf16 wave intrinsics).
+# Both f16 and bf16 widen to f32: per-thread half accumulation loses 2-3 digits
+# of precision (GradPar.1); the wave-level reduce itself is always float.
 _WAVE_COMPUTE_DTYPE: dict[torch.dtype, torch.dtype] = {
-    torch.float16: torch.float16,  # native half — no widening
+    torch.float16: torch.float32,  # widen: avoid per-thread half accumulation precision loss
     torch.bfloat16: torch.float32,  # widen: bf16 wave intrinsics not universal
     torch.float32: torch.float32,
     torch.float64: torch.float64,

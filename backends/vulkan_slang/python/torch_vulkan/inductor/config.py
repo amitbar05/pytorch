@@ -168,10 +168,10 @@ _STRICT_OCCUPANCY = os.environ.get("TORCH_VULKAN_STRICT_OCCUPANCY", "0") == "1"
 
 # M11.3 — Register-tile pointwise: each thread processes 2-4 consecutive
 # elements instead of 1, reducing thread count and improving ILP.
-# Set to 2, 3, or 4 to enable; 0 disables (default: off until validated).
-# Only applies to simple single-axis pointwise kernels not eligible for
-# vec4 or packed16 paths.
-_REGISTER_TILE = int(os.environ.get("TORCH_VULKAN_REGISTER_TILE", "0"))
+# Set to 2, 3, or 4 to enable; 0 disables.  Default 2: divisibility gate
+# (numel % (wg*2)==0) and VGPR cap guard ineligible shapes safely.
+# Opt out: TORCH_VULKAN_REGISTER_TILE=0.
+_REGISTER_TILE = int(os.environ.get("TORCH_VULKAN_REGISTER_TILE", "2"))
 
 # N+1.5.c — Descriptor indexing feature gate for >16 storage buffer bindings.
 # When enabled (default) and VK_EXT_descriptor_indexing is available on the

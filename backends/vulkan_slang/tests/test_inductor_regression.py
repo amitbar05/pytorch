@@ -64810,3 +64810,65 @@ class TestAotiShimHandleLifetime:
 
         ret2 = fn_delete(handle)
         assert ret2 == 0, f"aoti_torch_delete returned error code {ret2}"
+
+
+class TestPointwiseRegisterTileDefault:
+    """M11.3 — register tile=2 is now the default (TORCH_VULKAN_REGISTER_TILE default 0→2).
+
+    Two cases:
+    1. Eligible shape (numel % (wg*2) == 0) must produce correct results.
+    2. Ineligible shape (numel % (wg*2) != 0) must silently skip with no error.
+    """
+
+    def test_register_tile2_eligible_shape_correct(self):
+        """tile=2 (the new default) produces correct results for numel%512==0 shapes."""
+        try:
+            import torch_vulkan
+
+            if not torch_vulkan.is_available():
+                pytest.skip("No Vulkan device")
+        except ImportError:
+            pytest.skip("torch_vulkan not installed")
+
+        x = torch.randn(2, 16, 16, device="vulkan:0")  # 512 elements, eligible
+        y = torch.randn(2, 16, 16, device="vulkan:0")
+
+        @torch.compile(backend="inductor", dynamic=False)
+        def fn(a, b):
+            return a * 2.0 + b
+
+        out = fn(x, y)
+        expected = x.cpu() * 2.0 + y.cpu()
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            rtol=1e-4,
+            atol=1e-4,
+            msg="M11.3: register tile=2 eligible shape correctness mismatch",
+        )
+
+    def test_register_tile2_ineligible_shape_silent_fallback(self):
+        """tile=2 is silently skipped for shapes where numel % (wg*2) != 0."""
+        try:
+            import torch_vulkan
+
+            if not torch_vulkan.is_available():
+                pytest.skip("No Vulkan device")
+        except ImportError:
+            pytest.skip("torch_vulkan not installed")
+
+        # 4*16*14*14 = 12544; 12544 % 512 = 256 → ineligible
+        x = torch.randn(4, 16, 14, 14, device="vulkan:0")
+
+        @torch.compile(backend="inductor", dynamic=False)
+        def fn(a):
+            return torch.relu(a)
+
+        out = fn(x)  # must not raise
+        torch.testing.assert_close(
+            out.cpu(),
+            torch.relu(x.cpu()),
+            rtol=1e-4,
+            atol=1e-4,
+            msg="M11.3: register tile=2 ineligible shape fallback correctness mismatch",
+        )
