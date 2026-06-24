@@ -7961,13 +7961,15 @@ class TestPacked16WelfordGuard:
 
     The fix adds ``if self.has_welford: return False`` to the packed16 path
     *before* ``_vec4_pw_eligible_structural`` is called — mirroring the
-    float path.  The sentinel design (``_p16_load_records`` intentionally
-    not set) proves the guard fires early: if it fires, no AttributeError;
-    if it is missing, the method reaches ``_p16_load_records`` and raises.
+    float path.  With ``has_welford=True`` the guard fires at that check and
+    returns False before ``_p16_load_records`` is ever accessed; the explicit
+    empty-list values below ensure that if the has_welford guard were removed,
+    the ``not self._p16_load_records`` check (also in the packed16 block)
+    would still return False cleanly rather than raising AttributeError.
     """
 
     def test_packed16_welford_guard_returns_false_early(self):
-        """Guard fires before _p16_load_records is accessed (sentinel test)."""
+        """packed16 path returns False early when has_welford=True (CG.3 guard)."""
         import types
         import sympy
         from torch_vulkan.inductor.kernel.pointwise_vec4_mixin import (
@@ -7995,12 +7997,13 @@ class TestPacked16WelfordGuard:
         # lives on PointwiseMixin).  Setting _vec4_pw_eligible_structural to
         # a stub that returns True makes the structural path say "eligible" and
         # skip the legacy fallback entirely, so execution reaches the intended
-        # sentinel without needing _check_index_lane_dependency at all.
+        # guard without needing _check_index_lane_dependency at all.
         kernel._vec4_pw_eligible_structural = lambda rt, all_inners, out_inners: True
-        # _p16_load_records intentionally NOT set.  If the welford guard fires
-        # before the _p16_load_records check, no AttributeError is raised and
-        # the method returns False.  If the guard is absent, the method
-        # eventually reaches _p16_load_records and raises AttributeError.
+        # Explicitly set to [] (falsy): if the has_welford guard fires (line 214),
+        # the method returns False before reaching this check; if the guard were
+        # absent, not self._p16_load_records would be True and still return False.
+        kernel._p16_load_records = []    # falsy → triggers return-False at line 236
+        kernel._p16_store_records = []   # same guard checks both
 
         try:
             result = kernel._vec4_pw_eligible(
@@ -65109,13 +65112,14 @@ class TestVec4EligibilityCompositeIndex:
         )
 
     def test_nested_subscript_non_lane_dep_no_crash(self):
-        """buf[a[i]+b] must not crash and must return False when b has no lane dep.
+        """buf[a[i]+b] must not crash and must return False when no lane dep exists.
 
-        Note: (.+?) stops at the first ']', so idx_expr captures only 'a[i'
-        and the '+b' tail is lost.  This is an acknowledged limitation: if b
-        were lane-dependent, it would be a false negative.  The companion test
-        test_nested_subscript_with_simple_lane_dep_is_detected confirms that
-        the common composite case (no nesting) IS detected correctly.
+        The test passes because the body contains no typed variable assignments
+        (``_build_body_var_deps`` returns an empty dict), so ``__lane_id__`` is
+        not in the transitive closure of any variable and the function returns
+        False at the early-exit check before the buffer-access regex is applied
+        at all.  The nested subscript pattern ``a[i]+b`` is never matched or
+        captured — the regex is simply never reached.
         """
         kernel = self._make_kernel()
         body = "buf[a[i]+b] = 1.0;\n"
