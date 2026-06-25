@@ -20,6 +20,8 @@
 > and AOTI-emit source files. New E4/E5 coverage items added.
 >
 > **2026-06-24 merge wave:** PRs #3 (S3.5a + SP.B1/B2 + conv-lowering), #5 (S4.0 AOTI pc_size), #6 (CG.3 Welford guard), #9 (S4.2 extern-C ABI), #10 (S4.3 factory shim) squash-merged to `main`. All five passed independent cross-vendor (`claude_code` → `pi`) review before merge. CG.4 PR in progress.
+>
+> **2026-06-25 merge wave:** PRs #17 (SP.1 async compile), #24 (batcher lifecycle fix), #25 (S2.3 in-process validation + M11.3 register-tile default 0→2 + GradPar.1 fp16 widening) merged to `main`. Pi (stepfun 3.7) is now the primary sub-agent for all implementation and investigation work.
 
 ---
 
@@ -109,7 +111,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | Shader-lib + template SPIR-V precompile (sync) | ✅ | `hardware_probe.py:_run_level_1_sync()` |
 | `prepare_model()` → 100% warm SPIR-V cache | ✅ | `hardware_probe.py:791`; proven 13 s→0.59 s |
 | Subprocess validation of autotune winners | ✅ | `autotune.py:validate_winner` spawns fresh-instance subprocess |
-| **In-process validation during warm-up** | 🔴 | aspirational — needs `VK_INSTANCE_LAYERS` set *before* `import torch_vulkan` (instance built at import). `validate=True` is a no-op for S0/S1 in-process. |
+| **In-process validation during warm-up** | ✅ **S2.3 FIXED 2026-06-25** | `csrc/vulkan/Context.cpp:debug_callback` — `debug_utils_full` flag now enabled when `TORCH_VULKAN_VUID_AS_ERROR` is set; ERROR-severity VUIDs throw `std::runtime_error` in-process. PR #25. |
 | **Warm→train cache coherence** | ✅ **S2.4 FIXED 2026-06-21** | `_restore_probe_defaults()` reads `mm_tiles_mode` from probe_status.json and applies as soft default on every import. `TestWarmCacheCoherence` ✅ |
 
 **S2 — Conv+GN+ReLU+Pool+Linear compile-path dispatch audit**
