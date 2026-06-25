@@ -82,6 +82,25 @@ M6 Phase 2 (T4.12 groups>1) — COMPLETE:
 from __future__ import annotations
 
 
+def _static_int(x) -> int:
+    """Resolve a stride/padding/dilation value to a concrete int.
+
+    Under dynamic shapes the value may arrive as a sympy expression or
+    ``torch.SymInt`` (e.g. ``padding=k // 2`` with symbolic ``k``). The
+    ``slang_conv2d`` template bakes these into the kernel, so guard the
+    graph on the concrete value rather than carrying a symbol.
+    """
+    import torch
+
+    if isinstance(x, torch.SymInt):
+        x = x.node.expr
+    if isinstance(x, int):
+        return x
+    from torch._inductor.virtualized import V
+
+    return V.graph.sizevars.guard_int(x)
+
+
 def _register_conv_and_pool_lowerings() -> None:
     """PF.3 (Strike 2) — Inductor lowerings for the PF.30 conv2d / max_pool2d
     custom_op shims.
@@ -579,12 +598,12 @@ def _register_conv_and_pool_lowerings() -> None:
             result = _lowerings[aten.cat.default](groups_out, 1)
             # Bias is already handled per-group above; no post-hoc bias add needed.
             return result
-        sH = int(stride[0])
-        sW = int(stride[-1] if len(stride) > 1 else stride[0])
-        pH = int(padding[0])
-        pW = int(padding[-1] if len(padding) > 1 else padding[0])
-        dH = int(dilation[0])
-        dW = int(dilation[-1] if len(dilation) > 1 else dilation[0])
+        sH = _static_int(stride[0])
+        sW = _static_int(stride[-1] if len(stride) > 1 else stride[0])
+        pH = _static_int(padding[0])
+        pW = _static_int(padding[-1] if len(padding) > 1 else padding[0])
+        dH = _static_int(dilation[0])
+        dW = _static_int(dilation[-1] if len(dilation) > 1 else dilation[0])
 
         H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
