@@ -128,7 +128,6 @@ from .reflection_ext import (  # noqa: F401
     _extract_linktime_spec_constants,
     _harvest_reflection_metrics,
     _load_spv_baselines,
-    _optimized_numthreads_by_hash,
     _parse_numthreads_from_source,
     _parse_reflection_metrics,
     _pick_numthreads_from_reflection,
@@ -136,7 +135,6 @@ from .reflection_ext import (  # noqa: F401
     _rewrite_numthreads_in_source,
     _save_spv_baselines,
     get_cached_metrics_for_key,
-    get_optimized_numthreads,
     get_reflection_metrics,
     reset_reflection_baselines,
 )
@@ -265,7 +263,17 @@ def _process_reflection(
     src: str,
     config_key: str | None,
 ) -> None:
-    """Harvest reflection metrics, check baselines, and possibly recompile."""
+    """Harvest reflection metrics and check baselines.
+
+    SP.2: The Pass-2 numthreads rewrite path was removed. It ran
+    _rewrite_numthreads_in_source + _compile_with_optimized_numthreads but
+    _compile_slang_to_spirv_inner always overwrote _cache_by_hash[hash_key]
+    back to Pass-1 afterward, making the recompile a no-op. Additionally,
+    the dispatch grid in Python is baked at codegen time with the original
+    numthreads, so a different SPIR-V LocalSize would silently process the
+    wrong number of elements. WG autotune (_maybe_autotune_wg) handles
+    numthreads selection correctly and is the supported path.
+    """
     from torch_vulkan.inductor import config as _cfg
 
     _reflection_cache[hash_key] = refl_blob
@@ -278,90 +286,7 @@ def _process_reflection(
     short_key = hashlib.sha256(spv).hexdigest()[:12]
     _check_spv_regression(short_key, _reflection_metrics_by_hash.get(hash_key, {}))
 
-    if not _cfg.reflection_routing():
-        return
 
-    metrics = _reflection_metrics_by_hash.get(hash_key, {})
-    vgprs = metrics.get("vgprs")
-    if vgprs is None:
-        return
-
-    current_nt = _parse_numthreads_from_source(src)
-    if current_nt is None:
-        return
-
-    shared_mem = metrics.get("shared_mem")
-    loop_depth = metrics.get("loop_depth")
-    optimal_nt = _pick_numthreads_from_reflection(
-        vgprs, shared_mem, loop_depth, current_nt,
-    )
-    if optimal_nt == current_nt:
-        _optimized_numthreads_by_hash[hash_key] = current_nt
-        return
-
-    # Recompile with optimized numthreads.
-    new_src = _rewrite_numthreads_in_source(src, optimal_nt)
-    _compile_with_optimized_numthreads(
-        new_src, optimal_nt, entry="computeMain", hash_key=hash_key,
-        config_key=config_key, src=src,
-    )
-    _optimized_numthreads_by_hash[hash_key] = optimal_nt
-
-
-def _compile_with_optimized_numthreads(
-    new_src: str,
-    optimal_nt: tuple[int, int, int],
-    *,
-    entry: str,
-    hash_key: str,
-    config_key: str | None,
-    src: str,
-) -> None:
-    """Second-pass compile with rewritten numthreads; replace cached SPV on success."""
-    with tempfile.TemporaryDirectory() as td:
-        new_src_path = os.path.join(td, "kernel_opt.slang")
-        new_out_path = os.path.join(td, "kernel_opt.spv")
-        new_refl_path = os.path.join(td, "kernel_opt.refl.json")
-        with open(new_src_path, "w") as f:
-            f.write(new_src)
-        cmd3 = [
-            _get_slangc(),
-            new_src_path,
-            "-target",
-            "spirv",
-            "-entry",
-            entry,
-            "-o",
-            new_out_path,
-            "-reflection-json",
-            new_refl_path,
-            "-matrix-layout-row-major",
-            "-ignore-capabilities",
-        ]
-        try:
-            proc3 = _run_slangc(cmd3, hash_key)
-        except SlangCompileTimeout:
-            return  # keep Pass-1 SPV
-        if proc3.returncode != 0:
-            return
-
-        with open(new_out_path, "rb") as f:
-            spv2 = f.read()
-        _cache_by_hash[hash_key] = spv2
-        _disk_cache_write(hash_key, spv2)
-
-        try:
-            with open(new_refl_path) as f:
-                refl_blob2 = f.read()
-            _reflection_cache[hash_key] = refl_blob2
-            _disk_reflection_write(hash_key, refl_blob2)
-            from torch_vulkan.inductor import config as _cfg
-            if _cfg.reflection_enabled():
-                _harvest_reflection_metrics(
-                    hash_key, refl_blob2, spv2, new_src, config_key,
-                )
-        except (FileNotFoundError, OSError):
-            pass
 
 
 def _compile_slang_to_spirv_inner(
