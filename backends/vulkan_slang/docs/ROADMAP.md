@@ -2008,20 +2008,20 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | # | Item | Files | LOC | Severity | Status |
 |---|------|-------|-----|----------|--------|
 | 1 | MS.1+MS.2 | `csrc/backend/aoti_shims.cpp` | ~8 | 🔴 CRITICAL | ✅ MERGED PR #3 2026-06-24 |
-| 2 | SP.B4 | `python/torch_vulkan/inductor/runtime/dispatch.py:1010` | 1 | 🔴 HIGH | Fix spec confirmed |
-| 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | Fix spec confirmed |
-| 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | Fix spec confirmed |
-| 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | Fix spec confirmed |
-| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ MERGED PR #6 2026-06-24 |
+| 2 | SP.B4 | `python/torch_vulkan/inductor/runtime/dispatch.py:1010` | 1 | 🔴 HIGH | ✅ FIXED 2026-06-25 `eff9c0d9a4f` |
+| 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | ✅ FIXED 2026-06-25 `eff9c0d9a4f` |
+| 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
+| 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
+| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `6d5cb00803f` (wg_argmax NUICF + wg_argmin) |
 | 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | 🔧 PR in progress |
 | 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | Fix spec confirmed |
 | 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |
-| 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | Fix spec confirmed |
+| 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `682f7793404` |
 | 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | Fix spec confirmed |
-| 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | Fix spec confirmed |
-| 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | Fix spec confirmed |
+| 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | ✅ MERGED PR #25 2026-06-25 |
+| 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | ✅ FIXED 2026-06-25 (tests added, 3/3 pass) |
 | 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | Fix spec confirmed |
-| 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | Fix spec confirmed |
+| 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | ✅ MERGED PR #17 2026-06-25 |
 | 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | Fix spec confirmed (see § 3.6) |
 
 **Ticket details for claude_code:**
