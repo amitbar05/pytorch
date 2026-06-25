@@ -6573,6 +6573,47 @@ class TestPacked16Verification:
         assert n <= 1, f"expected 1 dispatch (fused pointwise), got {n}"
 
 
+class TestBf16PackedStoreWave32:
+    """CG.2: bf16 fallback store missing _packed16_vw_active guard.
+
+    When _packed16_vw_active is True the _packed16_vw_rewrite path replaces
+    the WaveReadLaneAt body with a gtid.x vector write.  The fallback bf16
+    store path must not set _pw_has_wave_ops in that state — otherwise the
+    shader codegen signals 'wave ops needed' for a body that has already been
+    rewritten into non-wave vector ops, producing a structural conflict.
+    """
+
+    def test_bf16_scalar_store_path_values(self):
+        """Small bf16 tensor (numel=64, not a multiple of wg*4=1024) forces
+        the scalar WaveReadLaneAt store path — values must survive round-trip."""
+        x = torch.tensor(
+            [1000.0 + i for i in range(64)], dtype=torch.bfloat16, device="vulkan:0"
+        )
+
+        @torch.compile(backend="inductor")
+        def fn(t):
+            return t + torch.zeros_like(t)
+
+        out = fn(x)
+        torch.testing.assert_close(out.cpu(), x.cpu(), rtol=0, atol=0)
+
+    def test_bf16_vector_store_path_values(self):
+        """Large bf16 tensor (numel=1024, multiple of wg*4) activates the
+        _packed16_vw_active vector-write rewrite — values must also survive."""
+        x = torch.tensor(
+            [float(i % 512) for i in range(1024)],
+            dtype=torch.bfloat16,
+            device="vulkan:0",
+        )
+
+        @torch.compile(backend="inductor")
+        def fn(t):
+            return t + torch.zeros_like(t)
+
+        out = fn(x)
+        torch.testing.assert_close(out.cpu(), x.cpu(), rtol=0, atol=0)
+
+
 class TestCrossEntropyBaseline:
     """P1.5: F.cross_entropy(logits, target) under torch.compile. Locks
     correctness vs CPU; dispatch-count target depends on the future
@@ -12146,30 +12187,36 @@ class TestVec4PointwiseF32:
     def _capture_compiled_slang(fn, *args):
         """Run ``fn(*args)`` once, returning every Slang source slangc saw.
 
-        Hooks ``runtime.compile_slang_to_spirv`` so we don't need a separate
-        log-capture mechanism. The cache is cleared first so we observe a
-        cold compile.
+        Patches ``slangc.compile_slang_to_spirv`` directly (not the runtime
+        re-export) so that the lazy-import call sites inside dispatch.py pick
+        up the spy.  Also resets Dynamo to force a fresh Inductor compile even
+        when Dynamo has a warm cache for the same bytecode.
         """
+        from torch_vulkan.inductor.runtime import slangc as _slangc
         from torch_vulkan.inductor import runtime as _rt
 
         captured: list[str] = []
-        orig = _rt.compile_slang_to_spirv
+        orig = _slangc.compile_slang_to_spirv
 
         def spy(src, entry="computeMain", cache_key=None, config_key=None):
             captured.append(src)
-            return orig(src, entry=entry, cache_key=cache_key)
+            return orig(src, entry=entry, cache_key=cache_key, config_key=config_key)
 
-        # Wipe the in-memory + on-disk SPIR-V caches so we re-compile.
+        # Wipe the in-memory SPIR-V caches so we re-compile.
         _rt._cache_by_key.clear()
         _rt._cache_by_hash.clear()
         rm_path = "/tmp/torchinductor_" + os.environ.get("USER", "amit")
         os.system(f"rm -rf {rm_path} 2>/dev/null")
+        # Reset Dynamo so it re-runs Inductor codegen instead of serving
+        # from a warm cache for identically-shaped inputs compiled in a
+        # prior test.
+        torch._dynamo.reset()
 
-        _rt.compile_slang_to_spirv = spy
+        _slangc.compile_slang_to_spirv = spy
         try:
             fn(*args)
         finally:
-            _rt.compile_slang_to_spirv = orig
+            _slangc.compile_slang_to_spirv = orig
         return captured
 
     def test_vec4_fires_on_contiguous_f32_add(self):
