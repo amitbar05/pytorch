@@ -2023,7 +2023,7 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | ✅ FIXED 2026-06-25 (tests added, 3/3 pass) |
 | 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | ✅ FIXED 2026-06-25 — `desc_set_mutex_` + 7 lock_guard sites in place |
 | 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | ✅ MERGED PR #17 2026-06-25 |
-| 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | Fix spec confirmed (see § 3.6) |
+| 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | ✅ FIXED 2026-06-26 — 397 LOC deleted; 5+6 dead backward fakes + _randperm_fake + conv_gn_relu_fusion body |
 
 **Ticket details for claude_code:**
 
