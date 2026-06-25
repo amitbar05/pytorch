@@ -420,6 +420,7 @@ def compile_slang_to_spirv(
     cache_key: Optional[str] = None,
     include_paths: tuple[str, ...] = (),
     config_key: Optional[str] = None,
+    pc_layout_hash: Optional[str] = None,
 ) -> bytes:
     """Compile Slang source to SPIR-V bytes, cached.
 
@@ -454,8 +455,14 @@ def compile_slang_to_spirv(
     # changes to shaders/lib/*.slang automatically invalidate the disk
     # cache for all kernels that import those files (M22.16-cache-fix).
     lib_tag = _shader_lib_import_hash(src)
+    # SP.3: mix in the caller-supplied push-constant layout hash so a PC
+    # struct field change invalidates cached SPIR-V even if the source text
+    # the caller passed happens to normalize identically.
+    pc_tag = "" if pc_layout_hash is None else f"\nPC={pc_layout_hash}"
     hash_key = hashlib.sha256(
-        (entry + "\n" + _normalize_slang_source(src) + inc_tag + sgs_tag + lib_tag).encode()
+        (
+            entry + "\n" + _normalize_slang_source(src) + inc_tag + sgs_tag + lib_tag + pc_tag
+        ).encode()
     ).hexdigest()
     hit = _cache_by_hash.get(hash_key)
     if hit is not None:

@@ -384,6 +384,7 @@ def compile_and_dispatch(
     entry: str = "computeMain",
     cache_key: str = "",
     spec_constants: list[tuple[int, int]] | None = None,
+    pc_layout_hash: str | None = None,
 ) -> None:
     """Compile Slang source (cached) and dispatch in one call.
 
@@ -393,12 +394,17 @@ def compile_and_dispatch(
 
     CG.M15: ``spec_constants`` are (constant_id, value) pairs for
     ``[[vk::constant_id]]`` overrides at pipeline-creation time.
+
+    SP.3: ``pc_layout_hash`` is mixed into the SPIR-V content hash so a
+    push-constant struct layout change invalidates cached SPIR-V.
     """
     if not cache_key:
         raise ValueError("compile_and_dispatch requires a non-empty cache_key")
     from .slangc import compile_slang_to_spirv
 
-    spv = compile_slang_to_spirv(src, entry=entry, cache_key=cache_key)
+    spv = compile_slang_to_spirv(
+        src, entry=entry, cache_key=cache_key, pc_layout_hash=pc_layout_hash
+    )
     dispatch(
         cache_key,
         spv,

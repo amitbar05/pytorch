@@ -21,6 +21,7 @@ from ....vulkan_template_caller import (
 )
 from .dispatch import (
     _get_device_subgroup_size,
+    _pc_layout_hash,
     _slang_tile_addmm,
     _slang_tile_addmm_gelu,
     _slang_tile_bmm,
@@ -189,6 +190,10 @@ class _SlangTileGEMM:
 
         src = _render_mm_slang(self.tile_m, self.tile_n, self.tile_k, use_module=False, **render_kwargs)
 
+        # SP.3: tag the cache key with the rendered PC-struct layout hash so a
+        # future push-constant field change can't silently reuse stale SPIR-V.
+        _pc_tag = f"_pc{_pc_layout_hash(src)}"
+
         # DR.3 / N+1.12: Include subgroup_size and loop_depth in the
         # cache key so wave32 vs wave64 SPIR-V variants and kernels with
         # different nesting depths get distinct cache entries.
@@ -213,28 +218,28 @@ class _SlangTileGEMM:
             cache_key = (
                 f"slang_bmm_v2_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111_a6"
+                f"{_sgs_tag}{_ld_tag}_n111_a6{_pc_tag}"
             )
         elif self.has_bias and self.epilogue == "OpGELU":
             cache_key = (
                 f"slang_addmm_epi_OpGELU_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111_a6"
+                f"{_sgs_tag}{_ld_tag}_n111_a6{_pc_tag}"
             )
         elif self.has_bias:
             cache_key = (
                 f"slang_addmm_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111_a6"
+                f"{_sgs_tag}{_ld_tag}_n111_a6{_pc_tag}"
             )
         else:
             cache_key = (
                 f"slang_mm_{self.tile_m}_{self.tile_n}_{self.tile_k}"
                 f"_s{self.num_stages}"
                 f"_r{self.m_per_thread}x{self.n_per_thread}_{dtype_s}"
-                f"{_sgs_tag}{_ld_tag}_n111_a6"
+                f"{_sgs_tag}{_ld_tag}_n111_a6{_pc_tag}"
             )
         if self.epilogue is not None and not (
             self.has_bias and self.epilogue == "OpGELU"

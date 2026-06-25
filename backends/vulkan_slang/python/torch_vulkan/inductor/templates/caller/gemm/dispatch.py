@@ -6,7 +6,9 @@ Includes tile-config pickers, device queries, and push-constant packing.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import struct
 from typing import TYPE_CHECKING
 
@@ -28,6 +30,23 @@ from ....vulkan_template_caller import (
 from .render import _render_mm_int8_slang, _render_mm_slang
 
 _TRUST_INDUCTOR = os.environ.get("TORCH_VULKAN_TRUST_INDUCTOR") == "1"
+
+# SP.3: matches the rendered push-constant struct body for both the forward
+# (``struct PC``) and single-kernel backward (``struct BwdPC``) templates.
+_PC_STRUCT_RE = re.compile(r"struct \w*PC\s*\{([^}]+)\}")
+
+
+def _pc_layout_hash(src: str) -> str:
+    """sha256[:8] of the rendered ``struct (Bwd)PC`` body.
+
+    SP.3: mixed into the SPIR-V ``hash_key`` (and appended to the textual
+    template ``cache_key``) so a push-constant field addition invalidates
+    cached SPIR-V instead of silently reusing a stale blob whose layout no
+    longer matches the kernel's bindings.
+    """
+    m = _PC_STRUCT_RE.search(src)
+    body = m.group(1) if m else ""
+    return hashlib.sha256(body.encode()).hexdigest()[:8]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -247,6 +266,7 @@ def _slang_tile_mm(
         num_outputs=1,
         entry=f"computeMain<{epi_name}>",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -360,6 +380,7 @@ def _slang_tile_addmm(
         num_outputs=1,
         entry=f"computeMain<{epi_name}>",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -460,6 +481,7 @@ def _slang_tile_addmm_gelu(
         num_outputs=1,
         entry="computeMain<OpGELU>",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -556,6 +578,7 @@ def _slang_tile_bmm(
         num_outputs=1,
         entry=f"computeMain<{epi_name}>",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -812,4 +835,5 @@ def _slang_tile_mm_int8(
         num_outputs=1,
         entry="computeMain",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
