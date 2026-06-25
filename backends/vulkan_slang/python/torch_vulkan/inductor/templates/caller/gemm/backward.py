@@ -187,11 +187,6 @@ def _slang_tile_mm_backward(
         stride_b_n,
         out.stride(0),
         out.stride(1),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_per_thread,
-        n_per_thread,
     )
 
     grid_x = (N + tile_n - 1) // tile_n

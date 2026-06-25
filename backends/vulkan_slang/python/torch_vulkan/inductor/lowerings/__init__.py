@@ -637,6 +637,12 @@ def register() -> None:
 
     _register_view_lowerings()
     _register_conv_and_pool_lowerings()
+    # S1: register Slang tile choices for conv2d via autotune_select_algorithm.
+    # Must run AFTER _register_conv_and_pool_lowerings() — it overrides the
+    # lowering that function just registered.
+    from ..templates.caller.conv_tile.install import install_external_conv
+
+    install_external_conv()
     # M17.3: adaptive_avg_pool2d backward lowering
     from . import pool  # noqa: F811
 

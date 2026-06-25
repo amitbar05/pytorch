@@ -18,7 +18,7 @@
 //
 // CG.M15: Tile sizes are specialization constants (``[[vk::constant_id]]``).
 // They determine numthreads at SPIR-V compile time.  Actual loop bounds use
-// push-constant values (``pc.tile_w``, ``pc.tile_h``, ``pc.tile_c``) so the
+// specialization constants directly, so the
 // same SPIR-V module serves multiple tile configurations.
 
 /*{%*/ set tile_w = tile_w | default(8) /*%}*/
@@ -33,6 +33,18 @@
 [[vk::constant_id(32)]] const uint TILE_C = /*{{*/ tile_c /*}}8*/;
 [[vk::constant_id(33)]] const uint THREADS_W = /*{{*/ threads_w /*}}16*/;
 [[vk::constant_id(34)]] const uint THREADS_H = /*{{*/ threads_h /*}}16*/;
+// perf: conv shape fields promoted to spec-constants (PC -48 B).
+// These are fixed per compiled model / dispatch site; baking them into
+// SPIR-V lets the driver constant-fold the inner loop bounds.
+[[vk::constant_id(35)]] const uint GROUPS = 1u;
+[[vk::constant_id(36)]] const uint KH = 3u;
+[[vk::constant_id(37)]] const uint KW = 3u;
+[[vk::constant_id(38)]] const uint SH = 1u;
+[[vk::constant_id(39)]] const uint SW = 1u;
+[[vk::constant_id(40)]] const uint PH = 0u;
+[[vk::constant_id(41)]] const uint PW = 0u;
+[[vk::constant_id(42)]] const uint DH = 1u;
+[[vk::constant_id(43)]] const uint DW = 1u;
 
 struct PC {
     uint N;
@@ -42,15 +54,6 @@ struct PC {
     uint iW;
     uint oH;
     uint oW;
-    uint kH;
-    uint kW;
-    uint sH;
-    uint sW;
-    uint pH;
-    uint pW;
-    uint groups;
-    uint dH;
-    uint dW;
     // Strides for input (NCHW): [C_in*iH*iW, iH*iW, iW, 1]
     uint stride_in_n;
     uint stride_in_c;
@@ -66,18 +69,12 @@ struct PC {
     uint stride_out_c;
     uint stride_out_h;
     uint stride_out_w;
-    // CG.M15: Runtime tile sizes — loop bounds use these so the same
-    // SPIR-V module (with fixed numthreads from specialization constants)
-    // handles multiple tile configurations.
-    uint tile_w;
-    uint tile_h;
-    uint tile_c;
     // M-SF.4: always present — gated at runtime by stride_bias != 0
     uint stride_bias;
 };
-// PC struct is 32 uints = 128 bytes, exactly at Vulkan's guaranteed minimum
-// maxPushConstantsSize.  The old _pad field pushed us to 132 bytes, which some
-// drivers silently truncate — dropping stride_bias and corrupting bias adds.
+// PC struct is 20 uints = 80 bytes (was 32 uints = 128 bytes).
+// kH/kW/sH/sW/pH/pW/groups/dH/dW moved to spec-constants 35-43;
+// tile_w/tile_h/tile_c moved to spec-constants 30-32 (already existed).
 
 [[vk::push_constant]] PC pc;
 
@@ -113,21 +110,20 @@ void computeMain<Epilogue : IDifferentiable>(
     uint tile_h_idx = gid.y;
     uint batch_co_tile = gid.z;
 
-    // CG.M15: tile_c_count uses pc.tile_c so the grid decode is correct
-    // for the chosen specialization.
-    uint tile_c_count = (pc.C_out + pc.tile_c - 1u) / pc.tile_c;
+    // CG.M15: tile_c_count uses TILE_C spec-constant for grid decode.
+    uint tile_c_count = (pc.C_out + TILE_C - 1u) / TILE_C;
     uint n = batch_co_tile / tile_c_count;
     uint co_tile = batch_co_tile % tile_c_count;
 
     if (n >= pc.N || co_tile >= tile_c_count) return;
 
-    uint co_start = co_tile * pc.tile_c;
-    uint co_end = min(co_start + pc.tile_c, pc.C_out);
+    uint co_start = co_tile * TILE_C;
+    uint co_end = min(co_start + TILE_C, pc.C_out);
 
-    uint ow_start = tile_w_idx * pc.tile_w;
-    uint oh_start = tile_h_idx * pc.tile_h;
-    uint ow_end = min(ow_start + pc.tile_w, pc.oW);
-    uint oh_end = min(oh_start + pc.tile_h, pc.oH);
+    uint ow_start = tile_w_idx * TILE_W;
+    uint oh_start = tile_h_idx * TILE_H;
+    uint ow_end = min(ow_start + TILE_W, pc.oW);
+    uint oh_end = min(oh_start + TILE_H, pc.oH);
 
     // ── Per-thread output position ─────────────────────────────────────
     // M-slang-new-4: derive local_ow / local_oh from a linearised
@@ -154,7 +150,7 @@ void computeMain<Epilogue : IDifferentiable>(
 
     // CG.M15: Early exit for threads outside the runtime workgroup
     // (spec-constant THREADS_W/THREADS_H may be larger than needed).
-    if (local_ow >= pc.tile_w || local_oh >= pc.tile_h) return;
+    if (local_ow >= TILE_W || local_oh >= TILE_H) return;
 
     uint ow = ow_start + local_ow;
     uint oh = oh_start + local_oh;
@@ -180,15 +176,15 @@ void computeMain<Epilogue : IDifferentiable>(
             uint in_c_base = in_batch_base + ci * pc.stride_in_c;
             uint w_ci_base = w_co_base + ci * pc.stride_w_in;
 
-            for (uint kh = 0; kh < pc.kH; kh++) {
-                int ih = int(oh * pc.sH + kh * pc.dH) - int(pc.pH);
+            for (uint kh = 0; kh < KH; kh++) {
+                int ih = int(oh * SH + kh * DH) - int(PH);
                 if (ih < 0 || uint(ih) >= pc.iH) continue;
 
                 uint in_h_base = in_c_base + uint(ih) * pc.stride_in_h;
                 uint w_kh_base = w_ci_base + kh * pc.stride_w_kh;
 
-                for (uint kw = 0; kw < pc.kW; kw++) {
-                    int iw = int(ow * pc.sW + kw * pc.dW) - int(pc.pW);
+                for (uint kw = 0; kw < KW; kw++) {
+                    int iw = int(ow * SW + kw * DW) - int(PW);
                     if (iw < 0 || uint(iw) >= pc.iW) continue;
 
                     float in_val = args.input[in_h_base + uint(iw) * pc.stride_in_w];

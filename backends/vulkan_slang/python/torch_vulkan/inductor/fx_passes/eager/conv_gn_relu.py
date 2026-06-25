@@ -176,7 +176,7 @@ def _dispatch_group_norm_backward_slang(
     )
 
     buffers = [go_2d, inp_2d, mean, rstd, w_1d, gi_2d]
-    cache_key = f"gn_bwd_input_{G}_{cpg}_{HxW}_f32_m22_6"
+    cache_key = f"gn_bwd_input_{G}_{cpg}_{HxW}_f32_gradpar1"
 
     compile_and_dispatch(
         src, buffers,
@@ -251,8 +251,9 @@ def _dispatch_group_norm_backward_weight_slang(
     )
 
     buffers = [go_buf, inp_buf, mean, rstd, gw_buf, gb_buf]
-    grid_x = (C + 255) // 256
-    cache_key = f"gn_bwd_weight_{G}_{C}_{HxW}_f32_m22_6"
+    # GradPar.1: one workgroup per channel (256 threads reduce HxW in parallel)
+    grid_x = C
+    cache_key = f"gn_bwd_weight_{G}_{C}_{HxW}_f32_gradpar1"
 
     compile_and_dispatch(
         src, buffers,

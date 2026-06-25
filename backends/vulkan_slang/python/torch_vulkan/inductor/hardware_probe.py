@@ -572,8 +572,8 @@ def profile_device(
         verbose: print per-stage progress to stdout (useful from the CLI).
         validate: when True, enable ``TORCH_VULKAN_VUID_AS_ERROR=1`` during
             warm-up so that any VUID emitted by pre-compiled or autotuned
-            shaders fails the warm-up call. Warns if VK_INSTANCE_LAYERS is
-            not also set (Vulkan validation requires restart to take effect).
+            shaders fails the warm-up call. ``TORCH_VULKAN_VALIDATION`` is
+            the correct env-var for in-process validation (default ON).
 
     Returns:
         ``{"level": int, "cached": bool, ...stage results}``.
@@ -583,23 +583,21 @@ def profile_device(
 
     # W4: Vulkan validation during warm-up.
     # When validate=True, set TORCH_VULKAN_VUID_AS_ERROR=1 for the duration
-    # so any shader bugs surface at warm-up time.  Note: VK_INSTANCE_LAYERS
-    # is read at Vulkan instance creation time (during import torch_vulkan)
-    # so it cannot be changed here — we just warn if it's missing.
+    # so any shader bugs surface at warm-up time.  TORCH_VULKAN_VALIDATION
+    # is the in-process validation switch (default ON); no restart needed.
     _prev_vuid = os.environ.get("TORCH_VULKAN_VUID_AS_ERROR")
     _validation_active = False
     if validate:
         os.environ["TORCH_VULKAN_VUID_AS_ERROR"] = "1"
         _validation_active = True
         if verbose:
-            _layers = os.environ.get("VK_INSTANCE_LAYERS", "")
-            if _layers and "validation" in _layers.lower():
-                print("  VUID-as-error + Vulkan validation layers: ON")
+            _validation = os.environ.get("TORCH_VULKAN_VALIDATION", "1")  # default ON
+            if _validation and _validation != "0":
+                print("  VUID-as-error + Vulkan validation layers: ON (in-process)")
             else:
                 print(
-                    "  VUID-as-error: ON "
-                    "(VK_INSTANCE_LAYERS not set — restart required for full "
-                    "Vulkan validation layer)"
+                    "  VUID-as-error: OFF "
+                    "(set TORCH_VULKAN_VALIDATION=1 and restart for in-process validation)"
                 )
     try:
         return _profile_device_impl(level, force, verbose, validate=validate)
@@ -751,6 +749,25 @@ def _restore_probe_defaults() -> None:
     mm_mode = status.get("mm_tiles_mode")
     if mm_mode and "TORCH_VULKAN_MM_TILES" not in os.environ:
         os.environ["TORCH_VULKAN_MM_TILES"] = mm_mode
+    _restore_conv_probe_defaults(status)
+
+
+def _restore_conv_probe_defaults(
+    status: Optional[dict[str, Any]] = None,
+) -> None:
+    """Re-apply the conv tile mode from a previous warm-up / install.
+
+    Reads ``conv_tile_mode`` from probe_status.json and sets
+    ``TORCH_VULKAN_CONV_TILE`` only when the user has not overridden it.
+    Mirrors the ``mm_tiles_mode`` / ``TORCH_VULKAN_MM_TILES`` pattern.
+    """
+    if status is None:
+        status = _read_probe_status()
+    if not status:
+        return
+    conv_mode = status.get("conv_tile_mode")
+    if conv_mode and "TORCH_VULKAN_CONV_TILE" not in os.environ:
+        os.environ["TORCH_VULKAN_CONV_TILE"] = conv_mode
 
 
 def auto_probe_on_import() -> Optional[dict[str, Any]]:

@@ -234,8 +234,6 @@ def _register_mm_lowering() -> None:
                 stride_a_m, stride_a_k,
                 stride_b_k, stride_b_n,
                 out_stride_m, out_stride_n,
-                int(tile_m), int(tile_n), int(tile_k),
-                int(m_per_thread), int(n_per_thread),
             )
             pc_values = list(struct.unpack(f"{len(pc) // 4}I", pc))
 
