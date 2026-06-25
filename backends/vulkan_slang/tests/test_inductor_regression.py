@@ -18638,7 +18638,7 @@ class TestReductionGenericFamily:
         [numthreads(64, 1, 1)]
         void computeMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {{
             float v = (tid.x < n) ? in_x[tid.x] : {op_name}::identity();
-            float s = wg_reduce<{op_name}>(v, lid.x, n);
+            float s = wg_reduce<{op_name}>(v, lid.x, n, VK_SUBGROUP_SIZE);
             if (lid.x == 0) out_y[0] = s;
         }}
         """
@@ -18658,7 +18658,7 @@ class TestReductionGenericFamily:
             wg_z=1,
             push_constants=struct.pack("I", x.numel()),
             entry="computeMain",
-            cache_key=f"p12_reduce_{op_name}_v1",
+            cache_key=f"p12_reduce_{op_name}_v2",
             num_outputs=1,
         )
         return out.cpu()
@@ -18689,21 +18689,57 @@ class TestReductionGenericFamily:
         ref = torch.prod(x).reshape(1)
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
+    @staticmethod
+    def _any_all_kernel(fn_name: str) -> str:
+        return f"""
+        import reduction;
+        [[vk::binding(0, 0)]] StructuredBuffer<float> in_x;
+        [[vk::binding(1, 0)]] RWStructuredBuffer<float> out_y;
+        [[vk::push_constant]] cbuffer Push {{ uint n; }};
+        [shader("compute")]
+        [numthreads(64, 1, 1)]
+        void computeMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {{
+            float v = (tid.x < n) ? in_x[tid.x] : 0.0f;
+            float s = {fn_name}(v, lid.x, n, VK_SUBGROUP_SIZE);
+            if (lid.x == 0) out_y[0] = s;
+        }}
+        """
+
+    def _dispatch_any_all(self, fn_name: str, x: torch.Tensor) -> torch.Tensor:
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        x_v = x.to("vulkan:0")
+        out = torch.zeros(1, device="vulkan:0")
+        compile_and_dispatch(
+            self._any_all_kernel(fn_name),
+            tensors=[x_v, out],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", x.numel()),
+            entry="computeMain",
+            cache_key=f"p12_{fn_name}_v1",
+            num_outputs=1,
+        )
+        return out.cpu()
+
     def test_any_all_match_torch(self):
         x_any = torch.tensor([0.0] * 60 + [1.0] * 4)
-        got = self._dispatch_reduce("OpAny", x_any)
+        got = self._dispatch_any_all("vk_wg_reduce_any", x_any)
         assert got.item() == 1.0
 
         x_no = torch.zeros(64)
-        got = self._dispatch_reduce("OpAny", x_no)
+        got = self._dispatch_any_all("vk_wg_reduce_any", x_no)
         assert got.item() == 0.0
 
         x_all = torch.ones(64)
-        got = self._dispatch_reduce("OpAll", x_all)
+        got = self._dispatch_any_all("vk_wg_reduce_all", x_all)
         assert got.item() == 1.0
 
         x_one_zero = torch.cat([torch.ones(63), torch.zeros(1)])
-        got = self._dispatch_reduce("OpAll", x_one_zero)
+        got = self._dispatch_any_all("vk_wg_reduce_all", x_one_zero)
         assert got.item() == 0.0
 
     def test_argmax_argmin_match_torch(self):
@@ -18729,7 +18765,7 @@ class TestReductionGenericFamily:
                 p.val = (tid.x < n) ? in_x[tid.x]
                                     : {"OpMaxReduce" if which == "wg_argmax" else "OpMinReduce"}::identity();
                 p.idx = float(tid.x);
-                ArgPair r = {which}(p, lid.x, n);
+                ArgPair r = {which}(p, lid.x, n, VK_SUBGROUP_SIZE);
                 if (lid.x == 0) {{
                     out_v[0] = r.val;
                     out_i[0] = r.idx;
@@ -18747,7 +18783,7 @@ class TestReductionGenericFamily:
                 wg_z=1,
                 push_constants=struct.pack("I", x.numel()),
                 entry="computeMain",
-                cache_key=f"p12_{which}_v1",
+                cache_key=f"p12_{which}_v2",
                 num_outputs=2,
             )
             ref_idx = (

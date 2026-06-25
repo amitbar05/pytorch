@@ -444,10 +444,13 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
     ArgPair acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
         uint _src = (lane + offset) & (simd - 1u);  // GPU.2: clamp to [0,simd-1]
+        // Hoist BOTH reads before the conditional: WaveReadLaneAt inside a
+        // branch is non-uniform control flow → UB on RDNA1 (wrong idx returned).
         float other_val = WaveReadLaneAt(acc.val, _src);
+        float other_idx = WaveReadLaneAt(acc.idx, _src);
         if (lane + offset < size && other_val > acc.val) {
             acc.val = other_val;
-            acc.idx = WaveReadLaneAt(acc.idx, _src);
+            acc.idx = other_idx;
         }
     }
 
@@ -466,10 +469,66 @@ public ArgPair wg_argmax(ArgPair v, uint tid, uint size, uint simd)
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
             uint _src_w = (lane + offset) & (simd - 1u);  // GPU.2: clamp
             float other_val = WaveReadLaneAt(result.val, _src_w);
+            float other_idx = WaveReadLaneAt(result.idx, _src_w);
             if (lane + offset < n_waves && other_val > result.val) {
                 result.val = other_val;
-                result.idx = WaveReadLaneAt(result.idx, _src_w);
+                result.idx = other_idx;
             }
+        }
+        // Write the inter-wave winner back so all threads read the same result.
+        if (lane == 0u) {
+            _wg_arg_smem_val[0] = result.val;
+            _wg_arg_smem_idx[0] = result.idx;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    result.val = _wg_arg_smem_val[0];
+    result.idx = _wg_arg_smem_idx[0];
+    return result;
+}
+
+[require(spirv, subgroup_shuffle)]
+public ArgPair wg_argmin(ArgPair v, uint tid, uint size, uint simd)
+{
+    if (size == 1u) return v;
+    uint lane = tid % simd;
+    uint wave_id = tid / simd;
+
+    ArgPair acc = v;
+    for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+        uint _src = (lane + offset) & (simd - 1u);  // GPU.2: clamp to [0,simd-1]
+        float other_val = WaveReadLaneAt(acc.val, _src);
+        float other_idx = WaveReadLaneAt(acc.idx, _src);
+        if (lane + offset < size && other_val < acc.val) {
+            acc.val = other_val;
+            acc.idx = other_idx;
+        }
+    }
+
+    uint n_waves = (size + simd - 1u) / simd;
+    if (lane == 0u) {
+        _wg_arg_smem_val[wave_id] = acc.val;
+        _wg_arg_smem_idx[wave_id] = acc.idx;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    ArgPair result;
+    if (wave_id == 0u) {
+        result.val = (tid < n_waves) ? _wg_arg_smem_val[tid] : 3.402823e38f;
+        result.idx = (tid < n_waves) ? _wg_arg_smem_idx[tid] : -1.0f;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
+            uint _src_w = (lane + offset) & (simd - 1u);  // GPU.2: clamp
+            float other_val = WaveReadLaneAt(result.val, _src_w);
+            float other_idx = WaveReadLaneAt(result.idx, _src_w);
+            if (lane + offset < n_waves && other_val < result.val) {
+                result.val = other_val;
+                result.idx = other_idx;
+            }
+        }
+        if (lane == 0u) {
+            _wg_arg_smem_val[0] = result.val;
+            _wg_arg_smem_idx[0] = result.idx;
         }
     }
     GroupMemoryBarrierWithGroupSync();
