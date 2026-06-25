@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from ....vulkan_template_caller import (
     _dtype_to_slang,
 )
-from .dispatch import _TRUST_INDUCTOR, _pack_mm_pc
+from .dispatch import _TRUST_INDUCTOR, _pack_mm_pc, _pc_layout_hash
 from .render import (
     _render_mm_backward_slang,
     _render_mm_bwd_slang,
@@ -207,6 +207,7 @@ def _slang_tile_mm_backward(
         num_outputs=1,
         entry="computeMain<OpIdentity>",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -306,6 +307,7 @@ def _slang_tile_mm_bwd(
         num_outputs=2,
         entry="computeMain",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )
 
 
@@ -400,4 +402,5 @@ def _slang_tile_bmm_bwd(
         num_outputs=2,
         entry="computeMain",
         cache_key=cache_key,
+        pc_layout_hash=_pc_layout_hash(src),
     )

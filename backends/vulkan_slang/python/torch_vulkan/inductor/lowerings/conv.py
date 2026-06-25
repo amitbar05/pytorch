@@ -605,6 +605,14 @@ def _register_conv_and_pool_lowerings() -> None:
         dH = _static_int(dilation[0])
         dW = _static_int(dilation[-1] if len(dilation) > 1 else dilation[0])
 
+        # The slang_conv2d template unrolls over the kernel window, so the
+        # kernel spatial extent must be concrete. Under dynamic shapes a
+        # varying kernel size arrives as a symbol; guard it to a static int
+        # (and keep the symbolic H_out/W_out below from carrying a sympy
+        # ``Max`` that the Slang expr-printer can't emit).
+        kH = _static_int(kH)
+        kW = _static_int(kW)
+
         H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
 
