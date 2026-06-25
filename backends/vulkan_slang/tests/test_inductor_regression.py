@@ -4404,6 +4404,77 @@ class TestSlangTilePerDtypeCache:
         assert restored.__name__ == fn.__name__
 
 
+class TestSP3PcLayoutHash:
+    """SP.3: the SPIR-V cache key includes a push-constant-layout hash so a
+    future PC struct field addition can't silently reuse stale SPIR-V (the
+    textual ``cache_key`` would otherwise be unchanged, bypassing the
+    source-hash path entirely)."""
+
+    def test_pc_hash_is_8_hex(self):
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        tag = _pc_layout_hash("struct PC { uint a; uint b; };")
+        assert re.fullmatch(r"[0-9a-f]{8}", tag)
+
+    def test_pc_hash_changes_when_field_added(self):
+        """The whole point of SP.3: a layout change must change the hash."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        before = _pc_layout_hash("struct PC { uint a; uint b; };")
+        after = _pc_layout_hash("struct PC { uint a; uint b; uint c; };")
+        assert before != after
+
+    def test_pc_hash_matches_backward_struct(self):
+        """The single-kernel backward template emits ``struct BwdPC`` — the
+        regex must capture it too, otherwise backward kernels would always
+        hash the empty body."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        empty = _pc_layout_hash("no struct here")
+        bwd = _pc_layout_hash("struct BwdPC { uint a; uint b; };")
+        assert re.fullmatch(r"[0-9a-f]{8}", bwd)
+        assert bwd != empty
+
+    def test_rendered_mm_template_feeds_nonempty_pc_tag(self):
+        """End-to-end (device-free): the real forward MM template renders a
+        ``struct PC`` body that the helper hashes to a non-empty 8-hex tag."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_slang,
+        )
+
+        src = _render_mm_slang(
+            8, 8, 16,
+            dtype_a="float", dtype_b="float", dtype_c="float",
+            dtype_acc="float", num_stages=1,
+            m_per_thread=1, n_per_thread=1, use_module=False,
+        )
+        empty = _pc_layout_hash("no struct here")
+        tag = _pc_layout_hash(src)
+        assert re.fullmatch(r"[0-9a-f]{8}", tag)
+        assert tag != empty
+
+    def test_compile_path_threads_pc_layout_hash(self):
+        """The hash must reach the SPIR-V content hash: both the runtime
+        ``compile_and_dispatch`` wrapper and the underlying
+        ``compile_slang_to_spirv`` accept a ``pc_layout_hash`` parameter."""
+        import inspect
+
+        from torch_vulkan.inductor.runtime.dispatch import compile_and_dispatch
+        from torch_vulkan.inductor.runtime.slangc import compile_slang_to_spirv
+
+        assert "pc_layout_hash" in inspect.signature(compile_and_dispatch).parameters
+        assert "pc_layout_hash" in inspect.signature(compile_slang_to_spirv).parameters
+
+
 class TestTrustInductor:
     """P0.4 (post P5.11.a.1): TORCH_VULKAN_TRUST_INDUCTOR no-ops
     assert_size_stride / assert_alignment in the wrapper preamble.
