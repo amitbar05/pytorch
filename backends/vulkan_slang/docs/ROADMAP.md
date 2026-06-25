@@ -158,7 +158,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 |---|---|---|
 | Tiny-kernel fusion (AccumulateGrad stash) | ✅ **S3.2 FIXED 2026-06-21** | gradient stash fix → 12 dispatches/step (≤14); `TestTinyKernelFusion` ✅ |
 | Persistent-kernel routing for large reductions | 🔴 | **dead code** — `dispatch_persistent_pointwise()` defined, never called; no numel>65536 routing |
-| Batch-dispatch overlap (exec N ∥ compile N+2) | 🟡 | async precompile at codegen-time only (`slangc.py:573`); `_compile_ahead` stubs in `batcher.py:63-65` declared but **never wired**; true runtime overlap requires SP.2 + wiring stubs; `BATCH_DISPATCH=1` still 1.8× slower → default OFF |
+| Batch-dispatch overlap (exec N ∥ compile N+2) | 🟡 | **2026-06-26**: `batcher.py:_flush()` fix — pending kernels now dispatched while C++ batch mode is active (enter the command buffer); previously dispatched AFTER `_end_batch()` in auto-flush mode, defeating batching. Old 1.8× overhead root-caused and fixed. `BATCH_DISPATCH=1` still default OFF pending benchmark run to confirm improvement. `_compile_ahead` lookahead stubs remain dead — true N‖N+2 overlap still needs wiring (SP.2 follow-up). |
 | GN backward fusion | ✅ | already 2 fused extern dispatches (`gn_backward_extern.py`); the 11-kernel figure was loss-bwd, not GN-bwd |
 
 **S4 — DEPLOY (AOTI)**

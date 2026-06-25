@@ -40244,6 +40244,62 @@ class TestDispatchBatcherLifecycle:
             DispatchBatcher._batch_probed = _orig_probed
             DispatchBatcher._current = _orig_current
 
+    def test_pending_kernels_dispatched_while_batch_mode_active(self):
+        """S3.4 fix: pending kernels must be dispatched while C++ batch mode
+        is ON so they enter the command buffer before _end_batch() submits.
+        Previously _end_batch() was called first (empty buffer) then kernels
+        ran in auto-flush mode, defeating the batching.
+        """
+        from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+
+        dispatch_log = []  # records ("begin"|"end"|"kernel-N") in order
+
+        def _fake_begin():
+            dispatch_log.append("begin")
+
+        def _fake_end():
+            dispatch_log.append("end")
+
+        def make_kernel(name):
+            def _kernel(*args):
+                dispatch_log.append(name)
+            return _kernel
+
+        _orig_begin = DispatchBatcher._begin_batch
+        _orig_end = DispatchBatcher._end_batch
+        _orig_probed = DispatchBatcher._batch_probed
+        _orig_current = DispatchBatcher._current
+        DispatchBatcher._begin_batch = staticmethod(_fake_begin)
+        DispatchBatcher._end_batch = staticmethod(_fake_end)
+        DispatchBatcher._batch_probed = True
+        DispatchBatcher._current = None
+        try:
+            batcher = DispatchBatcher()
+            with batcher:
+                batcher.add(make_kernel("k0"))
+                batcher.add(make_kernel("k1"))
+        finally:
+            DispatchBatcher._begin_batch = _orig_begin
+            DispatchBatcher._end_batch = _orig_end
+            DispatchBatcher._batch_probed = _orig_probed
+            DispatchBatcher._current = _orig_current
+
+        # Expected: begin → k0 → k1 → end → begin → end
+        # (the final begin+end in __exit__ flush the now-empty batch)
+        # Key assertion: k0 and k1 appear BEFORE "end", proving they were
+        # dispatched while batch mode was still active.
+        assert dispatch_log[0] == "begin", f"first event should be begin: {dispatch_log}"
+        k0_idx = dispatch_log.index("k0")
+        k1_idx = dispatch_log.index("k1")
+        first_end_idx = dispatch_log.index("end")
+        assert k0_idx < first_end_idx, (
+            f"k0 must be dispatched before _end_batch(): {dispatch_log}"
+        )
+        assert k1_idx < first_end_idx, (
+            f"k1 must be dispatched before _end_batch(): {dispatch_log}"
+        )
+        assert k0_idx < k1_idx, f"dispatch order must be preserved: {dispatch_log}"
+
 
 class TestM173AdaptiveAvgPool2d:
     """M17.3 — ``aten._adaptive_avg_pool2d.default`` forward lowering.

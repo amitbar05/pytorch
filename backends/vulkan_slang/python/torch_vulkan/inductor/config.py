@@ -115,11 +115,13 @@ _VEC4_AUDIT = os.environ.get("TORCH_VULKAN_VEC4_AUDIT", "0") == "1"
 # Set ``TORCH_VULKAN_LINK_TIME_SPEC=1`` to enable.
 _LINK_TIME_SPEC = os.environ.get("TORCH_VULKAN_LINK_TIME_SPEC", "0") == "1"
 
-# GPU.1 — Batch dispatch submission. Disabled by default (2026-06-01).
-# PERF.1 fix makes BATCH_DISPATCH=1 correct but adds setup/teardown
-# overhead without batching benefit (batch mode exits on first flush).
-# BATCH_DISPATCH=0 is 1.8x faster (385ms vs 676ms for MNISTNet batch=64).
-# Set ``TORCH_VULKAN_BATCH_DISPATCH=1`` to enable (correct but slower).
+# GPU.1 — Batch dispatch submission. Disabled by default pending benchmark.
+# 2026-06-26 fix: _flush() now dispatches pending kernels WHILE C++ batch
+# mode is active so they enter the command buffer before _end_batch().
+# Previously _end_batch() was called first (empty buffer), then kernels ran
+# in auto-submit mode — defeating the purpose of batching.  The 1.8× old
+# overhead (385ms vs 676ms for MNISTNet batch=64) was caused by this bug.
+# Set ``TORCH_VULKAN_BATCH_DISPATCH=1`` to enable; benchmark pending flip.
 _BATCH_DISPATCH = os.environ.get("TORCH_VULKAN_BATCH_DISPATCH", "0") != "0"
 
 # GPU.2 — Python wrapper hot-path optimization. When enabled (default ON),
