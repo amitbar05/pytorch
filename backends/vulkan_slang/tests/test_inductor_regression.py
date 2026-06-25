@@ -43162,7 +43162,7 @@ void computeMain(uint3 lid : SV_GroupThreadID) {
         )
         import math
 
-        got_val = math.frombytes(out_val.cpu()[0].view(torch.uint8).numpy().tobytes(), "little")
+        got_val = out_val.cpu().view(torch.float32)[0].item()
         got_idx = out_idx.cpu()[0].item()
         assert got_idx == HIGH_IDX, (
             f"CG.1 precision: got index {got_idx}, expected {HIGH_IDX}. "
