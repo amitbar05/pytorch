@@ -113,7 +113,10 @@ void end_batch_dispatch() {
         rt.dirty_buffers.clear();
         rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
-        rt.desc_set_cache.clear();  // M17.5: clear on batch end
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            rt.desc_set_cache.clear();  // M17.5: clear on batch end
+        }
     }
 }
 
@@ -232,7 +235,8 @@ void dispatch_shader(
     const void* push_constants,
     uint32_t push_constants_size,
     uint32_t num_outputs,
-    const std::vector<SpecConstant>& spec_constants) {
+    const std::vector<SpecConstant>& spec_constants,
+    const std::vector<VkDeviceSize>* per_tensor_byte_offsets) {
 
     uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0;
     if (g_profile_enabled) t0 = _now_ns();
@@ -268,7 +272,10 @@ void dispatch_shader(
         rt.dirty_buffers.clear();
         rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
-        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        }
     }
 
     // M-cpp-new-5: gate the M17.5 descriptor-set cache on descriptor
@@ -329,7 +336,12 @@ void dispatch_shader(
         auto info = get_buffer_info(tensors[i]);
         vk_buffers_arr[i] = info.buffer;
         vk_sizes_arr[i] = info.size;
-        vk_offsets_arr[i] = info.offset;
+        if (per_tensor_byte_offsets && i < per_tensor_byte_offsets->size() &&
+            (*per_tensor_byte_offsets)[i] != VK_WHOLE_SIZE) {
+            vk_offsets_arr[i] = (*per_tensor_byte_offsets)[i];
+        } else {
+            vk_offsets_arr[i] = info.offset;
+        }
     }
 
     if (g_profile_enabled) { t4 = _now_ns(); g_profile_buffer_info_ns += (t4 - t3); }
@@ -358,21 +370,24 @@ void dispatch_shader(
     if (kUseDescCache) {
         DeviceRuntime::DescSetCacheKey key{
             pipeline->descriptor_set_layout(), buffers_hash};
-        auto cache_it = rt.desc_set_cache.find(key);
-        if (cache_it != rt.desc_set_cache.end()) {
-            desc_set = cache_it->second;
-        } else {
-            // M-cpp-new-6 Layer 2: snapshot reset generation before
-            // allocate() in case pool exhaustion triggers an internal
-            // reset. If the generation changed, the cache holds stale
-            // VkDescriptorSet handles from the pre-reset pool — clear.
-            uint64_t gen_before = rt.desc_pool->reset_generation();
-            desc_set = rt.desc_pool->allocate(
-                pipeline->descriptor_set_layout());
-            if (rt.desc_pool->reset_generation() != gen_before) {
-                rt.desc_set_cache.clear();
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            auto cache_it = rt.desc_set_cache.find(key);
+            if (cache_it != rt.desc_set_cache.end()) {
+                desc_set = cache_it->second;
+            } else {
+                // M-cpp-new-6 Layer 2: snapshot reset generation before
+                // allocate() in case pool exhaustion triggers an internal
+                // reset. If the generation changed, the cache holds stale
+                // VkDescriptorSet handles from the pre-reset pool — clear.
+                uint64_t gen_before = rt.desc_pool->reset_generation();
+                desc_set = rt.desc_pool->allocate(
+                    pipeline->descriptor_set_layout());
+                if (rt.desc_pool->reset_generation() != gen_before) {
+                    rt.desc_set_cache.clear();
+                }
+                rt.desc_set_cache[key] = desc_set;
             }
-            rt.desc_set_cache[key] = desc_set;
         }
     } else {
         // Legacy path: allocate fresh; do not cache. Pool reset on
@@ -538,7 +553,10 @@ void dispatch_shader_indexed(
         rt.dirty_buffers.clear();
         rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
-        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        }
     }
 
     // M-cpp-new-5 / M-cpp-new-6 note: unlike `dispatch_shader` we know
@@ -588,6 +606,7 @@ void dispatch_shader_indexed(
     // M17.5: Reuse cached descriptor set keyed on (layout, buffer-list+offsets).
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     {
+        std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
         DeviceRuntime::DescSetCacheKey key{
             pipeline->descriptor_set_layout(), buffers_hash};
         auto cache_it = rt.desc_set_cache.find(key);
@@ -696,7 +715,10 @@ void flush_stream() {
         rt.dirty_buffers.clear();
         rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
-        rt.desc_set_cache.clear();  // M17.5: clear on pool reset (flush)
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            rt.desc_set_cache.clear();  // M17.5: clear on pool reset (flush)
+        }
     }
     // Drain quarantined buffers back into the reuse pool now that
     // the command buffer they were referenced by has completed.
@@ -768,7 +790,10 @@ static void dispatch_copy_buffer_byte(const at::Tensor& src, const at::Tensor& d
         rt.dirty_buffers.clear();
         rt.read_buffers.clear();  // S2.0d
         rt.host_written_buffers.clear();
-        rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        {
+            std::lock_guard<std::mutex> _lk(rt.desc_set_mutex_);
+            rt.desc_set_cache.clear();  // M17.5: clear on pool reset
+        }
     }
 
     auto& cmd = rt.stream->deferred_cmd();
@@ -932,11 +957,10 @@ void dispatch_strided_copy(const at::Tensor& src, const at::Tensor& dst) {
 
     params.numel = numel;
     params.ndim = ndim;
-    // storage_offset_src was the manual fallback when VkDescriptorBufferInfo.offset
-    // was always 0. Now get_buffer_info() propagates storage_offset into the
-    // descriptor binding, so src[0] already maps to physical[storage_offset].
-    // Setting this to 0 prevents double-counting the offset.
-    params.storage_offset_src = 0;
+    // Always pass storage_offset via push constant. kBaseOffsets below forces the
+    // descriptor to bind at offset=0, so there is no double-counting: the shader
+    // reads src[storage_offset_src + computed_index] from the buffer base.
+    params.storage_offset_src = static_cast<uint32_t>(src.storage_offset());
 
     auto sizes = src.sizes();
     auto strides = src.strides();
@@ -953,12 +977,16 @@ void dispatch_strided_copy(const at::Tensor& src, const at::Tensor& dst) {
     params.strides3 = st[3]; params.strides4 = st[4];
 
     uint32_t workgroups = (numel + 255) / 256;
+    // Force both buffers to bind at descriptor offset=0 so storage_offset_src
+    // push constant is not double-counted for aligned src offsets.
+    static const std::vector<VkDeviceSize> kBaseOffsets = {0, 0};
     dispatch_shader("copy_strided_copy_fwd",
                     shaders::copy_strided_copy_fwd,
                     shaders::copy_strided_copy_fwd_size,
                     {src, dst},
                     workgroups, 1, 1,
-                    &params, sizeof(params));
+                    &params, sizeof(params),
+                    1, {}, &kBaseOffsets);
 }
 
 }} // namespace torch_vulkan::ops

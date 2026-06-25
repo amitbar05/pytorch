@@ -19,9 +19,8 @@ split (Stage 3).  Owns:
   - Reflection metrics access API
     (``_harvest_reflection_metrics``, ``get_reflection_metrics``,
      ``get_cached_metrics_for_key``, ``reset_reflection_baselines``)
-  - numthreads tuning
-    (``_parse_numthreads_from_source``, ``_rewrite_numthreads_in_source``,
-     ``get_optimized_numthreads``, ``_pick_numthreads_from_reflection``)
+  - numthreads parsing
+    (``_parse_numthreads_from_source``, ``_pick_numthreads_from_reflection``)
 """
 
 from __future__ import annotations
@@ -648,17 +647,9 @@ def reset_reflection_baselines() -> None:
 
 _NUMTHREADS_SRC_RE = re.compile(r"\[numthreads\((\d+),\s*(\d+),\s*(\d+)\)\]")
 
-# DR.7 / M11.1: After Pass-2 optimizes numthreads, store the final value
-# so the dispatch grid can be divided by the actual WG size instead of the
-# codegen-time estimate.  Keyed by hash_key (same key as the SPV cache).
-_optimized_numthreads_by_hash: dict[str, tuple[int, int, int]] = {}
-
 
 def _parse_numthreads_from_source(src: str) -> tuple[int, int, int] | None:
-    """Extract numthreads tuple from Slang source.
-
-    Returns ``(x, y, z)`` or ``None`` if no numthreads attribute is found.
-    """
+    """Extract numthreads tuple from Slang source."""
     m = _NUMTHREADS_SRC_RE.search(src)
     if m is None:
         return None
@@ -669,17 +660,6 @@ def _rewrite_numthreads_in_source(src: str, new_nt: tuple[int, int, int]) -> str
     """Replace the first numthreads attribute in *src* with *new_nt*."""
     replacement = f"[numthreads({new_nt[0]}, {new_nt[1]}, {new_nt[2]})]"
     return _NUMTHREADS_SRC_RE.sub(replacement, src, count=1)
-
-
-def get_optimized_numthreads(hash_key: str) -> tuple[int, int, int] | None:
-    """DR.7 / M11.1: Return the Pass-2 optimized numthreads for a kernel.
-
-    Returns ``(x, y, z)`` if a Pass-2 recompile succeeded and stored
-    optimized numthreads, or ``None`` if no optimization was applied.
-    Callers (e.g. dispatch-grid codegen) use this to divide total numel
-    by the ACTUAL workgroup size instead of the codegen-time estimate.
-    """
-    return _optimized_numthreads_by_hash.get(hash_key)
 
 
 def _pick_numthreads_from_reflection(

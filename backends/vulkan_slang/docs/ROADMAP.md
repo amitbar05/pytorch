@@ -20,6 +20,8 @@
 > and AOTI-emit source files. New E4/E5 coverage items added.
 >
 > **2026-06-24 merge wave:** PRs #3 (S3.5a + SP.B1/B2 + conv-lowering), #5 (S4.0 AOTI pc_size), #6 (CG.3 Welford guard), #9 (S4.2 extern-C ABI), #10 (S4.3 factory shim) squash-merged to `main`. All five passed independent cross-vendor (`claude_code` → `pi`) review before merge. CG.4 PR in progress.
+>
+> **2026-06-25 merge wave:** PRs #17 (SP.1 async compile), #24 (batcher lifecycle fix), #25 (S2.3 in-process validation + M11.3 register-tile default 0→2 + GradPar.1 fp16 widening) merged to `main`. Pi (stepfun 3.7) is now the primary sub-agent for all implementation and investigation work.
 
 ---
 
@@ -109,7 +111,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | Shader-lib + template SPIR-V precompile (sync) | ✅ | `hardware_probe.py:_run_level_1_sync()` |
 | `prepare_model()` → 100% warm SPIR-V cache | ✅ | `hardware_probe.py:791`; proven 13 s→0.59 s |
 | Subprocess validation of autotune winners | ✅ | `autotune.py:validate_winner` spawns fresh-instance subprocess |
-| **In-process validation during warm-up** | 🔴 | aspirational — needs `VK_INSTANCE_LAYERS` set *before* `import torch_vulkan` (instance built at import). `validate=True` is a no-op for S0/S1 in-process. |
+| **In-process validation during warm-up** | ✅ **S2.3 FIXED 2026-06-25** | `csrc/vulkan/Context.cpp:debug_callback` — `debug_utils_full` flag now enabled when `TORCH_VULKAN_VUID_AS_ERROR` is set; ERROR-severity VUIDs throw `std::runtime_error` in-process. PR #25. |
 | **Warm→train cache coherence** | ✅ **S2.4 FIXED 2026-06-21** | `_restore_probe_defaults()` reads `mm_tiles_mode` from probe_status.json and applies as soft default on every import. `TestWarmCacheCoherence` ✅ |
 
 **S2 — Conv+GN+ReLU+Pool+Linear compile-path dispatch audit**
@@ -136,16 +138,18 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S2.1** | Conv+GN+Pool+Linear backward wrapper leaks — **FIXED 2026-06-21**: two root-cause fixes in `matmul.py` + `bwd_lowerings.py` + `pool.py` (`TestNoExternInFullCNNBwd` ✅). | ✅ **FIXED** |
 | **S3.1** | Compiled SGD step = 1 tiny `binary_add_inplace` per param tensor (4 here) + strided copies; should route to the foreach `IOptimizer` extern. | ✅ **FIXED 2026-06-21** — routes `aten._foreach_add.List` (functional form, post AOTAutograd) + `aten._foreach_add_.List` (inplace form) both to `foreach_sgd_step` ExternKernel. Batch sizes capped at 8 (push-const limit). Tests: `test_s3_1_compiled_sgd_optimizer_correctness_vs_cpu` ✅, `test_s3_1_compiled_sgd_variable_numel_correctness` ✅ |
 | **TRAIN.4.b** | `vulkan_nll_loss_forward` (C++ FallbackKernel) ignores weight for mean reduction — returns `total_weight = N` instead of `sum(weight[target_n])`, causing 75% wrong gradients in weighted cross-entropy. | ✅ **FIXED 2026-06-21** — added `aten.nll_loss_forward` Inductor lowering in `lowerings/loss.py` that calls `_nll_loss_decomp()` with correct weighted total_weight IR. `TestTrain4CrossEntropyBackward::test_cross_entropy_with_weight` ✅ |
-| **S3.5a** | **Causal conv1d wrong values** (`test_m6_causal_conv1d_matches_cpu`): `VkDescriptorBufferInfo.offset` hardcoded to 0 in `bind_buffers` — `reinterpret_tensor` views with non-zero `storage_offset` all bind to the start of the VkBuffer, so per-group dispatches write the same positions. Exposed by S3.5 commit (ReinterpretView preserved instead of cloned). **C++ fix designed and stashed** (`csrc/ops/dispatch.h/cpp`, `csrc/vulkan/DescriptorSet.h/cpp`): thread `storage_offset * element_size` through `get_buffer_info → dispatch_shader → bind_buffers → VkDescriptorBufferInfo.offset`. | 🔴 **OPEN** — fix in `git stash@{0}` (needs rebuild + verify) |
+| **S3.5a** | **Causal conv1d wrong values** (`test_m6_causal_conv1d_matches_cpu`): `VkDescriptorBufferInfo.offset` hardcoded to 0 in `bind_buffers`. | ✅ **FIXED** — `csrc/ops/dispatch.cpp:get_buffer_info` threads `storage_offset * element_size` through `bind_buffers → VkDescriptorBufferInfo.offset`. Built and verified. `test_m6_causal_conv1d_matches_cpu` ✅ |
 | **S3.5b** | **Conv1d backward x.grad=0** (`test_m6_conv1d_backward_matches_cpu` + `test_s3_5b_conv1d_backward_grad_input_not_primal`): Root cause was AoT backward graph buffer-reuse aliasing: `input_4d = input.unsqueeze(-1)` created a dead intermediate that Inductor's memory planner reused for `conv2d_backward[0]` (grad-input). Since `input_4d` is a view of `primals_3` (primal x), grad-input aliased x, returning x itself as x.grad. **Fix**: new `conv1d_backward_core` opaque non-autograd custom op takes 3-D tensors directly (no Python-side unsqueeze), with a fake kernel deriving outputs from `input` (FT proxy) so FunctionalTensorMode produces fresh storage refs. Forward graph now saves `primals_3` as residual; backward graph uses it as a proper graph INPUT (not freed/reused). | ✅ **CLOSED 2026-06-22** — `fx_passes/eager/conv_backward.py` + `conv.py` + `lowerings/__init__.py` |
-| **S3.5c** | **Grouped conv weight storage_offset ignored** (`test_m6_conv1d_groups_matches_cpu`): 50% wrong elements (256/512) on GPU re-run 2026-06-24. Root cause: `_slang_tile_conv2d` (`templates/caller/conv.py:344-348`) checks `not weight_t.is_contiguous()` before copying, but per-group weight slices from `aten.slice.Tensor(weight_4d, 0, 4, 8)` have `is_contiguous()==True` (strides match shape) yet `storage_offset()==48`. `is_contiguous()` does NOT guarantee offset=0; `.contiguous()` on an already-contiguous tensor returns self (same offset). Vulkan dispatch binds VkBuffer from byte 0 (same S3.5a bug: `VkDescriptorBufferInfo.offset` hardcoded to 0 in `bind_buffers`), so group 1 reads group 0's weights → wrong conv output for half the channels. **Fix path**: S3.5a C++ fix (thread `storage_offset*elem_size` through `get_buffer_info→bind_buffers→VkDescriptorBufferInfo.offset`) also closes S3.5c; OR Python-side: check `storage_offset() != 0` and call `.clone()` (not `.contiguous()`) in `_slang_tile_conv2d`. | 🔴 **OPEN** — GPU re-run FAILED 2026-06-24; blocked on S3.5a C++ offset fix |
+| **S3.5c** | **Grouped conv wrong values** (`test_m6_conv1d_groups_matches_cpu`): two independent bugs. (1) Group 1 weight/bias slice has `storage_offset != 0`; bind_buffers used offset=0 → reads group-0 weights. (2) `pointwise_cat` merge kernel: `VulkanExprPrinter._print_Mul(Mul(32, Identity(Add(x1,-4))))` printed `"32 * -4 + x1"` (wrong) instead of `"32 * (x1 - 4)"` (correct) — sympy orders `-4` before `x1` in `Add`, so `_print_Identity` returned `"-4 + x1"` without parens, making `32 * -4 + x1` parse as `(32*-4)+x1 = -128+x1`. | ✅ **FIXED 2026-06-25** — (1) `templates/caller/conv.py:_slang_tile_conv2d` clones input/weight/bias when `storage_offset() != 0`. (2) `expr_printer.py:VulkanExprPrinter._print_Identity` added: wraps `Add` inner in `()` so Mul context gets correct parens. `test_m6_conv1d_groups_matches_cpu` ✅ |
 | **S3.5d** | **Conv2d backward `.item()` intentional GPU pipeline drain** (`fx_passes/eager/conv_backward.py:99`): `grad_bias[0].item()` is a deliberate sync barrier inserted to prevent stale gradient data in the FallbackKernel compiled path. NOT removable without a proper Vulkan submission fence in the C++ dispatch layer. Performance stall on every conv bwd+bias; correctness preserved. Proper fix: C++ submission tracking in `csrc/ops/dispatch.cpp`. | 🟡 **KNOWN LIMITATION** — intentional; fix requires C++ dispatch change |
+| **S3.5e** | **Depthwise conv backward two codegen bugs** (`test_m6_depthwise_conv_backward_matches_cpu`): (1) `VulkanOverrides.index_expr` bypassed `codegen_indexing()`, so range-tree sub-entries (e.g. `r0_1` channel dim) were never declared → slangc E30015. (2) `_lower_vulkan_conv2d_backward` returned `NotImplemented` for `groups != 1`; since `_has_real_vulkan_storage` is always False during `torch.compile`, all depthwise conv backward routes to `torch_vulkan.conv2d_backward.default`, hitting `LoweringException`. | ✅ **FIXED 2026-06-26** — `overrides.py:index_expr` now calls `codegen_indexing(expr)` first; `lowerings/conv_backward.py` uses `FallbackKernel.create()` for groups>1. Commits `9c3bf9adebc`, `26611cbd6b1`. `test_m6_depthwise_conv_backward_matches_cpu` ✅ |
 | **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **MERGED 2026-06-24** — PR #5, cross-review PASS (2 fix rounds) |
-| **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): The `(value, index)` pair is encoded as `float2({value}, float({index}))` — casting index to float truncates to 24-bit mantissa precision. Fix: emit `uint2` pair or a dedicated struct. | 🔴 **OPEN** — silent wrong results for large tensors |
-| **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | 🔴 **OPEN** — latent, wave32 only |
+| **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): float2 cast truncates 24-bit mantissa. | ✅ **FIXED 2026-06-25** — `kernel/reduction.py` + `shaders/lib/vk_reduction.slang`: encode as `uint2(asuint(val), idx)`, decode with `asfloat(pair.x)` + `pair.y`. Both argmax and argmin fixed. |
+| **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | ✅ **FIXED 2026-06-25** — `kernel/pointwise.py`: when `_packed16_vw_active` is True the WaveReadLaneAt body is replaced by a gtid.x vector write; `_pw_has_wave_ops` must not be set in that state. Guard added. `TestBf16PackedStoreWave32` ✅ |
 | **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | ✅ **MERGED 2026-06-24** — PR #6, cross-review PASS |
+| **GPU.3** | **wg_argmax NUICF + smem write-back** (`shaders/lib/reduction.slang`): (1) `WaveReadLaneAt(acc.idx, _src)` inside conditional → non-uniform control flow on RDNA1 → idx always 0 instead of correct lane value; (2) inter-wave winner never written back to smem[0] for multi-wave case. | ✅ **FIXED 2026-06-25** — hoisted both `WaveReadLaneAt` calls before conditional; added `if (lane==0) smem[0]=result` + final sync in wg_argmax. Added missing `wg_argmin` function. `TestReductionGenericFamily` 4/4 ✅ |
 | **SP.1** | **Async compile still serial: `.result()` blocks caller** (`runtime/slangc.py:552-560`): `compile_slang_to_spirv` calls `pool.submit(...).result()` on cache-miss — overlap never happens. Fix: `add_done_callback` + `_compile_exceptions` store + `event.wait()` (non-blocking; owner thread uses same pattern as non-owner threads). | ✅ **PR #17 ready for merge** — cross-review PASS (pi, 2026-06-24). Advisories posted as PR comment. |
-| **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` runs but rewritten source is never recompiled — `get_optimized_numthreads` has no callers outside `slangc.py`. Wire into `make_vulkan_kernel:_maybe_autotune_wg` or remove. | 🔴 **OPEN** — dead code / wasted compile time |
+| **SP.2** | **numthreads rewrite path dead** (`runtime/reflection_ext.py:654-700`): `_rewrite_numthreads_in_source` ran but rewritten source was never recompiled. | ✅ **FIXED 2026-06-25** — removed `get_optimized_numthreads` + dead Pass-2 rewrite path from `reflection_ext.py`, `slangc.py:_process_reflection`, `runtime/__init__.py`. WG autotune is the correct path. |
 | **MS.2** | **Use-after-free: AOTI shim `zeros/ones/full/as_strided` return dangling `AtenTensorHandle`** (`csrc/backend/aoti_shims.cpp:146,172,193,215`): each function returned `tensor.unsafeGetTensorImpl()` of a local `at::Tensor` that was destroyed on return. Fix: allocate with `new at::Tensor(std::move(tensor))` at all four sites (matching `empty_strided_vulkan`). | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
 | **MS.1** | **Memory leak: `aoti_torch_delete` is a no-op** (`csrc/backend/aoti_shims.cpp:154-156`): `RAIIAtenTensorHandle` destructor calls this for every intermediate tensor; the handle was silently discarded. Fix: `delete reinterpret_cast<at::Tensor*>(handle)`. Fixed together with MS.2. | ✅ **FIXED 2026-06-22** — `csrc/backend/aoti_shims.cpp` |
 
@@ -154,7 +158,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 |---|---|---|
 | Tiny-kernel fusion (AccumulateGrad stash) | ✅ **S3.2 FIXED 2026-06-21** | gradient stash fix → 12 dispatches/step (≤14); `TestTinyKernelFusion` ✅ |
 | Persistent-kernel routing for large reductions | 🔴 | **dead code** — `dispatch_persistent_pointwise()` defined, never called; no numel>65536 routing |
-| Batch-dispatch overlap (exec N ∥ compile N+2) | 🟡 | async precompile at codegen-time only (`slangc.py:573`); `_compile_ahead` stubs in `batcher.py:63-65` declared but **never wired**; true runtime overlap requires SP.2 + wiring stubs; `BATCH_DISPATCH=1` still 1.8× slower → default OFF |
+| Batch-dispatch overlap (exec N ∥ compile N+2) | 🟡 | **2026-06-26**: `batcher.py:_flush()` fix — pending kernels now dispatched while C++ batch mode is active (enter the command buffer); previously dispatched AFTER `_end_batch()` in auto-flush mode, defeating batching. Old 1.8× overhead root-caused and fixed. `BATCH_DISPATCH=1` still default OFF pending benchmark run to confirm improvement. `_compile_ahead` lookahead stubs remain dead — true N‖N+2 overlap still needs wiring (SP.2 follow-up). |
 | GN backward fusion | ✅ | already 2 fused extern dispatches (`gn_backward_extern.py`); the 11-kernel figure was loss-bwd, not GN-bwd |
 
 **S4 — DEPLOY (AOTI)**
@@ -174,7 +178,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 4 | No symptom-fixes in `meta_patches/` | 🟡 several remain |
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
 | 6 | **No CPU/eager fallbacks on the compile path** | ✅ S2.5 ✅ FIXED 2026-06-21 (avg_pool2d → `torch_vulkan` custom op); S2.1 ✅ fixed; S2.2 ✅ confirmed |
-| 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
+| 7 | No file > 800 lines | ✅ **CG.5 FIXED 2026-06-25** — `pointwise.py` 558L (bwd_diff+DCE extracted to `pointwise_bwd.py` 283L) |
 | 8 | **Binary loss backward via inline bwd_diff (not external custom-op shim)** | ✅ **CG.M8 FIXED 2026-06-21** — `aten.{mse,l1,bce,bce_with_logits,smooth_l1,huber}_loss_backward` route through `ops.vulkan_bwd_diff_binary` inline path with correct 1/N mean-scale. `TestTrain1LossBackwardReachability` 10/10 ✅. |
 
 ---
@@ -645,23 +649,11 @@ Fix: correct the stride order and preserve `ReinterpretView` nodes.
 S3.5 preserving `ReinterpretView` exposes the long-standing storage-offset bug (S3.5a)
 and the grouped-conv push-constant mismatch (S3.5c). See defect table above.
 
-#### S3.5a — 🔴 OPEN: Fix storage-offset in `bind_buffers` (causal conv1d)
+#### S3.5a — ✅ FIXED: Fix storage-offset in `bind_buffers` (causal conv1d)
 
-`VkDescriptorBufferInfo.offset` is hardcoded to 0. After S3.5 preserves
-`ReinterpretView` nodes, the Inductor wrapper emits `reinterpret_tensor(buf, ..., non_zero_offset)`
-calls — but all of them bind the same start of the VkBuffer. For causal depthwise conv
-(groups=C), all 16 per-group dispatches write to position 0.
-
-**C++ fix designed (in `git stash@{0}`):**
-- `csrc/ops/dispatch.h`: add `VkDeviceSize offset` to `BufferInfo`
-- `csrc/ops/dispatch.cpp`: `get_buffer_info()` computes `off_bytes = storage_offset * element_size`,
-  recovers the base VkBuffer via pointer arithmetic; `dispatch_shader` / `dispatch_shader_indexed`
-  thread offsets through; descriptor-set cache key includes offsets
-- `csrc/vulkan/DescriptorSet.h/cpp`: `bind_buffers` offset overload sets `buf_info.offset = off`,
-  `buf_info.range = size - off`
-
-**To close:** `git stash pop`, rebuild C++ (`TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3 python setup.py build_ext --inplace`), verify `test_m6_causal_conv1d_matches_cpu`.
-- **Exit**: `test_m6_causal_conv1d_matches_cpu` ✅
+Fixed in PR #3 (merged 2026-06-24). `csrc/ops/dispatch.cpp:get_buffer_info` now
+threads `storage_offset * element_size` through `bind_buffers → VkDescriptorBufferInfo.offset`.
+`test_m6_causal_conv1d_matches_cpu` ✅
 
 #### S3.5b — ✅ CLOSED 2026-06-22: Conv1d backward x.grad=0
 
@@ -692,53 +684,27 @@ x itself as x.grad (either primal values or all-zero depending on buffer lifetim
 
 - **Exit**: `test_m6_conv1d_backward_matches_cpu` ✅, `test_s3_5b_conv1d_backward_grad_input_not_primal` ✅
 
-#### S3.5c — 🔴 OPEN: Grouped conv weight storage_offset ignored by Vulkan dispatch
+#### S3.5c — ✅ FIXED 2026-06-25: Grouped conv wrong values (two bugs)
 
-**2026-06-24 GPU re-run result**: `test_m6_conv1d_groups_matches_cpu` **FAILS** —
-256/512 elements wrong (50% mismatch), greatest absolute diff 2.29.
+**Two independent bugs** combined to produce 50% wrong elements.
 
-**Prior audit correction (2026-06-22)**: The original `slang_addmm` PC-size-mismatch
-attribution was correctly debunked — groups>1 conv does use per-group
-`_VulkanConv2dExternKernel` + `aten.cat`, not `slang_addmm`. However the prior audit
-incorrectly concluded the test would pass; it fails for a different root cause.
+**Bug 1 — storage_offset ignored**: Group 1's weight/bias slices have
+`storage_offset != 0` (48 elements = 192 bytes); `bind_buffers` used offset=0 →
+reads group-0 data. **Fix**: `templates/caller/conv.py:_slang_tile_conv2d` clones
+input, weight, and bias when `storage_offset() != 0`.
 
-**Actual root cause** (confirmed 2026-06-24):
+**Bug 2 — `pointwise_cat` index expression**: The `vulkan_kernel_0` merge kernel
+for `aten.cat` used an incorrect index for group-1 elements. `pointwise_cat`
+generates `Identity(x1 - 4)` for the channel offset; `VulkanExprPrinter._print_Mul`
+printed `Mul(32, Identity(Add(x1, -4)))` as `"32 * -4 + x1"` because:
+- `_print_Identity` stripped the wrapper and returned `"-4 + x1"` (sympy ordered `-4` before `x1`)
+- `_print_Mul` joined without parens → `"32 * -4 + x1"` which C evaluates as `-128 + x1`
 
-`lowerings/conv.py:544-573` decomposes `nn.Conv1d(groups=2)` into two per-group
-Conv2d calls. After `aten.unsqueeze(-1)` (3D→4D), slicing the 4D weight on dim=0:
+**Fix**: Added `_print_Identity` override to `VulkanExprPrinter` (`expr_printer.py`):
+wraps inner `Add` in `()` so `"32 * (-4 + x1)"` = `32*(x1-4)` is emitted correctly.
 
-- `weight_g0`: shape [4,4,3,1], stride [12,3,1,1], offset=0 → `is_contiguous()=True` ✓
-- `weight_g1`: shape [4,4,3,1], stride [12,3,1,1], offset=48 → `is_contiguous()=True` ⚠️
-
-`_slang_tile_conv2d` (`templates/caller/conv.py:344-348`) calls `.contiguous()` only when
-`not weight_t.is_contiguous()`. Since `weight_g1.is_contiguous()==True` (strides match
-shape), the guard is skipped and no copy is made. Crucially, `.contiguous()` on an already-
-contiguous tensor returns `self` — same storage, same offset=48 — so calling it explicitly
-also would not help.
-
-The C++ dispatch (`csrc/ops/dispatch.cpp`) binds the VkBuffer via `get_buffer_info` with
-`VkDescriptorBufferInfo.offset=0` (the S3.5a bug). It ignores `storage_offset()`. Group 1's
-weight reads from VkBuffer byte 0 instead of byte 48×sizeof(float) → reads group 0's
-weights → wrong output for all 4 group-1 output channels → 50% mismatch.
-
-**Fix options**:
-
-1. **(Preferred) S3.5a C++ fix** (`csrc/ops/dispatch.h/cpp`, `csrc/vulkan/DescriptorSet.h/cpp`):
-   thread `storage_offset * element_size` through `get_buffer_info → dispatch_shader →
-   bind_buffers → VkDescriptorBufferInfo.offset`. Designed and stashed at `git stash@{0}`;
-   this closes both S3.5a and S3.5c.
-
-2. **(Python-side workaround)** In `_slang_tile_conv2d` (`templates/caller/conv.py:344-348`),
-   also check `storage_offset() != 0` and force `.clone()` (NOT `.contiguous()`) to produce
-   a fresh buffer at offset 0:
-   ```python
-   if not weight_t.is_contiguous() or weight_t.storage_offset() != 0:
-       weight_t = weight_t.contiguous().clone()
-   ```
-   Same guard for `input_t` and `bias`. This is a Python-layer fix that doesn't require a C++ rebuild.
-
-- **Files**: `templates/caller/conv.py:344-348` (Python workaround) OR `csrc/ops/dispatch.cpp` + `csrc/vulkan/DescriptorSet.cpp` (C++ preferred fix)
-- **Exit**: `test_m6_conv1d_groups_matches_cpu` ✅ after fix
+- **Commit**: `d066727f32b vulkan: S3.5c dispatch — storage_offset push-const + bias clone + Identity parens fix`
+- **Exit**: `test_m6_conv1d_groups_matches_cpu` ✅ PASSED 2026-06-25
 
 #### S3.5d — 🟡 KNOWN LIMITATION: Conv2d backward `.item()` intentional GPU→CPU sync
 
@@ -763,6 +729,31 @@ pending Vulkan write leaves stale data in `grad_input`/`grad_weight`/`grad_bias`
   (submission/fence tracking)
 - **Exit**: No `.item()` in `_conv2d_backward_impl`; TSAN/valgrind + correctness
   test confirm no stale gradient under the compiled path.
+
+#### S3.5e — ✅ FIXED 2026-06-26: Depthwise conv backward — two codegen bugs unblocked
+
+Two independent bugs blocked `test_m6_depthwise_conv_backward_matches_cpu`:
+
+**Bug 1 — `index_expr` range-tree bypass** (`overrides.py`): `VulkanOverrides.index_expr`
+called `kexpr(expr)` directly, bypassing `codegen_indexing()`. That function's side
+effect is walking `expr.free_symbols` and triggering codegen for every range-tree
+`IterationRangesEntry` — emitting its declaration and loop-body assignment. For the
+depthwise conv backward multistage reduction, the channel-dim sub-entry `r0_1` was
+only referenced inside `index_expr` calls, so it was never declared → slangc E30015
+"undefined identifier 'r0_1'". Fix: call `codegen_indexing(expr)` first for the side
+effect, then pass the simplified return value to `kexpr()`.
+
+**Bug 2 — `LoweringException` for groups>1** (`lowerings/conv_backward.py`): during
+`torch.compile`, `_has_real_vulkan_storage()` always returns False (fake/tracing
+tensors), so the AOT Autograd autograd hook routes ALL depthwise conv backward through
+`torch_vulkan.conv2d_backward.default` regardless of groups. The lowering returned
+`NotImplemented` for `groups != 1`, which Inductor's `validate_ir()` converts to a
+`LoweringException`. Fix: replace `NotImplemented` with `FallbackKernel.create()` so
+Inductor emits an extern call to the eager op; at runtime the eager impl correctly
+dispatches to `aten.convolution_backward` → Vulkan C++ extension.
+
+- **Commits**: `9c3bf9adebc` (index_expr), `26611cbd6b1` (FallbackKernel)
+- **Exit**: `test_m6_depthwise_conv_backward_matches_cpu` ✅ 2026-06-26
 
 ### S3.3 — Wire persistent-kernel routing for large reductions (C3 is dead code)
 
@@ -1465,9 +1456,10 @@ producing garbage `mean` and `m2`.
 
 - **Files**: `kernel/pointwise_vec4_mixin.py` — 1-line insert before `return True`
   of the packed16 block.
-- **Exit**: new `TestPacked16Vec4WelfordGuard` in `tests/test_inductor_regression.py`
+- **Exit**: `TestPacked16WelfordGuard` in `tests/test_inductor_regression.py` (merged in PR #12 under name `TestPacked16WelfordGuard`)
   — fp16 GroupNorm (shape `[1,16,8,8]`, `num_groups=4`) forward matches CPU;
   emitted Slang source does **not** contain `_pvw_in_` / `_pvw_out_` identifiers.
+  2/2 ✅ VERIFIED 2026-06-26.
 
 ### CG.4 — vec4 eligibility false-positive from `\w+` regex on composite index
 
@@ -1515,10 +1507,9 @@ brackets). Literal-only index `buf[42]` — `findall` returns empty, no false de
 but CSE always pre-assigns such expressions to variables so the dep-graph check
 covers them via the variable in the assignment.
 
-- **Files**: `kernel/pointwise.py:385-394` (5-line change).
-- **Exit**: `TestVec4EligibilityCompositeIndex` — kernel with
-  `buf[base + xindex]` where `base = lid.x * 16` returns ineligible (False)
-  from `_check_index_lane_dependency`.
+- **Files**: `kernel/pointwise.py:385-394` (now at line ~74 after CG.5 split; in PointwiseMixin via inheritance from PointwiseBwdMixin).
+- **Exit**: `TestVec4EligibilityCompositeIndex` — 6/6 ✅ (2026-06-25).
+- **Status**: ✅ **FIXED** (already implemented in `dc7b4bc72e2`).
 
 ### CG.5 — Split `kernel/pointwise.py` to ≤ 800 lines (anti-goal #7)
 
@@ -1692,7 +1683,9 @@ proof-of-concept requires the deferred-resolution closure pattern.
   calls on different kernels complete in overlapping wall-clock time; wall-clock time
   < 2× single-compile latency.
 
-### SP.3 — Add PC-layout hash to SPIR-V template cache key
+### SP.3 — ✅ FIXED 2026-06-25 — Add PC-layout hash to SPIR-V template cache key
+
+**FIXED** — `2197bbc1903` + `5af57ab7bd2`: `_pc_layout_hash()` in `gemm/dispatch.py` extracts `struct PC`/`struct BwdPC` body via regex → sha256[:8]; threaded through `compile_and_dispatch` → `compile_slang_to_spirv` as `pc_layout_hash`; mixed into `hash_key` via `PC=<tag>`. All 4 fwd+bwd dispatch call sites updated. `TestSP3PcLayoutHash` (5 tests) ✅
 
 **2026-06-22 deep audit (confirmed) — 4-file change:**
 
@@ -1880,29 +1873,12 @@ same-kernel race writes identical content to the same path (harmless).
     routes through `templates/scatter_atomic.slang` instead).
   - **This is the same work as E4.** The E4 4-phase plan already describes the full
     implementation. E1 is now subsumed by E4; see E4 for the complete plan.
-- **E2** — masking backward (`tril`/`triu`/`masked_fill`/`where`) verification.
+- **E2** — masking backward (`tril`/`triu`/`masked_fill`/`where`) verification. ✅ **VERIFIED 2026-06-26** — `TestMaskingBackward` 5/5 pass on GPU.
 
-  **2026-06-22 audit (confirmed): item is ALREADY IMPLEMENTED — only verification needed.**
-
-  Rationale: `tril`/`triu`/`masked_fill`/`where` have no `aten.*_backward` ops.
-  Autograd decomposes their backward into the **same forward op on `grad_output`**:
-  - `tril(x).backward()` → `aten.tril.default(grad_output)` (re-applies same op)
-  - `where(cond, a, b).backward()` → `where(cond, grad, 0)` + `where(cond, 0, grad)` 
-  - `masked_fill(x, mask, val).backward()` → `masked_fill(grad, mask, 0)`
-
-  `bwd_diff` is fundamentally incompatible with these ops (they are conditional
-  selects, not differentiable float elementals; `masking.py:14-15` explicitly states
-  this). The ROADMAP item's original "via `bwd_diff`" framing was incorrect.
-
-  **What IS done**: all forward lowerings exist in `lowerings/masking.py`; autograd
-  decomposes backward into forward ops; `TestMaskingBackward` has 5 regression tests
-  (lines 63772-63840 of `test_inductor_regression.py`), not xfailed.
-
-  **Only remaining work**: run the 5 `TestMaskingBackward` tests on GPU to confirm
-  they pass. If any fail, it is a bug in the forward lowering, not a missing backward
-  mechanism. Re-scope this item from "implement" to "GPU verify."
-
-  **Tests**: `test_tril_backward_grad_parity`, `test_triu_backward_grad_parity`,
+  All forward lowerings in `lowerings/masking.py`; autograd decomposes backward into
+  the same forward ops (no `bwd_diff` needed — these are conditional selects, not
+  differentiable float elementals). `TestMaskingBackward` 5/5 pass:
+  `test_tril_backward_grad_parity`, `test_triu_backward_grad_parity`,
   `test_tril_batched_backward_grad_parity`, `test_masked_fill_backward_grad_parity`,
   `test_where_backward_grad_parity`.
 - **E3** — missing ops: `sort`, `bucketize`, `multinomial`, sparse (csr/coo),
@@ -2043,21 +2019,21 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | # | Item | Files | LOC | Severity | Status |
 |---|------|-------|-----|----------|--------|
 | 1 | MS.1+MS.2 | `csrc/backend/aoti_shims.cpp` | ~8 | 🔴 CRITICAL | ✅ MERGED PR #3 2026-06-24 |
-| 2 | SP.B4 | `python/torch_vulkan/inductor/runtime/dispatch.py:1010` | 1 | 🔴 HIGH | Fix spec confirmed |
-| 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | Fix spec confirmed |
-| 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | Fix spec confirmed |
-| 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | Fix spec confirmed |
-| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ MERGED PR #6 2026-06-24 |
-| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | 🔧 PR in progress |
-| 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | Fix spec confirmed |
+| 2 | SP.B4 | `python/torch_vulkan/inductor/runtime/dispatch.py:1010` | 1 | 🔴 HIGH | ✅ FIXED 2026-06-25 `eff9c0d9a4f` |
+| 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | ✅ FIXED 2026-06-25 `eff9c0d9a4f` |
+| 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
+| 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
+| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ MERGED PR #6 2026-06-24 `ac686c68fee` (packed16+welford guard; `TestPacked16WelfordGuard` 2/2 ✅) |
+| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | ✅ FIXED (already in `dc7b4bc72e2`, 6/6 tests pass) |
+| 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 (bf16 wave32 guard, `TestBf16PackedStoreWave32` ✅) |
 | 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |
-| 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | Fix spec confirmed |
-| 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | Fix spec confirmed |
-| 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | Fix spec confirmed |
-| 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | Fix spec confirmed |
-| 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | Fix spec confirmed |
-| 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | Fix spec confirmed |
-| 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | Fix spec confirmed (see § 3.6) |
+| 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `682f7793404` |
+| 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | ⛔ BLOCKED — `aten.scaled_dot_product_attention_backward` absent in PyTorch 2.11 |
+| 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | ✅ MERGED PR #25 2026-06-25 |
+| 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | ✅ FIXED 2026-06-25 (tests added, 3/3 pass) |
+| 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | ✅ FIXED 2026-06-25 — `desc_set_mutex_` + 7 lock_guard sites in place |
+| 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | ✅ MERGED PR #17 2026-06-25 |
+| 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | ✅ FIXED 2026-06-26 — 397 LOC deleted; 5+6 dead backward fakes + _randperm_fake + conv_gn_relu_fusion body |
 
 **Ticket details for claude_code:**
 
@@ -2147,7 +2123,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S2.0 (buf7 full-CNN bwd crash) ✅ FIXED
 │   ├─ S2.1 (extern/aten leak)        ✅ FIXED 2026-06-21
 │   ├─ S2.2 (conv_gn_relu RDNA1 bug)  ✅ FIXED 2026-06-21
-│   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
+│   ├─ S2.3 (in-process validation)   ✅ FIXED 2026-06-25
 │   ├─ S2.4 (warm→train coherence)    ✅ FIXED 2026-06-21
 │   └─ S2.5 (pooling fwd custom-op)   ✅ FIXED 2026-06-21
 │
@@ -2157,7 +2133,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S3.5 (conv1d stride+ReinterpretView) ✅ COMMITTED 2026-06-22
 │   │   ├─ S3.5a (storage-offset in bind_buffers) ✅ MERGED PR #3 2026-06-24
 │   │   ├─ S3.5b (conv1d backward x.grad=0)       ✅ MERGED PR #3 2026-06-24
-│   │   └─ S3.5c (grouped conv weight offset ignored) 🔴 OPEN — re-run FAILED 2026-06-24; blocked on S3.5a C++ fix
+│   │   └─ S3.5c (grouped conv wrong values, 2 bugs)  ✅ FIXED 2026-06-25
 │   ├─ S3.3 (persistent reduction wiring) 🔴 dead code
 │   └─ S3.4 (batch-dispatch overlap)      🟡 ◀── needs SP.2 first
 │
@@ -2169,16 +2145,16 @@ prepare_device(level, timeout_s, validate)
 │   └─ S4.3 (A2.6 factory-op shim → all _FACTORY_OPS) ✅ MERGED PR #10 2026-06-24
 │
 ├─ Codegen correctness (CG)
-│   ├─ CG.1 (argmin/argmax uint2 index > 16M) 🔴
-│   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) 🔴
+│   ├─ CG.1 (argmin/argmax uint2 index > 16M) ✅ FIXED 2026-06-25
+│   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) ✅ FIXED 2026-06-25
 │   ├─ CG.3 (packed16+welford guard bypass) ✅ MERGED PR #6 2026-06-24
-│   ├─ CG.4 (vec4 eligibility regex false-positive) 🔧 PR in progress
-│   └─ CG.5 (pointwise.py split to ≤800 L) ⛔
+│   ├─ CG.4 (vec4 eligibility regex false-positive) ✅ FIXED (`dc7b4bc72e2`, 6/6 tests pass)
+│   └─ CG.5 (pointwise.py split to ≤800 L) ✅ FIXED 2026-06-25
 │
 ├─ Slang/SPIR-V pipeline (SP)
-│   ├─ SP.1 (reflection_ext numthreads dead/wire) 🔴
-│   ├─ SP.2 (async compile .result() blocking) ✅ PR #17 ready for merge ◀── prerequisite for S3.4
-│   └─ SP.3 (SPIR-V cache key PC-layout hash) 🔴
+│   ├─ SP.1 (reflection_ext numthreads dead/wire) ✅ FIXED 2026-06-25
+│   ├─ SP.2 (async compile .result() blocking) ✅ MERGED PR #17 2026-06-25 ◀── prerequisite for S3.4
+│   └─ SP.3 (SPIR-V cache key PC-layout hash) ✅ FIXED 2026-06-25
 │
 └─ Continuous: E1/E2/E3/E4/E5 (coverage) · F (regression lock)
 ```
@@ -2311,11 +2287,11 @@ See `§ 2.5` ticket 16: delete the 13 immediately-removable items (~80 LOC net).
 |---|---|---|
 | 🔧 PR in progress | CG.4 vec4 eligibility regex | `fix/cg4-composite-index-regex` — rebasing onto updated main |
 | ⛔ Blocked upstream | S4.1 full-step AOTI `.so` | `torch.export` `empty.memory_format` gap; no upstream fix for PrivateUse1 |
-| 🔴 Open | CG.1 argmin/argmax uint2 index | Silent wrong result for tensors >16M elements |
-| 🔴 Open | CG.2 bf16 packed16 wave32 guard | Latent, wave32 GPUs only |
+| ✅ Fixed | CG.1 argmin/argmax uint2 index | FIXED 2026-06-25 commit `682f7793404` — uint2 encoding |
+| ✅ Fixed | CG.2 bf16 packed16 wave32 guard | FIXED 2026-06-25 — _pw_has_wave_ops guard |
 | ✅ PR #17 | SP.1 async compile blocking | `add_done_callback` + event.wait fix; cross-review PASS |
-| 🔴 Open | SP.2 numthreads dead code | Wire or delete `_rewrite_numthreads_in_source` |
-| 🔴 Open | SP.3 SPIR-V cache key PC-layout | Cache collision risk |
+| ✅ Fixed | SP.2 numthreads dead code | FIXED 2026-06-25 — deleted dead rewrite path from reflection_ext.py |
+| ✅ Fixed | SP.3 SPIR-V cache key PC-layout | FIXED 2026-06-25 — PC-layout hash in cache key |
 
 ### Risk register
 

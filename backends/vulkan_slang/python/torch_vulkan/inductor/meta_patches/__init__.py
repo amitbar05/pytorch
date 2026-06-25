@@ -34,7 +34,6 @@ from .autograd_registrations import (
 # ── Decomposition / pre-grad passes ─────────────────────────────────────────
 from .decomposition_passes import (
     _patch_decompositions,
-    _patch_pre_grad_passes_for_conv_gn_relu_fusion,
     _patch_pre_grad_passes_for_optimizer_foreach,
     _patch_pre_grad_passes_for_relu_rewrite,
 )
@@ -159,7 +158,6 @@ from .shape_ops import (
     _narrow_fake,
     _one_hot_fake,
     _permute_fake,
-    _randperm_fake,
     _repeat_fake,
     _repeat_interleave_self_int_fake,
     _reshape_as_fake,
@@ -392,8 +390,6 @@ _OP_IMPLS: dict[str, Callable] = {
     "aten::embedding": _embedding_fake,
     "aten::embedding_backward": _embedding_backward_fake,
     "aten::one_hot": _one_hot_fake,
-    # Factory ops
-    "aten::randperm.default": _randperm_fake,
 }
 
 _patched = False
@@ -516,11 +512,5 @@ def apply() -> None:
     # catches in-place ``add_/mul_/addcdiv_/addcmul_`` sequences BEFORE
     # AOTAutograd functionalization decomposes them into triplets/doublets.
     _patch_pre_grad_passes_for_optimizer_foreach()
-
-    # M17.2 Phase 2 DISABLED (correctness fix):
-    # Pre-grad fusion caused AOTAutograd to use register_autograd setup_context
-    # backward, which rematerialised conv without bias → wrong GN xhat → 22×
-    # gradient errors.  Unfused aten ops use native Inductor lowerings instead.
-    # _patch_pre_grad_passes_for_conv_gn_relu_fusion()
 
     _patched = True

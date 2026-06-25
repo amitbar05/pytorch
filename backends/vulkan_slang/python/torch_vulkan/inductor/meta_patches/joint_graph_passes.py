@@ -773,7 +773,7 @@ def _install_joint_partition_device_fix() -> None:
                 src_val = node.meta.get("val")
                 if isinstance(src_val, torch.Tensor):
                     to_node.meta["val"] = fm.from_tensor(
-                        torch.empty_like(src_val, device=_vulkan_dev),
+                        src_val.new_empty(src_val.shape, device=_vulkan_dev),
                         static_shapes=True,
                     )
                 node.replace_all_uses_with(to_node)

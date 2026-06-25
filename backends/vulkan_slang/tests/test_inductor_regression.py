@@ -4404,6 +4404,77 @@ class TestSlangTilePerDtypeCache:
         assert restored.__name__ == fn.__name__
 
 
+class TestSP3PcLayoutHash:
+    """SP.3: the SPIR-V cache key includes a push-constant-layout hash so a
+    future PC struct field addition can't silently reuse stale SPIR-V (the
+    textual ``cache_key`` would otherwise be unchanged, bypassing the
+    source-hash path entirely)."""
+
+    def test_pc_hash_is_8_hex(self):
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        tag = _pc_layout_hash("struct PC { uint a; uint b; };")
+        assert re.fullmatch(r"[0-9a-f]{8}", tag)
+
+    def test_pc_hash_changes_when_field_added(self):
+        """The whole point of SP.3: a layout change must change the hash."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        before = _pc_layout_hash("struct PC { uint a; uint b; };")
+        after = _pc_layout_hash("struct PC { uint a; uint b; uint c; };")
+        assert before != after
+
+    def test_pc_hash_matches_backward_struct(self):
+        """The single-kernel backward template emits ``struct BwdPC`` — the
+        regex must capture it too, otherwise backward kernels would always
+        hash the empty body."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+
+        empty = _pc_layout_hash("no struct here")
+        bwd = _pc_layout_hash("struct BwdPC { uint a; uint b; };")
+        assert re.fullmatch(r"[0-9a-f]{8}", bwd)
+        assert bwd != empty
+
+    def test_rendered_mm_template_feeds_nonempty_pc_tag(self):
+        """End-to-end (device-free): the real forward MM template renders a
+        ``struct PC`` body that the helper hashes to a non-empty 8-hex tag."""
+        from torch_vulkan.inductor.templates.caller.gemm.dispatch import (
+            _pc_layout_hash,
+        )
+        from torch_vulkan.inductor.templates.caller.gemm.render import (
+            _render_mm_slang,
+        )
+
+        src = _render_mm_slang(
+            8, 8, 16,
+            dtype_a="float", dtype_b="float", dtype_c="float",
+            dtype_acc="float", num_stages=1,
+            m_per_thread=1, n_per_thread=1, use_module=False,
+        )
+        empty = _pc_layout_hash("no struct here")
+        tag = _pc_layout_hash(src)
+        assert re.fullmatch(r"[0-9a-f]{8}", tag)
+        assert tag != empty
+
+    def test_compile_path_threads_pc_layout_hash(self):
+        """The hash must reach the SPIR-V content hash: both the runtime
+        ``compile_and_dispatch`` wrapper and the underlying
+        ``compile_slang_to_spirv`` accept a ``pc_layout_hash`` parameter."""
+        import inspect
+
+        from torch_vulkan.inductor.runtime.dispatch import compile_and_dispatch
+        from torch_vulkan.inductor.runtime.slangc import compile_slang_to_spirv
+
+        assert "pc_layout_hash" in inspect.signature(compile_and_dispatch).parameters
+        assert "pc_layout_hash" in inspect.signature(compile_slang_to_spirv).parameters
+
+
 class TestTrustInductor:
     """P0.4 (post P5.11.a.1): TORCH_VULKAN_TRUST_INDUCTOR no-ops
     assert_size_stride / assert_alignment in the wrapper preamble.
@@ -6571,6 +6642,47 @@ class TestPacked16Verification:
         torch_vulkan._c_ext._synchronize(0)
         n = torch_vulkan._c_ext._get_dispatch_count()
         assert n <= 1, f"expected 1 dispatch (fused pointwise), got {n}"
+
+
+class TestBf16PackedStoreWave32:
+    """CG.2: bf16 fallback store missing _packed16_vw_active guard.
+
+    When _packed16_vw_active is True the _packed16_vw_rewrite path replaces
+    the WaveReadLaneAt body with a gtid.x vector write.  The fallback bf16
+    store path must not set _pw_has_wave_ops in that state — otherwise the
+    shader codegen signals 'wave ops needed' for a body that has already been
+    rewritten into non-wave vector ops, producing a structural conflict.
+    """
+
+    def test_bf16_scalar_store_path_values(self):
+        """Small bf16 tensor (numel=64, not a multiple of wg*4=1024) forces
+        the scalar WaveReadLaneAt store path — values must survive round-trip."""
+        x = torch.tensor(
+            [1000.0 + i for i in range(64)], dtype=torch.bfloat16, device="vulkan:0"
+        )
+
+        @torch.compile(backend="inductor")
+        def fn(t):
+            return t + torch.zeros_like(t)
+
+        out = fn(x)
+        torch.testing.assert_close(out.cpu(), x.cpu(), rtol=0, atol=0)
+
+    def test_bf16_vector_store_path_values(self):
+        """Large bf16 tensor (numel=1024, multiple of wg*4) activates the
+        _packed16_vw_active vector-write rewrite — values must also survive."""
+        x = torch.tensor(
+            [float(i % 512) for i in range(1024)],
+            dtype=torch.bfloat16,
+            device="vulkan:0",
+        )
+
+        @torch.compile(backend="inductor")
+        def fn(t):
+            return t + torch.zeros_like(t)
+
+        out = fn(x)
+        torch.testing.assert_close(out.cpu(), x.cpu(), rtol=0, atol=0)
 
 
 class TestCrossEntropyBaseline:
@@ -8935,12 +9047,19 @@ class TestConvGeneralityGaps:
             f"via the native slang_conv3d template, got {d}"
         )
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "T4.12 not wired: conv_transpose.py:308 NOTE — slangc segfaults on "
+            "flip+permute intermediate; lowering raises NotImplementedError"
+        ),
+    )
     def test_transposed_conv_graph_breaks_gracefully(self):
-        """Transposed conv2d (stride=1) matches CPU via decomposition.
+        """Transposed conv2d floor-gate (xfail until T4.12 is wired).
 
-        The T4.12 decomposition flips the weight spatially, transposes
-        in/out channels, then dispatches to the regular Conv2d path.
-        Verifies full value parity with CPU (not just shape)."""
+        conv_transpose2d traces to aten.convolution.default(transposed=True).
+        Our lowering raises NotImplementedError (T4.12 not wired — see
+        conv_transpose.py:308). Flip this xfail when T4.12 is unblocked."""
         import torch.nn.functional as F
 
         torch._dynamo.reset()
@@ -12146,30 +12265,36 @@ class TestVec4PointwiseF32:
     def _capture_compiled_slang(fn, *args):
         """Run ``fn(*args)`` once, returning every Slang source slangc saw.
 
-        Hooks ``runtime.compile_slang_to_spirv`` so we don't need a separate
-        log-capture mechanism. The cache is cleared first so we observe a
-        cold compile.
+        Patches ``slangc.compile_slang_to_spirv`` directly (not the runtime
+        re-export) so that the lazy-import call sites inside dispatch.py pick
+        up the spy.  Also resets Dynamo to force a fresh Inductor compile even
+        when Dynamo has a warm cache for the same bytecode.
         """
+        from torch_vulkan.inductor.runtime import slangc as _slangc
         from torch_vulkan.inductor import runtime as _rt
 
         captured: list[str] = []
-        orig = _rt.compile_slang_to_spirv
+        orig = _slangc.compile_slang_to_spirv
 
         def spy(src, entry="computeMain", cache_key=None, config_key=None):
             captured.append(src)
-            return orig(src, entry=entry, cache_key=cache_key)
+            return orig(src, entry=entry, cache_key=cache_key, config_key=config_key)
 
-        # Wipe the in-memory + on-disk SPIR-V caches so we re-compile.
+        # Wipe the in-memory SPIR-V caches so we re-compile.
         _rt._cache_by_key.clear()
         _rt._cache_by_hash.clear()
         rm_path = "/tmp/torchinductor_" + os.environ.get("USER", "amit")
         os.system(f"rm -rf {rm_path} 2>/dev/null")
+        # Reset Dynamo so it re-runs Inductor codegen instead of serving
+        # from a warm cache for identically-shaped inputs compiled in a
+        # prior test.
+        torch._dynamo.reset()
 
-        _rt.compile_slang_to_spirv = spy
+        _slangc.compile_slang_to_spirv = spy
         try:
             fn(*args)
         finally:
-            _rt.compile_slang_to_spirv = orig
+            _slangc.compile_slang_to_spirv = orig
         return captured
 
     def test_vec4_fires_on_contiguous_f32_add(self):
@@ -18638,7 +18763,7 @@ class TestReductionGenericFamily:
         [numthreads(64, 1, 1)]
         void computeMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {{
             float v = (tid.x < n) ? in_x[tid.x] : {op_name}::identity();
-            float s = wg_reduce<{op_name}>(v, lid.x, n);
+            float s = wg_reduce<{op_name}>(v, lid.x, n, VK_SUBGROUP_SIZE);
             if (lid.x == 0) out_y[0] = s;
         }}
         """
@@ -18658,7 +18783,7 @@ class TestReductionGenericFamily:
             wg_z=1,
             push_constants=struct.pack("I", x.numel()),
             entry="computeMain",
-            cache_key=f"p12_reduce_{op_name}_v1",
+            cache_key=f"p12_reduce_{op_name}_v2",
             num_outputs=1,
         )
         return out.cpu()
@@ -18689,21 +18814,57 @@ class TestReductionGenericFamily:
         ref = torch.prod(x).reshape(1)
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
+    @staticmethod
+    def _any_all_kernel(fn_name: str) -> str:
+        return f"""
+        import reduction;
+        [[vk::binding(0, 0)]] StructuredBuffer<float> in_x;
+        [[vk::binding(1, 0)]] RWStructuredBuffer<float> out_y;
+        [[vk::push_constant]] cbuffer Push {{ uint n; }};
+        [shader("compute")]
+        [numthreads(64, 1, 1)]
+        void computeMain(uint3 tid : SV_DispatchThreadID, uint3 lid : SV_GroupThreadID) {{
+            float v = (tid.x < n) ? in_x[tid.x] : 0.0f;
+            float s = {fn_name}(v, lid.x, n, VK_SUBGROUP_SIZE);
+            if (lid.x == 0) out_y[0] = s;
+        }}
+        """
+
+    def _dispatch_any_all(self, fn_name: str, x: torch.Tensor) -> torch.Tensor:
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        x_v = x.to("vulkan:0")
+        out = torch.zeros(1, device="vulkan:0")
+        compile_and_dispatch(
+            self._any_all_kernel(fn_name),
+            tensors=[x_v, out],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", x.numel()),
+            entry="computeMain",
+            cache_key=f"p12_{fn_name}_v1",
+            num_outputs=1,
+        )
+        return out.cpu()
+
     def test_any_all_match_torch(self):
         x_any = torch.tensor([0.0] * 60 + [1.0] * 4)
-        got = self._dispatch_reduce("OpAny", x_any)
+        got = self._dispatch_any_all("vk_wg_reduce_any", x_any)
         assert got.item() == 1.0
 
         x_no = torch.zeros(64)
-        got = self._dispatch_reduce("OpAny", x_no)
+        got = self._dispatch_any_all("vk_wg_reduce_any", x_no)
         assert got.item() == 0.0
 
         x_all = torch.ones(64)
-        got = self._dispatch_reduce("OpAll", x_all)
+        got = self._dispatch_any_all("vk_wg_reduce_all", x_all)
         assert got.item() == 1.0
 
         x_one_zero = torch.cat([torch.ones(63), torch.zeros(1)])
-        got = self._dispatch_reduce("OpAll", x_one_zero)
+        got = self._dispatch_any_all("vk_wg_reduce_all", x_one_zero)
         assert got.item() == 0.0
 
     def test_argmax_argmin_match_torch(self):
@@ -18729,7 +18890,7 @@ class TestReductionGenericFamily:
                 p.val = (tid.x < n) ? in_x[tid.x]
                                     : {"OpMaxReduce" if which == "wg_argmax" else "OpMinReduce"}::identity();
                 p.idx = float(tid.x);
-                ArgPair r = {which}(p, lid.x, n);
+                ArgPair r = {which}(p, lid.x, n, VK_SUBGROUP_SIZE);
                 if (lid.x == 0) {{
                     out_v[0] = r.val;
                     out_i[0] = r.idx;
@@ -18747,7 +18908,7 @@ class TestReductionGenericFamily:
                 wg_z=1,
                 push_constants=struct.pack("I", x.numel()),
                 entry="computeMain",
-                cache_key=f"p12_{which}_v1",
+                cache_key=f"p12_{which}_v2",
                 num_outputs=2,
             )
             ref_idx = (
@@ -40083,6 +40244,62 @@ class TestDispatchBatcherLifecycle:
             DispatchBatcher._batch_probed = _orig_probed
             DispatchBatcher._current = _orig_current
 
+    def test_pending_kernels_dispatched_while_batch_mode_active(self):
+        """S3.4 fix: pending kernels must be dispatched while C++ batch mode
+        is ON so they enter the command buffer before _end_batch() submits.
+        Previously _end_batch() was called first (empty buffer) then kernels
+        ran in auto-flush mode, defeating the batching.
+        """
+        from torch_vulkan.inductor.runtime.batcher import DispatchBatcher
+
+        dispatch_log = []  # records ("begin"|"end"|"kernel-N") in order
+
+        def _fake_begin():
+            dispatch_log.append("begin")
+
+        def _fake_end():
+            dispatch_log.append("end")
+
+        def make_kernel(name):
+            def _kernel(*args):
+                dispatch_log.append(name)
+            return _kernel
+
+        _orig_begin = DispatchBatcher._begin_batch
+        _orig_end = DispatchBatcher._end_batch
+        _orig_probed = DispatchBatcher._batch_probed
+        _orig_current = DispatchBatcher._current
+        DispatchBatcher._begin_batch = staticmethod(_fake_begin)
+        DispatchBatcher._end_batch = staticmethod(_fake_end)
+        DispatchBatcher._batch_probed = True
+        DispatchBatcher._current = None
+        try:
+            batcher = DispatchBatcher()
+            with batcher:
+                batcher.add(make_kernel("k0"))
+                batcher.add(make_kernel("k1"))
+        finally:
+            DispatchBatcher._begin_batch = _orig_begin
+            DispatchBatcher._end_batch = _orig_end
+            DispatchBatcher._batch_probed = _orig_probed
+            DispatchBatcher._current = _orig_current
+
+        # Expected: begin → k0 → k1 → end → begin → end
+        # (the final begin+end in __exit__ flush the now-empty batch)
+        # Key assertion: k0 and k1 appear BEFORE "end", proving they were
+        # dispatched while batch mode was still active.
+        assert dispatch_log[0] == "begin", f"first event should be begin: {dispatch_log}"
+        k0_idx = dispatch_log.index("k0")
+        k1_idx = dispatch_log.index("k1")
+        first_end_idx = dispatch_log.index("end")
+        assert k0_idx < first_end_idx, (
+            f"k0 must be dispatched before _end_batch(): {dispatch_log}"
+        )
+        assert k1_idx < first_end_idx, (
+            f"k1 must be dispatched before _end_batch(): {dispatch_log}"
+        )
+        assert k0_idx < k1_idx, f"dispatch order must be preserved: {dispatch_log}"
+
 
 class TestM173AdaptiveAvgPool2d:
     """M17.3 — ``aten._adaptive_avg_pool2d.default`` forward lowering.
@@ -43098,6 +43315,121 @@ class TestM181WgReduceHelpers:
         got = fn(x_vk).cpu()
         expected = x_cpu.argmin(dim=-1)
         torch.testing.assert_close(got, expected)
+
+
+class TestCG1ArgmaxUint2Precision:
+    """CG.1 — argmin/argmax index stored as uint2, not float2.
+
+    float2 encoding truncated the index to 24-bit mantissa precision
+    (float32 can only represent integers exactly up to 2^24 = 16777216).
+    Any tensor with > 16M elements would silently return a wrong index.
+
+    Fix: vk_wg_reduce_argmax/argmin now accept/return uint2 where:
+      - x = asuint(float_value)  (bitcast, lossless round-trip via asfloat)
+      - y = uint32 index         (exact, no precision loss)
+    """
+
+    def test_vk_wg_reduce_argmin_large_index(self):
+        """Index 16777217 (> 2^24) must survive the workgroup reduction losslessly.
+
+        With the old float2 encoding: float(16777217) rounds to 16777216.0
+        (the nearest representable float — 2^24 + 1 is not exactly representable).
+        The reduced output would have y == 16777216, i.e. off by one.
+
+        With uint2: y == 16777217 exactly.
+        """
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        HIGH_IDX = 16777217  # 2^24 + 1 — not exactly representable as float32
+
+        src = """
+import vk_reduction;
+[[vk::binding(0, 0)]] RWStructuredBuffer<uint> out_val_bits;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> out_idx;
+[[vk::push_constant]] cbuffer Push { uint high_idx; };
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 lid : SV_GroupThreadID) {
+    // Thread 0 has the minimum (-1.0f) with the large index.
+    // All other threads have 0.0f with their thread id as index.
+    float val = (lid.x == 0u) ? -1.0f : 0.0f;
+    uint  idx = (lid.x == 0u) ? high_idx : lid.x;
+    uint2 pair = uint2(asuint(val), idx);
+    uint2 result = vk_wg_reduce_argmin(pair, lid.x, 64u, 64u);
+    if (lid.x == 0u) {
+        out_val_bits[0] = result.x;
+        out_idx[0] = result.y;
+    }
+}
+"""
+        out_val = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        out_idx = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        compile_and_dispatch(
+            src,
+            tensors=[out_val, out_idx],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", HIGH_IDX),
+            entry="computeMain",
+            cache_key="cg1_argmin_uint2_v1",
+            num_outputs=2,
+        )
+        import math
+
+        got_val = out_val.cpu().view(torch.float32)[0].item()
+        got_idx = out_idx.cpu()[0].item()
+        assert got_idx == HIGH_IDX, (
+            f"CG.1 precision: got index {got_idx}, expected {HIGH_IDX}. "
+            f"Float would round 16777217 to {int(float(HIGH_IDX))}."
+        )
+        assert abs(got_val - (-1.0)) < 1e-6, f"Expected val=-1.0, got {got_val}"
+
+    def test_vk_wg_reduce_argmax_large_index(self):
+        """Mirror of argmin test — argmax also uses uint2 encoding."""
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        HIGH_IDX = 16777219  # 2^24 + 3 — not exactly representable as float32
+
+        src = """
+import vk_reduction;
+[[vk::binding(0, 0)]] RWStructuredBuffer<uint> out_val_bits;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> out_idx;
+[[vk::push_constant]] cbuffer Push { uint high_idx; };
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 lid : SV_GroupThreadID) {
+    float val = (lid.x == 0u) ? 1.0f : 0.0f;
+    uint  idx = (lid.x == 0u) ? high_idx : lid.x;
+    uint2 pair = uint2(asuint(val), idx);
+    uint2 result = vk_wg_reduce_argmax(pair, lid.x, 64u, 64u);
+    if (lid.x == 0u) {
+        out_val_bits[0] = result.x;
+        out_idx[0] = result.y;
+    }
+}
+"""
+        out_val = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        out_idx = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        compile_and_dispatch(
+            src,
+            tensors=[out_val, out_idx],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", HIGH_IDX),
+            entry="computeMain",
+            cache_key="cg1_argmax_uint2_v1",
+            num_outputs=2,
+        )
+        got_idx = out_idx.cpu()[0].item()
+        assert got_idx == HIGH_IDX, (
+            f"CG.1 precision: got index {got_idx}, expected {HIGH_IDX}."
+        )
 
 
 class TestM211DeviceProfile:
@@ -64657,6 +64989,42 @@ class TestProfileDrivenPersistentCap:
         assert cap <= 65536, f"S0.1: cap must be <= 65536 (max), got {cap}"
 
 
+class TestAutotuneWorkgroupVariants:
+    """S0.1 Slice A — get_wg_size_variants caps candidates at device max_workgroup_size."""
+
+    def test_wg_variants_capped_at_device_max(self, monkeypatch):
+        """S0.1A: at level-2 autotune, pointwise candidates exclude sizes above device limit."""
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setenv("TORCH_VULKAN_MAX_AUTOTUNE", "2")
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 512 if key == "max_workgroup_size" else fallback)
+        variants = get_wg_size_variants(is_reduction=False)
+        assert 1024 not in variants, f"1024 should be excluded for max_wg=512, got {variants}"
+        assert 512 in variants, f"512 should be included for max_wg=512, got {variants}"
+
+    def test_wg_variants_reduction_capped(self, monkeypatch):
+        """S0.1A: reduction candidates are also capped at device limit."""
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 128 if key == "max_workgroup_size" else fallback)
+        variants = get_wg_size_variants(is_reduction=True)
+        assert all(w <= 128 for w in variants), f"All reduction variants should be ≤128 for max_wg=128, got {variants}"
+        assert len(variants) > 0, "Should return at least one variant"
+
+    def test_wg_variants_low_autotune_capped(self, monkeypatch):
+        """S0.1A: level<2 single-candidate path also respects device cap."""
+        import os
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 128 if key == "max_workgroup_size" else fallback)
+        monkeypatch.setenv("TORCH_VULKAN_MAX_AUTOTUNE", "1")
+        variants = get_wg_size_variants(is_reduction=False)
+        assert all(w <= 128 for w in variants), f"Level-1 variants should be ≤128, got {variants}"
+
+
 class TestAOTIAddmmBmmPC:
     """S4.0: verify pc_size_bytes is populated correctly for mm/addmm/bmm in AOTI mode."""
 
@@ -65124,6 +65492,95 @@ class TestSPB2WgCacheKeySuffix:
         assert "return None" in fn_src
         default_key = "test_kernel"
         assert "_wg" not in default_key
+
+    def test_cached_wg_branch_passes_suffixed_key(self):
+        """SP.B3 — the cache-hit branch must rebuild with a _wg-suffixed key.
+
+        Before the fix, the ``src_hash in _WG_AUTOTUNE_CACHE`` branch passed
+        the original ``key`` to ``_build_kernel_for_wg``, so
+        ``compile_slang_to_spirv`` returned the cached *original* SPV instead
+        of compiling the re-numthreaded source — WG autotune was a silent
+        no-op for every warm-cache dispatch.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        # The cache-hit recompile must thread cached_wg into the key.
+        assert 'f"{key}_wg{cached_wg}"' in fn_src, (
+            "SP.B3 regression: cache-hit branch must pass "
+            'f"{key}_wg{cached_wg}" to _build_kernel_for_wg, not the bare key'
+        )
+        # The bare `key,` must no longer appear as a _build_kernel_for_wg arg.
+        assert "cached_wg, key, n_pc" not in fn_src, (
+            "SP.B3 regression: cache-hit branch still passes the original "
+            "unsuffixed key — dispatches cached original (unoptimized) SPV"
+        )
+
+    def test_training_mode_disk_cache_path_passes_suffixed_key(self):
+        """SP.B3 — the training-mode disk-cache path must also suffix the key.
+
+        ``_maybe_autotune_wg`` has a second ``_build_kernel_for_wg`` call on
+        the steady-state path: WG autotune disabled, winner loaded from the
+        SP.B4 disk cache.  This is exactly where a persisted winner is
+        consumed, so a bare ``key`` here means every training run after the
+        first dispatches the original unoptimized SPV — defeating SP.B4
+        persistence entirely.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._maybe_autotune_wg)
+        assert 'f"{key}_wg{cached_wg}"' in fn_src, (
+            "SP.B3 regression: training-mode disk-cache path must pass "
+            'f"{key}_wg{cached_wg}" to _build_kernel_for_wg, not the bare key'
+        )
+        assert "cached_wg, key, n_pc" not in fn_src, (
+            "SP.B3 regression: training-mode disk-cache path still passes the "
+            "original unsuffixed key — a persisted WG winner is loaded but the "
+            "original unoptimized SPV is dispatched"
+        )
+
+
+class TestSPB4WgWinnerPersisted:
+    """SP.B4 regression — WG autotune winner must be persisted to disk."""
+
+    def test_save_wg_cache_is_called(self):
+        """``_save_wg_cache`` must be invoked after the in-memory cache update.
+
+        It was defined but had zero call sites, so an autotune winner lived
+        only in ``_WG_AUTOTUNE_CACHE`` for the process lifetime — the next
+        launch re-ran the full benchmark sweep from scratch.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        assert "_save_wg_cache(src_hash, best_wg)" in fn_src, (
+            "SP.B4 regression: _autotune_kernel_wg must call "
+            "_save_wg_cache(src_hash, best_wg) to persist the winner"
+        )
+
+    def test_save_wg_cache_round_trips_through_disk(self, tmp_path, monkeypatch):
+        """A saved winner must be readable back via ``_load_wg_cache``."""
+        import importlib
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        monkeypatch.setattr(dispatch_mod, "_WG_DISK_CACHE_DIR", tmp_path)
+        dispatch_mod._save_wg_cache("deadbeef0001", 128)
+        loaded = dispatch_mod._load_wg_cache()
+        assert loaded.get("deadbeef0001") == 128
 
 
 class TestVec4EligibilityCompositeIndex:

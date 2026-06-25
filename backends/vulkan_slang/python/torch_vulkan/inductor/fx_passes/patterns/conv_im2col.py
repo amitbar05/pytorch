@@ -22,6 +22,29 @@ from torch.fx import GraphModule, Node
 from .registry import register_fx_pattern
 
 
+def _fx_to_int(x: Any) -> int:
+    """Extract a concrete int from a value that may be an FX Node or SymInt.
+
+    A grouped/depthwise conv is structurally specialized on its groups,
+    kernel extent, and channel counts — the per-group decomposition slices
+    a concrete number of channels and the ``slang_conv2d`` template bakes
+    the kernel window in. Under dynamic shapes these arrive as symbols, so
+    guard (specialize) them to a concrete value rather than crashing.
+    """
+    if isinstance(x, Node):
+        val = x.meta.get("val")
+        if val is None:
+            raise ValueError(f"Cannot extract int from FX Node {x} with no val meta")
+        x = val
+    if isinstance(x, int):
+        return x
+    if isinstance(x, torch.SymInt):
+        from torch.fx.experimental.symbolic_shapes import guard_int
+
+        return int(guard_int(x))
+    return int(x)
+
+
 def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]:
     """Match ``torch_vulkan.conv2d_with_optional_bias`` calls whose input
     and weight tensors are 4-D with valid group division."""
@@ -46,7 +69,7 @@ def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]
             continue
         if inp_val.dim() != 4 or w_val.dim() != 4:
             continue
-        g = int(groups)
+        g = _fx_to_int(groups)
         if g < 1:
             continue
         # T4.12 / M6 Phase 2: groups==1 convs go through the dedicated
@@ -55,9 +78,9 @@ def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]
         # im2col+mm.
         if g == 1:
             continue
-        if int(w_val.shape[0]) % g != 0:
+        if _fx_to_int(w_val.shape[0]) % g != 0:
             continue
-        if int(inp_val.shape[1]) % g != 0:
+        if _fx_to_int(inp_val.shape[1]) % g != 0:
             continue
         # All checks passed — yield the match context.
         yield (
@@ -92,15 +115,15 @@ def _rewrite_conv_im2col(
     stride = ctx["stride"]
     padding = ctx["padding"]
     dilation = ctx["dilation"]
-    groups: int = ctx["groups"]
+    groups: int = _fx_to_int(ctx["groups"])
     conv_target = root.target
 
-    sH = int(stride[0])
-    sW = int(stride[-1]) if len(stride) > 1 else sH
-    pH = int(padding[0])
-    pW = int(padding[-1]) if len(padding) > 1 else pH
-    dH = int(dilation[0])
-    dW = int(dilation[-1]) if len(dilation) > 1 else dH
+    sH = _fx_to_int(stride[0])
+    sW = _fx_to_int(stride[-1]) if len(stride) > 1 else sH
+    pH = _fx_to_int(padding[0])
+    pW = _fx_to_int(padding[-1]) if len(padding) > 1 else pH
+    dH = _fx_to_int(dilation[0])
+    dW = _fx_to_int(dilation[-1]) if len(dilation) > 1 else dH
 
     inp_val = inp.meta["val"]
     w_val = weight.meta["val"]

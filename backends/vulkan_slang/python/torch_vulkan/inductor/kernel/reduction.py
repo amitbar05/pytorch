@@ -369,20 +369,25 @@ class ReductionMixin(ReductionLoadMixin):
         self.headers.add(f"wgreduce_arg{suffix}")
 
         n_waves = max(1, self.max_threadgroup_size // self.simd_group_size)
-        neutral_val = "(-3.4e38f)" if is_max else "(3.4e38f)"
+        # CG.1: encode as uint2(asuint(val), idx) — index stored as uint32,
+        # no 24-bit mantissa truncation for tensors with > 16M elements.
+        neutral_bits = "asuint(-3.4e38f)" if is_max else "asuint(3.4e38f)"
         guarded_val = (
-            f"((lid.x < {red_numel}) ? float2({value}, float({index})) : float2({neutral_val}, 0.0f))"
+            f"((lid.x < {red_numel}) ? uint2(asuint({value}), uint({index})) : uint2({neutral_bits}, 0u))"
             if red_numel < self.max_threadgroup_size
-            else f"float2({value}, float({index}))"
+            else f"uint2(asuint({value}), uint({index}))"
         )
 
         if self.multistage_reduction_entry:
             acc_name = f"_arg_{suffix}_{next(self.acc_var_ids)}"
-            self.indexing_code.writeline(f"float2 {acc_name} = {guarded_val};")
-            op_str = f"(({value}) {cmp_op} ({acc_name}).x ? float2({value}, float({index})) : {acc_name})"
+            self.indexing_code.writeline(f"uint2 {acc_name} = {guarded_val};")
+            op_str = (
+                f"(({value}) {cmp_op} asfloat(({acc_name}).x)"
+                f" ? uint2(asuint({value}), uint({index})) : {acc_name})"
+            )
             self.compute.writeline(f"{acc_name} = {op_str};")
             result_val = V.kernel.create_cse_var(
-                f"{acc_name}.x", ValueRanges.unknown(), dtype
+                f"asfloat({acc_name}.x)", ValueRanges.unknown(), dtype
             )
             result_idx = V.kernel.create_cse_var(
                 f"{acc_name}.y", ValueRanges.unknown(), torch.int64
@@ -395,7 +400,7 @@ class ReductionMixin(ReductionLoadMixin):
             dtype=dtype,
         )
         result_val = V.kernel.create_cse_var(
-            f"{result}.x", ValueRanges.unknown(), dtype
+            f"asfloat({result}.x)", ValueRanges.unknown(), dtype
         )
         result_idx = V.kernel.create_cse_var(
             f"{result}.y", ValueRanges.unknown(), torch.int64

@@ -306,7 +306,8 @@ def _get_slang_conv2d_template():
 
 
 def _philox_rng_grid(numel, meta):
-    threadgroup_size = 256
+    from .device_profile import profile_limit
+    threadgroup_size = profile_limit("max_workgroup_size", 256)
     grid_x = (numel + threadgroup_size - 1) // threadgroup_size
     return (grid_x, 1, 1)
 
@@ -360,9 +361,10 @@ def _get_slang_flash_attention_template():
 
 
 def _foreach_optimizer_grid(numel, meta):
+    from .device_profile import profile_limit
     batch_size = meta.get("BATCH_SIZE", 7)
     total_params = meta.get("TOTAL_PARAMS", batch_size)
-    threadgroup_size = 256
+    threadgroup_size = profile_limit("max_workgroup_size", 256)
     grid_x = (numel + threadgroup_size - 1) // threadgroup_size
     grid_y = min(total_params, batch_size)
     return (grid_x, grid_y, 1)

@@ -325,75 +325,6 @@ def _convolution_backward_overrideable_fake(
     return grad_input, grad_weight, grad_bias
 
 
-# ── Normalization backward ops ────────────────────────────────────────────────
-
-
-def _native_batch_norm_backward_fake(
-    grad_out,
-    input,
-    weight,
-    running_mean,
-    running_var,
-    save_mean,
-    save_var,
-    train,
-    eps,
-    output_mask,
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    C = int(input.size(1))
-    grad_weight = (
-        grad_out.new_empty((C,)) if output_mask[1] else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        grad_out.new_empty((C,)) if output_mask[2] else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
-def _native_layer_norm_backward_fake(
-    grad_out, input, normalized_shape, mean, rstd, weight, bias, output_mask
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    grad_weight = (
-        weight.new_empty(weight.shape)
-        if (output_mask[1] and weight is not None)
-        else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        bias.new_empty(bias.shape)
-        if (output_mask[2] and bias is not None)
-        else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
-def _native_group_norm_backward_fake(
-    grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
-):
-    # M18.8 (2026-05-18): see _convolution_backward_overrideable_fake.
-    grad_input = (
-        input.new_empty(input.shape) if output_mask[0] else input.new_empty((0,))
-    )
-    grad_weight = (
-        grad_out.new_empty((int(C),))
-        if output_mask[1]
-        else grad_out.new_empty((0,))
-    )
-    grad_bias = (
-        grad_out.new_empty((int(C),))
-        if output_mask[2]
-        else grad_out.new_empty((0,))
-    )
-    return grad_input, grad_weight, grad_bias
-
-
 # ── Indexing ops ──────────────────────────────────────────────────────────────
 
 
@@ -425,25 +356,6 @@ def _repeat_interleave_self_int_fake(self, repeats, dim=None, output_size=None):
     sizes = list(self.size())
     sizes[dim] = sizes[dim] * int(repeats)
     return torch.empty(sizes, dtype=self.dtype, device=self.device)
-
-
-# ── Upsample backward ops ─────────────────────────────────────────────────────
-
-
-def _upsample_bilinear2d_backward_fake(
-    grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
-):
-    return torch.empty(
-        list(input_size), dtype=grad_output.dtype, device=grad_output.device
-    )
-
-
-def _upsample_nearest2d_backward_fake(
-    grad_output, output_size, input_size, scales_h=None, scales_w=None
-):
-    return torch.empty(
-        list(input_size), dtype=grad_output.dtype, device=grad_output.device
-    )
 
 
 # ── Attention ────────────────────────────────────────────────────────
@@ -744,15 +656,3 @@ def _one_hot_fake(self, num_classes=-1):
     return torch.empty(sizes, dtype=self.dtype, device=self.device)
 
 
-def _randperm_fake(
-    n,
-    *,
-    generator=None,
-    out=None,
-    dtype=torch.int64,
-    layout=torch.strided,
-    device=None,
-    requires_grad=False,
-    pin_memory=False,
-):
-    return torch.empty([int(n)], dtype=dtype, device=device)

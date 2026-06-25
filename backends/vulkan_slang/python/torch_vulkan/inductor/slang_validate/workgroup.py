@@ -46,7 +46,9 @@ def _validate_workgroup_size(src: str) -> list[str]:
     # waves.  Blocking compilation on suboptimal occupancy prevents correct
     # kernels from running.  The warning is emitted but does not block.
     if _WAVE_SIZE > 0 and product % _WAVE_SIZE != 0:
-        # Advisory only — don't block compilation
-        pass
+        errors.append(
+            f"[M27] numthreads product {product} ({x}×{y}×{z}) is not a "
+            f"multiple of wave size {_WAVE_SIZE} — partial wave wastes lanes"
+        )
 
     return errors

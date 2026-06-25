@@ -82,6 +82,25 @@ M6 Phase 2 (T4.12 groups>1) — COMPLETE:
 from __future__ import annotations
 
 
+def _static_int(x) -> int:
+    """Resolve a stride/padding/dilation value to a concrete int.
+
+    Under dynamic shapes the value may arrive as a sympy expression or
+    ``torch.SymInt`` (e.g. ``padding=k // 2`` with symbolic ``k``). The
+    ``slang_conv2d`` template bakes these into the kernel, so guard the
+    graph on the concrete value rather than carrying a symbol.
+    """
+    import torch
+
+    if isinstance(x, torch.SymInt):
+        x = x.node.expr
+    if isinstance(x, int):
+        return x
+    from torch._inductor.virtualized import V
+
+    return V.graph.sizevars.guard_int(x)
+
+
 def _register_conv_and_pool_lowerings() -> None:
     """PF.3 (Strike 2) — Inductor lowerings for the PF.30 conv2d / max_pool2d
     custom_op shims.
@@ -481,7 +500,7 @@ def _register_conv_and_pool_lowerings() -> None:
         input, weight, bias, stride, padding, dilation, groups
     ):
         if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
-            return NotImplemented
+            raise NotImplementedError("vulkan conv2d: non-4D input/weight")
 
         # M19.5 — input dims (N especially) may be ``SymInt``/``sympy.Expr``
         # under dynamic-shape compile (e.g. ``torch._dynamo.mark_dynamic
@@ -494,7 +513,7 @@ def _register_conv_and_pool_lowerings() -> None:
         # to a Python int (the rest of the lowering tolerates either).
         from torch_vulkan.inductor.kernel.symbolic import get_static_numel
 
-        g = int(groups)
+        g = _static_int(groups)
         t1_sizes = input.get_size()
         w_sizes = weight.get_size()
         N = t1_sizes[0]
@@ -531,9 +550,13 @@ def _register_conv_and_pool_lowerings() -> None:
             if C_in_static is None or C_out_static is None:
                 # Dynamic channels under grouped conv — can't compute
                 # per-group slice indices. Fall through to extern.
-                return NotImplemented
+                raise NotImplementedError(
+                    "vulkan conv2d: dynamic channels under grouped conv"
+                )
             if C_in_static % g != 0 or C_out_static % g != 0:
-                return NotImplemented
+                raise NotImplementedError(
+                    "vulkan conv2d: channels not divisible by groups"
+                )
 
             from torch._inductor.lowering import lowerings as _lowerings
 
@@ -561,22 +584,34 @@ def _register_conv_and_pool_lowerings() -> None:
                 # The helper iterates by string form, surviving that.
                 _conv2d_lower = get_lowering_by_name(_lowerings, conv_op)
                 if _conv2d_lower is None:
-                    return NotImplemented
+                    raise NotImplementedError(
+                        "vulkan conv2d: per-group conv2d lowering lookup failed"
+                    )
                 out_g = _conv2d_lower(
                     inp_g, w_g, bias_g, stride, padding, dilation, 1
                 )
                 if out_g is NotImplemented:
-                    return NotImplemented
+                    raise NotImplementedError(
+                        "vulkan conv2d: per-group conv2d sub-lowering declined"
+                    )
                 groups_out.append(out_g)
             result = _lowerings[aten.cat.default](groups_out, 1)
             # Bias is already handled per-group above; no post-hoc bias add needed.
             return result
-        sH = int(stride[0])
-        sW = int(stride[-1] if len(stride) > 1 else stride[0])
-        pH = int(padding[0])
-        pW = int(padding[-1] if len(padding) > 1 else padding[0])
-        dH = int(dilation[0])
-        dW = int(dilation[-1] if len(dilation) > 1 else dilation[0])
+        sH = _static_int(stride[0])
+        sW = _static_int(stride[-1] if len(stride) > 1 else stride[0])
+        pH = _static_int(padding[0])
+        pW = _static_int(padding[-1] if len(padding) > 1 else padding[0])
+        dH = _static_int(dilation[0])
+        dW = _static_int(dilation[-1] if len(dilation) > 1 else dilation[0])
+
+        # The slang_conv2d template unrolls over the kernel window, so the
+        # kernel spatial extent must be concrete. Under dynamic shapes a
+        # varying kernel size arrives as a symbol; guard it to a static int
+        # (and keep the symbolic H_out/W_out below from carrying a sympy
+        # ``Max`` that the Slang expr-printer can't emit).
+        kH = _static_int(kH)
+        kW = _static_int(kW)
 
         H_out = (H_in + 2 * pH - dH * (kH - 1) - 1) // sH + 1
         W_out = (W_in + 2 * pW - dW * (kW - 1) - 1) // sW + 1
@@ -613,8 +648,6 @@ def _register_conv_and_pool_lowerings() -> None:
     # _VulkanConv2dExternKernel.  Replaces the default
     # extern_kernels.convolution path (→ eager C++ Vulkan) with the
     # Slang template dispatch for groups==1, non-transposed, 4D input.
-    # For groups>1 or transposed conv, returns NotImplemented so the
-    # existing fallback paths handle them.
     # ═════════════════════════════════════════════════════════════════════
     @register_lowering(aten.convolution.default, type_promotion_kind=None)
     def _vulkan_aten_convolution(
@@ -622,13 +655,22 @@ def _register_conv_and_pool_lowerings() -> None:
         transposed, output_padding, groups,
     ):
         if bool(transposed):
-            return NotImplemented
-        if int(groups) != 1:
-            return NotImplemented
-        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
-            return NotImplemented
+            # T4.12: interceptor not yet wired; conv_transpose.py:308 NOTE
+            # explains the slangc segfault blocker on the flip+permute path.
+            raise NotImplementedError("vulkan convolution: transposed conv (T4.12)")
         if input.get_device().type != "vulkan":
-            return NotImplemented
+            raise NotImplementedError("vulkan convolution: non-vulkan device")
+        # Route 5D (conv3d) through the reshape-to-conv2d path; the
+        # conv3d lowerings registered for aten.conv3d.* are not always
+        # invoked when F.conv3d traces to aten.convolution.default.
+        if len(input.get_size()) == 5 and len(weight.get_size()) == 5:
+            return _conv3d_to_conv2d_lowering(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
+            raise NotImplementedError("vulkan convolution: non-4D input/weight")
+        if int(groups) != 1:
+            raise NotImplementedError("vulkan convolution: groups != 1")
         # Delegate to the existing conv2d custom-op lowering which
         # creates a _VulkanConv2dExternKernel → _slang_tile_conv2d.
         return _vulkan_conv2d_with_optional_bias(
@@ -666,7 +708,7 @@ def _register_conv_and_pool_lowerings() -> None:
             input, weight, bias, stride, padding, dilation, groups
         ):
             if len(input.get_size()) != 3 or len(weight.get_size()) != 3:
-                return NotImplemented
+                raise NotImplementedError("vulkan conv1d: non-3D input/weight")
 
             from torch._inductor.lowering import lowerings as _lowerings
 
@@ -695,7 +737,9 @@ def _register_conv_and_pool_lowerings() -> None:
             # the dict key we registered against).
             conv2d_lower = _get_conv2d_lowering_by_name()
             if conv2d_lower is None:
-                return NotImplemented
+                raise NotImplementedError(
+                    "vulkan conv1d: conv2d lowering lookup failed"
+                )
             result_4d = conv2d_lower(
                 input_4d,
                 weight_4d,
@@ -706,7 +750,9 @@ def _register_conv_and_pool_lowerings() -> None:
                 int(groups),
             )
             if result_4d is NotImplemented:
-                return NotImplemented
+                raise NotImplementedError(
+                    "vulkan conv1d: conv2d sub-lowering declined"
+                )
 
             # Step 5 — squeeze the dummy dim back:
             #          [N, C_out, L_out, 1] → [N, C_out, L_out]
@@ -733,7 +779,7 @@ def _register_conv_and_pool_lowerings() -> None:
     ):
         """Reshape Conv1d args → Conv2d, dispatch, squeeze back."""
         if len(input.get_size()) != 3 or len(weight.get_size()) != 3:
-            return NotImplemented
+            raise NotImplementedError("vulkan conv1d: non-3D input/weight")
 
         from torch._inductor.lowering import lowerings as _lowerings
 
@@ -765,7 +811,9 @@ def _register_conv_and_pool_lowerings() -> None:
         # return a different ``OpOverload`` instance.
         conv2d_lower = _get_conv2d_lowering_by_name()
         if conv2d_lower is None:
-            return NotImplemented
+            raise NotImplementedError(
+                "vulkan conv1d: conv2d lowering lookup failed"
+            )
         result_4d = conv2d_lower(
             input_4d,
             weight_4d,
@@ -776,7 +824,9 @@ def _register_conv_and_pool_lowerings() -> None:
             int(groups),
         )
         if result_4d is NotImplemented:
-            return NotImplemented
+            raise NotImplementedError(
+                "vulkan conv1d: conv2d sub-lowering declined"
+            )
 
         # Step 5 — add clone to ensure contiguous strides before squeeze.
         # The conv2d extern kernel may return a tensor with strides that
@@ -826,7 +876,7 @@ def _register_conv_and_pool_lowerings() -> None:
         KD>1 case: delegate to native Conv3d template (MODEL.1).
         """
         if len(input.get_size()) != 5 or len(weight.get_size()) != 5:
-            return NotImplemented
+            raise NotImplementedError("vulkan conv3d: non-5D input/weight")
 
         from torch._inductor.lowering import lowerings as _lowerings
         from torch_vulkan.inductor.kernel.symbolic import get_static_numel
@@ -875,7 +925,7 @@ def _register_conv_and_pool_lowerings() -> None:
         C_in_static = get_static_numel(C_in)
         C_out_static = get_static_numel(C_out)
         if C_in_static is None or C_out_static is None:
-            return NotImplemented
+            raise NotImplementedError("vulkan conv3d: dynamic channel count")
         C_in_per_g = C_in_static // g
         C_out_per_g = C_out_static // g
         # M19.5-followup-1: look up the conv2d lowering by op-name string
@@ -884,15 +934,27 @@ def _register_conv_and_pool_lowerings() -> None:
         # ``register_eager_patch_custom_ops()`` re-registration.
         conv2d_lower = _get_conv2d_lowering_by_name()
         if conv2d_lower is None:
-            return NotImplemented
+            raise NotImplementedError(
+                "vulkan conv3d: conv2d lowering lookup failed"
+            )
 
         if KD == 1 and dD == 1 and sD == 1:
-            # Optimised path: reshape [N,C,D,H,W] → [N*D,C,H,W].
-            # Clone after reshape to avoid as_strided view materialization
-            # issues (the reshape from [N,C,D,H,W] to [N*D,C,H,W] merges
-            # non-adjacent dims N and D, creating a non-contiguous view).
-            input_4d = _lowerings[aten.reshape.default](input, [N * D, C_in, H, W])
-            input_4d = _lowerings[aten.clone.default](input_4d)
+            # KD==1 path: map conv3d to N*D independent conv2d calls.
+            #
+            # [N, C, D, H, W] cannot be reshaped directly to [N*D, C, H, W]
+            # because C (channels) sits between N and D in NCHW memory order —
+            # the stride for the merged batch dim would be H*W, not C*H*W.
+            # The correct transform is: permute → contiguous → reshape.
+            #
+            # Step 1: permute [N, C, D, H, W] → [N, D, C, H, W]
+            input_perm = _lowerings[aten.permute.default](input, [0, 2, 1, 3, 4])
+            # Step 2: materialise contiguous [N, D, C, H, W] (required before
+            # reshape so the merged batch dim has stride = C*H*W).
+            input_perm = _lowerings[aten.clone.default](input_perm)
+            # Step 3: reshape [N, D, C, H, W] → [N*D, C, H, W]
+            input_4d = _lowerings[aten.reshape.default](
+                input_perm, [N * D, C_in, H, W]
+            )
             weight_4d = _lowerings[aten.reshape.default](
                 weight, [C_out, C_in_per_g, KH, KW]
             )
@@ -901,18 +963,19 @@ def _register_conv_and_pool_lowerings() -> None:
                 input_4d, weight_4d, bias, [sH, sW], [pH, pW], [dH, dW], g
             )
             if result_4d is NotImplemented:
-                return NotImplemented
-            # Clone before reshaping back to avoid SqueezeView stride-length
-            # assertion failures (same pattern as Conv1d lowering).
-            result_4d = _lowerings[aten.clone.default](result_4d)
-            # H_out_actual / W_out_actual are passed straight into
-            # the reshape size list — sympy expressions flow through
-            # without coercion.
+                raise NotImplementedError(
+                    "vulkan conv3d: conv2d sub-lowering declined"
+                )
+            # result_4d: [N*D, C_out, H_out, W_out]
+            # Reshape back: [N*D, C_out, H_out, W_out] → [N, D_out, C_out, H_out, W_out]
             H_out_actual = result_4d.get_size()[2]
             W_out_actual = result_4d.get_size()[3]
-            return _lowerings[aten.reshape.default](
-                result_4d, [N, C_out, D_out, H_out_actual, W_out_actual]
+            result_5d = _lowerings[aten.reshape.default](
+                result_4d, [N, D_out, C_out, H_out_actual, W_out_actual]
             )
+            # Permute back: [N, D_out, C_out, H_out, W_out] → [N, C_out, D_out, H_out, W_out]
+            result_5d = _lowerings[aten.permute.default](result_5d, [0, 2, 1, 3, 4])
+            return _lowerings[aten.clone.default](result_5d)
 
         # KD > 1 or dD > 1 or sD > 1 — full 3D kernel support via native
         # Conv3d template (MODEL.1). Delegates to the dedicated
@@ -964,9 +1027,9 @@ def _register_conv_and_pool_lowerings() -> None:
         from torch._inductor.lowering import constant_boundary_condition
 
         if bool(ceil_mode):
-            return NotImplemented
+            raise NotImplementedError("vulkan max_pool2d: ceil_mode")
         if len(input.get_size()) != 4:
-            return NotImplemented
+            raise NotImplementedError("vulkan max_pool2d: non-4D input")
 
         kH = int(kernel_size[0])
         kW = int(kernel_size[-1] if len(kernel_size) > 1 else kernel_size[0])

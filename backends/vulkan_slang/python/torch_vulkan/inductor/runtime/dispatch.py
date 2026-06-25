@@ -384,6 +384,7 @@ def compile_and_dispatch(
     entry: str = "computeMain",
     cache_key: str = "",
     spec_constants: list[tuple[int, int]] | None = None,
+    pc_layout_hash: str | None = None,
 ) -> None:
     """Compile Slang source (cached) and dispatch in one call.
 
@@ -393,12 +394,17 @@ def compile_and_dispatch(
 
     CG.M15: ``spec_constants`` are (constant_id, value) pairs for
     ``[[vk::constant_id]]`` overrides at pipeline-creation time.
+
+    SP.3: ``pc_layout_hash`` is mixed into the SPIR-V content hash so a
+    push-constant struct layout change invalidates cached SPIR-V.
     """
     if not cache_key:
         raise ValueError("compile_and_dispatch requires a non-empty cache_key")
     from .slangc import compile_slang_to_spirv
 
-    spv = compile_slang_to_spirv(src, entry=entry, cache_key=cache_key)
+    spv = compile_slang_to_spirv(
+        src, entry=entry, cache_key=cache_key, pc_layout_hash=pc_layout_hash
+    )
     dispatch(
         cache_key,
         spv,
@@ -641,7 +647,7 @@ def _maybe_autotune_wg(
             orig_wg = _extract_wg_from_numthreads(orig_nt)
             if cached_wg != orig_wg:
                 tuned = _build_kernel_for_wg(
-                    src, orig_nt, cached_wg, key, n_pc, n_outputs,
+                    src, orig_nt, cached_wg, f"{key}_wg{cached_wg}", n_pc, n_outputs,
                     dispatch_fn, pc_buf, pc_pack_into,
                 )
                 if tuned is not None:
@@ -952,7 +958,7 @@ def _autotune_kernel_wg(
         if cached_wg != _extract_wg_from_numthreads(orig_nt):
             # Recompile with cached winner
             return _build_kernel_for_wg(
-                src, orig_nt, cached_wg, key, n_pc, n_outputs,
+                src, orig_nt, cached_wg, f"{key}_wg{cached_wg}", n_pc, n_outputs,
                 dispatch_fn, pc_buf, pc_pack_into,
             )
 
@@ -1007,6 +1013,7 @@ def _autotune_kernel_wg(
 
     # Cache the winner
     _WG_AUTOTUNE_CACHE[src_hash] = best_wg
+    _save_wg_cache(src_hash, best_wg)
 
     # If the original was fastest, return None (caller uses default)
     if best_wg == orig_wg:

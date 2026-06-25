@@ -694,8 +694,14 @@ class VulkanOverrides(OpOverrides):
 
     @staticmethod
     def index_expr(expr, dtype):
+        # codegen_indexing triggers range-tree entry codegen (declarations +
+        # loop-body assignments) for every symbol in expr, and returns a
+        # simplified form.  kexpr() bypasses this, so without this call an
+        # entry referenced only here (e.g. r0_1 channel dim in depthwise conv
+        # bwd) would be referenced but never declared → slangc E30015.
+        simplified = V.kernel.codegen_indexing(expr)
         with V.kernel._vk_printer.subscript():
-            return f"((int)({V.kernel.kexpr(expr)}))"
+            return f"((int)({V.kernel.kexpr(simplified)}))"
 
     @staticmethod
     def indirect_indexing(index_var, size, check=True, wrap_neg=True):

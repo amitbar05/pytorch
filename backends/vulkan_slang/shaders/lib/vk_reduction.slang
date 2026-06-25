@@ -807,39 +807,39 @@ public uint vk_wg_reduce_xor_2d(uint value, uint tx, uint flat_idx, uint total, 
     return vk_wg_reduce_xor(value, flat_idx, total, simd);
 }
 
-// ── argmax / argmin workgroup reduction (float2) ──────────────────────
+// ── argmax / argmin workgroup reduction (uint2) ───────────────────────
 //
-// Codegen packs (value, index) as `float2(val, float(idx))` and expects
-// the same float2 back — the caller extracts `.x` (val) and `.y` (idx).
-// We mirror the existing `wg_argmax(ArgPair, …)` pattern but accept /
-// return `float2` to match the codegen string.
+// CG.1 fix: codegen now packs (value, index) as `uint2(asuint(val), idx)`
+// so the 32-bit index is stored losslessly (float cast truncated to 24-bit
+// mantissa for indices > 16M). Caller extracts `asfloat(result.x)` for
+// the value and `result.y` directly for the index.
 //
-// On tie (acc.val == other.val) we propagate the *smaller* index for both
-// argmax and argmin — this matches PyTorch's behaviour (first occurrence
-// wins on ties).
+// On tie (asfloat(acc.x) == asfloat(other_val)) we propagate the *smaller*
+// index for both argmax and argmin — matches PyTorch behaviour (first
+// occurrence wins on ties).
 //
 // CG.M16: WaveReadLaneAt requires subgroup_shuffle; RDNA1 (wave64): yes.
 
 // +32 bank-conflict padding (matches _wg_arg_smem_* layout).
-groupshared float _wg_argxx_smem_val[1024 + 32];
-groupshared float _wg_argxx_smem_idx[1024 + 32];
+groupshared uint _wg_argxx_smem_val[1024 + 32];  // float bits via asuint
+groupshared uint _wg_argxx_smem_idx[1024 + 32];  // 32-bit index, lossless
 
 [require(spirv, subgroup_shuffle)]
 [ForceInline]
-public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
+public uint2 vk_wg_reduce_argmax(uint2 v, uint tid, uint red_size, uint simd)
 {
     if (red_size == 1u) return v;
     uint lane = tid % simd;
     uint wave_id = tid / simd;
 
-    float2 acc = v;
+    uint2 acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
         uint _src = (lane + offset) & (simd - 1u);
-        float other_val = WaveReadLaneAt(acc.x, _src);
-        float other_idx = WaveReadLaneAt(acc.y, _src);
+        uint other_val = WaveReadLaneAt(acc.x, _src);
+        uint other_idx = WaveReadLaneAt(acc.y, _src);
         if (lane + offset < red_size) {
-            bool take = (other_val > acc.x) ||
-                        (other_val == acc.x && other_idx < acc.y);
+            bool take = (asfloat(other_val) > asfloat(acc.x)) ||
+                        (asfloat(other_val) == asfloat(acc.x) && other_idx < acc.y);
             if (take) {
                 acc.x = other_val;
                 acc.y = other_idx;
@@ -857,16 +857,16 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
     GroupMemoryBarrierWithGroupSync();
 
     if (wave_id == 0u) {
-        float2 r;
-        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : -3.402823e38f;
-        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
+        uint2 r;
+        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : asuint(-3.402823e38f);
+        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0u;
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
             uint _src = (lane + offset) & (simd - 1u);
-            float other_val = WaveReadLaneAt(r.x, _src);
-            float other_idx = WaveReadLaneAt(r.y, _src);
+            uint other_val = WaveReadLaneAt(r.x, _src);
+            uint other_idx = WaveReadLaneAt(r.y, _src);
             if (lane + offset < n_waves) {
-                bool take = (other_val > r.x) ||
-                            (other_val == r.x && other_idx < r.y);
+                bool take = (asfloat(other_val) > asfloat(r.x)) ||
+                            (asfloat(other_val) == asfloat(r.x) && other_idx < r.y);
                 if (take) {
                     r.x = other_val;
                     r.y = other_idx;
@@ -878,7 +878,7 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    float2 result;
+    uint2 result;
     result.x = _wg_argxx_smem_val[0];
     result.y = _wg_argxx_smem_idx[0];
     return result;
@@ -886,20 +886,20 @@ public float2 vk_wg_reduce_argmax(float2 v, uint tid, uint red_size, uint simd)
 
 [require(spirv, subgroup_shuffle)]
 [ForceInline]
-public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
+public uint2 vk_wg_reduce_argmin(uint2 v, uint tid, uint red_size, uint simd)
 {
     if (red_size == 1u) return v;
     uint lane = tid % simd;
     uint wave_id = tid / simd;
 
-    float2 acc = v;
+    uint2 acc = v;
     for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
         uint _src = (lane + offset) & (simd - 1u);
-        float other_val = WaveReadLaneAt(acc.x, _src);
-        float other_idx = WaveReadLaneAt(acc.y, _src);
+        uint other_val = WaveReadLaneAt(acc.x, _src);
+        uint other_idx = WaveReadLaneAt(acc.y, _src);
         if (lane + offset < red_size) {
-            bool take = (other_val < acc.x) ||
-                        (other_val == acc.x && other_idx < acc.y);
+            bool take = (asfloat(other_val) < asfloat(acc.x)) ||
+                        (asfloat(other_val) == asfloat(acc.x) && other_idx < acc.y);
             if (take) {
                 acc.x = other_val;
                 acc.y = other_idx;
@@ -917,16 +917,16 @@ public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
     GroupMemoryBarrierWithGroupSync();
 
     if (wave_id == 0u) {
-        float2 r;
-        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : 3.402823e38f;
-        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0.0f;
+        uint2 r;
+        r.x = (tid < n_waves) ? _wg_argxx_smem_val[tid] : asuint(3.402823e38f);
+        r.y = (tid < n_waves) ? _wg_argxx_smem_idx[tid] : 0u;
         for (uint offset = simd >> 1u; offset > 0u; offset >>= 1u) {
             uint _src = (lane + offset) & (simd - 1u);
-            float other_val = WaveReadLaneAt(r.x, _src);
-            float other_idx = WaveReadLaneAt(r.y, _src);
+            uint other_val = WaveReadLaneAt(r.x, _src);
+            uint other_idx = WaveReadLaneAt(r.y, _src);
             if (lane + offset < n_waves) {
-                bool take = (other_val < r.x) ||
-                            (other_val == r.x && other_idx < r.y);
+                bool take = (asfloat(other_val) < asfloat(r.x)) ||
+                            (asfloat(other_val) == asfloat(r.x) && other_idx < r.y);
                 if (take) {
                     r.x = other_val;
                     r.y = other_idx;
@@ -938,7 +938,7 @@ public float2 vk_wg_reduce_argmin(float2 v, uint tid, uint red_size, uint simd)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    float2 result;
+    uint2 result;
     result.x = _wg_argxx_smem_val[0];
     result.y = _wg_argxx_smem_idx[0];
     return result;
