@@ -648,23 +648,11 @@ Fix: correct the stride order and preserve `ReinterpretView` nodes.
 S3.5 preserving `ReinterpretView` exposes the long-standing storage-offset bug (S3.5a)
 and the grouped-conv push-constant mismatch (S3.5c). See defect table above.
 
-#### S3.5a — 🔴 OPEN: Fix storage-offset in `bind_buffers` (causal conv1d)
+#### S3.5a — ✅ FIXED: Fix storage-offset in `bind_buffers` (causal conv1d)
 
-`VkDescriptorBufferInfo.offset` is hardcoded to 0. After S3.5 preserves
-`ReinterpretView` nodes, the Inductor wrapper emits `reinterpret_tensor(buf, ..., non_zero_offset)`
-calls — but all of them bind the same start of the VkBuffer. For causal depthwise conv
-(groups=C), all 16 per-group dispatches write to position 0.
-
-**C++ fix designed (in `git stash@{0}`):**
-- `csrc/ops/dispatch.h`: add `VkDeviceSize offset` to `BufferInfo`
-- `csrc/ops/dispatch.cpp`: `get_buffer_info()` computes `off_bytes = storage_offset * element_size`,
-  recovers the base VkBuffer via pointer arithmetic; `dispatch_shader` / `dispatch_shader_indexed`
-  thread offsets through; descriptor-set cache key includes offsets
-- `csrc/vulkan/DescriptorSet.h/cpp`: `bind_buffers` offset overload sets `buf_info.offset = off`,
-  `buf_info.range = size - off`
-
-**To close:** `git stash pop`, rebuild C++ (`TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=3 python setup.py build_ext --inplace`), verify `test_m6_causal_conv1d_matches_cpu`.
-- **Exit**: `test_m6_causal_conv1d_matches_cpu` ✅
+Fixed in PR #3 (merged 2026-06-24). `csrc/ops/dispatch.cpp:get_buffer_info` now
+threads `storage_offset * element_size` through `bind_buffers → VkDescriptorBufferInfo.offset`.
+`test_m6_causal_conv1d_matches_cpu` ✅
 
 #### S3.5b — ✅ CLOSED 2026-06-22: Conv1d backward x.grad=0
 
