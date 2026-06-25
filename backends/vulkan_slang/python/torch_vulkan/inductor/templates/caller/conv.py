@@ -329,16 +329,27 @@ def _slang_tile_conv2d(
     cache_key = (
         f"slang_conv2d_{tile_w}x{tile_h}x{tile_c}"
         f"_t{threads_w}x{threads_h}_{dtype_s}"
-        f"{'_' + epilogue if epilogue else ''}_msf5"
+        f"_k{kH}x{kW}_s{sH}x{sW}_p{pH}x{pW}_d{dH}x{dW}_g{groups}"
+        f"{'_' + epilogue if epilogue else ''}_scpc1"
     )
 
     # CG.M15: spec_constants for [[vk::constant_id]] overrides.
+    # tile dims (30-34) + shape params promoted from PC (35-43).
     spec_constants = [
-        (30, tile_w),
-        (31, tile_h),
-        (32, tile_c),
-        (33, threads_w),
-        (34, threads_h),
+        (30, int(tile_w)),
+        (31, int(tile_h)),
+        (32, int(tile_c)),
+        (33, int(threads_w)),
+        (34, int(threads_h)),
+        (35, int(groups)),
+        (36, int(kH)),
+        (37, int(kW)),
+        (38, int(sH)),
+        (39, int(sW)),
+        (40, int(pH)),
+        (41, int(pW)),
+        (42, int(dH)),
+        (43, int(dW)),
     ]
 
     # Ensure contiguous for direct buffer access
@@ -347,7 +358,9 @@ def _slang_tile_conv2d(
     if not weight_t.is_contiguous():
         weight_t = weight_t.contiguous()
 
-    # Pack push constants: 15 uint fields for no-bias, 17 for bias.
+    # Pack push constants: PC now 20 uints = 80 bytes.
+    # kH/kW/sH/sW/pH/pW/groups/dH/dW and tile_w/tile_h/tile_c moved to
+    # spec_constants above (PC -48 B vs old 128 B layout).
     # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
     # AOT-passed ``SymInt`` shape / stride metadata coerces cleanly.
     common_fields = (
@@ -358,15 +371,6 @@ def _slang_tile_conv2d(
         int(iW),
         int(oH),
         int(oW),
-        int(kH),
-        int(kW),
-        int(sH),
-        int(sW),
-        int(pH),
-        int(pW),
-        int(1),  # groups (groups==1 supported by this template)
-        int(dH),
-        int(dW),
         int(input_t.stride(0)),
         int(input_t.stride(1)),
         int(input_t.stride(2)),
@@ -379,13 +383,7 @@ def _slang_tile_conv2d(
         int(out.stride(1)),
         int(out.stride(2)),
         int(out.stride(3)),
-        int(tile_w),
-        int(tile_h),
-        int(tile_c),
     )
-    # M-SF.4: PC is exactly 32 uints = 128 bytes (Vulkan min maxPushConstantsSize).
-    # The _pad field was removed — it pushed the struct to 132 bytes, which
-    # some drivers silently truncate, dropping stride_bias and corrupting bias adds.
     bias_1d = (
         bias.view(-1)
         if has_bias
@@ -393,7 +391,7 @@ def _slang_tile_conv2d(
     )
     stride_bias = int(bias_1d.stride(0)) if has_bias else 0
     pc = struct.pack(
-        "32I",
+        "20I",
         *common_fields,
         stride_bias,
     )

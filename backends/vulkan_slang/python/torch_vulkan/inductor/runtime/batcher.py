@@ -170,20 +170,24 @@ class DispatchBatcher:
         self._blocked = still_blocked
 
     def _flush(self):
-        """Submit all pending dispatches.
+        """Submit all pending dispatches, then re-enter batch mode.
 
-        When C++ batch mode is active (M17.5), we permanently exit batch
-        mode so the replayed dispatches are actually submitted to the GPU
-        queue (via per-8-dispatch auto-flush).  We do NOT re-enter batch
-        mode because the extern kernel that triggered this flush must
-        execute AFTER the replayed dispatches, and restarting batch mode
-        would suppress auto-flush again — causing the extern kernel and
-        the replayed dispatches to all accumulate in an un-submitted
-        command buffer.
+        When C++ batch mode is active (M17.5), submits the accumulated
+        command buffer via ``_end_batch()``, replays pending dispatches
+        in auto-flush mode (so the results are on-GPU before the caller's
+        extern kernel reads them), and then immediately re-enters batch
+        mode via ``_begin_batch()``.  This means direct-dispatch calls
+        that follow the flush point (the extern kernel itself plus any
+        subsequent ``_jit_dispatch`` calls) accumulate in a fresh command
+        buffer that is submitted by ``__exit__``'s ``_end_batch()`` call
+        or by the next ``_flush()`` — rather than each doing a separate
+        ``vkQueueSubmit``.
 
-        The ``__exit__`` handler sees ``_batch_active=False`` and skips
-        its own ``_end_batch()`` call (already done here).  Remaining
-        dispatches for this graph use auto-flush mode.
+        The old concern ("do NOT re-enter batch mode because replayed
+        dispatches would accumulate unsent") does not apply here: we
+        restart batch mode AFTER the replay, so those dispatches have
+        already been issued in auto-flush mode before the new batch
+        begins.
 
         Falls back to sequential individual dispatches with per-8-dispatch
         auto-flush when the C++ batch functions are unavailable.
@@ -192,15 +196,25 @@ class DispatchBatcher:
             return
 
         if self._batch_active and self._end_batch is not None:
-            # v12/PERF.1: Exit C++ batch mode permanently.  The
-            # accumulated command buffer is submitted (if non-empty);
-            # replayed dispatches use auto-flush, and subsequent extern
-            # kernels also use auto-flush — ensuring correct queue order.
+            # Submit the accumulated command buffer (may be empty if no
+            # direct dispatches happened since __enter__ / last _flush).
             self._end_batch()
             self._batch_active = False
+            # Replay pending dispatches in auto-flush mode.  The caller's
+            # extern kernel (the sync point that triggered this flush) will
+            # run after we return, reading from these now-submitted results.
             for kernel_handle, dispatch_args in self._pending:
                 kernel_handle(*dispatch_args)
             self._pending.clear()
+            # Re-enter batch mode so direct dispatches after the sync point
+            # (the extern kernel and subsequent _jit_dispatch calls) accumulate
+            # in a fresh command buffer instead of doing per-dispatch submits.
+            if self._begin_batch is not None:
+                try:
+                    self._begin_batch()
+                    self._batch_active = True
+                except Exception:
+                    self._batch_active = False
         else:
             # Sequential replay: no batch mode or no C++ batch functions.
             for kernel_handle, dispatch_args in self._pending:
