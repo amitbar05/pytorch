@@ -50,6 +50,8 @@ from .common import (  # noqa: F401
     _cache_by_hash,
     _cache_by_key,
     _cache_lock,
+    _compile_exceptions,
+    _compile_exceptions_lock,
     _default_max_workers,
     _device_subgroup_size_tag,
     _get_async_pool,
@@ -467,6 +469,22 @@ def _compile_slang_to_spirv_inner(
     return spv
 
 
+def _on_async_compile_done(future, hash_key):
+    """SP.1: Done-callback for async compile Futures. Extracts the result,
+    stores any exception, then signals the per-key event so waiters unblock."""
+    exc = None
+    try:
+        future.result()  # raises if worker raised; return value already in _cache_by_hash
+    except Exception as e:
+        exc = e
+    with _compile_exceptions_lock:
+        _compile_exceptions[hash_key] = exc
+    with _in_flight_lock:
+        ev = _in_flight.pop(hash_key, None)
+        if ev is not None:
+            ev.set()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Public API (unchanged signatures)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -551,10 +569,24 @@ def compile_slang_to_spirv(
     try:
         if _PARALLEL_COMPILE and _ASYNC_COMPILE and not _is_in_pool_worker():
             pool = _get_async_pool()
-            spv = pool.submit(
+            future = pool.submit(
                 _wrap_pool_worker(_compile_slang_to_spirv_inner),
                 src, entry, hash_key, include_paths, config_key,
-            ).result()
+            )
+            future.add_done_callback(
+                lambda f, hk=hash_key: _on_async_compile_done(f, hk)
+            )
+            event.wait()  # blocks on event (not Future); unblocked by done-callback
+            with _compile_exceptions_lock:
+                exc = _compile_exceptions.pop(hash_key, None)
+            if exc is not None:
+                raise exc
+            spv = _cache_by_hash.get(hash_key)
+            if spv is None:
+                raise RuntimeError(
+                    f"slangc async compile for {hash_key[:8]} completed "
+                    f"but did not populate _cache_by_hash"
+                )
         else:
             spv = _compile_slang_to_spirv_inner(
                 src, entry, hash_key, include_paths, config_key

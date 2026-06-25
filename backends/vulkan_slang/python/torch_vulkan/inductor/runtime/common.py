@@ -274,6 +274,10 @@ _spv_baselines_loaded: bool = False
 _in_flight: dict[str, threading.Event] = {}
 _in_flight_lock = threading.Lock()
 
+# SP.1: carries compilation exceptions from pool workers back to waiters.
+_compile_exceptions: dict[str, Exception] = {}
+_compile_exceptions_lock = threading.Lock()
+
 # TRAIN.8 / M21: guards _cache_by_key and _cache_by_hash for thread-safety.
 _cache_lock = threading.Lock()
 
