@@ -43100,6 +43100,121 @@ class TestM181WgReduceHelpers:
         torch.testing.assert_close(got, expected)
 
 
+class TestCG1ArgmaxUint2Precision:
+    """CG.1 — argmin/argmax index stored as uint2, not float2.
+
+    float2 encoding truncated the index to 24-bit mantissa precision
+    (float32 can only represent integers exactly up to 2^24 = 16777216).
+    Any tensor with > 16M elements would silently return a wrong index.
+
+    Fix: vk_wg_reduce_argmax/argmin now accept/return uint2 where:
+      - x = asuint(float_value)  (bitcast, lossless round-trip via asfloat)
+      - y = uint32 index         (exact, no precision loss)
+    """
+
+    def test_vk_wg_reduce_argmin_large_index(self):
+        """Index 16777217 (> 2^24) must survive the workgroup reduction losslessly.
+
+        With the old float2 encoding: float(16777217) rounds to 16777216.0
+        (the nearest representable float — 2^24 + 1 is not exactly representable).
+        The reduced output would have y == 16777216, i.e. off by one.
+
+        With uint2: y == 16777217 exactly.
+        """
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        HIGH_IDX = 16777217  # 2^24 + 1 — not exactly representable as float32
+
+        src = """
+import vk_reduction;
+[[vk::binding(0, 0)]] RWStructuredBuffer<uint> out_val_bits;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> out_idx;
+[[vk::push_constant]] cbuffer Push { uint high_idx; };
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 lid : SV_GroupThreadID) {
+    // Thread 0 has the minimum (-1.0f) with the large index.
+    // All other threads have 0.0f with their thread id as index.
+    float val = (lid.x == 0u) ? -1.0f : 0.0f;
+    uint  idx = (lid.x == 0u) ? high_idx : lid.x;
+    uint2 pair = uint2(asuint(val), idx);
+    uint2 result = vk_wg_reduce_argmin(pair, lid.x, 64u, 64u);
+    if (lid.x == 0u) {
+        out_val_bits[0] = result.x;
+        out_idx[0] = result.y;
+    }
+}
+"""
+        out_val = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        out_idx = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        compile_and_dispatch(
+            src,
+            tensors=[out_val, out_idx],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", HIGH_IDX),
+            entry="computeMain",
+            cache_key="cg1_argmin_uint2_v1",
+            num_outputs=2,
+        )
+        import math
+
+        got_val = math.frombytes(out_val.cpu()[0].view(torch.uint8).numpy().tobytes(), "little")
+        got_idx = out_idx.cpu()[0].item()
+        assert got_idx == HIGH_IDX, (
+            f"CG.1 precision: got index {got_idx}, expected {HIGH_IDX}. "
+            f"Float would round 16777217 to {int(float(HIGH_IDX))}."
+        )
+        assert abs(got_val - (-1.0)) < 1e-6, f"Expected val=-1.0, got {got_val}"
+
+    def test_vk_wg_reduce_argmax_large_index(self):
+        """Mirror of argmin test — argmax also uses uint2 encoding."""
+        import struct
+
+        from torch_vulkan.inductor.runtime import compile_and_dispatch
+
+        HIGH_IDX = 16777219  # 2^24 + 3 — not exactly representable as float32
+
+        src = """
+import vk_reduction;
+[[vk::binding(0, 0)]] RWStructuredBuffer<uint> out_val_bits;
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> out_idx;
+[[vk::push_constant]] cbuffer Push { uint high_idx; };
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void computeMain(uint3 lid : SV_GroupThreadID) {
+    float val = (lid.x == 0u) ? 1.0f : 0.0f;
+    uint  idx = (lid.x == 0u) ? high_idx : lid.x;
+    uint2 pair = uint2(asuint(val), idx);
+    uint2 result = vk_wg_reduce_argmax(pair, lid.x, 64u, 64u);
+    if (lid.x == 0u) {
+        out_val_bits[0] = result.x;
+        out_idx[0] = result.y;
+    }
+}
+"""
+        out_val = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        out_idx = torch.zeros(1, dtype=torch.int32, device="vulkan:0")
+        compile_and_dispatch(
+            src,
+            tensors=[out_val, out_idx],
+            wg_x=1,
+            wg_y=1,
+            wg_z=1,
+            push_constants=struct.pack("I", HIGH_IDX),
+            entry="computeMain",
+            cache_key="cg1_argmax_uint2_v1",
+            num_outputs=2,
+        )
+        got_idx = out_idx.cpu()[0].item()
+        assert got_idx == HIGH_IDX, (
+            f"CG.1 precision: got index {got_idx}, expected {HIGH_IDX}."
+        )
+
+
 class TestM211DeviceProfile:
     """M21.1 — device profile microbench + cache.
 
@@ -64655,6 +64770,42 @@ class TestProfileDrivenPersistentCap:
 
         cap = sched_mod._persistent_pointwise_numel_cap()
         assert cap <= 65536, f"S0.1: cap must be <= 65536 (max), got {cap}"
+
+
+class TestAutotuneWorkgroupVariants:
+    """S0.1 Slice A — get_wg_size_variants caps candidates at device max_workgroup_size."""
+
+    def test_wg_variants_capped_at_device_max(self, monkeypatch):
+        """S0.1A: at level-2 autotune, pointwise candidates exclude sizes above device limit."""
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setenv("TORCH_VULKAN_MAX_AUTOTUNE", "2")
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 512 if key == "max_workgroup_size" else fallback)
+        variants = get_wg_size_variants(is_reduction=False)
+        assert 1024 not in variants, f"1024 should be excluded for max_wg=512, got {variants}"
+        assert 512 in variants, f"512 should be included for max_wg=512, got {variants}"
+
+    def test_wg_variants_reduction_capped(self, monkeypatch):
+        """S0.1A: reduction candidates are also capped at device limit."""
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 128 if key == "max_workgroup_size" else fallback)
+        variants = get_wg_size_variants(is_reduction=True)
+        assert all(w <= 128 for w in variants), f"All reduction variants should be ≤128 for max_wg=128, got {variants}"
+        assert len(variants) > 0, "Should return at least one variant"
+
+    def test_wg_variants_low_autotune_capped(self, monkeypatch):
+        """S0.1A: level<2 single-candidate path also respects device cap."""
+        import os
+        from torch_vulkan.inductor import device_profile as dp_mod
+        from torch_vulkan.inductor.autotune import get_wg_size_variants
+
+        monkeypatch.setattr(dp_mod, "profile_limit", lambda key, fallback=None: 128 if key == "max_workgroup_size" else fallback)
+        monkeypatch.setenv("TORCH_VULKAN_MAX_AUTOTUNE", "1")
+        variants = get_wg_size_variants(is_reduction=False)
+        assert all(w <= 128 for w in variants), f"Level-1 variants should be ≤128, got {variants}"
 
 
 class TestAOTIAddmmBmmPC:
