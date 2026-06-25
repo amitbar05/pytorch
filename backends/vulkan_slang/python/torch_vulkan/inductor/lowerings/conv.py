@@ -648,8 +648,6 @@ def _register_conv_and_pool_lowerings() -> None:
     # _VulkanConv2dExternKernel.  Replaces the default
     # extern_kernels.convolution path (→ eager C++ Vulkan) with the
     # Slang template dispatch for groups==1, non-transposed, 4D input.
-    # For groups>1 or transposed conv, returns NotImplemented so the
-    # existing fallback paths handle them.
     # ═════════════════════════════════════════════════════════════════════
     @register_lowering(aten.convolution.default, type_promotion_kind=None)
     def _vulkan_aten_convolution(
@@ -657,7 +655,9 @@ def _register_conv_and_pool_lowerings() -> None:
         transposed, output_padding, groups,
     ):
         if bool(transposed):
-            raise NotImplementedError("vulkan convolution: transposed conv")
+            # T4.12: interceptor not yet wired; conv_transpose.py:308 NOTE
+            # explains the slangc segfault blocker on the flip+permute path.
+            raise NotImplementedError("vulkan convolution: transposed conv (T4.12)")
         if input.get_device().type != "vulkan":
             raise NotImplementedError("vulkan convolution: non-vulkan device")
         # Route 5D (conv3d) through the reshape-to-conv2d path; the
