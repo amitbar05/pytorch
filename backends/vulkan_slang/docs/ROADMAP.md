@@ -1430,9 +1430,10 @@ producing garbage `mean` and `m2`.
 
 - **Files**: `kernel/pointwise_vec4_mixin.py` — 1-line insert before `return True`
   of the packed16 block.
-- **Exit**: new `TestPacked16Vec4WelfordGuard` in `tests/test_inductor_regression.py`
+- **Exit**: `TestPacked16WelfordGuard` in `tests/test_inductor_regression.py` (merged in PR #12 under name `TestPacked16WelfordGuard`)
   — fp16 GroupNorm (shape `[1,16,8,8]`, `num_groups=4`) forward matches CPU;
   emitted Slang source does **not** contain `_pvw_in_` / `_pvw_out_` identifiers.
+  2/2 ✅ VERIFIED 2026-06-26.
 
 ### CG.4 — vec4 eligibility false-positive from `\w+` regex on composite index
 
@@ -1996,7 +1997,7 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | 3 | SP.B3 | `python/torch_vulkan/inductor/runtime/dispatch.py:955-957` | 1 | 🔴 HIGH | ✅ FIXED 2026-06-25 `eff9c0d9a4f` |
 | 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
 | 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
-| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `6d5cb00803f` (wg_argmax NUICF + wg_argmin) |
+| 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ MERGED PR #6 2026-06-24 `ac686c68fee` (packed16+welford guard; `TestPacked16WelfordGuard` 2/2 ✅) |
 | 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | ✅ FIXED (already in `dc7b4bc72e2`, 6/6 tests pass) |
 | 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 (bf16 wave32 guard, `TestBf16PackedStoreWave32` ✅) |
 | 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |

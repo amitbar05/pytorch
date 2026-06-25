@@ -14,7 +14,9 @@ Checks performed (all O(n) in source length):
      not exceed the device limit (default 65536 bytes for RDNA1 — full LDS).
   5. **Numthreads product** — ``[numthreads(X, Y, Z)]`` product must be
      ≤ device limit (default 1024 for RDNA1).
-  6. **Workgroup size advisory** — wave-size alignment check (M27).
+  6. **Workgroup size advisory** — wave-size alignment check (M27); advisory
+     only, does NOT block compilation (use ``_validate_workgroup_size``
+     directly to surface as a warning during autotune candidate rejection).
   7. **Push-constant budget** — struct size ≤ 128 bytes (Vulkan minimum).
   8. **BwdDiff annotation scan** — ``[Differentiable]``/``[BackwardDerivative]``
      pairing check.
@@ -72,8 +74,9 @@ def validate_slang_source(src: str) -> list[ValidationIssue]:
         issues.append(ValidationIssue("groupshared", msg))
     for msg in _check_numthreads_product(src):
         issues.append(ValidationIssue("numthreads", msg))
-    for msg in _validate_workgroup_size(src):
-        issues.append(ValidationIssue("workgroup", msg))
+    # M27 wave-alignment is ADVISORY — partial waves waste lanes but are
+    # not incorrect.  Do not add to hard-error issues; call
+    # _validate_workgroup_size() directly for advisory/autotune purposes.
     for msg in _check_push_constant_size(src):
         issues.append(ValidationIssue("push_constant", msg))
     for msg in _check_differentiable_pairs(src):
