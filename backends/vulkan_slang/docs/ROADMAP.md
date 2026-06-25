@@ -142,6 +142,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S3.5b** | **Conv1d backward x.grad=0** (`test_m6_conv1d_backward_matches_cpu` + `test_s3_5b_conv1d_backward_grad_input_not_primal`): Root cause was AoT backward graph buffer-reuse aliasing: `input_4d = input.unsqueeze(-1)` created a dead intermediate that Inductor's memory planner reused for `conv2d_backward[0]` (grad-input). Since `input_4d` is a view of `primals_3` (primal x), grad-input aliased x, returning x itself as x.grad. **Fix**: new `conv1d_backward_core` opaque non-autograd custom op takes 3-D tensors directly (no Python-side unsqueeze), with a fake kernel deriving outputs from `input` (FT proxy) so FunctionalTensorMode produces fresh storage refs. Forward graph now saves `primals_3` as residual; backward graph uses it as a proper graph INPUT (not freed/reused). | ✅ **CLOSED 2026-06-22** — `fx_passes/eager/conv_backward.py` + `conv.py` + `lowerings/__init__.py` |
 | **S3.5c** | **Grouped conv wrong values** (`test_m6_conv1d_groups_matches_cpu`): two independent bugs. (1) Group 1 weight/bias slice has `storage_offset != 0`; bind_buffers used offset=0 → reads group-0 weights. (2) `pointwise_cat` merge kernel: `VulkanExprPrinter._print_Mul(Mul(32, Identity(Add(x1,-4))))` printed `"32 * -4 + x1"` (wrong) instead of `"32 * (x1 - 4)"` (correct) — sympy orders `-4` before `x1` in `Add`, so `_print_Identity` returned `"-4 + x1"` without parens, making `32 * -4 + x1` parse as `(32*-4)+x1 = -128+x1`. | ✅ **FIXED 2026-06-25** — (1) `templates/caller/conv.py:_slang_tile_conv2d` clones input/weight/bias when `storage_offset() != 0`. (2) `expr_printer.py:VulkanExprPrinter._print_Identity` added: wraps `Add` inner in `()` so Mul context gets correct parens. `test_m6_conv1d_groups_matches_cpu` ✅ |
 | **S3.5d** | **Conv2d backward `.item()` intentional GPU pipeline drain** (`fx_passes/eager/conv_backward.py:99`): `grad_bias[0].item()` is a deliberate sync barrier inserted to prevent stale gradient data in the FallbackKernel compiled path. NOT removable without a proper Vulkan submission fence in the C++ dispatch layer. Performance stall on every conv bwd+bias; correctness preserved. Proper fix: C++ submission tracking in `csrc/ops/dispatch.cpp`. | 🟡 **KNOWN LIMITATION** — intentional; fix requires C++ dispatch change |
+| **S3.5e** | **Depthwise conv backward two codegen bugs** (`test_m6_depthwise_conv_backward_matches_cpu`): (1) `VulkanOverrides.index_expr` bypassed `codegen_indexing()`, so range-tree sub-entries (e.g. `r0_1` channel dim) were never declared → slangc E30015. (2) `_lower_vulkan_conv2d_backward` returned `NotImplemented` for `groups != 1`; since `_has_real_vulkan_storage` is always False during `torch.compile`, all depthwise conv backward routes to `torch_vulkan.conv2d_backward.default`, hitting `LoweringException`. | ✅ **FIXED 2026-06-26** — `overrides.py:index_expr` now calls `codegen_indexing(expr)` first; `lowerings/conv_backward.py` uses `FallbackKernel.create()` for groups>1. Commits `9c3bf9adebc`, `26611cbd6b1`. `test_m6_depthwise_conv_backward_matches_cpu` ✅ |
 | **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **MERGED 2026-06-24** — PR #5, cross-review PASS (2 fix rounds) |
 | **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): float2 cast truncates 24-bit mantissa. | ✅ **FIXED 2026-06-25** — `kernel/reduction.py` + `shaders/lib/vk_reduction.slang`: encode as `uint2(asuint(val), idx)`, decode with `asfloat(pair.x)` + `pair.y`. Both argmax and argmin fixed. |
 | **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | ✅ **FIXED 2026-06-25** — `kernel/pointwise.py`: when `_packed16_vw_active` is True the WaveReadLaneAt body is replaced by a gtid.x vector write; `_pw_has_wave_ops` must not be set in that state. Guard added. `TestBf16PackedStoreWave32` ✅ |
@@ -728,6 +729,31 @@ pending Vulkan write leaves stale data in `grad_input`/`grad_weight`/`grad_bias`
   (submission/fence tracking)
 - **Exit**: No `.item()` in `_conv2d_backward_impl`; TSAN/valgrind + correctness
   test confirm no stale gradient under the compiled path.
+
+#### S3.5e — ✅ FIXED 2026-06-26: Depthwise conv backward — two codegen bugs unblocked
+
+Two independent bugs blocked `test_m6_depthwise_conv_backward_matches_cpu`:
+
+**Bug 1 — `index_expr` range-tree bypass** (`overrides.py`): `VulkanOverrides.index_expr`
+called `kexpr(expr)` directly, bypassing `codegen_indexing()`. That function's side
+effect is walking `expr.free_symbols` and triggering codegen for every range-tree
+`IterationRangesEntry` — emitting its declaration and loop-body assignment. For the
+depthwise conv backward multistage reduction, the channel-dim sub-entry `r0_1` was
+only referenced inside `index_expr` calls, so it was never declared → slangc E30015
+"undefined identifier 'r0_1'". Fix: call `codegen_indexing(expr)` first for the side
+effect, then pass the simplified return value to `kexpr()`.
+
+**Bug 2 — `LoweringException` for groups>1** (`lowerings/conv_backward.py`): during
+`torch.compile`, `_has_real_vulkan_storage()` always returns False (fake/tracing
+tensors), so the AOT Autograd autograd hook routes ALL depthwise conv backward through
+`torch_vulkan.conv2d_backward.default` regardless of groups. The lowering returned
+`NotImplemented` for `groups != 1`, which Inductor's `validate_ir()` converts to a
+`LoweringException`. Fix: replace `NotImplemented` with `FallbackKernel.create()` so
+Inductor emits an extern call to the eager op; at runtime the eager impl correctly
+dispatches to `aten.convolution_backward` → Vulkan C++ extension.
+
+- **Commits**: `9c3bf9adebc` (index_expr), `26611cbd6b1` (FallbackKernel)
+- **Exit**: `test_m6_depthwise_conv_backward_matches_cpu` ✅ 2026-06-26
 
 ### S3.3 — Wire persistent-kernel routing for large reductions (C3 is dead code)
 
