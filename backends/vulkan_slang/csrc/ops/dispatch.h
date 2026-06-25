@@ -9,6 +9,7 @@
 #include "../backend/Allocator.h"
 
 #include <torch/torch.h>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -90,6 +91,8 @@ struct DeviceRuntime {
     };
     std::unordered_map<DescSetCacheKey, VkDescriptorSet, DescSetCacheKeyHash>
         desc_set_cache;
+
+    mutable std::mutex desc_set_mutex_;
 };
 
 DeviceRuntime& get_runtime(uint32_t device_index = UINT32_MAX);
