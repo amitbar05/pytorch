@@ -237,6 +237,11 @@ void Context::init_instance() {
     // and ordinary tests get the WARNING+ floor.
     const char* du_env = getenv("TORCH_VULKAN_DEBUG_UTILS");
     bool debug_utils_full = du_env && strcmp(du_env, "0") != 0;
+    // S2.3: when the validation layer is active, also capture INFO-level
+    // BestPractices hints so validate=True warm-up surfaces them in-process.
+    if (validation_wanted) {
+        debug_utils_full = true;
+    }
     if (has_validation && has_debug_utils) {
         VkDebugUtilsMessengerCreateInfoEXT dbg_info{};
         dbg_info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
