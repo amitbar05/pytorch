@@ -502,7 +502,19 @@ def _get_conv2d_backward_custom_op_lowering():
         has_bias,
     ):
         if int(groups) != 1:
-            return NotImplemented
+            # Depthwise / grouped conv backward: fall back to the eager impl
+            # (which for groups>1 calls aten.convolution_backward → Vulkan
+            # dispatch).  Use FallbackKernel so Inductor emits an extern call
+            # rather than raising LoweringException for NotImplemented.
+            import torch.utils._pytree as _pytree
+            from torch._inductor.ir import FallbackKernel as _FBK, IRNode as _IRNode
+            packed = _FBK.create(
+                _torch_module.ops.torch_vulkan.conv2d_backward.default,
+                input, grad_output, weight, stride, padding, dilation, groups, has_bias,
+            )
+            def _wrap(x):
+                return x.wrap_for_lowering() if isinstance(x, _IRNode) else x
+            return _pytree.tree_map(_wrap, packed)
         if input.get_device().type != "vulkan":
             return NotImplemented
 
