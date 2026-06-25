@@ -513,7 +513,7 @@ def _register_conv_and_pool_lowerings() -> None:
         # to a Python int (the rest of the lowering tolerates either).
         from torch_vulkan.inductor.kernel.symbolic import get_static_numel
 
-        g = int(groups)
+        g = _static_int(groups)
         t1_sizes = input.get_size()
         w_sizes = weight.get_size()
         N = t1_sizes[0]

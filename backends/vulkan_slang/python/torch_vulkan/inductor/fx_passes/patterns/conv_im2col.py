@@ -23,12 +23,25 @@ from .registry import register_fx_pattern
 
 
 def _fx_to_int(x: Any) -> int:
-    """Extract a concrete int from a value that may be an FX Node or SymInt."""
+    """Extract a concrete int from a value that may be an FX Node or SymInt.
+
+    A grouped/depthwise conv is structurally specialized on its groups,
+    kernel extent, and channel counts — the per-group decomposition slices
+    a concrete number of channels and the ``slang_conv2d`` template bakes
+    the kernel window in. Under dynamic shapes these arrive as symbols, so
+    guard (specialize) them to a concrete value rather than crashing.
+    """
     if isinstance(x, Node):
         val = x.meta.get("val")
-        if val is not None:
-            return int(val)
-        raise ValueError(f"Cannot extract int from FX Node {x} with no val meta")
+        if val is None:
+            raise ValueError(f"Cannot extract int from FX Node {x} with no val meta")
+        x = val
+    if isinstance(x, int):
+        return x
+    if isinstance(x, torch.SymInt):
+        from torch.fx.experimental.symbolic_shapes import guard_int
+
+        return int(guard_int(x))
     return int(x)
 
 
@@ -56,7 +69,7 @@ def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]
             continue
         if inp_val.dim() != 4 or w_val.dim() != 4:
             continue
-        g = int(groups)
+        g = _fx_to_int(groups)
         if g < 1:
             continue
         # T4.12 / M6 Phase 2: groups==1 convs go through the dedicated
@@ -65,9 +78,9 @@ def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]
         # im2col+mm.
         if g == 1:
             continue
-        if int(w_val.shape[0]) % g != 0:
+        if _fx_to_int(w_val.shape[0]) % g != 0:
             continue
-        if int(inp_val.shape[1]) % g != 0:
+        if _fx_to_int(inp_val.shape[1]) % g != 0:
             continue
         # All checks passed — yield the match context.
         yield (
