@@ -60,8 +60,28 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     uint group_idx = row % params.num_groups;
     uint weight_base = group_idx * params.cpg;
 
-    // Step 1: Compute c1 and c2 simultaneously via strided partial sums
+    // Pass 1: c1 = (1/D) * sum(go_w).  Only go_w is accumulated here.
     float partial_c1 = 0.0f;
+    for (uint d = tid; d < D; d += 256) {
+        float go = args.grad_output[base + d];
+        float w = 1.0f;
+        if (params.has_weight != 0) {
+            uint channel_in_group = d / params.HxW;
+            w = args.weight[weight_base + channel_in_group];
+        }
+        partial_c1 += go * w;
+    }
+    smem[tid] = partial_c1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float c1 = smem[0] / float(D);
+
+    // Pass 2: c2 = (1/D) * sum(go_w * x_hat).  Separate barrier pass so the
+    // two accumulations never share FP rounding state — avoids the single-pass
+    // correlation error where positive/negative go_w*x_hat terms cancel.
     float partial_c2 = 0.0f;
     for (uint d = tid; d < D; d += 256) {
         float go = args.grad_output[base + d];
@@ -72,23 +92,14 @@ void computeMain(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
         }
         float go_w = go * w;
         float x_hat = (args.input[base + d] - mean_val) * rstd_val;
-        partial_c1 += go_w;
         partial_c2 += go_w * x_hat;
     }
-
-    smem[tid] = partial_c1;
     smem2[tid] = partial_c2;
     GroupMemoryBarrierWithGroupSync();
-
     for (uint s = 128; s > 0; s >>= 1) {
-        if (tid < s) {
-            smem[tid] += smem[tid + s];
-            smem2[tid] += smem2[tid + s];
-        }
+        if (tid < s) smem2[tid] += smem2[tid + s];
         GroupMemoryBarrierWithGroupSync();
     }
-
-    float c1 = smem[0] / float(D);
     float c2 = smem2[0] / float(D);
 
     // Step 2: Compute grad_input per-element
