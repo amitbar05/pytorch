@@ -641,7 +641,7 @@ def _maybe_autotune_wg(
             orig_wg = _extract_wg_from_numthreads(orig_nt)
             if cached_wg != orig_wg:
                 tuned = _build_kernel_for_wg(
-                    src, orig_nt, cached_wg, key, n_pc, n_outputs,
+                    src, orig_nt, cached_wg, f"{key}_wg{cached_wg}", n_pc, n_outputs,
                     dispatch_fn, pc_buf, pc_pack_into,
                 )
                 if tuned is not None:

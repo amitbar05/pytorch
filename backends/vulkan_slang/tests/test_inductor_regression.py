@@ -65312,6 +65312,95 @@ class TestSPB2WgCacheKeySuffix:
         default_key = "test_kernel"
         assert "_wg" not in default_key
 
+    def test_cached_wg_branch_passes_suffixed_key(self):
+        """SP.B3 — the cache-hit branch must rebuild with a _wg-suffixed key.
+
+        Before the fix, the ``src_hash in _WG_AUTOTUNE_CACHE`` branch passed
+        the original ``key`` to ``_build_kernel_for_wg``, so
+        ``compile_slang_to_spirv`` returned the cached *original* SPV instead
+        of compiling the re-numthreaded source — WG autotune was a silent
+        no-op for every warm-cache dispatch.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        # The cache-hit recompile must thread cached_wg into the key.
+        assert 'f"{key}_wg{cached_wg}"' in fn_src, (
+            "SP.B3 regression: cache-hit branch must pass "
+            'f"{key}_wg{cached_wg}" to _build_kernel_for_wg, not the bare key'
+        )
+        # The bare `key,` must no longer appear as a _build_kernel_for_wg arg.
+        assert "cached_wg, key, n_pc" not in fn_src, (
+            "SP.B3 regression: cache-hit branch still passes the original "
+            "unsuffixed key — dispatches cached original (unoptimized) SPV"
+        )
+
+    def test_training_mode_disk_cache_path_passes_suffixed_key(self):
+        """SP.B3 — the training-mode disk-cache path must also suffix the key.
+
+        ``_maybe_autotune_wg`` has a second ``_build_kernel_for_wg`` call on
+        the steady-state path: WG autotune disabled, winner loaded from the
+        SP.B4 disk cache.  This is exactly where a persisted winner is
+        consumed, so a bare ``key`` here means every training run after the
+        first dispatches the original unoptimized SPV — defeating SP.B4
+        persistence entirely.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._maybe_autotune_wg)
+        assert 'f"{key}_wg{cached_wg}"' in fn_src, (
+            "SP.B3 regression: training-mode disk-cache path must pass "
+            'f"{key}_wg{cached_wg}" to _build_kernel_for_wg, not the bare key'
+        )
+        assert "cached_wg, key, n_pc" not in fn_src, (
+            "SP.B3 regression: training-mode disk-cache path still passes the "
+            "original unsuffixed key — a persisted WG winner is loaded but the "
+            "original unoptimized SPV is dispatched"
+        )
+
+
+class TestSPB4WgWinnerPersisted:
+    """SP.B4 regression — WG autotune winner must be persisted to disk."""
+
+    def test_save_wg_cache_is_called(self):
+        """``_save_wg_cache`` must be invoked after the in-memory cache update.
+
+        It was defined but had zero call sites, so an autotune winner lived
+        only in ``_WG_AUTOTUNE_CACHE`` for the process lifetime — the next
+        launch re-ran the full benchmark sweep from scratch.
+        """
+        import importlib
+        import inspect
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        fn_src = inspect.getsource(dispatch_mod._autotune_kernel_wg)
+        assert "_save_wg_cache(src_hash, best_wg)" in fn_src, (
+            "SP.B4 regression: _autotune_kernel_wg must call "
+            "_save_wg_cache(src_hash, best_wg) to persist the winner"
+        )
+
+    def test_save_wg_cache_round_trips_through_disk(self, tmp_path, monkeypatch):
+        """A saved winner must be readable back via ``_load_wg_cache``."""
+        import importlib
+
+        dispatch_mod = importlib.import_module(
+            "torch_vulkan.inductor.runtime.dispatch"
+        )
+        monkeypatch.setattr(dispatch_mod, "_WG_DISK_CACHE_DIR", tmp_path)
+        dispatch_mod._save_wg_cache("deadbeef0001", 128)
+        loaded = dispatch_mod._load_wg_cache()
+        assert loaded.get("deadbeef0001") == 128
+
 
 class TestVec4EligibilityCompositeIndex:
     """CG.4 — composite buffer index must propagate lane-dependency check.
