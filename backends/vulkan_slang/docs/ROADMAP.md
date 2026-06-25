@@ -1846,29 +1846,12 @@ same-kernel race writes identical content to the same path (harmless).
     routes through `templates/scatter_atomic.slang` instead).
   - **This is the same work as E4.** The E4 4-phase plan already describes the full
     implementation. E1 is now subsumed by E4; see E4 for the complete plan.
-- **E2** — masking backward (`tril`/`triu`/`masked_fill`/`where`) verification.
+- **E2** — masking backward (`tril`/`triu`/`masked_fill`/`where`) verification. ✅ **VERIFIED 2026-06-26** — `TestMaskingBackward` 5/5 pass on GPU.
 
-  **2026-06-22 audit (confirmed): item is ALREADY IMPLEMENTED — only verification needed.**
-
-  Rationale: `tril`/`triu`/`masked_fill`/`where` have no `aten.*_backward` ops.
-  Autograd decomposes their backward into the **same forward op on `grad_output`**:
-  - `tril(x).backward()` → `aten.tril.default(grad_output)` (re-applies same op)
-  - `where(cond, a, b).backward()` → `where(cond, grad, 0)` + `where(cond, 0, grad)` 
-  - `masked_fill(x, mask, val).backward()` → `masked_fill(grad, mask, 0)`
-
-  `bwd_diff` is fundamentally incompatible with these ops (they are conditional
-  selects, not differentiable float elementals; `masking.py:14-15` explicitly states
-  this). The ROADMAP item's original "via `bwd_diff`" framing was incorrect.
-
-  **What IS done**: all forward lowerings exist in `lowerings/masking.py`; autograd
-  decomposes backward into forward ops; `TestMaskingBackward` has 5 regression tests
-  (lines 63772-63840 of `test_inductor_regression.py`), not xfailed.
-
-  **Only remaining work**: run the 5 `TestMaskingBackward` tests on GPU to confirm
-  they pass. If any fail, it is a bug in the forward lowering, not a missing backward
-  mechanism. Re-scope this item from "implement" to "GPU verify."
-
-  **Tests**: `test_tril_backward_grad_parity`, `test_triu_backward_grad_parity`,
+  All forward lowerings in `lowerings/masking.py`; autograd decomposes backward into
+  the same forward ops (no `bwd_diff` needed — these are conditional selects, not
+  differentiable float elementals). `TestMaskingBackward` 5/5 pass:
+  `test_tril_backward_grad_parity`, `test_triu_backward_grad_parity`,
   `test_tril_batched_backward_grad_parity`, `test_masked_fill_backward_grad_parity`,
   `test_where_backward_grad_parity`.
 - **E3** — missing ops: `sort`, `bucketize`, `multinomial`, sparse (csr/coo),
@@ -2138,12 +2121,12 @@ prepare_device(level, timeout_s, validate)
 │   ├─ CG.1 (argmin/argmax uint2 index > 16M) ✅ FIXED 2026-06-25
 │   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) ✅ FIXED 2026-06-25
 │   ├─ CG.3 (packed16+welford guard bypass) ✅ MERGED PR #6 2026-06-24
-│   ├─ CG.4 (vec4 eligibility regex false-positive) 🔧 PR in progress
+│   ├─ CG.4 (vec4 eligibility regex false-positive) ✅ FIXED (`dc7b4bc72e2`, 6/6 tests pass)
 │   └─ CG.5 (pointwise.py split to ≤800 L) ✅ FIXED 2026-06-25
 │
 ├─ Slang/SPIR-V pipeline (SP)
 │   ├─ SP.1 (reflection_ext numthreads dead/wire) ✅ FIXED 2026-06-25
-│   ├─ SP.2 (async compile .result() blocking) ✅ PR #17 ready for merge ◀── prerequisite for S3.4
+│   ├─ SP.2 (async compile .result() blocking) ✅ MERGED PR #17 2026-06-25 ◀── prerequisite for S3.4
 │   └─ SP.3 (SPIR-V cache key PC-layout hash) ✅ FIXED 2026-06-25
 │
 └─ Continuous: E1/E2/E3/E4/E5 (coverage) · F (regression lock)
