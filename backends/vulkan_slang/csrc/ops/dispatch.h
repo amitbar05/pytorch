@@ -125,6 +125,10 @@ BufferInfo get_buffer_info(const at::Tensor& tensor);
 // CG.M15: spec_constants are (constant_id, value) pairs that override
 // ``[[vk::constant_id]]`` defaults at pipeline-creation time.  A single
 // SPIR-V module can serve multiple tile configurations this way.
+// per_tensor_byte_offsets: when non-null, overrides the descriptor byte offset for
+// each tensor (indexed 0..n-1).  Use VK_WHOLE_SIZE as sentinel to mean "natural".
+// Used by dispatch_strided_copy to force offset=0 so that storage_offset_src push
+// constant is not double-counted when the natural offset happens to be aligned.
 void dispatch_shader(
     const std::string& key,
     const uint32_t* spirv_code,
@@ -136,7 +140,8 @@ void dispatch_shader(
     const void* push_constants = nullptr,
     uint32_t push_constants_size = 0,
     uint32_t num_outputs = 1,
-    const std::vector<SpecConstant>& spec_constants = {});
+    const std::vector<SpecConstant>& spec_constants = {},
+    const std::vector<VkDeviceSize>* per_tensor_byte_offsets = nullptr);
 
 // N+1.5: dispatch with descriptor-array bindings.
 // `descriptor_counts.size()` = number of bindings; sum = total buffers,

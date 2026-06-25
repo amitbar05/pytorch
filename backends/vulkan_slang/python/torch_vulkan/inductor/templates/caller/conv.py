@@ -411,6 +411,11 @@ def _slang_tile_conv2d(
     # The shader always declares StructuredBuffer<float> bias in KernelArgs.
     buffers = [input_t, weight_t]
     if has_bias:
+        # S3.5c: per-group bias slice (e.g. bias[4:8]) has non-zero
+        # storage_offset that the C++ dispatcher maps to
+        # VkDescriptorBufferInfo.offset.  Clone to ensure offset==0.
+        if bias.storage_offset() != 0:
+            bias = bias.clone()
         buffers.append(bias.view(-1))
     else:
         buffers.append(torch.zeros(1, device=input_t.device, dtype=input_t.dtype))

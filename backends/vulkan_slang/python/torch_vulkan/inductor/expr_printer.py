@@ -74,6 +74,21 @@ class VulkanExprPrinter(ExprPrinter_):
         finally:
             self._subscript_depth -= 1
 
+    def _print_Identity(self, expr: sympy.Expr) -> str:
+        # pointwise_cat wraps channel offsets as Identity(idx - start) to
+        # prevent sympy from expanding stride*offset products.  When Identity
+        # appears as a factor inside Mul (e.g. 32 * Identity(x1 - 4)), the
+        # base-class _print_Identity strips the wrapper and returns the inner
+        # string without parens.  If the inner expression is an Add, _print_Mul
+        # then joins without grouping — "32 * x1 - 4" or "32 * -4 + x1" —
+        # which C interprets as "(32 * x1) - 4" or "(32 * (-4)) + x1", both
+        # wrong by 124 per element.  Adding parens here produces
+        # "32 * (x1 - 4)" = 32*(x1-4) = correct stride offset.
+        inner = self.doprint(expr.args[0])
+        if isinstance(expr.args[0], sympy.Add):
+            return f"({inner})"
+        return inner
+
     def _print_Mul(self, expr: sympy.Expr) -> str:
         # SymPy normally constant-folds 0*x → 0 and 1*x → x, but Inductor
         # sometimes constructs Mul nodes with `evaluate=False` (e.g. for
