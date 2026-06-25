@@ -341,11 +341,15 @@ def _slang_tile_conv2d(
         (34, threads_h),
     ]
 
-    # Ensure contiguous for direct buffer access
-    if not input_t.is_contiguous():
-        input_t = input_t.contiguous()
-    if not weight_t.is_contiguous():
-        weight_t = weight_t.contiguous()
+    # Ensure contiguous and zero-offset for direct buffer access.
+    # S3.5c: is_contiguous() doesn't imply storage_offset==0 — a slice like
+    # weight[4:8] can be contiguous yet start at offset 48. The C++ dispatcher
+    # needs VkDescriptorBufferInfo.offset aligned to minStorageBufferOffsetAlignment
+    # (256 B on RDNA1), which 48*4=192 B is not. Clone to produce a fresh buffer.
+    if not input_t.is_contiguous() or input_t.storage_offset() != 0:
+        input_t = input_t.clone()
+    if not weight_t.is_contiguous() or weight_t.storage_offset() != 0:
+        weight_t = weight_t.clone()
 
     # Pack push constants: 15 uint fields for no-bias, 17 for bias.
     # M-pipeline-1-followup: wrap every int field with ``int(...)`` so
