@@ -2015,13 +2015,13 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
 | 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `6d5cb00803f` (wg_argmax NUICF + wg_argmin) |
 | 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | ✅ FIXED (already in `dc7b4bc72e2`, 6/6 tests pass) |
-| 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | Fix spec confirmed |
+| 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 (bf16 wave32 guard, `TestBf16PackedStoreWave32` ✅) |
 | 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |
 | 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `682f7793404` |
-| 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | Fix spec confirmed |
+| 11 | E5 | `python/torch_vulkan/inductor/bwd_lowerings.py` | ~25 | 🟡 MEDIUM | ⛔ BLOCKED — `aten.scaled_dot_product_attention_backward` absent in PyTorch 2.11 |
 | 12 | S2.3 | `csrc/vulkan/Context.cpp:107` | 4 | 🟡 MEDIUM | ✅ MERGED PR #25 2026-06-25 |
 | 13 | S0.1 | `autotune.py:43-57` + `gemm/dispatch.py:121-137` | ~15 | 🟡 LOW | ✅ FIXED 2026-06-25 (tests added, 3/3 pass) |
-| 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | Fix spec confirmed |
+| 14 | MS.3 | `csrc/ops/dispatch.h` + `csrc/ops/dispatch.cpp` | ~30 | 🟡 LOW | ✅ FIXED 2026-06-25 — `desc_set_mutex_` + 7 lock_guard sites in place |
 | 15 | SP.1 | 3 Python files + 2 test files | ~160 del | 🟢 CLEANUP | ✅ MERGED PR #17 2026-06-25 |
 | 16 | meta_patches cleanup | `meta_patches/shape_ops.py`, `dtype_ops.py`, `decomposition_passes.py` | ~80 del | 🟢 CLEANUP | Fix spec confirmed (see § 3.6) |
 
@@ -2113,7 +2113,7 @@ prepare_device(level, timeout_s, validate)
 │   ├─ S2.0 (buf7 full-CNN bwd crash) ✅ FIXED
 │   ├─ S2.1 (extern/aten leak)        ✅ FIXED 2026-06-21
 │   ├─ S2.2 (conv_gn_relu RDNA1 bug)  ✅ FIXED 2026-06-21
-│   ├─ S2.3 (in-process validation)   🔴  ◀── makes validate=True real
+│   ├─ S2.3 (in-process validation)   ✅ FIXED 2026-06-25
 │   ├─ S2.4 (warm→train coherence)    ✅ FIXED 2026-06-21
 │   └─ S2.5 (pooling fwd custom-op)   ✅ FIXED 2026-06-21
 │
