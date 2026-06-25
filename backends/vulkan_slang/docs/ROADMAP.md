@@ -177,7 +177,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | 4 | No symptom-fixes in `meta_patches/` | 🟡 several remain |
 | 5 | No Jinja for interface-level params | ✅ (foreach + rnn_cell migrated) |
 | 6 | **No CPU/eager fallbacks on the compile path** | ✅ S2.5 ✅ FIXED 2026-06-21 (avg_pool2d → `torch_vulkan` custom op); S2.1 ✅ fixed; S2.2 ✅ confirmed |
-| 7 | No file > 800 lines | 🟡 `pointwise.py` 820L |
+| 7 | No file > 800 lines | ✅ **CG.5 FIXED 2026-06-25** — `pointwise.py` 558L (bwd_diff+DCE extracted to `pointwise_bwd.py` 283L) |
 | 8 | **Binary loss backward via inline bwd_diff (not external custom-op shim)** | ✅ **CG.M8 FIXED 2026-06-21** — `aten.{mse,l1,bce,bce_with_logits,smooth_l1,huber}_loss_backward` route through `ops.vulkan_bwd_diff_binary` inline path with correct 1/N mean-scale. `TestTrain1LossBackwardReachability` 10/10 ✅. |
 
 ---
@@ -1480,10 +1480,9 @@ brackets). Literal-only index `buf[42]` — `findall` returns empty, no false de
 but CSE always pre-assigns such expressions to variables so the dep-graph check
 covers them via the variable in the assignment.
 
-- **Files**: `kernel/pointwise.py:385-394` (5-line change).
-- **Exit**: `TestVec4EligibilityCompositeIndex` — kernel with
-  `buf[base + xindex]` where `base = lid.x * 16` returns ineligible (False)
-  from `_check_index_lane_dependency`.
+- **Files**: `kernel/pointwise.py:385-394` (now at line ~74 after CG.5 split; in PointwiseMixin via inheritance from PointwiseBwdMixin).
+- **Exit**: `TestVec4EligibilityCompositeIndex` — 6/6 ✅ (2026-06-25).
+- **Status**: ✅ **FIXED** (already implemented in `dc7b4bc72e2`).
 
 ### CG.5 — Split `kernel/pointwise.py` to ≤ 800 lines (anti-goal #7)
 
@@ -2013,7 +2012,7 @@ separate `claude_code` implement ticket — one at a time, cross-reviewed by `pi
 | 4 | SP.B1 | `python/torch_vulkan/inductor/runtime/slangc.py:636-639` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
 | 5 | SP.B2 | `python/torch_vulkan/inductor/runtime/shader_lib.py:99-101` | 3 | 🟡 HIGH | ✅ MERGED PR #3 2026-06-24 |
 | 6 | CG.3 | `python/torch_vulkan/inductor/kernel/pointwise_vec4_mixin.py` | 1 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `6d5cb00803f` (wg_argmax NUICF + wg_argmin) |
-| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | 🔧 PR in progress |
+| 7 | CG.4 | `python/torch_vulkan/inductor/kernel/pointwise.py:385-394` | 5 | 🟡 MEDIUM | ✅ FIXED (already in `dc7b4bc72e2`, 6/6 tests pass) |
 | 8 | CG.2 | `python/torch_vulkan/inductor/kernel/pointwise.py:725` | 4 | 🟡 MEDIUM | Fix spec confirmed |
 | 9 | S4.0 | `python/torch_vulkan/inductor/cpp_wrapper_gpu.py` | ~15 | 🟡 MEDIUM | ✅ MERGED PR #5 2026-06-24 |
 | 10 | CG.1 | `kernel/reduction.py` + 2 Slang files | ~50 | 🟡 MEDIUM | ✅ FIXED 2026-06-25 `682f7793404` |

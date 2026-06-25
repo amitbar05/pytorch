@@ -22,6 +22,16 @@ from torch.fx import GraphModule, Node
 from .registry import register_fx_pattern
 
 
+def _fx_to_int(x: Any) -> int:
+    """Extract a concrete int from a value that may be an FX Node or SymInt."""
+    if isinstance(x, Node):
+        val = x.meta.get("val")
+        if val is not None:
+            return int(val)
+        raise ValueError(f"Cannot extract int from FX Node {x} with no val meta")
+    return int(x)
+
+
 def _match_conv_im2col(gm: GraphModule) -> Iterable[tuple[Node, dict[str, Any]]]:
     """Match ``torch_vulkan.conv2d_with_optional_bias`` calls whose input
     and weight tensors are 4-D with valid group division."""
@@ -92,15 +102,15 @@ def _rewrite_conv_im2col(
     stride = ctx["stride"]
     padding = ctx["padding"]
     dilation = ctx["dilation"]
-    groups: int = ctx["groups"]
+    groups: int = _fx_to_int(ctx["groups"])
     conv_target = root.target
 
-    sH = int(stride[0])
-    sW = int(stride[-1]) if len(stride) > 1 else sH
-    pH = int(padding[0])
-    pW = int(padding[-1]) if len(padding) > 1 else pH
-    dH = int(dilation[0])
-    dW = int(dilation[-1]) if len(dilation) > 1 else dH
+    sH = _fx_to_int(stride[0])
+    sW = _fx_to_int(stride[-1]) if len(stride) > 1 else sH
+    pH = _fx_to_int(padding[0])
+    pW = _fx_to_int(padding[-1]) if len(padding) > 1 else pH
+    dH = _fx_to_int(dilation[0])
+    dW = _fx_to_int(dilation[-1]) if len(dilation) > 1 else dH
 
     inp_val = inp.meta["val"]
     w_val = weight.meta["val"]

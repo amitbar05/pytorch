@@ -207,14 +207,14 @@ def _vulkan_conv3d_native_lowering(
     from torch._inductor import ir
 
     if len(input.get_size()) != 5 or len(weight.get_size()) != 5:
-        return NotImplemented
+        raise NotImplementedError("vulkan conv3d: non-5D input/weight")
 
     g = int(groups)
     if g != 1:
-        return NotImplemented
+        raise NotImplementedError("vulkan conv3d: groups != 1")
 
     if input.get_dtype() != torch.float32:
-        return NotImplemented
+        raise NotImplementedError("vulkan conv3d: non-fp32 dtype")
 
     t1_sizes = input.get_size()
     w_sizes = weight.get_size()
