@@ -702,7 +702,7 @@ printed `Mul(32, Identity(Add(x1, -4)))` as `"32 * -4 + x1"` because:
 **Fix**: Added `_print_Identity` override to `VulkanExprPrinter` (`expr_printer.py`):
 wraps inner `Add` in `()` so `"32 * (-4 + x1)"` = `32*(x1-4)` is emitted correctly.
 
-- **Commit**: to be committed with S3.5c tag
+- **Commit**: `d066727f32b vulkan: S3.5c dispatch — storage_offset push-const + bias clone + Identity parens fix`
 - **Exit**: `test_m6_conv1d_groups_matches_cpu` ✅ PASSED 2026-06-25
 
 #### S3.5d — 🟡 KNOWN LIMITATION: Conv2d backward `.item()` intentional GPU→CPU sync
