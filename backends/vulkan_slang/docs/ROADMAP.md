@@ -144,7 +144,7 @@ Legend: ✅ done · 🟡 partial · ⛔ open · 🔴 regression/defect · 🔬 n
 | **S3.5d** | **Conv2d backward `.item()` intentional GPU pipeline drain** (`fx_passes/eager/conv_backward.py:99`): `grad_bias[0].item()` is a deliberate sync barrier inserted to prevent stale gradient data in the FallbackKernel compiled path. NOT removable without a proper Vulkan submission fence in the C++ dispatch layer. Performance stall on every conv bwd+bias; correctness preserved. Proper fix: C++ submission tracking in `csrc/ops/dispatch.cpp`. | 🟡 **KNOWN LIMITATION** — intentional; fix requires C++ dispatch change |
 | **S4.0** | **AOTI: MM/addmm/bmm templates emit `n_pc=0` → `pc_size_bytes=0` in AotiRuntime**: Template kernels bypass `define_kernel`; `_set_kernel_meta` never called; `get_kernel_meta` returns `n_pc=0`. SPIR-V expects 96 bytes (24×uint32). Fix: `get_reflected_pc_size(spv)` reads `push_constant_size` from SPIR-V reflection JSON (authoritative); `_generate_kernel_call_helper` uses reflection-first `pc_size_bytes`; `generate_extern_kernel_out` override intercepts Vulkan ExternKernelOut; `emit_aoti_spv_header` accepts `metadata` dict; arg-split `n_pc = max(0, n_args - 3 - _meta_n_buffers)`. | ✅ **MERGED 2026-06-24** — PR #5, cross-review PASS (2 fix rounds) |
 | **CG.1** | **argmin/argmax index precision loss for tensors > 16M elements** (`kernel/reduction.py:336-342`): float2 cast truncates 24-bit mantissa. | ✅ **FIXED 2026-06-25** — `kernel/reduction.py` + `shaders/lib/vk_reduction.slang`: encode as `uint2(asuint(val), idx)`, decode with `asfloat(pair.x)` + `pair.y`. Both argmax and argmin fixed. |
-| **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | 🔴 **OPEN** — latent, wave32 only |
+| **CG.2** | **bf16 packed16 store uses `WaveReadLaneAt` unconditionally** (`kernel/pointwise.py:145-170`): wave32 hardware reads wrong lane. Guard with device simd_group_size check. | ✅ **FIXED 2026-06-25** — `kernel/pointwise.py`: when `_packed16_vw_active` is True the WaveReadLaneAt body is replaced by a gtid.x vector write; `_pw_has_wave_ops` must not be set in that state. Guard added. `TestBf16PackedStoreWave32` ✅ |
 | **CG.3** | **packed16 + welford guard bypass** (`kernel/pointwise_load_mixin.py:130-145`): early-return at line 138 skips `has_welford` guard — fp16 loads + welford produces garbage mean/m2. Move welford check before early-return. | ✅ **MERGED 2026-06-24** — PR #6, cross-review PASS |
 | **GPU.3** | **wg_argmax NUICF + smem write-back** (`shaders/lib/reduction.slang`): (1) `WaveReadLaneAt(acc.idx, _src)` inside conditional → non-uniform control flow on RDNA1 → idx always 0 instead of correct lane value; (2) inter-wave winner never written back to smem[0] for multi-wave case. | ✅ **FIXED 2026-06-25** — hoisted both `WaveReadLaneAt` calls before conditional; added `if (lane==0) smem[0]=result` + final sync in wg_argmax. Added missing `wg_argmin` function. `TestReductionGenericFamily` 4/4 ✅ |
 | **SP.1** | **Async compile still serial: `.result()` blocks caller** (`runtime/slangc.py:552-560`): `compile_slang_to_spirv` calls `pool.submit(...).result()` on cache-miss — overlap never happens. Fix: `add_done_callback` + `_compile_exceptions` store + `event.wait()` (non-blocking; owner thread uses same pattern as non-owner threads). | ✅ **PR #17 ready for merge** — cross-review PASS (pi, 2026-06-24). Advisories posted as PR comment. |
@@ -1656,7 +1656,9 @@ proof-of-concept requires the deferred-resolution closure pattern.
   calls on different kernels complete in overlapping wall-clock time; wall-clock time
   < 2× single-compile latency.
 
-### SP.3 — Add PC-layout hash to SPIR-V template cache key
+### SP.3 — ✅ FIXED 2026-06-25 — Add PC-layout hash to SPIR-V template cache key
+
+**FIXED** — `2197bbc1903` + `5af57ab7bd2`: `_pc_layout_hash()` in `gemm/dispatch.py` extracts `struct PC`/`struct BwdPC` body via regex → sha256[:8]; threaded through `compile_and_dispatch` → `compile_slang_to_spirv` as `pc_layout_hash`; mixed into `hash_key` via `PC=<tag>`. All 4 fwd+bwd dispatch call sites updated. `TestSP3PcLayoutHash` (5 tests) ✅
 
 **2026-06-22 deep audit (confirmed) — 4-file change:**
 
@@ -2133,16 +2135,16 @@ prepare_device(level, timeout_s, validate)
 │   └─ S4.3 (A2.6 factory-op shim → all _FACTORY_OPS) ✅ MERGED PR #10 2026-06-24
 │
 ├─ Codegen correctness (CG)
-│   ├─ CG.1 (argmin/argmax uint2 index > 16M) 🔴
-│   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) 🔴
+│   ├─ CG.1 (argmin/argmax uint2 index > 16M) ✅ FIXED 2026-06-25
+│   ├─ CG.2 (bf16 packed16 wave32 WaveReadLaneAt guard) ✅ FIXED 2026-06-25
 │   ├─ CG.3 (packed16+welford guard bypass) ✅ MERGED PR #6 2026-06-24
 │   ├─ CG.4 (vec4 eligibility regex false-positive) 🔧 PR in progress
-│   └─ CG.5 (pointwise.py split to ≤800 L) ⛔
+│   └─ CG.5 (pointwise.py split to ≤800 L) ✅ FIXED 2026-06-25
 │
 ├─ Slang/SPIR-V pipeline (SP)
-│   ├─ SP.1 (reflection_ext numthreads dead/wire) 🔴
+│   ├─ SP.1 (reflection_ext numthreads dead/wire) ✅ FIXED 2026-06-25
 │   ├─ SP.2 (async compile .result() blocking) ✅ PR #17 ready for merge ◀── prerequisite for S3.4
-│   └─ SP.3 (SPIR-V cache key PC-layout hash) 🔴
+│   └─ SP.3 (SPIR-V cache key PC-layout hash) ✅ FIXED 2026-06-25
 │
 └─ Continuous: E1/E2/E3/E4/E5 (coverage) · F (regression lock)
 ```
@@ -2276,10 +2278,10 @@ See `§ 2.5` ticket 16: delete the 13 immediately-removable items (~80 LOC net).
 | 🔧 PR in progress | CG.4 vec4 eligibility regex | `fix/cg4-composite-index-regex` — rebasing onto updated main |
 | ⛔ Blocked upstream | S4.1 full-step AOTI `.so` | `torch.export` `empty.memory_format` gap; no upstream fix for PrivateUse1 |
 | 🔴 Open | CG.1 argmin/argmax uint2 index | Silent wrong result for tensors >16M elements |
-| 🔴 Open | CG.2 bf16 packed16 wave32 guard | Latent, wave32 GPUs only |
+| ✅ Fixed | CG.2 bf16 packed16 wave32 guard | FIXED 2026-06-25 — _pw_has_wave_ops guard |
 | ✅ PR #17 | SP.1 async compile blocking | `add_done_callback` + event.wait fix; cross-review PASS |
 | 🔴 Open | SP.2 numthreads dead code | Wire or delete `_rewrite_numthreads_in_source` |
-| 🔴 Open | SP.3 SPIR-V cache key PC-layout | Cache collision risk |
+| ✅ Fixed | SP.3 SPIR-V cache key PC-layout | FIXED 2026-06-25 — PC-layout hash in cache key |
 
 ### Risk register
 
