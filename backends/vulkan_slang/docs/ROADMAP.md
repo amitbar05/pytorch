@@ -2277,10 +2277,10 @@ See `§ 2.5` ticket 16: delete the 13 immediately-removable items (~80 LOC net).
 |---|---|---|
 | 🔧 PR in progress | CG.4 vec4 eligibility regex | `fix/cg4-composite-index-regex` — rebasing onto updated main |
 | ⛔ Blocked upstream | S4.1 full-step AOTI `.so` | `torch.export` `empty.memory_format` gap; no upstream fix for PrivateUse1 |
-| 🔴 Open | CG.1 argmin/argmax uint2 index | Silent wrong result for tensors >16M elements |
+| ✅ Fixed | CG.1 argmin/argmax uint2 index | FIXED 2026-06-25 commit `682f7793404` — uint2 encoding |
 | ✅ Fixed | CG.2 bf16 packed16 wave32 guard | FIXED 2026-06-25 — _pw_has_wave_ops guard |
 | ✅ PR #17 | SP.1 async compile blocking | `add_done_callback` + event.wait fix; cross-review PASS |
-| 🔴 Open | SP.2 numthreads dead code | Wire or delete `_rewrite_numthreads_in_source` |
+| ✅ Fixed | SP.2 numthreads dead code | FIXED 2026-06-25 — deleted dead rewrite path from reflection_ext.py |
 | ✅ Fixed | SP.3 SPIR-V cache key PC-layout | FIXED 2026-06-25 — PC-layout hash in cache key |
 
 ### Risk register
