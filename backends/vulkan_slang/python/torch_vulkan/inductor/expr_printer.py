@@ -172,6 +172,22 @@ class VulkanExprPrinter(ExprPrinter_):
     def _print_ceiling(self, expr: sympy.Expr) -> str:
         return f"ceil({self.doprint(expr.args[0])})"
 
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        return self._nary_minmax("max", expr.args)
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        return self._nary_minmax("min", expr.args)
+
+    def _nary_minmax(self, fn: str, args) -> str:
+        """sympy ``Max``/``Min`` are N-ary; Slang ``max``/``min`` are binary.
+        Fold left into nested calls. Used by symbolic-shape index expressions
+        (e.g. ``Max(1, ...)`` from a dynamic conv output extent)."""
+        rendered = [self.doprint(a) for a in args]
+        acc = rendered[0]
+        for nxt in rendered[1:]:
+            acc = f"{fn}({acc}, {nxt})"
+        return acc
+
     def _print_Symbol(self, expr: sympy.Expr) -> str:
         # Register symbolic shape symbols (e.g. `s27` from dynamic=True) as
         # kernel sizevars so they get a push-constant slot. Without this the

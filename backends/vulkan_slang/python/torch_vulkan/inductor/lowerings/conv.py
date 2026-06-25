@@ -658,12 +658,19 @@ def _register_conv_and_pool_lowerings() -> None:
     ):
         if bool(transposed):
             raise NotImplementedError("vulkan convolution: transposed conv")
-        if int(groups) != 1:
-            raise NotImplementedError("vulkan convolution: groups != 1")
-        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
-            raise NotImplementedError("vulkan convolution: non-4D input/weight")
         if input.get_device().type != "vulkan":
             raise NotImplementedError("vulkan convolution: non-vulkan device")
+        # Route 5D (conv3d) through the reshape-to-conv2d path; the
+        # conv3d lowerings registered for aten.conv3d.* are not always
+        # invoked when F.conv3d traces to aten.convolution.default.
+        if len(input.get_size()) == 5 and len(weight.get_size()) == 5:
+            return _conv3d_to_conv2d_lowering(
+                input, weight, bias, stride, padding, dilation, groups
+            )
+        if len(input.get_size()) != 4 or len(weight.get_size()) != 4:
+            raise NotImplementedError("vulkan convolution: non-4D input/weight")
+        if int(groups) != 1:
+            raise NotImplementedError("vulkan convolution: groups != 1")
         # Delegate to the existing conv2d custom-op lowering which
         # creates a _VulkanConv2dExternKernel → _slang_tile_conv2d.
         return _vulkan_conv2d_with_optional_bias(
@@ -932,12 +939,22 @@ def _register_conv_and_pool_lowerings() -> None:
             )
 
         if KD == 1 and dD == 1 and sD == 1:
-            # Optimised path: reshape [N,C,D,H,W] → [N*D,C,H,W].
-            # Clone after reshape to avoid as_strided view materialization
-            # issues (the reshape from [N,C,D,H,W] to [N*D,C,H,W] merges
-            # non-adjacent dims N and D, creating a non-contiguous view).
-            input_4d = _lowerings[aten.reshape.default](input, [N * D, C_in, H, W])
-            input_4d = _lowerings[aten.clone.default](input_4d)
+            # KD==1 path: map conv3d to N*D independent conv2d calls.
+            #
+            # [N, C, D, H, W] cannot be reshaped directly to [N*D, C, H, W]
+            # because C (channels) sits between N and D in NCHW memory order —
+            # the stride for the merged batch dim would be H*W, not C*H*W.
+            # The correct transform is: permute → contiguous → reshape.
+            #
+            # Step 1: permute [N, C, D, H, W] → [N, D, C, H, W]
+            input_perm = _lowerings[aten.permute.default](input, [0, 2, 1, 3, 4])
+            # Step 2: materialise contiguous [N, D, C, H, W] (required before
+            # reshape so the merged batch dim has stride = C*H*W).
+            input_perm = _lowerings[aten.clone.default](input_perm)
+            # Step 3: reshape [N, D, C, H, W] → [N*D, C, H, W]
+            input_4d = _lowerings[aten.reshape.default](
+                input_perm, [N * D, C_in, H, W]
+            )
             weight_4d = _lowerings[aten.reshape.default](
                 weight, [C_out, C_in_per_g, KH, KW]
             )
@@ -949,17 +966,16 @@ def _register_conv_and_pool_lowerings() -> None:
                 raise NotImplementedError(
                     "vulkan conv3d: conv2d sub-lowering declined"
                 )
-            # Clone before reshaping back to avoid SqueezeView stride-length
-            # assertion failures (same pattern as Conv1d lowering).
-            result_4d = _lowerings[aten.clone.default](result_4d)
-            # H_out_actual / W_out_actual are passed straight into
-            # the reshape size list — sympy expressions flow through
-            # without coercion.
+            # result_4d: [N*D, C_out, H_out, W_out]
+            # Reshape back: [N*D, C_out, H_out, W_out] → [N, D_out, C_out, H_out, W_out]
             H_out_actual = result_4d.get_size()[2]
             W_out_actual = result_4d.get_size()[3]
-            return _lowerings[aten.reshape.default](
-                result_4d, [N, C_out, D_out, H_out_actual, W_out_actual]
+            result_5d = _lowerings[aten.reshape.default](
+                result_4d, [N, D_out, C_out, H_out_actual, W_out_actual]
             )
+            # Permute back: [N, D_out, C_out, H_out, W_out] → [N, C_out, D_out, H_out, W_out]
+            result_5d = _lowerings[aten.permute.default](result_5d, [0, 2, 1, 3, 4])
+            return _lowerings[aten.clone.default](result_5d)
 
         # KD > 1 or dD > 1 or sD > 1 — full 3D kernel support via native
         # Conv3d template (MODEL.1). Delegates to the dedicated
